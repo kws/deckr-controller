@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deckr-controller"
-version = "0.1.0"
+version = "0.1.0.dev0"
 description = "Deckr controller runtime with config, routing, rendering, and device management"
 readme = "README.md"
 license = { text = "MIT" }
@@ -28,7 +28,7 @@ classifiers = [
 dependencies = [
     "aiomqtt>=2.0.0,<3.0.0",
     "cairosvg>=2.8.2,<3.0.0",
-    "deckr>=0.1.0,<0.2.0",
+    "deckr[graph,mqtt]>=0.2.0.dev0,<0.3.0",
     "deckr-fonts>=0.2.0",
     "httpx>=0.28.1,<0.29.0",
     "invariant-core==0.3.0",

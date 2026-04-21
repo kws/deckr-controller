@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 
-from deckr.core.mqtt import MqttGateway
+from deckr.core.mqtt import MqttGateway, MqttGatewayConfig
 from deckr.plugin.messages import HostMessage
 
 logger = logging.getLogger(__name__)
@@ -15,13 +16,27 @@ _MQTT_REQUIRED_MSG = (
 )
 
 
+def _load_gateway_config() -> MqttGatewayConfig:
+    username = os.getenv("MQTT_USERNAME", "").strip() or None
+    password = os.getenv("MQTT_PASSWORD", "").strip() if username else None
+    return MqttGatewayConfig(
+        hostname=os.getenv("MQTT_HOSTNAME", "").strip(),
+        port=int(os.getenv("MQTT_PORT", "1883")),
+        topic=os.getenv("MQTT_TOPIC", "").strip(),
+        username=username,
+        password=password or None,
+    )
+
+
 def host_factory(event_bus: object) -> MqttGateway:
     """Return MqttGateway for bridging plugin bus to remote host. Fails if not configured."""
-    if not MqttGateway.is_enabled():
+    config = _load_gateway_config()
+    if not config.enabled:
         logger.error(_MQTT_REQUIRED_MSG)
         raise ValueError(_MQTT_REQUIRED_MSG)
     return MqttGateway(
         event_bus=event_bus,
+        config=config,
         serialize=lambda m: m.to_dict(),
         deserialize=HostMessage.from_dict,
         deserialize_from_mqtt=lambda d: HostMessage.from_dict(

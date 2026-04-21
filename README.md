@@ -37,10 +37,6 @@ Install the project and development tooling:
 uv sync
 ```
 
-For local sibling-repo development, `uv` is configured to resolve `deckr` from
-`../deckr`. The published package metadata still depends on the normal PyPI
-`deckr` release.
-
 Run the default validation suite:
 
 ```bash

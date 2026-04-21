@@ -300,28 +300,36 @@ wheels = [
 
 [[package]]
 name = "deckr"
-version = "0.1.0"
+version = "0.2.0.dev0"
 source = { editable = "../deckr" }
 dependencies = [
-    { name = "aiomqtt" },
     { name = "anyio" },
-    { name = "invariant-core" },
     { name = "pydantic" },
-    { name = "python-decouple" },
+]
+
+[package.optional-dependencies]
+graph = [
+    { name = "invariant-core" },
+]
+mqtt = [
+    { name = "aiomqtt" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
+    { name = "aiomqtt", marker = "extra == 'mqtt'", specifier = ">=2.0.0,<3.0.0" },
     { name = "anyio", specifier = ">=4.12.1,<5.0.0" },
-    { name = "invariant-core", specifier = "==0.3.0" },
+    { name = "deckr", extras = ["graph", "mqtt"], marker = "extra == 'all'" },
+    { name = "invariant-core", marker = "extra == 'graph'", specifier = "==0.3.0" },
     { name = "pydantic", specifier = ">=2.12.5,<3.0.0" },
-    { name = "python-decouple", specifier = ">=3.8,<4.0" },
 ]
+provides-extras = ["mqtt", "graph", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
     { name = "import-linter", specifier = ">=2.11,<3.0.0" },
+    { name = "invariant-core", specifier = "==0.3.0" },
     { name = "pytest", specifier = ">=9.0.2,<10.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.3.0,<2.0.0" },
     { name = "pytest-cov", specifier = ">=6.0.0,<7.0.0" },
@@ -330,12 +338,12 @@ dev = [
 
 [[package]]
 name = "deckr-controller"
-version = "0.1.0"
+version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "aiomqtt" },
     { name = "cairosvg" },
-    { name = "deckr" },
+    { name = "deckr", extra = ["graph", "mqtt"] },
     { name = "deckr-fonts" },
     { name = "httpx" },
     { name = "invariant-core" },
@@ -365,7 +373,7 @@ dev = [
 requires-dist = [
     { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
     { name = "cairosvg", specifier = ">=2.8.2,<3.0.0" },
-    { name = "deckr", editable = "../deckr" },
+    { name = "deckr", extras = ["graph", "mqtt"], editable = "../deckr" },
     { name = "deckr-fonts", specifier = ">=0.2.0" },
     { name = "httpx", specifier = ">=0.28.1,<0.29.0" },
     { name = "invariant-core", specifier = "==0.3.0" },
