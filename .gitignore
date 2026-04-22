@@ -12,6 +12,7 @@
 .ruff_cache/
 .tox/
 .venv/
+uv.toml
 *.egg-info/
 *.log
 *.py[cod]
