@@ -321,7 +321,7 @@ mqtt = [
 
 [[package]]
 name = "deckr-controller"
-version = "0.2.0.dev0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiomqtt" },
@@ -356,7 +356,7 @@ dev = [
 requires-dist = [
     { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
     { name = "cairosvg", specifier = ">=2.8.2,<3.0.0" },
-    { name = "deckr", extras = ["graph", "mqtt"], specifier = ">=0.2.0.dev0,<0.3.0" },
+    { name = "deckr", extras = ["graph", "mqtt"], specifier = ">=0.2.0,<1.0.0" },
     { name = "deckr-fonts", specifier = ">=0.2.0" },
     { name = "httpx", specifier = ">=0.28.1,<0.29.0" },
     { name = "invariant-core", specifier = "==0.3.0" },
