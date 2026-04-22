@@ -32,9 +32,9 @@ from deckr.plugin.messages import (
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
-from deckr.controller.settings import SettingsService, SettingsTarget
 from deckr.controller._state_store import ControlStateStore, StateOverride, TitleOptions
 from deckr.controller.plugin.builtin._context import BuiltInPluginContext
+from deckr.controller.settings import SettingsService, SettingsTarget
 
 if TYPE_CHECKING:
     from deckr.plugin.interface import PluginAction

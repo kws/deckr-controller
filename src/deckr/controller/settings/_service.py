@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import anyio
+from decouple import config as decouple_config
 from platformdirs import PlatformDirs
 from tinydb import Query, TinyDB
-from decouple import config as decouple_config
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def _safe_filename(value: str) -> str:
     return value.replace("/", "_").replace(":", "_")
 
 
-def _store_key(target: "SettingsTarget") -> str:
+def _store_key(target: SettingsTarget) -> str:
     if target.scope == "plugin_global":
         return target.as_key()
     return f"controller={target.controller_id}|{target.as_key()}"
@@ -62,7 +62,7 @@ class SettingsTarget:
         dynamic_page_uuid: str | None = None,
         plugin_uuid: str | None = None,
         legacy_context_id: str | None = None,
-    ) -> "SettingsTarget":
+    ) -> SettingsTarget:
         return cls(
             scope="context",
             controller_id=controller_id,
@@ -82,7 +82,7 @@ class SettingsTarget:
         *,
         controller_id: str,
         plugin_uuid: str,
-    ) -> "SettingsTarget":
+    ) -> SettingsTarget:
         return cls(
             scope="plugin_global",
             controller_id=controller_id,

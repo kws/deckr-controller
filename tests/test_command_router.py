@@ -6,17 +6,17 @@ import pytest
 import pytest_asyncio
 from deckr.hardware.events import HWSImageFormat
 
-from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller import _persistence
+from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._persistence import ControllerPersistence
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
-from deckr.controller.settings import FileBackedSettingsService, SettingsTarget
 from deckr.controller._state_store import (
     ControlStateStore,
     StateOverride,
     TransientOverlay,
 )
+from deckr.controller.settings import FileBackedSettingsService, SettingsTarget
 
 # --- DeviceOutput: last_frame tracking ---
 

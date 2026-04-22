@@ -10,12 +10,12 @@ import anyio
 
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
-from deckr.controller.settings import SettingsService, SettingsTarget
 from deckr.controller._state_store import (
     ControlStateStore,
     StateOverride,
     TransientOverlay,
 )
+from deckr.controller.settings import SettingsService, SettingsTarget
 
 if TYPE_CHECKING:
     from deckr.hardware.events import HWDevice, HWSImageFormat

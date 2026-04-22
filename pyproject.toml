@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deckr-controller"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Deckr controller runtime with config, routing, rendering, and device management"
 readme = "README.md"
 license = { text = "MIT" }
