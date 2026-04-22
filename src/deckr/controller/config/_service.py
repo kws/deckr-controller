@@ -213,3 +213,22 @@ class FileBackedDeviceConfigService(BaseComponent):
 # Backward-compatible aliases for existing imports.
 ConfigService = DeviceConfigService
 FileSystemConfigService = FileBackedDeviceConfigService
+
+
+class NullDeviceConfigService(BaseComponent):
+    """DeviceConfigService that always yields no config and performs no I/O."""
+
+    def __init__(self) -> None:
+        super().__init__(name="NullDeviceConfigService")
+
+    async def start(self, ctx: RunContext) -> None:
+        return
+
+    async def stop(self) -> None:
+        return
+
+    def subscribe(self, device_id: str) -> AsyncIterator[DeviceConfig | None]:
+        return self._subscribe_impl()
+
+    async def _subscribe_impl(self) -> AsyncIterator[DeviceConfig | None]:
+        yield None

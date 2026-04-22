@@ -1,6 +1,8 @@
+import inspect
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from importlib.metadata import entry_points
+from typing import Any
 
 from deckr.core.component import BaseComponent, Component, ComponentManager, RunContext
 from deckr.core.messaging import EventBus
@@ -23,6 +25,7 @@ class DriverService(BaseComponent):
         driver_bus: EventBus,
         *,
         enabled_drivers: Iterable[str] | None = None,
+        driver_configs: Mapping[str, Mapping[str, Any]] | None = None,
     ):
         super().__init__()
         self._driver_bus = driver_bus
@@ -30,6 +33,23 @@ class DriverService(BaseComponent):
         self._enabled_drivers = (
             frozenset(enabled_drivers) if enabled_drivers is not None else None
         )
+        self._driver_configs = {
+            name: dict(config)
+            for name, config in (driver_configs or {}).items()
+        }
+
+    @staticmethod
+    def _accepts_config(factory: object) -> bool:
+        try:
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError):
+            return False
+        for parameter in signature.parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                return True
+            if parameter.name == "config":
+                return True
+        return False
 
     async def start(self, ctx: RunContext):
         await self._driver_manager.start(ctx)
@@ -57,7 +77,10 @@ class DriverService(BaseComponent):
                 continue
 
             try:
-                driver = factory(event_bus=self._driver_bus)
+                kwargs: dict[str, Any] = {"event_bus": self._driver_bus}
+                if self._accepts_config(factory):
+                    kwargs["config"] = self._driver_configs.get(ep.name, {})
+                driver = factory(**kwargs)
             except Exception as e:
                 logger.exception(f"Error creating driver {ep.name}: {e}", exc_info=True)
                 continue

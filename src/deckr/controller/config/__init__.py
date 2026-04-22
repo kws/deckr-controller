@@ -4,6 +4,7 @@ from ._service import (
     DeviceConfigService,
     FileBackedDeviceConfigService,
     FileSystemConfigService,
+    NullDeviceConfigService,
 )
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "DeviceConfigService",
     "FileBackedDeviceConfigService",
     "FileSystemConfigService",
+    "NullDeviceConfigService",
     "Page",
     "Profile",
 ]

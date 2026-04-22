@@ -28,15 +28,19 @@ def _load_gateway_config() -> MqttGatewayConfig:
     )
 
 
-def host_factory(event_bus: object) -> MqttGateway:
+def host_factory(
+    event_bus: object,
+    *,
+    config: MqttGatewayConfig | None = None,
+) -> MqttGateway:
     """Return MqttGateway for bridging plugin bus to remote host. Fails if not configured."""
-    config = _load_gateway_config()
-    if not config.enabled:
+    gateway_config = config or _load_gateway_config()
+    if not gateway_config.enabled:
         logger.error(_MQTT_REQUIRED_MSG)
         raise ValueError(_MQTT_REQUIRED_MSG)
     return MqttGateway(
         event_bus=event_bus,
-        config=config,
+        config=gateway_config,
         serialize=lambda m: m.to_dict(),
         deserialize=HostMessage.from_dict,
         deserialize_from_mqtt=lambda d: HostMessage.from_dict(
