@@ -23,8 +23,9 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Build deckr wheel
-        run: (cd ../deckr && uv build --wheel)
+      - name: Build dependency wheels
+        run: |
+          (cd ../deckr && uv build --wheel)
 
       - name: Run unit tests
         run: |

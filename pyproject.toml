@@ -65,6 +65,9 @@ dev = [
     "ruff>=0.14.14,<0.15.0",
 ]
 
+[tool.uv.sources]
+deckr = { path = "../deckr" }
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/deckr"]
 

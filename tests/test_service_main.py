@@ -34,7 +34,7 @@ def test_main_loads_explicit_config_and_runs_anyio(
     config_path = tmp_path / "deckr.toml"
     config_path.write_text(
         """
-[controller]
+[deckr.controller]
 log_level = "warning"
 """.strip()
     )
@@ -62,7 +62,7 @@ def test_main_auto_loads_cwd_config(
     config_path = tmp_path / "deckr.toml"
     config_path.write_text(
         """
-[controller]
+[deckr.controller]
 log_level = "error"
 """.strip()
     )

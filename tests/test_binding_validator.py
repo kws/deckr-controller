@@ -191,7 +191,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     registry.get_action = AsyncMock(
         return_value=ActionMetadata(
             uuid="deckr.plugin.builtin.gotopage",
-            host_id="python_local",
+            host_id="python",
             manifest_defaults=None,
         )
     )
@@ -265,7 +265,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
         if uuid == "deckr.plugin.builtin.gotopage":
             return ActionMetadata(
                 uuid=action.uuid,
-                host_id="python_local",
+                host_id="python",
                 manifest_defaults=None,
             )
         return None
