@@ -51,7 +51,6 @@ from deckr.controller._navigation_service import (
     SlotBinding,
     StaticPageRef,
 )
-from deckr.controller._persistence import ControllerPersistence, PersistenceKey
 from deckr.controller._render import RenderModel, RenderService
 from deckr.controller._render_dispatcher import (
     RenderBackend,
@@ -61,6 +60,11 @@ from deckr.controller._render_dispatcher import (
 from deckr.controller.config._data import Control, DeviceConfig, Profile
 from deckr.controller.plugin.context import ControlContext
 from deckr.controller.plugin.provider import PluginManager
+from deckr.controller.settings import (
+    FileBackedSettingsService,
+    SettingsService,
+    SettingsTarget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +129,7 @@ class DynamicPageOwner:
     owner_page: int
     timeout_ms: int
     last_activity: float
-    settings: dict
-    persistence_key: PersistenceKey
+    settings_target: SettingsTarget | None
 
 
 class DeviceManager:
@@ -140,6 +143,7 @@ class DeviceManager:
         plugin_bus: Any,
         start_soon: Callable,
         render_backend: RenderBackend | None = None,
+        settings_service: SettingsService | None = None,
         config_stream: AsyncIterator[DeviceConfig | None] | None = None,
         clock: Callable[[], float] | None = None,
         page_timeout_check_interval: float = 0.25,
@@ -158,7 +162,7 @@ class DeviceManager:
             backend=self._render_backend,
             start_soon=start_soon,
         )
-        self.persistence = ControllerPersistence(device.id)
+        self._settings_service = settings_service or FileBackedSettingsService()
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
         self._nav = NavigationService(config)
@@ -231,38 +235,48 @@ class DeviceManager:
                     output=DeviceOutput(self.device, enc.slot_id),
                 )
 
-    def _build_persistence_key(
+    def _build_context_settings_target(
         self,
         *,
         profile_name: str,
         page_index: int,
         control: Control,
+        plugin_uuid: str | None = None,
         dynamic_page_uuid: str | None = None,
-    ) -> PersistenceKey:
-        return PersistenceKey(
+        legacy_context_id: str | None = None,
+    ) -> SettingsTarget:
+        return SettingsTarget.for_context(
+            controller_id=self._controller_id,
             device_id=self.device.id,
             profile_id=profile_name,
             page_id=str(page_index),
             slot_id=control.slot,
             action_uuid=control.action,
             dynamic_page_uuid=dynamic_page_uuid,
+            plugin_uuid=plugin_uuid,
+            legacy_context_id=legacy_context_id,
         )
 
-    def _build_persistence_key_for_binding(
+    def _build_context_settings_target_for_binding(
         self,
         *,
         profile_id: str,
         page_id: str,
         binding: SlotBinding,
+        plugin_uuid: str | None = None,
         dynamic_page_uuid: str | None = None,
-    ) -> PersistenceKey:
-        return PersistenceKey(
+        legacy_context_id: str | None = None,
+    ) -> SettingsTarget:
+        return SettingsTarget.for_context(
+            controller_id=self._controller_id,
             device_id=self.device.id,
             profile_id=profile_id,
             page_id=page_id,
             slot_id=binding.slot_id,
             action_uuid=binding.action_uuid,
             dynamic_page_uuid=dynamic_page_uuid,
+            plugin_uuid=plugin_uuid,
+            legacy_context_id=legacy_context_id,
         )
 
     async def _try_resolve_binding(
@@ -281,14 +295,32 @@ class DeviceManager:
         action_meta = await self.manager.get_action(binding.action_uuid)
         if action_meta is None:
             return False
-        persistence_key = self._build_persistence_key_for_binding(
+        legacy_context_id = build_context_id(
+            self._controller_id,
+            self.device.id,
+            binding.slot_id,
+        )
+        settings_target = self._build_context_settings_target_for_binding(
             profile_id=profile_id,
             page_id=page_id,
             binding=binding,
+            plugin_uuid=action_meta.plugin_uuid,
             dynamic_page_uuid=dynamic_page_uuid,
+            legacy_context_id=legacy_context_id,
         )
         if seed_config:
-            self.persistence.set_settings(persistence_key, dict(binding.settings))
+            target_exists = await self._settings_service.exists(settings_target)
+            if not target_exists and binding.settings:
+                await self._settings_service.merge(
+                    settings_target,
+                    dict(binding.settings),
+                )
+        global_settings_target = None
+        if action_meta.plugin_uuid:
+            global_settings_target = SettingsTarget.for_plugin_global(
+                controller_id=self._controller_id,
+                plugin_uuid=action_meta.plugin_uuid,
+            )
         builtin_action = None
         if action_meta.host_id == "builtin" and hasattr(
             self.manager, "get_builtin_action"
@@ -305,8 +337,9 @@ class DeviceManager:
             plugin_bus=self._plugin_bus,
             start_soon=self._start_soon,
             render_dispatcher=self._render_dispatcher,
-            persistence=self.persistence,
-            persistence_key=persistence_key,
+            settings_service=self._settings_service,
+            context_settings_target=settings_target,
+            global_settings_target=global_settings_target,
             profile_id=profile_id,
             page_id=page_id,
             title_options=binding.title_options,
@@ -317,13 +350,14 @@ class DeviceManager:
         await ctx.on_will_appear()
         return True
 
-    def _build_valid_persistence_keys(self) -> set[str]:
-        """Keys that are currently valid: all bindings from config profiles/pages plus any registered dynamic-page keys."""
+    def _build_valid_settings_keys(self) -> set[str]:
+        """Keys that are currently valid: config bindings plus active dynamic pages."""
+
         valid_keys: set[str] = set(self._dynamic_persistence_keys)
         for profile in self.config.profiles:
             for page_index, page in enumerate(profile.pages):
                 for control in page.controls:
-                    key = self._build_persistence_key(
+                    key = self._build_context_settings_target(
                         profile_name=profile.name,
                         page_index=page_index,
                         control=control,
@@ -331,10 +365,15 @@ class DeviceManager:
                     valid_keys.add(key.as_key())
         return valid_keys
 
-    def _reconcile_persistence(self) -> None:
-        """Prune persisted settings for this device that are no longer in config or dynamic-page registry. Runs on each set_page (including initial page load)."""
-        valid_keys = self._build_valid_persistence_keys()
-        pruned = self.persistence.prune_settings(
+    async def _reconcile_persistence(self) -> None:
+        """Prune stale persisted context settings for this device."""
+
+        prune = getattr(self._settings_service, "prune_context_targets", None)
+        if not callable(prune):
+            return
+        valid_keys = self._build_valid_settings_keys()
+        pruned = await prune(
+            controller_id=self._controller_id,
             device_id=self.device.id,
             valid_keys=valid_keys,
         )
@@ -376,6 +415,11 @@ class DeviceManager:
     async def _emit_page_appear(self, owner: DynamicPageOwner) -> None:
         if owner.owner_host_id == "builtin":
             return
+        settings = (
+            await self._settings_service.get(owner.settings_target)
+            if owner.settings_target is not None
+            else {}
+        )
         event = PageAppear(
             action=owner.owner_action_uuid,
             context=owner.page_context_id,
@@ -384,7 +428,7 @@ class DeviceManager:
             owner_profile=owner.owner_profile,
             owner_page=owner.owner_page,
             timeout_ms=owner.timeout_ms,
-            settings=owner.settings,
+            settings=settings,
         )
         msg = HostMessage(
             from_id=controller_address(self._controller_id),
@@ -519,7 +563,7 @@ class DeviceManager:
         elif isinstance(arriving, DynamicPageDescriptor):
             for b in arriving.slots:
                 self._dynamic_persistence_keys.add(
-                    self._build_persistence_key_for_binding(
+                    self._build_context_settings_target_for_binding(
                         profile_id="_dynamic",
                         page_id=arriving.page_id,
                         binding=b,
@@ -556,7 +600,7 @@ class DeviceManager:
         close_reason: str = "navigate",
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor). Caller must hold _nav_lock."""
-        self._reconcile_persistence()
+        await self._reconcile_persistence()
         owner_to_close = self._dynamic_page_owner if close_dynamic else None
         if descriptor is not None:
             transition = self._nav.set_page(descriptor)
@@ -625,8 +669,7 @@ class DeviceManager:
                             owner_page=current_owner.owner_page,
                             timeout_ms=current_owner.timeout_ms,
                             last_activity=current_owner.last_activity,
-                            settings=current_owner.settings,
-                            persistence_key=current_owner.persistence_key,
+                            settings_target=current_owner.settings_target,
                         ),
                         reason="replaced",
                     )
@@ -666,7 +709,6 @@ class DeviceManager:
                 owner_page = 0
 
             timeout_ms = self._resolve_widget_timeout_ms(ctx.profile_id, owner_page)
-            settings = await ctx._router.get_settings()
             page_id = descriptor.page_id or make_dynamic_page_id()
             page_context_id = build_context_id(
                 self._controller_id, self.device.id, f"page:{make_dynamic_page_id()}"
@@ -684,8 +726,7 @@ class DeviceManager:
                 owner_page=owner_page,
                 timeout_ms=timeout_ms,
                 last_activity=self._clock(),
-                settings=vars(settings),
-                persistence_key=ctx.persistence_key,
+                settings_target=ctx.settings_target,
             )
 
             ok = await self._set_page_locked(
@@ -829,9 +870,15 @@ class DeviceManager:
         owner = self._dynamic_page_owner
         if owner is not None and context_id == owner.page_context_id:
             if msg_type == SET_SETTINGS:
-                new_settings = dict(payload.get("settings", {}))
-                owner.settings = new_settings
-                self.persistence.set_settings(owner.persistence_key, new_settings)
+                target = owner.settings_target
+                new_settings = (
+                    await self._settings_service.merge(
+                        target,
+                        dict(payload.get("settings", {})),
+                    )
+                    if target is not None
+                    else {}
+                )
                 resp = HostMessage(
                     from_id=controller_address(self._controller_id),
                     to_id=msg.from_id,
@@ -844,13 +891,18 @@ class DeviceManager:
                 )
                 await self._plugin_bus.send(resp)
             elif msg_type == REQUEST_SETTINGS:
+                current_settings = (
+                    await self._settings_service.get(owner.settings_target)
+                    if owner.settings_target is not None
+                    else {}
+                )
                 resp = HostMessage(
                     from_id=controller_address(self._controller_id),
                     to_id=msg.from_id,
                     type=HERE_ARE_SETTINGS,
                     payload={
                         "contextId": context_id,
-                        "settings": dict(owner.settings),
+                        "settings": current_settings,
                     },
                     in_reply_to=msg.message_id,
                 )

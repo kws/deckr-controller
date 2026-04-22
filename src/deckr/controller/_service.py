@@ -12,7 +12,8 @@ from deckr.core.util.host_id import resolve_controller_id, resolve_host_id
 from deckr.controller._controller_service import ControllerService
 from deckr.controller._driver_service import DriverService, available_driver_names
 from deckr.controller._remote_hardware import RemoteHardwareWebSocketServer
-from deckr.controller.config import FileSystemConfigService
+from deckr.controller.config import FileBackedDeviceConfigService
+from deckr.controller.settings import FileBackedSettingsService
 
 logger = logging.getLogger(__name__)
 
@@ -159,8 +160,9 @@ async def service_runner(
     async with anyio.create_task_group() as tg:
         tg.start_soon(component_manager.run)
 
-        config_service = FileSystemConfigService()
+        config_service = FileBackedDeviceConfigService()
         await component_manager.add_component(config_service)
+        settings_service = FileBackedSettingsService()
 
         from deckr.controller.plugin.action_registry import ActionRegistry
 
@@ -194,6 +196,7 @@ async def service_runner(
         controller_service = ControllerService(
             driver_bus=driver_bus,
             config_service=config_service,
+            settings_service=settings_service,
             controller_id=controller_id,
             action_registry=action_registry,
             plugin_bus=plugin_bus,

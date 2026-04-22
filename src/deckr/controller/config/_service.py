@@ -1,4 +1,4 @@
-"""ConfigService protocol and FileSystemConfigService implementation."""
+"""Device config service protocol and file-backed implementation."""
 
 from __future__ import annotations
 
@@ -17,8 +17,16 @@ from deckr.controller.config._data import DeviceConfig
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded for now; override via CONFIG_DIR env. Will move to controller config when available.
-_CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
+
+def resolve_default_config_dir() -> Path:
+    """Resolve the default device-config directory from env."""
+
+    return Path(
+        decouple_config(
+            "DECKR_CONFIG_DIR",
+            default=decouple_config("CONFIG_DIR", default="settings"),
+        )
+    ).resolve()
 
 
 def _yaml_filter(change: Change, path: str) -> bool:
@@ -39,7 +47,7 @@ def _load_config_file(path: Path) -> DeviceConfig | None:
         return None
 
 
-class ConfigService(Protocol):
+class DeviceConfigService(Protocol):
     """Configuration service: subscribe to receive config and change notifications."""
 
     def subscribe(self, device_id: str) -> AsyncIterator[DeviceConfig | None]:
@@ -53,12 +61,14 @@ class ConfigService(Protocol):
         ...
 
 
-class FileSystemConfigService(BaseComponent):
-    """ConfigService implementation that watches a directory for YAML device configs."""
+class FileBackedDeviceConfigService(BaseComponent):
+    """DeviceConfigService implementation backed by a watched YAML directory."""
 
     def __init__(self, config_dir: Path | None = None):
-        super().__init__(name="FileSystemConfigService")
-        self._config_dir = config_dir if config_dir is not None else _CONFIG_DIR
+        super().__init__(name="FileBackedDeviceConfigService")
+        self._config_dir = (
+            config_dir if config_dir is not None else resolve_default_config_dir()
+        )
         self._path_to_device: dict[Path, str] = {}
         self._device_to_config: dict[str, DeviceConfig] = {}
         self._subscribers: dict[
@@ -69,7 +79,7 @@ class FileSystemConfigService(BaseComponent):
 
     async def start(self, ctx: RunContext) -> None:
         logger.warning(
-            "Using hardcoded config path %s; will move to controller config when available",
+            "Using device config path %s",
             self._config_dir,
         )
         self._stop_event = anyio.Event()
@@ -198,3 +208,8 @@ class FileSystemConfigService(BaseComponent):
                     await send.send(config)
                 except Exception:
                     logger.exception("Failed to send config update to subscriber")
+
+
+# Backward-compatible aliases for existing imports.
+ConfigService = DeviceConfigService
+FileSystemConfigService = FileBackedDeviceConfigService

@@ -7,9 +7,11 @@ import pytest_asyncio
 from deckr.hardware.events import HWSImageFormat
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
-from deckr.controller._persistence import PersistenceKey
+from deckr.controller import _persistence
+from deckr.controller._persistence import ControllerPersistence
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
+from deckr.controller.settings import FileBackedSettingsService, SettingsTarget
 from deckr.controller._state_store import (
     ControlStateStore,
     StateOverride,
@@ -181,25 +183,23 @@ async def test_get_settings_hydrates_from_persistence():
     output = DeviceOutput(AsyncMock(), "0,0")
     image_format = HWSImageFormat(width=72, height=72)
 
-    class FakePersistence:
+    class FakeSettingsService:
         def __init__(self):
             self.calls = 0
 
-        def get_settings(self, key):
+        async def exists(self, target):
+            return True
+
+        async def get(self, target):
             self.calls += 1
             return {"persisted": 42}
 
-        def get_value(self, _legacy_key):
-            return None
+        async def merge(self, target, patch):
+            return {"persisted": 42, **dict(patch)}
 
-        def set_settings(self, key, value):
-            pass
-
-        def delete_value(self, _legacy_key):
-            return 0
-
-    persistence = FakePersistence()
-    key = PersistenceKey(
+    settings_service = FakeSettingsService()
+    target = SettingsTarget.for_context(
+        controller_id="controller-main",
         device_id="dev",
         profile_id="default",
         page_id="0",
@@ -214,19 +214,19 @@ async def test_get_settings_hydrates_from_persistence():
         output=output,
         image_format=image_format,
         start_soon=lambda *args, **kwargs: None,
-        persistence=persistence,
-        persistence_key=key,
+        settings_service=settings_service,
+        settings_target=target,
     )
 
     settings = await router.get_settings()
     assert settings.default_only == "x"
     assert settings.persisted == 42
-    assert persistence.calls == 1
+    assert settings_service.calls == 1
 
     # second read should not hit persistence again
     settings_again = await router.get_settings()
     assert settings_again.persisted == 42
-    assert persistence.calls == 1
+    assert settings_service.calls == 1
 
 
 @pytest.mark.asyncio
@@ -241,20 +241,18 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
     output = DeviceOutput(AsyncMock(), "0,0")
     image_format = HWSImageFormat(width=72, height=72)
 
-    class FailingPersistence:
-        def get_settings(self, key):
-            return None
+    class FailingSettingsService:
+        async def exists(self, target):
+            return True
 
-        def get_value(self, _legacy_key):
-            return None
+        async def get(self, target):
+            return {}
 
-        def set_settings(self, key, value):
+        async def merge(self, target, patch):
             raise OSError("disk full")
 
-        def delete_value(self, _legacy_key):
-            return 0
-
-    key = PersistenceKey(
+    target = SettingsTarget.for_context(
+        controller_id="controller-main",
         device_id="dev",
         profile_id="default",
         page_id="0",
@@ -268,8 +266,8 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
         output=output,
         image_format=image_format,
         start_soon=lambda *args, **kwargs: None,
-        persistence=FailingPersistence(),
-        persistence_key=key,
+        settings_service=FailingSettingsService(),
+        settings_target=target,
     )
 
     with pytest.raises(OSError):
@@ -279,38 +277,27 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
 
 
 @pytest.mark.asyncio
-async def test_hydrate_settings_migrates_legacy_key_to_composite():
+async def test_hydrate_settings_migrates_legacy_key_to_composite(monkeypatch, tmp_path):
     """When no composite row exists, hydrate reads legacy context_id key and migrates to composite then deletes legacy."""
     store = ControlStateStore(context_id="dev.slot0")
     store.settings = {"from_config": "a"}
 
-    migrated_to = []
-    legacy_deleted = []
+    class TmpDirs:
+        user_data_dir = str(tmp_path)
 
-    class LegacyMigrationPersistence:
-        def get_settings(self, key):
-            return None
+    monkeypatch.setattr(_persistence, "dirs", TmpDirs())
+    legacy = ControllerPersistence("dev")
+    legacy.set_value("dev.slot0", {"legacy_key": 100})
 
-        def get_value(self, legacy_key):
-            if legacy_key == "dev.slot0":
-                return {"legacy_key": 100}
-            return None
-
-        def set_settings(self, key, value):
-            migrated_to.append((key.as_key(), value))
-
-        def delete_value(self, legacy_key):
-            legacy_deleted.append(legacy_key)
-            return 1
-
-    key = PersistenceKey(
+    target = SettingsTarget.for_context(
+        controller_id="controller-main",
         device_id="dev",
         profile_id="default",
         page_id="0",
         slot_id="slot0",
         action_uuid="action",
+        legacy_context_id="dev.slot0",
     )
-    persistence = LegacyMigrationPersistence()
     render_service = MagicMock(spec=RenderService)
     render_service.build_request = MagicMock(return_value=object())
     render_dispatcher = MagicMock(spec=RenderDispatcher)
@@ -325,15 +312,11 @@ async def test_hydrate_settings_migrates_legacy_key_to_composite():
         output=output,
         image_format=image_format,
         start_soon=lambda *args, **kwargs: None,
-        persistence=persistence,
-        persistence_key=key,
+        settings_service=FileBackedSettingsService(settings_dir=tmp_path),
+        settings_target=target,
     )
 
     settings = await router.get_settings()
     assert settings.from_config == "a"
     assert settings.legacy_key == 100
-    assert len(migrated_to) == 1
-    assert migrated_to[0][1] == {
-        "legacy_key": 100
-    }  # migration writes legacy payload to composite key
-    assert legacy_deleted == ["dev.slot0"]
+    assert legacy.get_value("dev.slot0") is None

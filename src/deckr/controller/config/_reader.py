@@ -2,13 +2,13 @@ import logging
 from pathlib import Path
 
 import yaml
-from decouple import config
 
 from deckr.controller.config._data import DeviceConfig
+from deckr.controller.config._service import resolve_default_config_dir
 
 logger = logging.getLogger(__name__)
 
-CONFIG_DIR = Path(config("CONFIG_DIR", default="settings")).resolve()
+CONFIG_DIR = resolve_default_config_dir()
 
 
 def load_config(file: Path):

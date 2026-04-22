@@ -55,6 +55,10 @@ class ActionRegistry(BaseComponent):
             return ActionMetadata(
                 uuid=action_uuid,
                 host_id=host_id,
+                name=meta.get("name"),
+                plugin_uuid=meta.get("pluginUuid"),
+                controllers=meta.get("controllers"),
+                property_inspector_path=meta.get("propertyInspectorPath"),
                 manifest_defaults=meta.get("manifestDefaults"),
             )
         for key, (host_id, action_uuid, meta) in self._action_registry.items():
@@ -62,6 +66,10 @@ class ActionRegistry(BaseComponent):
                 return ActionMetadata(
                     uuid=action_uuid,
                     host_id=host_id,
+                    name=meta.get("name"),
+                    plugin_uuid=meta.get("pluginUuid"),
+                    controllers=meta.get("controllers"),
+                    property_inspector_path=meta.get("propertyInspectorPath"),
                     manifest_defaults=meta.get("manifestDefaults"),
                 )
         return None
@@ -86,7 +94,13 @@ class ActionRegistry(BaseComponent):
                 self._action_registry[qualified] = (
                     host_id,
                     action_uuid,
-                    {"manifestDefaults": a.get("manifestDefaults")},
+                    {
+                        "controllers": a.get("controllers"),
+                        "manifestDefaults": a.get("manifestDefaults"),
+                        "name": a.get("name"),
+                        "pluginUuid": a.get("pluginUuid"),
+                        "propertyInspectorPath": a.get("propertyInspectorPath"),
+                    },
                 )
                 if qualified not in seen:
                     touched.append(qualified)
@@ -156,7 +170,15 @@ class ActionRegistry(BaseComponent):
                 self._action_registry[qualified] = (
                     "builtin",
                     action_uuid,
-                    {"manifestDefaults": meta.get("manifest_defaults")},
+                    {
+                        "controllers": meta.get("controllers"),
+                        "manifestDefaults": meta.get("manifest_defaults"),
+                        "name": meta.get("name"),
+                        "pluginUuid": meta.get("plugin_uuid"),
+                        "propertyInspectorPath": meta.get(
+                            "property_inspector_path"
+                        ),
+                    },
                 )
 
         start_soon(self._subscription_loop)

@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING
 
 import anyio
 
-from deckr.controller._persistence import ControllerPersistence, PersistenceKey
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
+from deckr.controller.settings import SettingsService, SettingsTarget
 from deckr.controller._state_store import (
     ControlStateStore,
     StateOverride,
@@ -56,8 +56,8 @@ class CommandRouter:
         image_format: "HWSImageFormat | None",
         start_soon: Callable,
         *,
-        persistence: ControllerPersistence | None = None,
-        persistence_key: PersistenceKey | None = None,
+        settings_service: SettingsService | None = None,
+        settings_target: SettingsTarget | None = None,
         manifest_defaults: dict[int, StateOverride] | None = None,
     ):
         self._store = store
@@ -67,8 +67,8 @@ class CommandRouter:
         self._image_format = image_format
         self._start_soon = start_soon
         self._overlay_token: int = 0
-        self._persistence = persistence
-        self._persistence_key = persistence_key
+        self._settings_service = settings_service
+        self._settings_target = settings_target
         self._manifest_defaults = manifest_defaults
         self._settings_hydrated = False
 
@@ -152,32 +152,31 @@ class CommandRouter:
         if self._settings_hydrated:
             return
 
-        if self._persistence is not None and self._persistence_key is not None:
-            persisted = self._persistence.get_settings(self._persistence_key)
-            if persisted is None:
-                # Legacy fallback: prior versions stored settings by runtime context only.
-                legacy = self._persistence.get_value(self._store.context_id)
-                if isinstance(legacy, dict):
-                    self._persistence.set_settings(self._persistence_key, legacy)
-                    self._persistence.delete_value(self._store.context_id)
-                    persisted = legacy
-
-            if persisted is not None:
-                # Config defaults (already in _store.settings) then overlay persisted; last wins.
-                merged = dict(self._store.settings)
-                merged.update(persisted)
-                self._store.settings = merged
+        if self._settings_service is not None and self._settings_target is not None:
+            persisted = await self._settings_service.get(self._settings_target)
+            merged = dict(self._store.settings)
+            merged.update(persisted)
+            self._store.settings = merged
 
         self._settings_hydrated = True
 
     async def set_settings(self, settings: dict) -> None:
         """Merge settings and persist. Fail-fast: on persistence write failure we do not update in-memory store."""
+        if not self._settings_hydrated:
+            await self.hydrate_settings()
+
         candidate = dict(self._store.settings)
         candidate.update(settings)
 
-        if self._persistence is not None and self._persistence_key is not None:
+        merged = candidate
+        if self._settings_service is not None and self._settings_target is not None:
             try:
-                self._persistence.set_settings(self._persistence_key, candidate)
+                target_exists = await self._settings_service.exists(self._settings_target)
+                patch = settings if target_exists else candidate
+                merged = await self._settings_service.merge(
+                    self._settings_target,
+                    patch,
+                )
             except Exception:
                 logger.exception(
                     "Failed to persist settings for context %s",
@@ -185,7 +184,7 @@ class CommandRouter:
                 )
                 raise
 
-        self._store.settings = candidate
+        self._store.settings = merged
         self._settings_hydrated = True
 
     async def get_settings(self) -> SimpleNamespace:

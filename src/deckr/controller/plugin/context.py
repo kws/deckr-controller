@@ -30,9 +30,9 @@ from deckr.plugin.messages import (
 )
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
-from deckr.controller._persistence import ControllerPersistence, PersistenceKey
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
+from deckr.controller.settings import SettingsService, SettingsTarget
 from deckr.controller._state_store import ControlStateStore, StateOverride, TitleOptions
 from deckr.controller.plugin.builtin._context import BuiltInPluginContext
 
@@ -118,8 +118,9 @@ class ControlContext(ControlContextProtocol):
         plugin_bus: Any,
         start_soon: Callable[..., None],
         render_dispatcher: RenderDispatcher,
-        persistence: ControllerPersistence,
-        persistence_key: PersistenceKey,
+        settings_service: SettingsService | None,
+        context_settings_target: SettingsTarget | None,
+        global_settings_target: SettingsTarget | None,
         *,
         profile_id: str,
         page_id: str,
@@ -138,7 +139,8 @@ class ControlContext(ControlContextProtocol):
         self._plugin_bus = plugin_bus
         self.profile_id = profile_id
         self.page_id = page_id
-        self.persistence_key = persistence_key
+        self.settings_target = context_settings_target
+        self.global_settings_target = global_settings_target
 
         md = manifest_defaults or _parse_manifest_defaults(manifest_defaults_raw)
         self._store = ControlStateStore(
@@ -158,8 +160,8 @@ class ControlContext(ControlContextProtocol):
             output=output,
             image_format=slot.image_format,
             start_soon=start_soon,
-            persistence=persistence,
-            persistence_key=persistence_key,
+            settings_service=settings_service,
+            settings_target=context_settings_target,
             manifest_defaults=md,
         )
         self.plugin_context = BuiltInPluginContext(
@@ -167,6 +169,8 @@ class ControlContext(ControlContextProtocol):
             device=device,
             manager=manager,
             context_id=self.id,
+            settings_service=settings_service,
+            global_settings_target=global_settings_target,
         )
 
     @property

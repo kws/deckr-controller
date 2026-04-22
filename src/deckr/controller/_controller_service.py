@@ -9,7 +9,11 @@ from deckr.hardware import events as hw_events
 from deckr.plugin.messages import (
     ALL_HOSTS,
     COMMAND_MESSAGE_TYPES,
+    GLOBAL_SETTINGS_MESSAGE_TYPES,
+    HERE_ARE_GLOBAL_SETTINGS,
     REQUEST_ACTIONS,
+    REQUEST_GLOBAL_SETTINGS,
+    SET_GLOBAL_SETTINGS,
     ActionsChangedEvent,
     HostMessage,
     controller_address,
@@ -21,8 +25,9 @@ from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderBackend,
 )
-from deckr.controller.config import ConfigService
+from deckr.controller.config import DeviceConfigService
 from deckr.controller.plugin.action_registry import ActionRegistry
+from deckr.controller.settings import SettingsService, SettingsTarget
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +36,8 @@ class ControllerService(BaseComponent):
     def __init__(
         self,
         driver_bus: EventBus,
-        config_service: ConfigService,
+        config_service: DeviceConfigService,
+        settings_service: SettingsService,
         *,
         controller_id: str,
         action_registry: ActionRegistry | None = None,
@@ -41,6 +47,7 @@ class ControllerService(BaseComponent):
         super().__init__()
         self._driver_bus = driver_bus
         self._config_service = config_service
+        self._settings_service = settings_service
         self._controller_id = controller_id
         self._controller_contexts = AsyncMap[str, DeviceManager]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
@@ -60,6 +67,39 @@ class ControllerService(BaseComponent):
         if ctrl_ctx is not None:
             await ctrl_ctx.handle_command(msg)
 
+    async def _handle_global_settings_command(self, msg: HostMessage) -> None:
+        """Handle controller-scoped plugin global settings commands."""
+
+        plugin_uuid = str(msg.payload.get("pluginUuid", "")).strip()
+        if not plugin_uuid:
+            return
+        target = SettingsTarget.for_plugin_global(
+            controller_id=self._controller_id,
+            plugin_uuid=plugin_uuid,
+        )
+        if msg.type == REQUEST_GLOBAL_SETTINGS:
+            settings = await self._settings_service.get(target)
+        elif msg.type == SET_GLOBAL_SETTINGS:
+            settings = await self._settings_service.merge(
+                target,
+                dict(msg.payload.get("settings", {})),
+            )
+        else:
+            return
+
+        await self._plugin_bus.send(
+            HostMessage(
+                from_id=controller_address(self._controller_id),
+                to_id=msg.from_id,
+                type=HERE_ARE_GLOBAL_SETTINGS,
+                payload={
+                    "pluginUuid": plugin_uuid,
+                    "settings": settings,
+                },
+                in_reply_to=msg.message_id,
+            )
+        )
+
     async def _plugin_subscription_loop(self) -> None:
         """Subscribe to plugin bus and route command messages to DeviceManagers."""
         if self._plugin_bus is None:
@@ -76,6 +116,9 @@ class ControllerService(BaseComponent):
                     if not isinstance(event, HostMessage):
                         continue
                     if not event.for_controller(self._controller_id):
+                        continue
+                    if event.type in GLOBAL_SETTINGS_MESSAGE_TYPES:
+                        await self._handle_global_settings_command(event)
                         continue
                     if event.type in COMMAND_MESSAGE_TYPES:
                         await self._handle_plugin_command(event)
@@ -140,6 +183,7 @@ class ControllerService(BaseComponent):
             plugin_bus=self._plugin_bus,
             start_soon=self._start_soon,
             render_backend=self._render_backend,
+            settings_service=self._settings_service,
             config_stream=stream,
         )
         await self._controller_contexts.set(device.id, ctrl_ctx)

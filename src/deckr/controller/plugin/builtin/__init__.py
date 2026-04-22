@@ -30,4 +30,10 @@ class BuiltinRegistry:
         if action is None:
             return None
         meta = build_action_metadata(action)
-        return {"manifest_defaults": meta["manifestDefaults"]}
+        return {
+            "controllers": meta.get("controllers"),
+            "manifest_defaults": meta.get("manifestDefaults"),
+            "name": meta.get("name"),
+            "plugin_uuid": meta.get("pluginUuid"),
+            "property_inspector_path": meta.get("propertyInspectorPath"),
+        }
