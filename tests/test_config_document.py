@@ -91,23 +91,15 @@ port = 1884
 
 def test_explicit_config_allows_missing_controller_table(tmp_path: Path) -> None:
     config_path = tmp_path / "deckr.toml"
-    config_path.write_text("[deckr.plugin_hosts.python.instances.main]\nenabled = false\n")
+    config_path.write_text("[deckr.plugins.openhab]\nurl = 'http://openhab.local:8080'\n")
 
     document = load_config_document(config_path)
     controller = controller_config_from_document(document)
 
     assert controller.log_level == "info"
-    plugin_host = document.namespace("deckr.plugin_hosts.python")
-    assert plugin_host is not None
-    assert plugin_host["instances"]["main"]["enabled"] is False
-
-
-def test_rejects_legacy_plugin_toml_namespaces(tmp_path: Path) -> None:
-    config_path = tmp_path / "deckr.toml"
-    config_path.write_text("[deckr.plugins.openhab]\nurl = 'http://openhab.local:8080'\n")
-
-    with pytest.raises(ValueError, match="Plugin TOML configuration is no longer supported"):
-        load_config_document(config_path)
+    assert document.namespace("deckr.plugins.openhab") == {
+        "url": "http://openhab.local:8080"
+    }
 
 
 def test_auto_loads_local_deckr_toml(

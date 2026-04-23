@@ -294,6 +294,13 @@ class DeviceManager:
         """
         action_meta = await self.manager.get_action(binding.action_uuid)
         if action_meta is None:
+            logger.info(
+                "Binding unresolved on profile=%s page=%s slot=%s action=%s",
+                profile_id,
+                page_id,
+                binding.slot_id,
+                binding.action_uuid,
+            )
             return False
         legacy_context_id = build_context_id(
             self._controller_id,
@@ -348,6 +355,14 @@ class DeviceManager:
         )
         await self.action_contexts.set(slot.id, ctx)
         await ctx.on_will_appear()
+        logger.info(
+            "Binding resolved on profile=%s page=%s slot=%s action=%s host=%s",
+            profile_id,
+            page_id,
+            binding.slot_id,
+            binding.action_uuid,
+            action_meta.host_id,
+        )
         return True
 
     def _build_valid_settings_keys(self) -> set[str]:
@@ -804,6 +819,14 @@ class DeviceManager:
             profile_id = "_dynamic"
             page_id = current_page.page_id
             dynamic_page_uuid = current_page.page_id
+
+        logger.info(
+            "Re-evaluating page bindings for device=%s page=%s after actions change +%s -%s",
+            self.device.id,
+            page_id,
+            registered,
+            unregistered,
+        )
 
         for binding in bindings:
             if await self.action_contexts.has_key(binding.slot_id):

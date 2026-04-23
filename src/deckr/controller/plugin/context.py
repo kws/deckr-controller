@@ -223,6 +223,13 @@ class ControlContext(ControlContextProtocol):
 
     async def on_will_appear(self):
         await self._router.hydrate_settings()
+        logger.info(
+            "Dispatching willAppear slot=%s action=%s host=%s settings=%s",
+            self.slot.id,
+            self.action_uuid,
+            self.host_id,
+            self._store.settings,
+        )
         payload = SingleActionPayload(
             controller="Keypad",
             coordinates=Coordinates(

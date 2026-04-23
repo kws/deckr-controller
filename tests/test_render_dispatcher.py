@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import signal
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -241,9 +242,28 @@ async def test_process_pool_render_backend_renders_request():
         await backend.aclose()
 
 
+def test_process_pool_render_backend_workers_ignore_sigint():
+    backend = ProcessPoolRenderBackend(max_workers=1)
+
+    try:
+        future = backend._executor.submit(_read_sigint_handler)
+        assert future.result(timeout=10) == 1
+    finally:
+        backend._executor.shutdown(wait=True, cancel_futures=True)
+
+
 def _sleep_and_return_pid(delay_ms: int) -> int:
     time.sleep(delay_ms / 1000)
     return os.getpid()
+
+
+def _read_sigint_handler() -> int:
+    current = signal.getsignal(signal.SIGINT)
+    if current == signal.SIG_IGN:
+        return 1
+    if current == signal.SIG_DFL:
+        return 0
+    return -1
 
 
 def _measure_pool_elapsed(max_workers: int, delay_ms: int) -> tuple[float, set[int]]:

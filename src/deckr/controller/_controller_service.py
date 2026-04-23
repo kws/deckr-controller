@@ -121,7 +121,14 @@ class ControllerService(BaseComponent):
             async for event in stream:
                 try:
                     if isinstance(event, ActionsChangedEvent):
-                        for ctrl_ctx in await self._controller_contexts.values():
+                        controller_contexts = await self._controller_contexts.values()
+                        logger.info(
+                            "Applying ActionsChangedEvent to %d device(s): +%s -%s",
+                            len(controller_contexts),
+                            event.registered,
+                            event.unregistered,
+                        )
+                        for ctrl_ctx in controller_contexts:
                             await ctrl_ctx.on_actions_changed(
                                 event.registered, event.unregistered
                             )

@@ -114,6 +114,12 @@ class ActionRegistry(BaseComponent):
                 touched.append(qualified)
                 seen.add(qualified)
         if touched:
+            logger.info(
+                "Registered %d action(s) from host %s: %s",
+                len(touched),
+                host_id,
+                touched,
+            )
             await self._event_bus.send(
                 ActionsChangedEvent(registered=touched, unregistered=[])
             )
@@ -132,6 +138,12 @@ class ActionRegistry(BaseComponent):
                 del self._action_registry[qualified]
                 removed.append(qualified)
         if removed:
+            logger.info(
+                "Unregistered %d action(s) from host %s: %s",
+                len(removed),
+                host_id,
+                removed,
+            )
             await self._event_bus.send(
                 ActionsChangedEvent(registered=[], unregistered=removed)
             )

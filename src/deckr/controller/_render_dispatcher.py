@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
@@ -24,6 +25,17 @@ class SlotOutput(Protocol):
 
 
 logger = logging.getLogger(__name__)
+
+
+def _init_render_worker() -> None:
+    """Let the parent process own Ctrl-C handling for render workers.
+
+    Without this, ProcessPoolExecutor workers inherit the terminal's SIGINT and can
+    emit noisy KeyboardInterrupt tracebacks while the controller is already shutting
+    down gracefully.
+    """
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def default_render_workers() -> int:
@@ -77,7 +89,8 @@ class ProcessPoolRenderBackend:
 
     def __init__(self, *, max_workers: int | None = None):
         self._executor = ProcessPoolExecutor(
-            max_workers=max_workers or default_render_workers()
+            max_workers=max_workers or default_render_workers(),
+            initializer=_init_render_worker,
         )
 
     async def render(self, request: RenderRequest) -> RenderResult:
