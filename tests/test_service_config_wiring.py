@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from deckr.controller._config_document import load_config_document
+from deckr.controller._config_document import (
+    controller_config_from_document,
+    load_config_document,
+)
 from deckr.controller._service import (
     _build_config_service,
     _build_settings_service,
@@ -18,9 +21,10 @@ def test_build_services_disable_when_sections_are_absent(tmp_path: Path) -> None
     config_path = tmp_path / "deckr.toml"
     config_path.write_text("[deckr.controller]\n")
     document = load_config_document(config_path)
+    config = controller_config_from_document(document)
 
-    assert isinstance(_build_config_service(document), NullDeviceConfigService)
-    assert isinstance(_build_settings_service(document), InMemorySettingsService)
+    assert isinstance(_build_config_service(config), NullDeviceConfigService)
+    assert isinstance(_build_settings_service(config), InMemorySettingsService)
 
 
 def test_build_services_enable_when_sections_are_present(tmp_path: Path) -> None:
@@ -32,14 +36,15 @@ def test_build_services_enable_when_sections_are_present(tmp_path: Path) -> None
 [deckr.controller.device_config.file]
 path = "configs"
 
-[deckr.controller.settings.file]
+    [deckr.controller.settings.file]
 path = "state"
 """.strip()
     )
     document = load_config_document(config_path)
+    config = controller_config_from_document(document)
 
-    config_service = _build_config_service(document)
-    settings_service = _build_settings_service(document)
+    config_service = _build_config_service(config)
+    settings_service = _build_settings_service(config)
 
     assert isinstance(config_service, FileBackedDeviceConfigService)
     assert config_service._config_dir == (tmp_path / "configs").resolve()

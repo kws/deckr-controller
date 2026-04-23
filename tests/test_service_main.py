@@ -4,8 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from deckr.controller import _service as service_mod
-from deckr.controller import default_config_document_text
+from deckr.controller import (
+    _service as service_mod,
+)
+from deckr.controller import (
+    controller_config_from_document,
+    default_config_document_text,
+)
 
 
 def test_parse_args_accepts_config_path() -> None:
@@ -52,7 +57,7 @@ log_level = "warning"
     assert captured["fn"] is service_mod.async_main
     document = captured["document"]
     assert document.source_path == config_path.resolve()
-    assert document.controller.log_level == "warning"
+    assert controller_config_from_document(document).log_level == "warning"
 
 
 def test_main_auto_loads_cwd_config(
@@ -79,4 +84,4 @@ log_level = "error"
 
     document = captured["document"]
     assert document.source_path == config_path.resolve()
-    assert document.controller.log_level == "error"
+    assert controller_config_from_document(document).log_level == "error"

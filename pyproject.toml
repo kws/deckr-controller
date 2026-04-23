@@ -50,6 +50,10 @@ dependencies = [
 deckr = "deckr.controller:main"
 deckr-device-manager = "deckr.controller:device_manager_main"
 
+[project.entry-points."deckr.components"]
+"deckr.controller" = "deckr.controller._runtime_service:component"
+"deckr.controller.remote_device_manager" = "deckr.controller._remote_hardware_service:component"
+
 [project.urls]
 Documentation = "https://github.com/kws/deckr-controller#readme"
 Homepage = "https://github.com/kws/deckr-controller"
@@ -66,7 +70,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-deckr = { path = "../deckr" }
+deckr = { path = "../deckr", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deckr"]

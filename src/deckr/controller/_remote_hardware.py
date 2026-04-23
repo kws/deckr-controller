@@ -5,22 +5,21 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import anyio
 import websockets
 from deckr.core.component import (
     BaseComponent,
-    Component,
-    ComponentManager,
-    ComponentState,
     RunContext,
 )
+from deckr.core.components import available_component_ids, run_components
+from deckr.core.config import ConfigDocument, load_config_document
 from deckr.core.messaging import EventBus
+from deckr.core.util.anyio import add_signal_handler
 from deckr.core.util.host_id import resolve_host_id
 from deckr.hardware import events as hw_events
 from websockets.exceptions import ConnectionClosed
-
-from deckr.controller._driver_service import DriverService, available_driver_names
 
 logger = logging.getLogger(__name__)
 
@@ -382,24 +381,11 @@ class RemoteDeviceManagerService:
         *,
         controller_url: str,
         manager_id: str,
-        driver_names: tuple[str, ...] | None = None,
-        driver_service_factory: (
-            Callable[[EventBus, tuple[str, ...] | None], Component] | None
-        ) = None,
+        driver_bus: EventBus,
     ) -> None:
         self._controller_url = controller_url
         self._manager_id = manager_id
-        self._driver_names = driver_names
-        self._driver_service_factory = (
-            driver_service_factory or self._default_driver_service_factory
-        )
-
-    @staticmethod
-    def _default_driver_service_factory(
-        driver_bus: EventBus,
-        driver_names: tuple[str, ...] | None,
-    ) -> Component:
-        return DriverService(driver_bus=driver_bus, enabled_drivers=driver_names)
+        self._driver_bus = driver_bus
 
     async def run(self) -> None:
         backoff = 1.0
@@ -452,28 +438,25 @@ class RemoteDeviceManagerService:
                 backoff = min(backoff * 2.0, 10.0)
 
     async def _run_connected_session(self, websocket) -> None:
-        driver_bus = EventBus()
-        component_manager = ComponentManager()
-        bridge = _RemoteDeviceManagerBridge(driver_bus, websocket)
-        driver_service = self._driver_service_factory(driver_bus, self._driver_names)
+        bridge = _RemoteDeviceManagerBridge(self._driver_bus, websocket)
 
         async with anyio.create_task_group() as tg:
-            tg.start_soon(component_manager.run)
             tg.start_soon(bridge.run)
             ready = await bridge.wait_ready(timeout=5.0)
             if not ready:
                 raise TimeoutError("Timed out waiting for remote hardware bridge")
-            await component_manager.add_component(driver_service)
-            await component_manager.wait_for_state(
-                driver_service,
-                ComponentState.RUNNING,
-                timeout=5.0,
-            )
             try:
                 await bridge.wait_closed()
             finally:
-                await component_manager.stop()
                 tg.cancel_scope.cancel()
+
+
+def available_driver_names() -> list[str]:
+    return sorted(
+        component_id.removeprefix("deckr.drivers.")
+        for component_id in available_component_ids()
+        if component_id.startswith("deckr.drivers.")
+    )
 
 
 def _parse_driver_args(
@@ -494,6 +477,19 @@ def _parse_driver_args(
 
 def _parse_device_manager_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deckr remote device manager")
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        metavar="PATH",
+        help="Load configuration from PATH instead of CLI/controller env flags.",
+    )
+    parser.add_argument(
+        "--print-default-config",
+        action="store_true",
+        dest="print_default_config",
+        help="Print the built-in default deckr.toml document and exit.",
+    )
     parser.add_argument(
         "--controller-url",
         default=os.getenv("DECKR_CONTROLLER_URL"),
@@ -522,6 +518,76 @@ async def device_manager_async_main(
     await service.run()
 
 
+def _device_manager_default_config_text() -> str:
+    return """# Deckr remote device manager
+
+[deckr.controller.remote_device_manager]
+controller_url = "ws://127.0.0.1:9876"
+"""
+
+
+def _device_manager_selected_drivers(document: ConfigDocument) -> tuple[str, ...] | None:
+    config = document.namespace("deckr.controller.remote_device_manager") or {}
+    raw_drivers = config.get("drivers")
+    if not isinstance(raw_drivers, tuple | list):
+        return None
+
+    selected = tuple(
+        str(name).strip()
+        for name in raw_drivers
+        if str(name).strip()
+    )
+    return selected or None
+
+
+def _device_manager_component_filter(document: ConfigDocument) -> Callable[[str], bool]:
+    selected = _device_manager_selected_drivers(document)
+    enabled_driver_ids = None
+    if selected is not None:
+        enabled_driver_ids = {
+            f"deckr.drivers.{name.removeprefix('deckr.drivers.')}"
+            for name in selected
+        }
+
+    def include(component_id: str) -> bool:
+        if component_id == "deckr.controller.remote_device_manager":
+            return True
+        if not component_id.startswith("deckr.drivers."):
+            return False
+        if enabled_driver_ids is None:
+            return True
+        return component_id in enabled_driver_ids
+
+    return include
+
+
+def _device_manager_config_text(
+    *,
+    controller_url: str,
+    manager_id: str,
+    driver_names: tuple[str, ...] | None,
+) -> str:
+    lines = [
+        "[deckr.controller.remote_device_manager]",
+        f"controller_url = {json.dumps(controller_url)}",
+        f"manager_id = {json.dumps(manager_id)}",
+    ]
+    if driver_names:
+        driver_values = ", ".join(json.dumps(name) for name in driver_names)
+        lines.append(f"drivers = [{driver_values}]")
+    return "\n".join(lines)
+
+
+async def _device_manager_component_main(document: ConfigDocument) -> None:
+    async with anyio.create_task_group() as tg:
+        await add_signal_handler(tg)
+        await run_components(
+            document,
+            component_filter=_device_manager_component_filter(document),
+        )
+        tg.cancel_scope.cancel()
+
+
 def device_manager_main() -> None:
     log_level = logging.DEBUG if os.getenv("DEBUG") == "1" else logging.INFO
     logging.basicConfig(
@@ -531,21 +597,31 @@ def device_manager_main() -> None:
     )
 
     args = _parse_device_manager_args()
-    if not args.controller_url:
-        raise SystemExit("A controller websocket URL is required.")
+    if args.print_default_config:
+        print(_device_manager_default_config_text())
+        return
 
-    manager_id = resolve_host_id(
-        cli_value=args.manager_id,
-        env_var="DEVICE_MANAGER_ID",
-        fallback_to_hostname=True,
-        fallback_to_uuid=True,
-    )
-    driver_names = (
-        tuple(args.drivers) if args.drivers else tuple(available_driver_names())
-    )
-    anyio.run(
-        device_manager_async_main,
-        args.controller_url,
-        manager_id,
-        driver_names,
-    )
+    if args.config_path:
+        document = load_config_document(Path(args.config_path).expanduser().resolve())
+    else:
+        if not args.controller_url:
+            raise SystemExit("A controller websocket URL is required.")
+        manager_id = resolve_host_id(
+            cli_value=args.manager_id,
+            env_var="DEVICE_MANAGER_ID",
+            fallback_to_hostname=True,
+            fallback_to_uuid=True,
+        )
+        driver_names = (
+            tuple(args.drivers) if args.drivers else tuple(available_driver_names())
+        )
+        document = load_config_document(
+            None,
+            default_text=_device_manager_config_text(
+                controller_url=args.controller_url,
+                manager_id=manager_id,
+                driver_names=driver_names,
+            ),
+        )
+
+    anyio.run(_device_manager_component_main, document)

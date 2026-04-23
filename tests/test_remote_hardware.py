@@ -5,7 +5,6 @@ import json
 import anyio
 import pytest
 import websockets
-from deckr.core.component import BaseComponent
 from deckr.core.messaging import EventBus
 from deckr.hardware import events as hw_events
 from websockets.exceptions import ConnectionClosed
@@ -196,35 +195,9 @@ async def test_remote_hardware_server_ignores_abrupt_disconnect(caplog):
         )
 
         tg.cancel_scope.cancel()
-
-
-class FakeDriverComponent(BaseComponent):
-    def __init__(self, driver_bus: EventBus, starts: list[str]) -> None:
-        super().__init__("fake_driver_component")
-        self._driver_bus = driver_bus
-        self._starts = starts
-
-    async def start(self, ctx) -> None:
-        ctx.tg.start_soon(self._run)
-
-    async def _run(self) -> None:
-        self._starts.append("started")
-        await self._driver_bus.send(
-            hw_events.DeviceConnectedEvent(
-                device_id="virtual-1",
-                device=StubDevice(),
-            )
-        )
-        await anyio.sleep_forever()
-
-    async def stop(self) -> None:
-        return
-
-
 @pytest.mark.asyncio
 async def test_remote_device_manager_reconnects_and_rediscover_devices():
     connections: list[str] = []
-    starts: list[str] = []
     reconnected = anyio.Event()
 
     async def handler(websocket, *args) -> None:
@@ -249,20 +222,30 @@ async def test_remote_device_manager_reconnects_and_rediscover_devices():
 
     async with websockets.serve(handler, "127.0.0.1", 0) as ws_server:
         port = ws_server.sockets[0].getsockname()[1]
+        driver_bus = EventBus()
         service = RemoteDeviceManagerService(
             controller_url=f"ws://127.0.0.1:{port}",
             manager_id="bedroom-pi",
-            driver_names=("virtual",),
-            driver_service_factory=lambda bus, _drivers: FakeDriverComponent(
-                bus, starts
-            ),
+            driver_bus=driver_bus,
         )
+
+        async def emit_when_connected(expected_count: int) -> None:
+            with anyio.fail_after(5):
+                while len(connections) < expected_count:
+                    await anyio.sleep(0.05)
+            await driver_bus.send(
+                hw_events.DeviceConnectedEvent(
+                    device_id="virtual-1",
+                    device=StubDevice(),
+                )
+            )
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(service.run)
+            tg.start_soon(emit_when_connected, 1)
+            tg.start_soon(emit_when_connected, 2)
             with anyio.fail_after(5):
                 await reconnected.wait()
             tg.cancel_scope.cancel()
 
     assert connections[:2] == ["bedroom-pi", "bedroom-pi"]
-    assert len(starts) >= 2

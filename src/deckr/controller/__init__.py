@@ -1,6 +1,6 @@
 from ._config_document import (
     ControllerRuntimeConfig,
-    DeckrConfigDocument,
+    controller_config_from_document,
     default_config_document_text,
     load_config_document,
 )
@@ -9,7 +9,7 @@ from ._service import main
 
 __all__ = [
     "ControllerRuntimeConfig",
-    "DeckrConfigDocument",
+    "controller_config_from_document",
     "default_config_document_text",
     "device_manager_main",
     "load_config_document",

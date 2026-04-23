@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 from platformdirs import PlatformDirs
 
-from deckr.controller import default_config_document_text, load_config_document
+from deckr.controller import (
+    controller_config_from_document,
+    default_config_document_text,
+    load_config_document,
+)
 
 
 def test_default_config_document_matches_builtin_defaults(
@@ -15,20 +19,21 @@ def test_default_config_document_matches_builtin_defaults(
     monkeypatch.chdir(tmp_path)
 
     document = load_config_document(None)
+    controller = controller_config_from_document(document)
 
     assert document.source_path is None
     assert document.base_dir == tmp_path.resolve()
-    assert document.controller.log_level == "info"
-    assert document.controller.device_config is not None
-    assert document.controller.device_config.file is not None
-    assert document.controller.device_config.file.path == (tmp_path / "settings").resolve()
-    assert document.controller.settings is not None
-    assert document.controller.settings.file is not None
-    assert document.controller.settings.file.path == Path(
+    assert controller.log_level == "info"
+    assert controller.device_config is not None
+    assert controller.device_config.file is not None
+    assert controller.device_config.file.path == (tmp_path / "settings").resolve()
+    assert controller.settings is not None
+    assert controller.settings.file is not None
+    assert controller.settings.file.path == Path(
         PlatformDirs("deckr", "deckr", version="1.0").user_data_dir
     ).resolve()
-    assert document.children("plugin_hosts") == {}
-    assert document.children("drivers") == {}
+    assert document.children("deckr.plugin_hosts") == {}
+    assert document.children("deckr.drivers") == {}
 
 
 def test_load_config_document_resolves_relative_paths_and_namespaces(
@@ -47,15 +52,11 @@ path = "configs"
 [deckr.controller.settings.file]
 path = "state"
 
-[deckr.plugin_hosts.python]
+[deckr.plugin_hosts.python.instances.main]
 host_id = "living-room"
 
-[deckr.plugin_hosts.python.runtime]
+[deckr.plugin_hosts.python.instances.main.runtime]
 descriptor_roots = ["plugins/runtime"]
-
-[deckr.plugins.openhab]
-url = "http://openhab.local:8080"
-api_key = "secret"
 
 [deckr.drivers.mqtt.broker]
 hostname = "mqtt.local"
@@ -64,30 +65,48 @@ port = 1884
     )
 
     document = load_config_document(config_path)
+    controller = controller_config_from_document(document)
 
     assert document.source_path == config_path.resolve()
     assert document.base_dir == tmp_path.resolve()
-    assert document.controller.id == "controller-main"
-    assert document.controller.device_config is not None
-    assert document.controller.device_config.file is not None
-    assert document.controller.device_config.file.path == (tmp_path / "configs").resolve()
-    assert document.controller.settings is not None
-    assert document.controller.settings.file is not None
-    assert document.controller.settings.file.path == (tmp_path / "state").resolve()
-    assert document.plugin_host_config("python")["host_id"] == "living-room"
-    assert document.plugin_host_config("python")["runtime"]["descriptor_roots"] == (
+    assert controller.id == "controller-main"
+    assert controller.device_config is not None
+    assert controller.device_config.file is not None
+    assert controller.device_config.file.path == (tmp_path / "configs").resolve()
+    assert controller.settings is not None
+    assert controller.settings.file is not None
+    assert controller.settings.file.path == (tmp_path / "state").resolve()
+    plugin_host = document.namespace("deckr.plugin_hosts.python")
+    assert plugin_host is not None
+    assert plugin_host["instances"]["main"]["host_id"] == (
+        "living-room"
+    )
+    assert plugin_host["instances"]["main"]["runtime"]["descriptor_roots"] == (
         "plugins/runtime",
     )
-    assert document.namespace("plugins.openhab") == document.plugin_config("openhab")
-    assert document.plugin_config("openhab")["url"] == "http://openhab.local:8080"
-    assert document.driver_config("mqtt")["broker"]["hostname"] == "mqtt.local"
+    driver = document.namespace("deckr.drivers.mqtt")
+    assert driver is not None
+    assert driver["broker"]["hostname"] == "mqtt.local"
 
 
-def test_explicit_config_requires_deckr_controller_table(tmp_path: Path) -> None:
+def test_explicit_config_allows_missing_controller_table(tmp_path: Path) -> None:
+    config_path = tmp_path / "deckr.toml"
+    config_path.write_text("[deckr.plugin_hosts.python.instances.main]\nenabled = false\n")
+
+    document = load_config_document(config_path)
+    controller = controller_config_from_document(document)
+
+    assert controller.log_level == "info"
+    plugin_host = document.namespace("deckr.plugin_hosts.python")
+    assert plugin_host is not None
+    assert plugin_host["instances"]["main"]["enabled"] is False
+
+
+def test_rejects_legacy_plugin_toml_namespaces(tmp_path: Path) -> None:
     config_path = tmp_path / "deckr.toml"
     config_path.write_text("[deckr.plugins.openhab]\nurl = 'http://openhab.local:8080'\n")
 
-    with pytest.raises(ValueError, match=r"\[deckr\.controller\]"):
+    with pytest.raises(ValueError, match="Plugin TOML configuration is no longer supported"):
         load_config_document(config_path)
 
 
@@ -101,17 +120,20 @@ def test_auto_loads_local_deckr_toml(
 [deckr.controller]
 log_level = "warning"
 
-[deckr.plugin_hosts.python]
+[deckr.plugin_hosts.python.instances.main]
 enabled = false
 """.strip()
     )
     monkeypatch.chdir(tmp_path)
 
     document = load_config_document(None)
+    controller = controller_config_from_document(document)
 
     assert document.source_path == config_path.resolve()
-    assert document.controller.log_level == "warning"
-    assert document.plugin_host_config("python")["enabled"] is False
+    assert controller.log_level == "warning"
+    plugin_host = document.namespace("deckr.plugin_hosts.python")
+    assert plugin_host is not None
+    assert plugin_host["instances"]["main"]["enabled"] is False
 
 
 def test_default_config_document_text_contains_controller_table() -> None:

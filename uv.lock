@@ -301,7 +301,7 @@ wheels = [
 [[package]]
 name = "deckr"
 version = "0.3.0.dev0"
-source = { directory = "../deckr" }
+source = { editable = "../deckr" }
 dependencies = [
     { name = "anyio" },
     { name = "pydantic" },
@@ -373,7 +373,7 @@ dev = [
 requires-dist = [
     { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
     { name = "cairosvg", specifier = ">=2.8.2,<3.0.0" },
-    { name = "deckr", extras = ["graph", "mqtt"], directory = "../deckr" },
+    { name = "deckr", extras = ["graph", "mqtt"], editable = "../deckr" },
     { name = "deckr-fonts", specifier = ">=0.2.0" },
     { name = "httpx", specifier = ">=0.28.1,<0.29.0" },
     { name = "invariant-core", specifier = "==0.3.0" },

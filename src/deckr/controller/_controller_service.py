@@ -11,6 +11,7 @@ from deckr.plugin.messages import (
     COMMAND_MESSAGE_TYPES,
     GLOBAL_SETTINGS_MESSAGE_TYPES,
     HERE_ARE_GLOBAL_SETTINGS,
+    HOST_ONLINE,
     REQUEST_ACTIONS,
     REQUEST_GLOBAL_SETTINGS,
     SET_GLOBAL_SETTINGS,
@@ -100,6 +101,18 @@ class ControllerService(BaseComponent):
             )
         )
 
+    async def _handle_host_online(self, msg: HostMessage) -> None:
+        if self._plugin_bus is None:
+            return
+        await self._plugin_bus.send(
+            HostMessage(
+                from_id=controller_address(self._controller_id),
+                to_id=msg.from_id,
+                type=REQUEST_ACTIONS,
+                payload={},
+            )
+        )
+
     async def _plugin_subscription_loop(self) -> None:
         """Subscribe to plugin bus and route command messages to DeviceManagers."""
         if self._plugin_bus is None:
@@ -116,6 +129,9 @@ class ControllerService(BaseComponent):
                     if not isinstance(event, HostMessage):
                         continue
                     if not event.for_controller(self._controller_id):
+                        continue
+                    if event.type == HOST_ONLINE:
+                        await self._handle_host_online(event)
                         continue
                     if event.type in GLOBAL_SETTINGS_MESSAGE_TYPES:
                         await self._handle_global_settings_command(event)
