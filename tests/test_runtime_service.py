@@ -5,7 +5,7 @@ from pathlib import Path
 import anyio
 import pytest
 from deckr.core.component import ComponentManager
-from deckr.core.components import activate_components
+from deckr.core.components import InactiveComponent, activate_components
 from deckr.core.config import ConfigDocument
 from deckr.core.messaging import EventBus
 
@@ -44,3 +44,20 @@ async def test_controller_component_uses_shared_lanes(
         assert isinstance(result.get_lane("plugin_messages"), EventBus)
 
         tg.cancel_scope.cancel()
+
+
+def test_controller_component_can_be_disabled_explicitly() -> None:
+    created = component.factory(
+        type(
+            "Context",
+            (),
+            {
+                "raw_config": {"enabled": False},
+                "runtime_name": "deckr.controller",
+                "base_dir": Path.cwd(),
+                "require_lane": lambda self, name: None,
+            },
+        )()
+    )
+
+    assert isinstance(created, InactiveComponent)

@@ -28,7 +28,7 @@ classifiers = [
 dependencies = [
     "aiomqtt>=2.0.0,<3.0.0",
     "cairosvg>=2.8.2,<3.0.0",
-    "deckr[graph,mqtt]>=0.2.0,<1.0.0",
+    "deckr[graph,mqtt,websocket]>=0.2.0,<1.0.0",
     "deckr-fonts>=0.2.0",
     "httpx>=0.28.1,<0.29.0",
     "invariant-core==0.3.0",
@@ -43,16 +43,13 @@ dependencies = [
     "simpleeval>=1.0.3,<2.0.0",
     "tinydb>=4.8.2,<5.0.0",
     "watchfiles>=1.1.1,<2.0.0",
-    "websockets>=12.0,<16.0",
 ]
 
 [project.scripts]
 deckr = "deckr.controller:main"
-deckr-device-manager = "deckr.controller:device_manager_main"
 
 [project.entry-points."deckr.components"]
 "deckr.controller" = "deckr.controller._runtime_service:component"
-"deckr.controller.remote_device_manager" = "deckr.controller._remote_hardware_service:component"
 
 [project.urls]
 Documentation = "https://github.com/kws/deckr-controller#readme"

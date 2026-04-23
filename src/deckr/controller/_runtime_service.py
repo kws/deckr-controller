@@ -9,6 +9,7 @@ from deckr.core.components import (
     ComponentContext,
     ComponentDefinition,
     ComponentManifest,
+    InactiveComponent,
 )
 from deckr.core.messaging import EventBus
 from deckr.core.util.host_id import resolve_controller_id
@@ -18,8 +19,6 @@ from deckr.controller._config_document import (
     parse_controller_config,
 )
 from deckr.controller._controller_service import ControllerService
-from deckr.controller._remote_hardware import RemoteHardwareWebSocketServer
-from deckr.controller._remote_hardware_service import RemoteHardwareWebSocketConfig
 from deckr.controller._service import _build_config_service, _build_settings_service
 from deckr.controller.plugin.action_registry import ActionRegistry
 
@@ -69,13 +68,6 @@ class ControllerRuntimeService(BaseComponent):
             plugin_bus=self._plugin_messages,
         )
         await self._component_manager.add_component(controller_service)
-        websocket = _build_remote_hardware_websocket(
-            raw_config=self._runtime.raw_config,
-            controller_id=self._runtime.controller_id,
-            hardware_events=self._hardware_events,
-        )
-        if websocket is not None:
-            await self._component_manager.add_component(websocket)
 
     async def stop(self) -> None:
         await self._component_manager.stop()
@@ -95,41 +87,13 @@ def build_controller_runtime(
     )
 
 
-def _remote_websocket_payload(
-    source: Mapping[str, object],
-) -> Mapping[str, object]:
-    remote_hardware = source.get("remote_hardware")
-    if not isinstance(remote_hardware, Mapping):
-        return {}
-    websocket = remote_hardware.get("websocket")
-    if not isinstance(websocket, Mapping):
-        return {}
-    return websocket
+def component_factory(context: ComponentContext):
+    source = dict(context.raw_config)
+    if source.get("enabled") is False:
+        return InactiveComponent(name=context.runtime_name)
 
-
-def _build_remote_hardware_websocket(
-    *,
-    raw_config: Mapping[str, object],
-    controller_id: str,
-    hardware_events: EventBus,
-) -> RemoteHardwareWebSocketServer | None:
-    source = _remote_websocket_payload(raw_config)
-    if not source:
-        return None
-    config = RemoteHardwareWebSocketConfig.model_validate(dict(source))
-    if not config.enabled:
-        return None
-    return RemoteHardwareWebSocketServer(
-        hardware_events,
-        controller_id=controller_id,
-        host=config.host,
-        port=config.port,
-    )
-
-
-def component_factory(context: ComponentContext) -> ControllerRuntimeService:
     runtime = build_controller_runtime(
-        raw_config=dict(context.raw_config),
+        raw_config=source,
         base_dir=context.base_dir,
     )
     return ControllerRuntimeService(

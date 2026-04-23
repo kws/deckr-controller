@@ -68,6 +68,7 @@ def _build_settings_service(config: ControllerRuntimeConfig):
 def _controller_component_filter(component_id: str) -> bool:
     return (
         component_id == "deckr.controller"
+        or component_id.startswith("deckr.bridges.")
         or component_id.startswith("deckr.plugin_hosts.")
         or component_id.startswith("deckr.drivers.")
     )

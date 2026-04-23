@@ -314,16 +314,20 @@ graph = [
 mqtt = [
     { name = "aiomqtt" },
 ]
+websocket = [
+    { name = "websockets" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "aiomqtt", marker = "extra == 'mqtt'", specifier = ">=2.0.0,<3.0.0" },
     { name = "anyio", specifier = ">=4.12.1,<5.0.0" },
-    { name = "deckr", extras = ["graph", "mqtt"], marker = "extra == 'all'" },
+    { name = "deckr", extras = ["graph", "mqtt", "websocket"], marker = "extra == 'all'" },
     { name = "invariant-core", marker = "extra == 'graph'", specifier = "==0.3.0" },
     { name = "pydantic", specifier = ">=2.12.5,<3.0.0" },
+    { name = "websockets", marker = "extra == 'websocket'", specifier = ">=15.0.1,<16.0.0" },
 ]
-provides-extras = ["mqtt", "graph", "all"]
+provides-extras = ["mqtt", "websocket", "graph", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -334,6 +338,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.3.0,<2.0.0" },
     { name = "pytest-cov", specifier = ">=6.0.0,<7.0.0" },
     { name = "ruff", specifier = ">=0.14.14,<0.15.0" },
+    { name = "websockets", specifier = ">=15.0.1,<16.0.0" },
 ]
 
 [[package]]
@@ -343,7 +348,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiomqtt" },
     { name = "cairosvg" },
-    { name = "deckr", extra = ["graph", "mqtt"] },
+    { name = "deckr", extra = ["graph", "mqtt", "websocket"] },
     { name = "deckr-fonts" },
     { name = "httpx" },
     { name = "invariant-core" },
@@ -358,7 +363,6 @@ dependencies = [
     { name = "simpleeval" },
     { name = "tinydb" },
     { name = "watchfiles" },
-    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -373,7 +377,7 @@ dev = [
 requires-dist = [
     { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
     { name = "cairosvg", specifier = ">=2.8.2,<3.0.0" },
-    { name = "deckr", extras = ["graph", "mqtt"], editable = "../deckr" },
+    { name = "deckr", extras = ["graph", "mqtt", "websocket"], editable = "../deckr" },
     { name = "deckr-fonts", specifier = ">=0.2.0" },
     { name = "httpx", specifier = ">=0.28.1,<0.29.0" },
     { name = "invariant-core", specifier = "==0.3.0" },
@@ -388,7 +392,6 @@ requires-dist = [
     { name = "simpleeval", specifier = ">=1.0.3,<2.0.0" },
     { name = "tinydb", specifier = ">=4.8.2,<5.0.0" },
     { name = "watchfiles", specifier = ">=1.1.1,<2.0.0" },
-    { name = "websockets", specifier = ">=12.0,<16.0" },
 ]
 
 [package.metadata.requires-dev]

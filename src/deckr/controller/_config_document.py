@@ -15,6 +15,7 @@ _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 #
 # Reserved top-level namespaces:
 #   [deckr.controller]
+#   [deckr.bridges.<component>.instances.<instance>]
 #   [deckr.plugin_hosts.<component>.instances.<instance>]
 #   [deckr.drivers.<component>]
 
@@ -53,6 +54,7 @@ class SettingsSection(_StrictModel):
 
 
 class ControllerRuntimeConfig(_StrictModel):
+    enabled: bool = True
     id: str | None = None
     log_level: str = "info"
     device_config: DeviceConfigSection | None = None
