@@ -11,9 +11,8 @@ from deckr.core.components import (
     ComponentManifest,
     InactiveComponent,
 )
-from deckr.core.logging import configure_process_logging
 from deckr.core.messaging import EventBus
-from deckr.core.util.host_id import resolve_controller_id
+from deckr.core.util.runtime_id import require_runtime_id
 
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
@@ -83,8 +82,11 @@ def build_controller_runtime(
     base_dir: Path,
 ) -> ControllerRuntime:
     config = parse_controller_config(raw_config, base_dir=base_dir)
-    configure_process_logging(config.log_level)
-    controller_id = resolve_controller_id(cli_value=config.id)
+    controller_id = require_runtime_id(
+        config.id,
+        label="Controller ID",
+        source_hint="Set `[deckr.controller].id`.",
+    )
     return ControllerRuntime(
         raw_config=dict(raw_config),
         config=config,

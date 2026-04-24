@@ -20,7 +20,6 @@ _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 #   [deckr.drivers.<component>]
 
 [deckr.controller]
-log_level = "info"
 
 [deckr.controller.device_config.file]
 path = "settings"
@@ -56,7 +55,6 @@ class SettingsSection(_StrictModel):
 class ControllerRuntimeConfig(_StrictModel):
     enabled: bool = True
     id: str | None = None
-    log_level: str = "info"
     device_config: DeviceConfigSection | None = None
     settings: SettingsSection | None = None
 

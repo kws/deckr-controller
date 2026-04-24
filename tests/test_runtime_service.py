@@ -9,7 +9,7 @@ from deckr.core.components import InactiveComponent, activate_components
 from deckr.core.config import ConfigDocument
 from deckr.core.messaging import EventBus
 
-from deckr.controller._runtime_service import component
+from deckr.controller._runtime_service import build_controller_runtime, component
 
 
 def _document(raw: dict) -> ConfigDocument:
@@ -61,3 +61,15 @@ def test_controller_component_can_be_disabled_explicitly() -> None:
     )
 
     assert isinstance(created, InactiveComponent)
+
+
+def test_controller_runtime_requires_configured_id_even_when_env_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CONTROLLER_ID", "from-env")
+
+    with pytest.raises(ValueError, match=r"Set `\[deckr\.controller\]\.id`"):
+        build_controller_runtime(
+            raw_config={},
+            base_dir=Path.cwd(),
+        )

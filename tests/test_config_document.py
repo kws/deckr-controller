@@ -23,7 +23,6 @@ def test_default_config_document_matches_builtin_defaults(
 
     assert document.source_path is None
     assert document.base_dir == tmp_path.resolve()
-    assert controller.log_level == "info"
     assert controller.device_config is not None
     assert controller.device_config.file is not None
     assert controller.device_config.file.path == (tmp_path / "settings").resolve()
@@ -44,7 +43,6 @@ def test_load_config_document_resolves_relative_paths_and_namespaces(
         """
 [deckr.controller]
 id = "controller-main"
-log_level = "debug"
 
 [deckr.controller.device_config.file]
 path = "configs"
@@ -94,9 +92,6 @@ def test_explicit_config_allows_missing_controller_table(tmp_path: Path) -> None
     config_path.write_text("[deckr.plugins.openhab]\nurl = 'http://openhab.local:8080'\n")
 
     document = load_config_document(config_path)
-    controller = controller_config_from_document(document)
-
-    assert controller.log_level == "info"
     assert document.namespace("deckr.plugins.openhab") == {
         "url": "http://openhab.local:8080"
     }
@@ -110,7 +105,6 @@ def test_auto_loads_local_deckr_toml(
     config_path.write_text(
         """
 [deckr.controller]
-log_level = "warning"
 
 [deckr.plugin_hosts.python.instances.main]
 enabled = false
@@ -119,10 +113,8 @@ enabled = false
     monkeypatch.chdir(tmp_path)
 
     document = load_config_document(None)
-    controller = controller_config_from_document(document)
 
     assert document.source_path == config_path.resolve()
-    assert controller.log_level == "warning"
     plugin_host = document.namespace("deckr.plugin_hosts.python")
     assert plugin_host is not None
     assert plugin_host["instances"]["main"]["enabled"] is False
