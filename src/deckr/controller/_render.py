@@ -10,9 +10,14 @@ from typing import Any, Literal
 
 import anyio
 from deckr.hardware.events import HWSImageFormat
-from deckr.plugin.graph_image import graph_image_data_uri_to_wire
-from deckr.plugin.graph_wire import graph_from_wire, graph_to_wire
-from invariant import Node, SubGraphNode, ref
+from invariant import (
+    Node,
+    SubGraphNode,
+    dump_graph_output_to_dict,
+    load_graph_output_data_uri,
+    load_graph_output_from_dict,
+    ref,
+)
 
 from deckr.controller._state_store import ControlStateStore, StateOverride, TitleOptions
 from deckr.controller._title_defaults import (
@@ -232,23 +237,26 @@ def _node_to_wire(node: Node | SubGraphNode) -> dict[str, Any]:
     """Serialize a render node to the invariant graph wire format."""
 
     if isinstance(node, SubGraphNode):
-        return graph_to_wire(node.graph, node.output)
-    return graph_to_wire({"output": node}, "output")
+        return dump_graph_output_to_dict(node.graph, node.output)
+    return dump_graph_output_to_dict({"output": node}, "output")
 
 
-def _wire_to_node(wire: dict[str, Any]) -> SubGraphNode:
-    """Rehydrate a wire-serialized graph into a canvas-aware SubGraphNode."""
+def _graph_output_to_node(graph_dict: dict[str, Any], output: str) -> SubGraphNode:
+    """Build a canvas-aware SubGraphNode from graph/output parts."""
 
-    parsed = graph_from_wire(wire)
-    if parsed is None:
-        raise ValueError("Render request does not contain a valid graph")
-    graph_dict, output = parsed
     return SubGraphNode(
         params={"canvas": ref("canvas")},
         deps=["canvas"],
         graph=graph_dict,
         output=output,
     )
+
+
+def _wire_to_node(wire: dict[str, Any]) -> SubGraphNode:
+    """Rehydrate a wire-serialized graph into a canvas-aware SubGraphNode."""
+
+    graph_dict, output = load_graph_output_from_dict(wire)
+    return _graph_output_to_node(graph_dict, output)
 
 
 def _to_render_image_format(image_format: HWSImageFormat) -> RenderImageFormat:
@@ -281,9 +289,9 @@ def _model_to_graph(
     if model.overlay_type == "blank":
         return solid_card()
     if model.image is not None:
-        graph_wire = graph_image_data_uri_to_wire(model.image)
-        if graph_wire is not None:
-            return _wire_to_node(graph_wire)
+        parsed = load_graph_output_data_uri(model.image)
+        if parsed is not None:
+            return _graph_output_to_node(*parsed)
         return image_card(model.image)
     if model.title is not None:
         params = _title_options_to_params(model.title_options, image_format)

@@ -173,6 +173,18 @@ wheels = [
 ]
 
 [[package]]
+name = "click"
+version = "8.3.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bb/63/f9e1ea081ce35720d8b92acde70daaedace594dc93b693c869e0d5910718/click-8.3.3.tar.gz", hash = "sha256:398329ad4837b2ff7cbe1dd166a4c0f8900c3ca3a218de04466f38f6497f18a2", size = 328061, upload-time = "2026-04-22T15:11:27.506Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ae/44/c1221527f6a71a01ec6fbad7fa78f1d50dfa02217385cf0fa3eec7087d59/click-8.3.3-py3-none-any.whl", hash = "sha256:a2bf429bb3033c89fa4936ffb35d5cb471e3719e1f3c8a7c3fff0b8314305613", size = 110502, upload-time = "2026-04-22T15:11:25.044Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -308,8 +320,8 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-graph = [
-    { name = "invariant-core" },
+cli = [
+    { name = "click" },
 ]
 mqtt = [
     { name = "aiomqtt" },
@@ -322,18 +334,18 @@ websocket = [
 requires-dist = [
     { name = "aiomqtt", marker = "extra == 'mqtt'", specifier = ">=2.0.0,<3.0.0" },
     { name = "anyio", specifier = ">=4.12.1,<5.0.0" },
-    { name = "deckr", extras = ["graph", "mqtt", "websocket"], marker = "extra == 'all'" },
-    { name = "invariant-core", marker = "extra == 'graph'", specifier = "==0.3.0" },
+    { name = "click", marker = "extra == 'cli'", specifier = ">=8.3.1,<9.0.0" },
+    { name = "deckr", extras = ["cli", "mqtt", "websocket"], marker = "extra == 'all'" },
     { name = "pydantic", specifier = ">=2.12.5,<3.0.0" },
     { name = "websockets", marker = "extra == 'websocket'", specifier = ">=15.0.1,<16.0.0" },
 ]
-provides-extras = ["mqtt", "websocket", "graph", "all"]
+provides-extras = ["cli", "mqtt", "websocket", "all"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
+    { name = "click", specifier = ">=8.3.1,<9.0.0" },
     { name = "import-linter", specifier = ">=2.11,<3.0.0" },
-    { name = "invariant-core", specifier = "==0.3.0" },
     { name = "pytest", specifier = ">=9.0.2,<10.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.3.0,<2.0.0" },
     { name = "pytest-cov", specifier = ">=6.0.0,<7.0.0" },
@@ -348,7 +360,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiomqtt" },
     { name = "cairosvg" },
-    { name = "deckr", extra = ["graph", "mqtt", "websocket"] },
+    { name = "deckr", extra = ["cli", "mqtt", "websocket"] },
     { name = "deckr-fonts" },
     { name = "httpx" },
     { name = "invariant-core" },
@@ -377,10 +389,10 @@ dev = [
 requires-dist = [
     { name = "aiomqtt", specifier = ">=2.0.0,<3.0.0" },
     { name = "cairosvg", specifier = ">=2.8.2,<3.0.0" },
-    { name = "deckr", extras = ["graph", "mqtt", "websocket"], editable = "../deckr" },
+    { name = "deckr", extras = ["cli", "mqtt", "websocket"], editable = "../deckr" },
     { name = "deckr-fonts", specifier = ">=0.2.0" },
     { name = "httpx", specifier = ">=0.28.1,<0.29.0" },
-    { name = "invariant-core", specifier = "==0.3.0" },
+    { name = "invariant-core", specifier = ">=0.4.0,<1.0.0" },
     { name = "invariant-gfx", specifier = "==0.2.0" },
     { name = "justmyresource", extras = ["icons"], specifier = ">=1.1.1,<2.0.0" },
     { name = "justmyresource-lucide", specifier = ">=0.575.0" },
@@ -590,16 +602,16 @@ wheels = [
 
 [[package]]
 name = "invariant-core"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cachetools" },
     { name = "cel-python" },
     { name = "diskcache" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/39/bf/77a4c5362ac387210dea45c57fa69bbe058e7d860a46aff48aca3e6ba1ee/invariant_core-0.3.0.tar.gz", hash = "sha256:04dbd30fafc7062feb44f86822e29e98a0255ddee07654317962e6bf2aa35a6b", size = 237082, upload-time = "2026-04-21T08:58:32.386Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/09/66/0e2fade263fcedbd688eb6d70a6546dedf08b811790a393ff243a36d93d7/invariant_core-0.4.0.tar.gz", hash = "sha256:908bac76de6f6ac4d45344af926cbb29500aa82455df1048df9660d150a0d052", size = 240687, upload-time = "2026-04-23T17:06:26.197Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/65/e08b0e3df1e06fe6890d10acc10e7122d78226b6c3e92f501a706a3baf9b/invariant_core-0.3.0-py3-none-any.whl", hash = "sha256:ab392e916393bee4d5cca9b0fb7fe803803dac5bab8c61915c9c9f1274fd4fe2", size = 37542, upload-time = "2026-04-21T08:58:30.547Z" },
+    { url = "https://files.pythonhosted.org/packages/06/4b/2b4476aedab212fcd25c224a077db679a6cab8bd7a7054c47483cb4b950c/invariant_core-0.4.0-py3-none-any.whl", hash = "sha256:d899b1f030bb80119cebbf37cd081b0f3f1a84c641a6f095101aeb93352a20bd", size = 38085, upload-time = "2026-04-23T17:06:27.54Z" },
 ]
 
 [[package]]

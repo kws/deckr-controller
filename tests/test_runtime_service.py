@@ -29,7 +29,7 @@ async def test_controller_component_uses_shared_lanes(
         lambda component_id: component,
     )
 
-    document = _document({"deckr": {"controller": {}}})
+    document = _document({"deckr": {"controller": {"id": "controller-main"}}})
     component_manager = ComponentManager()
 
     async with anyio.create_task_group() as tg:

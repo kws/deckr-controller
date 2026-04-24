@@ -81,9 +81,10 @@ class ActionRegistry(BaseComponent):
     async def _handle_actions_registered(self, msg: HostMessage) -> None:
         """Handle actionsRegistered. Add actions to registry."""
         payload = msg.payload
-        host_id = (
-            payload.get("hostId") or parse_host_address(msg.from_id) or msg.from_id
-        )
+        host_id = payload.get("hostId") or parse_host_address(msg.from_id)
+        if not host_id:
+            logger.warning("Ignoring actionsRegistered from invalid host address %s", msg.from_id)
+            return
         touched: list[str] = []
         seen: set[str] = set()
         actions = payload.get("actions", [])
@@ -127,9 +128,13 @@ class ActionRegistry(BaseComponent):
     async def _handle_actions_unregistered(self, msg: HostMessage) -> None:
         """Handle actionsUnregistered. Remove actions from registry."""
         payload = msg.payload
-        host_id = (
-            payload.get("hostId") or parse_host_address(msg.from_id) or msg.from_id
-        )
+        host_id = payload.get("hostId") or parse_host_address(msg.from_id)
+        if not host_id:
+            logger.warning(
+                "Ignoring actionsUnregistered from invalid host address %s",
+                msg.from_id,
+            )
+            return
         action_uuids = payload.get("actionUuids", [])
         removed: list[str] = []
         for action_uuid in action_uuids:
@@ -151,9 +156,10 @@ class ActionRegistry(BaseComponent):
     async def _handle_host_offline(self, msg: HostMessage) -> None:
         """Remove all actions for a host when the transport reports it offline."""
         payload = msg.payload
-        host_id = (
-            payload.get("hostId") or parse_host_address(msg.from_id) or msg.from_id
-        )
+        host_id = payload.get("hostId") or parse_host_address(msg.from_id)
+        if not host_id:
+            logger.warning("Ignoring hostOffline from invalid host address %s", msg.from_id)
+            return
         removed = [
             qualified
             for qualified, (entry_host_id, _, _) in self._action_registry.items()

@@ -28,10 +28,10 @@ classifiers = [
 dependencies = [
     "aiomqtt>=2.0.0,<3.0.0",
     "cairosvg>=2.8.2,<3.0.0",
-    "deckr[graph,mqtt,websocket]>=0.2.0,<1.0.0",
+    "deckr[cli,mqtt,websocket]>=0.2.0,<1.0.0",
     "deckr-fonts>=0.2.0",
     "httpx>=0.28.1,<0.29.0",
-    "invariant-core==0.3.0",
+    "invariant-core>=0.4.0,<1.0.0",
     "invariant-gfx==0.2.0",
     "justmyresource[icons]>=1.1.1,<2.0.0",
     "justmyresource-lucide>=0.575.0",
@@ -44,9 +44,6 @@ dependencies = [
     "tinydb>=4.8.2,<5.0.0",
     "watchfiles>=1.1.1,<2.0.0",
 ]
-
-[project.scripts]
-deckr = "deckr.controller:main"
 
 [project.entry-points."deckr.components"]
 "deckr.controller" = "deckr.controller._runtime_service:component"

@@ -11,6 +11,7 @@ from deckr.core.components import (
     ComponentManifest,
     InactiveComponent,
 )
+from deckr.core.logging import configure_process_logging
 from deckr.core.messaging import EventBus
 from deckr.core.util.host_id import resolve_controller_id
 
@@ -19,7 +20,10 @@ from deckr.controller._config_document import (
     parse_controller_config,
 )
 from deckr.controller._controller_service import ControllerService
-from deckr.controller._service import _build_config_service, _build_settings_service
+from deckr.controller._runtime_support import (
+    build_config_service,
+    build_settings_service,
+)
 from deckr.controller.plugin.action_registry import ActionRegistry
 
 
@@ -48,10 +52,10 @@ class ControllerRuntimeService(BaseComponent):
     async def start(self, ctx: RunContext) -> None:
         ctx.tg.start_soon(self._component_manager.run)
 
-        config_service = _build_config_service(self._runtime.config)
+        config_service = build_config_service(self._runtime.config)
         if isinstance(config_service, Component):
             await self._component_manager.add_component(config_service)
-        settings_service = _build_settings_service(self._runtime.config)
+        settings_service = build_settings_service(self._runtime.config)
 
         action_registry = ActionRegistry(
             event_bus=self._plugin_messages,
@@ -79,6 +83,7 @@ def build_controller_runtime(
     base_dir: Path,
 ) -> ControllerRuntime:
     config = parse_controller_config(raw_config, base_dir=base_dir)
+    configure_process_logging(config.log_level)
     controller_id = resolve_controller_id(cli_value=config.id)
     return ControllerRuntime(
         raw_config=dict(raw_config),

@@ -13,9 +13,7 @@ from unittest.mock import AsyncMock
 import anyio
 import pytest
 from deckr.hardware.events import HWSImageFormat
-from deckr.plugin.graph_image import wire_to_graph_image_data_uri
-from deckr.plugin.graph_wire import graph_to_wire
-from invariant import Node, SubGraphNode
+from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
 from invariant_gfx.artifacts import BlobArtifact
 from PIL import Image
@@ -102,8 +100,7 @@ def _custom_graph() -> SubGraphNode:
 
 def _graph_data_uri() -> str:
     graph = _custom_graph()
-    wire = graph_to_wire(graph.graph, graph.output)
-    return wire_to_graph_image_data_uri(wire)
+    return dump_graph_output_data_uri(graph.graph, graph.output)
 
 
 @pytest.mark.asyncio
