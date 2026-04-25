@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
-from deckr.hardware.events import WireHWSImageFormat
+from deckr.hardware.events import HardwareImageFormat
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
 from invariant_gfx.artifacts import BlobArtifact
@@ -212,7 +212,7 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
     ids=["title", "image", "alert", "unavailable", "blank", "graph"],
 )
 def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     request = RenderService().build_request(
         model,
         fmt,
@@ -230,7 +230,7 @@ def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
 @pytest.mark.asyncio
 async def test_process_pool_render_backend_renders_request():
     backend = ProcessPoolRenderBackend(max_workers=2)
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     service = RenderService()
 
     try:

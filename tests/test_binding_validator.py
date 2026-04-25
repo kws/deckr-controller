@@ -4,14 +4,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
-from deckr.transports.bus import EventBus
 from deckr.hardware.events import (
-    WireCoordinates,
-    WireHWDevice,
-    WireHWSImageFormat,
-    WireHWSlot,
+    HardwareCoordinates,
+    HardwareDevice,
+    HardwareImageFormat,
+    HardwareSlot,
 )
 from deckr.plugin.messages import SlotBinding
+from deckr.transports.bus import EventBus
 
 from deckr.controller._binding_validator import (
     ValidationError,
@@ -35,9 +35,9 @@ class FakeHardwareCommandService:
 
 def _make_device(
     device_id: str = "test-dev",
-    slots: list[WireHWSlot] | None = None,
-) -> WireHWDevice:
-    return WireHWDevice(
+    slots: list[HardwareSlot] | None = None,
+) -> HardwareDevice:
+    return HardwareDevice(
         id=device_id,
         name="Test",
         hid=f"mock:{device_id}",
@@ -65,13 +65,13 @@ def _make_slot(
     slot_type: str = "key",
     gestures: list[str] | None = None,
     has_display: bool = True,
-) -> WireHWSlot:
+) -> HardwareSlot:
     if gestures is None:
         gestures = ["key_down", "key_up"]
-    return WireHWSlot(
+    return HardwareSlot(
         id=slot_id,
-        coordinates=WireCoordinates(column=col, row=row),
-        image_format=WireHWSImageFormat(width=72, height=72) if has_display else None,
+        coordinates=HardwareCoordinates(column=col, row=row),
+        image_format=HardwareImageFormat(width=72, height=72) if has_display else None,
         slot_type=slot_type,
         gestures=gestures,
     )

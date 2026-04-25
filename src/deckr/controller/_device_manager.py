@@ -91,7 +91,7 @@ def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
         return None
 
 
-def _find_slot(device: hw_events.WireHWDevice, slot_id: str) -> hw_events.WireHWSlot | None:
+def _find_slot(device: hw_events.HardwareDevice, slot_id: str) -> hw_events.HardwareSlot | None:
     for slot in device.slots:
         if slot.id == slot_id:
             return slot
@@ -124,7 +124,7 @@ class DeviceManager:
         self,
         *,
         controller_id: str,
-        device: hw_events.WireHWDevice,
+        device: hw_events.HardwareDevice,
         command_service: HardwareCommandService,
         config: DeviceConfig,
         manager: PluginManager,
@@ -164,7 +164,7 @@ class DeviceManager:
         self._nav_lock = anyio.Lock()
         self._start_soon(self._page_timeout_loop)
 
-    async def _render_unavailable_to_slot(self, slot: hw_events.WireHWSlot) -> None:
+    async def _render_unavailable_to_slot(self, slot: hw_events.HardwareSlot) -> None:
         """Render 'not available' overlay to a slot (e.g. when action is missing)."""
         if slot.image_format is None:
             return
@@ -280,7 +280,7 @@ class DeviceManager:
     async def _try_resolve_binding(
         self,
         binding: SlotBinding,
-        slot: hw_events.WireHWSlot,
+        slot: hw_events.HardwareSlot,
         *,
         profile_id: str,
         page_id: str,

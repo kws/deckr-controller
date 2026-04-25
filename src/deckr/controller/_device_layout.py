@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import WireHWDevice, WireHWSImageFormat
+    from deckr.hardware.events import HardwareDevice, HardwareImageFormat
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,7 @@ class SlotInfo:
     slot_id: str
     row: int
     col: int
-    image_format: WireHWSImageFormat
+    image_format: HardwareImageFormat
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,7 @@ class EncoderInfo:
 
     slot_id: str
     gestures: list[str]
-    image_format: WireHWSImageFormat | None
+    image_format: HardwareImageFormat | None
 
 
 @dataclass(frozen=True)
@@ -73,7 +73,7 @@ _IMAGE_GRID_TYPES = frozenset({"key", "touch_dial", "touch_strip", "screen"})
 _ENCODER_TYPES = frozenset({"encoder", "touch_dial"})
 
 
-def build_device_layout(device: WireHWDevice) -> DeviceLayout:
+def build_device_layout(device: HardwareDevice) -> DeviceLayout:
     """Classify device slots into image grid, buttons, and encoders. Pure function of slot list."""
     image_slots: list[SlotInfo] = []
     button_infos: list[ButtonInfo] = []

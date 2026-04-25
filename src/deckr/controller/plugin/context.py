@@ -49,11 +49,11 @@ class ControlContext(ControlContextProtocol):
     def __init__(
         self,
         controller_id: str,
-        device: hw_events.WireHWDevice,
+        device: hw_events.HardwareDevice,
         command_service: HardwareCommandService,
         host_id: str,
         action_uuid: str,
-        slot: hw_events.WireHWSlot,
+        slot: hw_events.HardwareSlot,
         settings: dict,
         manager: "DeviceManager",
         plugin_bus: Any,

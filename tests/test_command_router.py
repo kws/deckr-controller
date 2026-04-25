@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from deckr.hardware.events import WireHWSImageFormat
+from deckr.hardware.events import HardwareImageFormat
 from deckr.plugin.messages import TitleOptions
 
 from deckr.controller import _persistence
@@ -78,7 +78,7 @@ def router_with_mocks():
     render_dispatcher.submit_request = AsyncMock()
 
     output = _make_output()
-    image_format = WireHWSImageFormat(width=72, height=72)
+    image_format = HardwareImageFormat(width=72, height=72)
 
     def no_start_soon(*args, **kwargs):
         pass  # don't run overlay expiry in tests
@@ -202,7 +202,7 @@ async def test_get_settings_hydrates_from_persistence():
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
     output = _make_output()
-    image_format = WireHWSImageFormat(width=72, height=72)
+    image_format = HardwareImageFormat(width=72, height=72)
 
     class FakeSettingsService:
         def __init__(self):
@@ -260,7 +260,7 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
     output = _make_output()
-    image_format = WireHWSImageFormat(width=72, height=72)
+    image_format = HardwareImageFormat(width=72, height=72)
 
     class FailingSettingsService:
         async def exists(self, target):
@@ -324,7 +324,7 @@ async def test_hydrate_settings_migrates_legacy_key_to_composite(monkeypatch, tm
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
     output = _make_output()
-    image_format = WireHWSImageFormat(width=72, height=72)
+    image_format = HardwareImageFormat(width=72, height=72)
 
     router = CommandRouter(
         store=store,

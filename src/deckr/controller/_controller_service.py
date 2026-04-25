@@ -160,7 +160,7 @@ class ControllerService(BaseComponent):
         if self._render_backend is not None:
             await self._render_backend.aclose()
 
-    async def _device_lifecycle(self, device: hw_events.WireHWDevice) -> None:
+    async def _device_lifecycle(self, device: hw_events.HardwareDevice) -> None:
         """Run device setup, config listener, and wait for disconnect."""
         stream = self._config_service.subscribe(device.id)
         first = await anext(stream)
@@ -191,7 +191,7 @@ class ControllerService(BaseComponent):
         finally:
             self._device_disconnect_events.pop(device.id, None)
 
-    async def on_device_connected(self, device: hw_events.WireHWDevice):
+    async def on_device_connected(self, device: hw_events.HardwareDevice):
         logger.info("Starting controller service for device %s", device.id)
         self._start_soon(self._device_lifecycle, device)
 

@@ -18,7 +18,7 @@ from deckr.controller._state_store import (
 from deckr.controller.settings import SettingsService, SettingsTarget
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import WireHWSImageFormat
+    from deckr.hardware.events import HardwareImageFormat
 
     from deckr.controller._hardware_service import HardwareCommandService
 
@@ -61,7 +61,7 @@ class CommandRouter:
         render_service: RenderService,
         render_dispatcher: RenderDispatcher,
         output: DeviceOutput,
-        image_format: "WireHWSImageFormat | None",
+        image_format: "HardwareImageFormat | None",
         start_soon: Callable,
         *,
         settings_service: SettingsService | None = None,

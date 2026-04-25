@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import WireHWDevice, WireHWSlot
+    from deckr.hardware.events import HardwareDevice, HardwareSlot
     from deckr.plugin.interface import PluginAction
     from deckr.plugin.messages import SlotBinding
 
@@ -76,7 +76,7 @@ class ValidationResult:
         )
 
 
-def _slot_by_id(device: WireHWDevice, slot_id: str) -> WireHWSlot | None:
+def _slot_by_id(device: HardwareDevice, slot_id: str) -> HardwareSlot | None:
     for slot in device.slots:
         if slot.id == slot_id:
             return slot
@@ -85,7 +85,7 @@ def _slot_by_id(device: WireHWDevice, slot_id: str) -> WireHWSlot | None:
 
 async def validate_page_bindings(
     bindings: list[SlotBinding],
-    device: WireHWDevice,
+    device: HardwareDevice,
     get_action: Callable[[str], Awaitable[PluginAction | None]],
     profile_id: str | None = None,
     page_id: str | None = None,

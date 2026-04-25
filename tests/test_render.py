@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 import pytest
-from deckr.hardware.events import WireHWSImageFormat
+from deckr.hardware.events import HardwareImageFormat
 from deckr.plugin.messages import TitleOptions
 
 from deckr.controller._render import (
@@ -70,7 +70,7 @@ def test_font_style_bold_italic():
 
 
 def test_title_options_to_params_none_uses_defaults():
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     params = _title_options_to_params(None, fmt)
     assert params["font"] == "Inter"
     assert params["font_size"] == '${decimal("17") * canvas.width / 72}'  # 1.25rem
@@ -82,7 +82,7 @@ def test_title_options_to_params_none_uses_defaults():
 
 
 def test_title_options_to_params_applies_options():
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     opts = TitleOptions(
         font_family="Roboto Mono",
         font_size=24,
@@ -101,7 +101,7 @@ def test_title_options_to_params_applies_options():
 
 def test_title_options_to_params_passes_font_size_through():
     """font_size is passed through as-is; no clamping."""
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     opts = TitleOptions(font_size=100)
     params = _title_options_to_params(opts, fmt)
     assert params["font_size"] == 100
@@ -113,7 +113,7 @@ def test_title_options_to_params_passes_font_size_through():
 
 def test_font_size_px_string():
     """font_size='14px' parses to size 14 pixels."""
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     opts = TitleOptions(font_size="14px")
     params = _title_options_to_params(opts, fmt)
     assert params["font_size"] == 14
@@ -123,7 +123,7 @@ def test_font_size_px_string():
 
 def test_font_size_rem_string():
     """font_size='1rem' yields CEL size and needs_canvas."""
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     opts = TitleOptions(font_size="1rem")
     params = _title_options_to_params(opts, fmt)
     assert params["font_size"] == '${decimal("14") * canvas.width / 72}'
@@ -133,7 +133,7 @@ def test_font_size_rem_string():
 
 def test_font_size_vw_string():
     """font_size='100vw' yields fit_width; '80vw' yields 0.8 * canvas.width."""
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     opts_100 = TitleOptions(font_size="100vw")
     params_100 = _title_options_to_params(opts_100, fmt)
     assert params_100["font_size"] is None
@@ -213,7 +213,7 @@ def test_resolve_overlay_ignores_title_options():
 @pytest.mark.asyncio
 async def test_render_service_encode_graph_failure_returns_none():
     """Encoding errors must not propagate; callers skip device write."""
-    fmt = WireHWSImageFormat(width=72, height=72)
+    fmt = HardwareImageFormat(width=72, height=72)
     model = RenderModel(title="Hi", title_options=TitleOptions(font_size=12))
     with patch(
         "deckr.controller._render._graph_to_jpeg_bytes",

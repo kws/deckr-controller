@@ -1,27 +1,27 @@
 from __future__ import annotations
 
-from deckr.transports.bus import EventBus
 from deckr.hardware import events as hw_events
+from deckr.transports.bus import EventBus
 
 
 class HardwareDeviceRegistry:
     """Controller-local cache of connected hardware metadata."""
 
     def __init__(self) -> None:
-        self._devices: dict[str, hw_events.WireHWDevice] = {}
+        self._devices: dict[str, hw_events.HardwareDevice] = {}
 
     def connect(
         self,
         message: hw_events.DeviceConnectedMessage,
-    ) -> hw_events.WireHWDevice:
+    ) -> hw_events.HardwareDevice:
         info = message.device.model_copy(update={"id": message.device_id})
         self._devices[message.device_id] = info
         return info
 
-    def disconnect(self, device_id: str) -> hw_events.WireHWDevice | None:
+    def disconnect(self, device_id: str) -> hw_events.HardwareDevice | None:
         return self._devices.pop(device_id, None)
 
-    def get(self, device_id: str) -> hw_events.WireHWDevice | None:
+    def get(self, device_id: str) -> hw_events.HardwareDevice | None:
         return self._devices.get(device_id)
 
 
