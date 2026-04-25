@@ -10,6 +10,7 @@ from deckr.plugin.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
     HOST_OFFLINE,
+    ActionDescriptor,
     ActionsChangedEvent,
     HostMessage,
     parse_host_address,
@@ -43,7 +44,7 @@ class ActionRegistry(BaseComponent):
         self._event_bus = event_bus
         self._controller_id = controller_id
         self._builtin_registry = BuiltinRegistry()
-        self._action_registry: dict[str, tuple[str, str, dict]] = {}
+        self._action_registry: dict[str, tuple[str, ActionDescriptor]] = {}
 
     async def get_action(self, address: str) -> ActionMetadata | None:
         """Resolve by address: host_id::action_id (host-specific) or action_id (host-agnostic)."""
@@ -51,20 +52,20 @@ class ActionRegistry(BaseComponent):
             entry = self._action_registry.get(address)
             if entry is None:
                 return None
-            host_id, action_uuid, meta = entry
+            host_id, descriptor = entry
             return ActionMetadata(
-                uuid=action_uuid,
+                uuid=descriptor.uuid,
                 host_id=host_id,
-                name=meta.get("name"),
-                plugin_uuid=meta.get("pluginUuid"),
+                name=descriptor.name,
+                plugin_uuid=descriptor.plugin_uuid,
             )
-        for key, (host_id, action_uuid, meta) in self._action_registry.items():
+        for key, (host_id, descriptor) in self._action_registry.items():
             if key.endswith(f"::{address}"):
                 return ActionMetadata(
-                    uuid=action_uuid,
+                    uuid=descriptor.uuid,
                     host_id=host_id,
-                    name=meta.get("name"),
-                    plugin_uuid=meta.get("pluginUuid"),
+                    name=descriptor.name,
+                    plugin_uuid=descriptor.plugin_uuid,
                 )
         return None
 
@@ -83,16 +84,21 @@ class ActionRegistry(BaseComponent):
         seen: set[str] = set()
         actions = payload.get("actions", [])
         for a in actions:
-            action_uuid = a.get("uuid")
+            try:
+                descriptor = ActionDescriptor.model_validate(a)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid action descriptor from host %s: %r",
+                    host_id,
+                    a,
+                )
+                continue
+            action_uuid = descriptor.uuid
             if action_uuid:
                 qualified = _qualified_id(host_id, action_uuid)
                 self._action_registry[qualified] = (
                     host_id,
-                    action_uuid,
-                    {
-                        "name": a.get("name"),
-                        "pluginUuid": a.get("pluginUuid"),
-                    },
+                    descriptor,
                 )
                 if qualified not in seen:
                     touched.append(qualified)
@@ -101,7 +107,10 @@ class ActionRegistry(BaseComponent):
         for action_uuid in action_uuids:
             qualified = _qualified_id(host_id, action_uuid)
             if qualified not in self._action_registry:
-                self._action_registry[qualified] = (host_id, action_uuid, {})
+                self._action_registry[qualified] = (
+                    host_id,
+                    ActionDescriptor(uuid=action_uuid),
+                )
             if qualified not in seen:
                 touched.append(qualified)
                 seen.add(qualified)
@@ -153,7 +162,7 @@ class ActionRegistry(BaseComponent):
             return
         removed = [
             qualified
-            for qualified, (entry_host_id, _, _) in self._action_registry.items()
+            for qualified, (entry_host_id, _) in self._action_registry.items()
             if entry_host_id == host_id
         ]
         for qualified in removed:
@@ -173,16 +182,12 @@ class ActionRegistry(BaseComponent):
 
         # Register builtin actions first
         for action_uuid in self._builtin_registry.provides_actions():
-            meta = self._builtin_registry.get_metadata(action_uuid)
-            if meta:
+            descriptor = self._builtin_registry.get_action_descriptor(action_uuid)
+            if descriptor:
                 qualified = _qualified_id("builtin", action_uuid)
                 self._action_registry[qualified] = (
                     "builtin",
-                    action_uuid,
-                    {
-                        "name": meta.get("name"),
-                        "pluginUuid": meta.get("plugin_uuid"),
-                    },
+                    descriptor,
                 )
 
         start_soon(self._subscription_loop)

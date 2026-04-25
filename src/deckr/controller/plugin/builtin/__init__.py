@@ -1,7 +1,7 @@
 """Builtin actions: run in controller with privileged access."""
 
 from deckr.plugin.interface import PluginAction
-from deckr.plugin.metadata import build_action_metadata
+from deckr.plugin.messages import ActionDescriptor
 
 from deckr.controller.plugin.builtin._goto import GoToPageAction
 from deckr.controller.plugin.builtin._nav_home import NavHomeAction
@@ -24,13 +24,13 @@ class BuiltinRegistry:
     def provides_actions(self) -> list[str]:
         return list(self._actions.keys())
 
-    def get_metadata(self, uuid: str) -> dict | None:
-        """Return action registration metadata."""
+    def get_action_descriptor(self, uuid: str) -> ActionDescriptor | None:
+        """Return action registration descriptor."""
         action = self._actions.get(uuid)
         if action is None:
             return None
-        meta = build_action_metadata(action)
-        return {
-            "name": meta.get("name"),
-            "plugin_uuid": meta.get("pluginUuid"),
-        }
+        return ActionDescriptor(
+            uuid=action.uuid,
+            name=getattr(action, "name", None),
+            plugin_uuid=getattr(action, "plugin_uuid", None),
+        )
