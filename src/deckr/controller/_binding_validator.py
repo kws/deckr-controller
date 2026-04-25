@@ -10,8 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from deckr.hardware.events import HWDevice, HWSlot
     from deckr.plugin.interface import PluginAction
-
-    from deckr.controller._navigation_service import SlotBinding
+    from deckr.plugin.messages import SlotBinding
 
 logger = logging.getLogger(__name__)
 

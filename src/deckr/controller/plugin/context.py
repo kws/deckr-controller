@@ -23,11 +23,11 @@ from deckr.plugin.messages import (
     WILL_APPEAR,
     WILL_DISAPPEAR,
     HostMessage,
+    TitleOptions,
     build_context_id,
     controller_address,
     host_address,
 )
-from deckr.plugin.rendering import TitleOptions
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._render import RenderService

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from deckr.hardware.events import HWSImageFormat
-from deckr.plugin.rendering import TitleOptions
+from deckr.plugin.messages import TitleOptions
 
 from deckr.controller import _persistence
 from deckr.controller._command_router import CommandRouter, DeviceOutput

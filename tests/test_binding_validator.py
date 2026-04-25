@@ -13,7 +13,7 @@ from deckr.controller._binding_validator import (
     format_validation_summary,
     validate_page_bindings,
 )
-from deckr.controller._navigation_service import SlotBinding
+from deckr.plugin.messages import SlotBinding
 from deckr.controller._render import RenderResult
 from deckr.controller.plugin.provider import ActionMetadata
 

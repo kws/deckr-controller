@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from deckr.plugin.rendering import TitleOptions
+from deckr.plugin.messages import TitleOptions
 
 
 @dataclass

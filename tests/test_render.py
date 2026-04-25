@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 from deckr.hardware.events import HWSImageFormat
-from deckr.plugin.rendering import TitleOptions
+from deckr.plugin.messages import TitleOptions
 
 from deckr.controller._render import (
     RenderModel,

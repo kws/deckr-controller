@@ -5,11 +5,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
+from pydantic import ValidationError
+
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
 from deckr.plugin.events import PageAppear, PageDisappear
 from deckr.plugin.messages import (
     CLOSE_PAGE,
+    DynamicPageDescriptor,
     HERE_ARE_SETTINGS,
     OPEN_PAGE,
     PAGE_APPEAR,
@@ -24,15 +27,16 @@ from deckr.plugin.messages import (
     SLEEP_SCREEN,
     WAKE_SCREEN,
     HostMessage,
+    SlotBinding,
+    TitleOptions,
     build_context_id,
     controller_address,
     extract_controller_id,
     extract_device_id,
     extract_slot_id,
     host_address,
+    make_dynamic_page_id,
 )
-from deckr.plugin.rendering import title_options_from_wire
-from deckr.plugin.types import make_dynamic_page_id
 
 from deckr.controller._binding_validator import (
     BLOCKING_ERROR_CODES,
@@ -43,10 +47,8 @@ from deckr.controller._command_router import DeviceOutput
 from deckr.controller._device_layout import build_device_layout
 from deckr.controller._event_translator import EventTranslator
 from deckr.controller._navigation_service import (
-    DynamicPageDescriptor,
     NavigationService,
     PageTransition,
-    SlotBinding,
     StaticPageRef,
 )
 from deckr.controller._render import RenderModel, RenderService
@@ -69,27 +71,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_WIDGET_TIMEOUT_MS = 60_000
 
 
+def _title_options_from_payload(payload: object) -> TitleOptions | None:
+    if payload is None:
+        return None
+    return TitleOptions.model_validate(payload)
+
+
 def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
-    """Reconstruct DynamicPageDescriptor from bus payload (camelCase keys)."""
+    """Validate a dynamic page descriptor from a bus payload."""
     if not data:
         return None
     slots_data = data.get("slots")
     if not slots_data:
         return None
-    slots: list[SlotBinding] = []
-    for s in slots_data:
-        slots.append(
-            SlotBinding(
-                slot_id=s.get("slotId", ""),
-                action_uuid=s.get("actionUuid", ""),
-                settings=dict(s.get("settings", {})),
-                title_options=title_options_from_wire(s.get("titleOptions")),
-            )
-        )
-    return DynamicPageDescriptor(
-        page_id=data.get("pageId", ""),
-        slots=slots,
-    )
+    try:
+        return DynamicPageDescriptor.model_validate(data)
+    except ValidationError:
+        logger.warning("Ignoring invalid dynamic page descriptor payload", exc_info=True)
+        return None
 
 
 def _find_slot(device: hw_events.HWDevice, slot_id: str) -> hw_events.HWSlot | None:
@@ -922,9 +921,7 @@ class DeviceManager:
         if msg_type == SET_TITLE:
             await router.set_title(
                 payload.get("text", ""),
-                title_options=title_options_from_wire(
-                    payload.get("titleOptions", payload.get("title_options"))
-                ),
+                title_options=_title_options_from_payload(payload.get("titleOptions")),
             )
         elif msg_type == SET_IMAGE:
             await router.set_image(payload.get("image", ""))
