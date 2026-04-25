@@ -4,8 +4,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
-from deckr.core.messaging import EventBus
-from deckr.hardware.events import Coordinates, HWSImageFormat, HWSlot
+from deckr.transports.bus import EventBus
+from deckr.hardware.events import (
+    WireCoordinates,
+    WireHWDevice,
+    WireHWSImageFormat,
+    WireHWSlot,
+)
+from deckr.plugin.messages import SlotBinding
 
 from deckr.controller._binding_validator import (
     ValidationError,
@@ -13,11 +19,30 @@ from deckr.controller._binding_validator import (
     format_validation_summary,
     validate_page_bindings,
 )
-from deckr.plugin.messages import SlotBinding
 from deckr.controller._render import RenderResult
 from deckr.controller.plugin.provider import ActionMetadata
 
 CONTROLLER_ID = "controller-main"
+
+
+class FakeHardwareCommandService:
+    def __init__(self):
+        self.set_image = AsyncMock()
+        self.clear_slot = AsyncMock()
+        self.sleep_screen = AsyncMock()
+        self.wake_screen = AsyncMock()
+
+
+def _make_device(
+    device_id: str = "test-dev",
+    slots: list[WireHWSlot] | None = None,
+) -> WireHWDevice:
+    return WireHWDevice(
+        id=device_id,
+        name="Test",
+        hid=f"mock:{device_id}",
+        slots=slots or [_make_slot("0,0")],
+    )
 
 
 class _ImmediateRenderBackend:
@@ -38,15 +63,15 @@ def _make_slot(
     row: int = 0,
     col: int = 0,
     slot_type: str = "key",
-    gestures: frozenset | None = None,
+    gestures: list[str] | None = None,
     has_display: bool = True,
-) -> HWSlot:
+) -> WireHWSlot:
     if gestures is None:
-        gestures = frozenset({"key_down", "key_up"})
-    return HWSlot(
+        gestures = ["key_down", "key_up"]
+    return WireHWSlot(
         id=slot_id,
-        coordinates=Coordinates(column=col, row=row),
-        image_format=HWSImageFormat(width=72, height=72) if has_display else None,
+        coordinates=WireCoordinates(column=col, row=row),
+        image_format=WireHWSImageFormat(width=72, height=72) if has_display else None,
         slot_type=slot_type,
         gestures=gestures,
     )
@@ -66,8 +91,7 @@ def _make_key_action():
 
 @pytest.mark.asyncio
 async def test_validate_page_bindings_all_valid():
-    device = MagicMock()
-    device.slots = [_make_slot("0,0"), _make_slot("0,1")]
+    device = _make_device(slots=[_make_slot("0,0"), _make_slot("0,1")])
     action = _make_key_action()
 
     async def get_action(uuid: str):
@@ -84,8 +108,7 @@ async def test_validate_page_bindings_all_valid():
 
 @pytest.mark.asyncio
 async def test_validate_page_bindings_missing_slot():
-    device = MagicMock()
-    device.slots = [_make_slot("0,0")]
+    device = _make_device(slots=[_make_slot("0,0")])
     action = MagicMock()
     action.on_key_down = MagicMock()
     action.on_key_up = MagicMock()
@@ -105,8 +128,7 @@ async def test_validate_page_bindings_missing_slot():
 @pytest.mark.asyncio
 async def test_validate_page_bindings_missing_action():
     """Missing action is non-blocking; page loads with slot showing 'unavailable'."""
-    device = MagicMock()
-    device.slots = [_make_slot("0,0")]
+    device = _make_device(slots=[_make_slot("0,0")])
 
     async def get_action(uuid: str):
         return None
@@ -157,14 +179,8 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     from deckr.controller._device_manager import DeviceManager
     from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 
-    device = MagicMock()
-    device.id = "test-dev"
-    device.hid = "test-hid"
-    device.slots = [_make_slot("0,0")]  # only slot 0,0 exists
-    device.set_image = AsyncMock()
-    device.clear_slot = AsyncMock()
-    device.sleep_screen = AsyncMock()
-    device.wake_screen = AsyncMock()
+    device = _make_device(slots=[_make_slot("0,0")])  # only slot 0,0 exists
+    command_service = FakeHardwareCommandService()
 
     config = DeviceConfig(
         id="test-dev",
@@ -202,6 +218,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        command_service=command_service,
         config=config,
         manager=registry,
         plugin_bus=plugin_bus,
@@ -221,14 +238,8 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
     from deckr.controller._device_manager import DeviceManager
     from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 
-    device = MagicMock()
-    device.id = "test-dev"
-    device.hid = "test-hid"
-    device.slots = [_make_slot("0,0"), _make_slot("0,1")]
-    device.set_image = AsyncMock()
-    device.clear_slot = AsyncMock()
-    device.sleep_screen = AsyncMock()
-    device.wake_screen = AsyncMock()
+    device = _make_device(slots=[_make_slot("0,0"), _make_slot("0,1")])
+    command_service = FakeHardwareCommandService()
 
     config = DeviceConfig(
         id="test-dev",
@@ -275,6 +286,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            command_service=command_service,
             config=config,
             manager=registry,
             plugin_bus=plugin_bus,
@@ -287,7 +299,9 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
         assert len(contexts) == 1
 
         with anyio.fail_after(1.0):
-            while not any(c[0][0] == "0,1" for c in device.set_image.call_args_list):
+            while not any(
+                c[0][1] == "0,1" for c in command_service.set_image.call_args_list
+            ):
                 await anyio.sleep(0.01)
 
         tg.cancel_scope.cancel()

@@ -50,7 +50,7 @@ class EventTranslator:
         self._is_gesture_supported = is_gesture_supported or (lambda _s, _g: True)
 
     def translate(
-        self, event: hw_events.HardwareEvent, device_id: str
+        self, event: hw_events.HardwareTransportMessage, device_id: str
     ) -> TranslatedEvent | None:
         """
         Translate a hardware event to plugin dispatch metadata.
@@ -60,21 +60,21 @@ class EventTranslator:
         if event.device_id != device_id:
             return None
 
-        if isinstance(event, hw_events.KeyDownEvent):
+        if isinstance(event, hw_events.KeyDownMessage):
             return self._translate_key_down(event, device_id)
-        if isinstance(event, hw_events.KeyUpEvent):
+        if isinstance(event, hw_events.KeyUpMessage):
             return self._translate_key_up(event, device_id)
-        if isinstance(event, hw_events.DialRotateEvent):
+        if isinstance(event, hw_events.DialRotateMessage):
             return self._translate_dial_rotate(event, device_id)
-        if isinstance(event, hw_events.TouchTapEvent):
+        if isinstance(event, hw_events.TouchTapMessage):
             return self._translate_touch_tap(event, device_id)
-        if isinstance(event, hw_events.TouchSwipeEvent):
+        if isinstance(event, hw_events.TouchSwipeMessage):
             return self._translate_touch_swipe(event, device_id)
 
         return None
 
     def _translate_key_down(
-        self, event: hw_events.KeyDownEvent, device_id: str
+        self, event: hw_events.KeyDownMessage, device_id: str
     ) -> TranslatedEvent | None:
         slot_id = event.key_id
         if not self._is_gesture_supported(slot_id, "key_down"):
@@ -88,7 +88,7 @@ class EventTranslator:
         )
 
     def _translate_key_up(
-        self, event: hw_events.KeyUpEvent, device_id: str
+        self, event: hw_events.KeyUpMessage, device_id: str
     ) -> TranslatedEvent | None:
         slot_id = event.key_id
         if not self._is_gesture_supported(slot_id, "key_up"):
@@ -102,7 +102,7 @@ class EventTranslator:
         )
 
     def _translate_dial_rotate(
-        self, event: hw_events.DialRotateEvent, device_id: str
+        self, event: hw_events.DialRotateMessage, device_id: str
     ) -> TranslatedEvent | None:
         slot_id = event.dial_id
         if not self._is_gesture_supported(slot_id, "encoder_rotate"):
@@ -120,7 +120,7 @@ class EventTranslator:
         )
 
     def _translate_touch_tap(
-        self, event: hw_events.TouchTapEvent, device_id: str
+        self, event: hw_events.TouchTapMessage, device_id: str
     ) -> TranslatedEvent | None:
         slot_id = event.touch_id
         if not self._is_gesture_supported(slot_id, "touch_tap"):
@@ -134,7 +134,7 @@ class EventTranslator:
         )
 
     def _translate_touch_swipe(
-        self, event: hw_events.TouchSwipeEvent, device_id: str
+        self, event: hw_events.TouchSwipeMessage, device_id: str
     ) -> TranslatedEvent | None:
         slot_id = event.touch_id
         if not self._is_gesture_supported(slot_id, "touch_swipe"):

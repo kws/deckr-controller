@@ -15,7 +15,7 @@ import anyio
 from deckr.controller._render import RenderRequest, RenderResult, render_request_to_jpeg
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import HWDevice
+    from deckr.controller._hardware_service import HardwareCommandService
 
 
 class SlotOutput(Protocol):
@@ -140,11 +140,13 @@ class RenderDispatcher:
     def __init__(
         self,
         *,
-        device: HWDevice,
+        command_service: HardwareCommandService,
+        device_id: str,
         backend: RenderBackend,
         start_soon,
     ):
-        self._device = device
+        self._command_service = command_service
+        self._device_id = device_id
         self._backend = backend
         self._start_soon = start_soon
         self._lock = anyio.Lock()
@@ -210,7 +212,7 @@ class RenderDispatcher:
             if target_output is not None:
                 await target_output.clear()
             else:
-                await self._device.clear_slot(slot_id)
+                await self._command_service.clear_slot(self._device_id, slot_id)
         return generation
 
     async def _run_slot(self, slot_id: str, request: RenderRequest) -> None:
@@ -254,4 +256,8 @@ class RenderDispatcher:
             if target_output is not None:
                 await target_output.write(result.frame)
             else:
-                await self._device.set_image(result.slot_id, result.frame)
+                await self._command_service.set_image(
+                    self._device_id,
+                    result.slot_id,
+                    result.frame,
+                )

@@ -10,24 +10,25 @@ from deckr.controller._command_router import CommandRouter
 from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import HWDevice
-
     from deckr.controller._device_manager import DeviceManager
+    from deckr.controller._hardware_service import HardwareCommandService
 
 
 class BuiltInPluginContext(PluginContextProtocol):
-    """Thin facade for builtin actions: delegates to CommandRouter, device, and manager."""
+    """Thin facade for builtin actions: delegates to router, hardware commands, and manager."""
 
     def __init__(
         self,
         router: CommandRouter,
-        device: "HWDevice",
+        command_service: "HardwareCommandService",
+        device_id: str,
         manager: "DeviceManager",
         context_id: str,
         settings_service: SettingsService | None = None,
     ):
         self._router = router
-        self._device = device
+        self._command_service = command_service
+        self._device_id = device_id
         self._manager = manager
         self._context_id = context_id
         self._settings_service = settings_service
@@ -57,10 +58,10 @@ class BuiltInPluginContext(PluginContextProtocol):
         return await self._router.get_settings()
 
     async def sleep_screen(self) -> None:
-        await self._device.sleep_screen()
+        await self._command_service.sleep_screen(self._device_id)
 
     async def wake_screen(self) -> None:
-        await self._device.wake_screen()
+        await self._command_service.wake_screen(self._device_id)
 
     async def set_page(
         self,

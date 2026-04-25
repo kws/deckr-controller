@@ -11,7 +11,7 @@ from deckr.core.components import (
     ComponentManifest,
     InactiveComponent,
 )
-from deckr.core.messaging import EventBus
+from deckr.transports.bus import EventBus
 from deckr.core.util.runtime_id import require_runtime_id
 
 from deckr.controller._config_document import (
@@ -110,13 +110,12 @@ def component_factory(context: ComponentContext):
         plugin_messages=context.require_lane("plugin_messages"),
     )
 
-
 component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="deckr.controller",
         config_prefix="deckr.controller",
         consumes=("hardware_events", "plugin_messages"),
-        publishes=("plugin_messages",),
+        publishes=("hardware_events", "plugin_messages"),
     ),
     factory=component_factory,
 )

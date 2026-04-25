@@ -15,7 +15,7 @@ _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 #
 # Reserved top-level namespaces:
 #   [deckr.controller]
-#   [deckr.bridges.<component>.instances.<instance>]
+#   [deckr.transports.<component>.instances.<instance>]
 #   [deckr.plugin_hosts.<component>.instances.<instance>]
 #   [deckr.drivers.<component>]
 

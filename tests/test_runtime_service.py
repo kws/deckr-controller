@@ -7,7 +7,7 @@ import pytest
 from deckr.core.component import ComponentManager
 from deckr.core.components import InactiveComponent, activate_components
 from deckr.core.config import ConfigDocument
-from deckr.core.messaging import EventBus
+from deckr.transports.bus import EventBus
 
 from deckr.controller._runtime_service import build_controller_runtime, component
 

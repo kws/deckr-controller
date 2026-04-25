@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import anyio
-from deckr.hardware.events import HWSImageFormat
+from deckr.hardware.events import WireHWSImageFormat
 from invariant import (
     Node,
     SubGraphNode,
@@ -186,7 +186,7 @@ def _parse_font_size(
 
 
 def _title_options_to_params(
-    opts: TitleOptions | None, image_format: HWSImageFormat
+    opts: TitleOptions | None, image_format: WireHWSImageFormat
 ) -> dict:
     """Convert TitleOptions to kwargs for title_card."""
     if opts is None:
@@ -249,7 +249,7 @@ def _wire_to_node(wire: dict[str, Any]) -> SubGraphNode:
     return _graph_output_to_node(graph_dict, output)
 
 
-def _to_render_image_format(image_format: HWSImageFormat) -> RenderImageFormat:
+def _to_render_image_format(image_format: WireHWSImageFormat) -> RenderImageFormat:
     return RenderImageFormat(
         width=image_format.width,
         height=image_format.height,
@@ -257,8 +257,8 @@ def _to_render_image_format(image_format: HWSImageFormat) -> RenderImageFormat:
     )
 
 
-def _to_hw_image_format(image_format: RenderImageFormat) -> HWSImageFormat:
-    return HWSImageFormat(
+def _to_hw_image_format(image_format: RenderImageFormat) -> WireHWSImageFormat:
+    return WireHWSImageFormat(
         width=image_format.width,
         height=image_format.height,
         rotation=image_format.rotation,
@@ -266,7 +266,7 @@ def _to_hw_image_format(image_format: RenderImageFormat) -> HWSImageFormat:
 
 
 def _model_to_graph(
-    model: RenderModel, image_format: HWSImageFormat
+    model: RenderModel, image_format: WireHWSImageFormat
 ) -> Node | SubGraphNode | None:
     """Resolve a RenderModel to the graph that should be executed."""
 
@@ -291,7 +291,7 @@ def _model_to_graph(
 
 def build_render_request(
     model: RenderModel,
-    image_format: HWSImageFormat,
+    image_format: WireHWSImageFormat,
     *,
     context_id: str = "",
     slot_id: str = "",
@@ -313,7 +313,7 @@ def build_render_request(
 
 
 def _graph_to_jpeg_bytes(
-    node: Node | SubGraphNode, image_format: HWSImageFormat
+    node: Node | SubGraphNode, image_format: WireHWSImageFormat
 ) -> bytes:
     """Run invariant-gfx graph with canvas context; apply rotation; return JPEG bytes."""
 
@@ -355,7 +355,7 @@ class RenderService:
     def build_request(
         self,
         model: RenderModel,
-        image_format: HWSImageFormat,
+        image_format: WireHWSImageFormat,
         *,
         context_id: str = "",
         slot_id: str = "",
@@ -370,7 +370,7 @@ class RenderService:
         )
 
     async def encode(
-        self, model: RenderModel, image_format: HWSImageFormat
+        self, model: RenderModel, image_format: WireHWSImageFormat
     ) -> bytes | None:
         """Compatibility path for tests and local tooling."""
         try:

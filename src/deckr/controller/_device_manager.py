@@ -5,14 +5,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
-from pydantic import ValidationError
-
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
 from deckr.plugin.events import PageAppear, PageDisappear
 from deckr.plugin.messages import (
     CLOSE_PAGE,
-    DynamicPageDescriptor,
     HERE_ARE_SETTINGS,
     OPEN_PAGE,
     PAGE_APPEAR,
@@ -26,6 +23,7 @@ from deckr.plugin.messages import (
     SHOW_OK,
     SLEEP_SCREEN,
     WAKE_SCREEN,
+    DynamicPageDescriptor,
     HostMessage,
     SlotBinding,
     TitleOptions,
@@ -37,6 +35,7 @@ from deckr.plugin.messages import (
     host_address,
     make_dynamic_page_id,
 )
+from pydantic import ValidationError
 
 from deckr.controller._binding_validator import (
     BLOCKING_ERROR_CODES,
@@ -46,6 +45,7 @@ from deckr.controller._binding_validator import (
 from deckr.controller._command_router import DeviceOutput
 from deckr.controller._device_layout import build_device_layout
 from deckr.controller._event_translator import EventTranslator
+from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._navigation_service import (
     NavigationService,
     PageTransition,
@@ -91,7 +91,7 @@ def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
         return None
 
 
-def _find_slot(device: hw_events.HWDevice, slot_id: str) -> hw_events.HWSlot | None:
+def _find_slot(device: hw_events.WireHWDevice, slot_id: str) -> hw_events.WireHWSlot | None:
     for slot in device.slots:
         if slot.id == slot_id:
             return slot
@@ -124,7 +124,8 @@ class DeviceManager:
         self,
         *,
         controller_id: str,
-        device: hw_events.HWDevice,
+        device: hw_events.WireHWDevice,
+        command_service: HardwareCommandService,
         config: DeviceConfig,
         manager: PluginManager,
         plugin_bus: Any,
@@ -137,6 +138,7 @@ class DeviceManager:
     ):
         self._controller_id = controller_id
         self.device = device
+        self._command_service = command_service
         self.config = config
         self.manager = manager
         self._plugin_bus = plugin_bus
@@ -145,7 +147,8 @@ class DeviceManager:
         self._config_listener_task = None
         self._render_backend = render_backend or ThreadRenderBackend()
         self._render_dispatcher = RenderDispatcher(
-            device=device,
+            command_service=command_service,
+            device_id=device.id,
             backend=self._render_backend,
             start_soon=start_soon,
         )
@@ -161,13 +164,13 @@ class DeviceManager:
         self._nav_lock = anyio.Lock()
         self._start_soon(self._page_timeout_loop)
 
-    async def _render_unavailable_to_slot(self, slot: hw_events.HWSlot) -> None:
+    async def _render_unavailable_to_slot(self, slot: hw_events.WireHWSlot) -> None:
         """Render 'not available' overlay to a slot (e.g. when action is missing)."""
         if slot.image_format is None:
             return
         model = RenderModel(overlay_type="unavailable")
         render_service = RenderService()
-        output = DeviceOutput(self.device, slot.id)
+        output = DeviceOutput(self._command_service, self.device.id, slot.id)
         request = render_service.build_request(
             model,
             slot.image_format,
@@ -198,7 +201,7 @@ class DeviceManager:
                 context_id=build_context_id(
                     self._controller_id, self.device.id, slot_id
                 ),
-                output=DeviceOutput(self.device, slot_id),
+                output=DeviceOutput(self._command_service, self.device.id, slot_id),
             )
 
     async def _clear_all_image_slots(self) -> None:
@@ -210,7 +213,11 @@ class DeviceManager:
                 context_id=build_context_id(
                     self._controller_id, self.device.id, slot_info.slot_id
                 ),
-                output=DeviceOutput(self.device, slot_info.slot_id),
+                output=DeviceOutput(
+                    self._command_service,
+                    self.device.id,
+                    slot_info.slot_id,
+                ),
             )
         for enc in layout.encoders:
             if enc.image_format is not None:
@@ -219,7 +226,11 @@ class DeviceManager:
                     context_id=build_context_id(
                         self._controller_id, self.device.id, enc.slot_id
                     ),
-                    output=DeviceOutput(self.device, enc.slot_id),
+                    output=DeviceOutput(
+                        self._command_service,
+                        self.device.id,
+                        enc.slot_id,
+                    ),
                 )
 
     def _build_context_settings_target(
@@ -269,7 +280,7 @@ class DeviceManager:
     async def _try_resolve_binding(
         self,
         binding: SlotBinding,
-        slot: hw_events.HWSlot,
+        slot: hw_events.WireHWSlot,
         *,
         profile_id: str,
         page_id: str,
@@ -317,6 +328,7 @@ class DeviceManager:
         ctx = ControlContext(
             controller_id=self._controller_id,
             device=self.device,
+            command_service=self._command_service,
             host_id=action_meta.host_id,
             action_uuid=action_meta.uuid,
             slot=slot,
@@ -962,11 +974,11 @@ class DeviceManager:
                 page=payload.get("page", 0),
             )
         elif msg_type == SLEEP_SCREEN:
-            await self.device.sleep_screen()
+            await self._command_service.sleep_screen(self.device.id)
         elif msg_type == WAKE_SCREEN:
-            await self.device.wake_screen()
+            await self._command_service.wake_screen(self.device.id)
 
-    async def on_event(self, event: hw_events.HardwareEvent):
+    async def on_event(self, event: hw_events.HardwareTransportMessage):
         translated = self._translator.translate(event, self.device.id)
         if translated is None:
             return

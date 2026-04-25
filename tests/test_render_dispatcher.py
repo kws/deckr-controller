@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
-from deckr.hardware.events import HWSImageFormat
+from deckr.hardware.events import WireHWSImageFormat
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
 from invariant_gfx.artifacts import BlobArtifact
@@ -32,6 +32,14 @@ from deckr.controller._render_dispatcher import (
     RenderDispatcher,
 )
 from deckr.controller.invariant.executor import ProcessSafeDiskStore
+
+
+class FakeHardwareCommandService:
+    def __init__(self):
+        self.set_image = AsyncMock()
+        self.clear_slot = AsyncMock()
+        self.sleep_screen = AsyncMock()
+        self.wake_screen = AsyncMock()
 
 
 def _png_data_uri() -> str:
@@ -105,16 +113,15 @@ def _graph_data_uri() -> str:
 
 @pytest.mark.asyncio
 async def test_render_dispatcher_replaces_pending_and_drops_stale():
-    device = type("Device", (), {})()
-    device.set_image = AsyncMock()
-    device.clear_slot = AsyncMock()
+    command_service = FakeHardwareCommandService()
 
     backend = ControlledBackend()
-    output = DeviceOutput(device, "0,0")
+    output = DeviceOutput(command_service, "dev", "0,0")
 
     async with anyio.create_task_group() as tg:
         dispatcher = RenderDispatcher(
-            device=device,
+            command_service=command_service,
+            device_id="dev",
             backend=backend,
             start_soon=tg.start_soon,
         )
@@ -150,26 +157,25 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
 
         backend.release(3)
         with anyio.fail_after(1.0):
-            while device.set_image.call_count != 1:
+            while command_service.set_image.call_count != 1:
                 await anyio.sleep(0.01)
 
         assert output.last_frame == b"frame-3"
-        device.set_image.assert_awaited_once_with("0,0", b"frame-3")
+        command_service.set_image.assert_awaited_once_with("dev", "0,0", b"frame-3")
         tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio
 async def test_render_dispatcher_clear_slot_blocks_stale_completion():
-    device = type("Device", (), {})()
-    device.set_image = AsyncMock()
-    device.clear_slot = AsyncMock()
+    command_service = FakeHardwareCommandService()
 
     backend = ControlledBackend()
-    output = DeviceOutput(device, "0,0")
+    output = DeviceOutput(command_service, "dev", "0,0")
 
     async with anyio.create_task_group() as tg:
         dispatcher = RenderDispatcher(
-            device=device,
+            command_service=command_service,
+            device_id="dev",
             backend=backend,
             start_soon=tg.start_soon,
         )
@@ -187,8 +193,8 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
         backend.release(1)
         await anyio.sleep(0.05)
 
-        device.clear_slot.assert_awaited_once_with("0,0")
-        device.set_image.assert_not_awaited()
+        command_service.clear_slot.assert_awaited_once_with("dev", "0,0")
+        command_service.set_image.assert_not_awaited()
         assert output.last_frame is None
         tg.cancel_scope.cancel()
 
@@ -206,7 +212,7 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
     ids=["title", "image", "alert", "unavailable", "blank", "graph"],
 )
 def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
-    fmt = HWSImageFormat(width=72, height=72)
+    fmt = WireHWSImageFormat(width=72, height=72)
     request = RenderService().build_request(
         model,
         fmt,
@@ -224,7 +230,7 @@ def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
 @pytest.mark.asyncio
 async def test_process_pool_render_backend_renders_request():
     backend = ProcessPoolRenderBackend(max_workers=2)
-    fmt = HWSImageFormat(width=72, height=72)
+    fmt = WireHWSImageFormat(width=72, height=72)
     service = RenderService()
 
     try:

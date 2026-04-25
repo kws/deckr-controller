@@ -30,6 +30,7 @@ from deckr.plugin.messages import (
 )
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
+from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
@@ -48,10 +49,11 @@ class ControlContext(ControlContextProtocol):
     def __init__(
         self,
         controller_id: str,
-        device: hw_events.HWDevice,
+        device: hw_events.WireHWDevice,
+        command_service: HardwareCommandService,
         host_id: str,
         action_uuid: str,
-        slot: hw_events.HWSlot,
+        slot: hw_events.WireHWSlot,
         settings: dict,
         manager: "DeviceManager",
         plugin_bus: Any,
@@ -67,6 +69,7 @@ class ControlContext(ControlContextProtocol):
     ):
         self._controller_id = controller_id
         self.device = device
+        self._command_service = command_service
         self.host_id = host_id
         self.action_uuid = action_uuid
         self._builtin_action = builtin_action
@@ -83,7 +86,7 @@ class ControlContext(ControlContextProtocol):
         self._store.settings = dict(settings)
         self._store.default_title_options = title_options
 
-        output = DeviceOutput(device, slot.id)
+        output = DeviceOutput(command_service, device.id, slot.id)
         render_service = RenderService()
         self._router = CommandRouter(
             store=self._store,
@@ -97,7 +100,8 @@ class ControlContext(ControlContextProtocol):
         )
         self.plugin_context = BuiltInPluginContext(
             router=self._router,
-            device=device,
+            command_service=command_service,
+            device_id=device.id,
             manager=manager,
             context_id=self.id,
             settings_service=settings_service,

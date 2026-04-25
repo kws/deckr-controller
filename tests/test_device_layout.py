@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from deckr.hardware.events import Coordinates, HWSImageFormat, HWSlot
+from deckr.hardware.events import WireCoordinates, WireHWSImageFormat, WireHWSlot
 
 from deckr.controller._device_layout import (
     ImageGrid,
@@ -15,15 +15,15 @@ def _make_slot(
     slot_id: str, row: int, col: int, slot_type: str = "key", has_display: bool = True
 ):
     if slot_type == "button":
-        g = frozenset({"key_down", "key_up"})
+        g = ["key_down", "key_up"]
     elif slot_type == "encoder":
-        g = frozenset({"encoder_rotate", "encoder_down", "encoder_up"})
+        g = ["encoder_down", "encoder_rotate", "encoder_up"]
     else:
-        g = frozenset({"key_down", "key_up"})
-    return HWSlot(
+        g = ["key_down", "key_up"]
+    return WireHWSlot(
         id=slot_id,
-        coordinates=Coordinates(column=col, row=row),
-        image_format=HWSImageFormat(width=72, height=72) if has_display else None,
+        coordinates=WireCoordinates(column=col, row=row),
+        image_format=WireHWSImageFormat(width=72, height=72) if has_display else None,
         slot_type=slot_type,
         gestures=g,
     )
@@ -70,26 +70,26 @@ def test_build_device_layout_classifies_buttons_and_encoders():
     device = MagicMock()
     device.id = "dev1"
     device.slots = [
-        HWSlot(
+        WireHWSlot(
             id="0,0",
-            coordinates=Coordinates(column=0, row=0),
-            image_format=HWSImageFormat(width=72, height=72),
+            coordinates=WireCoordinates(column=0, row=0),
+            image_format=WireHWSImageFormat(width=72, height=72),
             slot_type="key",
-            gestures=frozenset({"key_down", "key_up"}),
+            gestures=["key_down", "key_up"],
         ),
-        HWSlot(
+        WireHWSlot(
             id="B1",
-            coordinates=Coordinates(column=0, row=2),
+            coordinates=WireCoordinates(column=0, row=2),
             image_format=None,
             slot_type="button",
-            gestures=frozenset({"key_down", "key_up"}),
+            gestures=["key_down", "key_up"],
         ),
-        HWSlot(
+        WireHWSlot(
             id="D1",
-            coordinates=Coordinates(column=1, row=2),
+            coordinates=WireCoordinates(column=1, row=2),
             image_format=None,
             slot_type="encoder",
-            gestures=frozenset({"encoder_rotate", "encoder_down", "encoder_up"}),
+            gestures=["encoder_down", "encoder_rotate", "encoder_up"],
         ),
     ]
     layout = build_device_layout(device)
@@ -107,10 +107,10 @@ def test_image_grid_slot_id_row_col():
         rows=2,
         cols=2,
         slots=(
-            SlotInfo("0,0", 0, 0, HWSImageFormat(width=72, height=72)),
-            SlotInfo("0,1", 0, 1, HWSImageFormat(width=72, height=72)),
-            SlotInfo("1,0", 1, 0, HWSImageFormat(width=72, height=72)),
-            SlotInfo("1,1", 1, 1, HWSImageFormat(width=72, height=72)),
+            SlotInfo("0,0", 0, 0, WireHWSImageFormat(width=72, height=72)),
+            SlotInfo("0,1", 0, 1, WireHWSImageFormat(width=72, height=72)),
+            SlotInfo("1,0", 1, 0, WireHWSImageFormat(width=72, height=72)),
+            SlotInfo("1,1", 1, 1, WireHWSImageFormat(width=72, height=72)),
         ),
     )
     assert grid.slot_id(0, 0) == "0,0"

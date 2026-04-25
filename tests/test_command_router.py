@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from deckr.hardware.events import HWSImageFormat
+from deckr.hardware.events import WireHWSImageFormat
 from deckr.plugin.messages import TitleOptions
 
 from deckr.controller import _persistence
@@ -18,29 +18,49 @@ from deckr.controller._state_store import (
 )
 from deckr.controller.settings import FileBackedSettingsService, SettingsTarget
 
+
+class FakeHardwareCommandService:
+    def __init__(self):
+        self.set_image = AsyncMock()
+        self.clear_slot = AsyncMock()
+        self.sleep_screen = AsyncMock()
+        self.wake_screen = AsyncMock()
+
+
+def _make_output(
+    slot_id: str = "0,0",
+    *,
+    device_id: str = "dev",
+    command_service: FakeHardwareCommandService | None = None,
+) -> DeviceOutput:
+    return DeviceOutput(
+        command_service or FakeHardwareCommandService(),
+        device_id,
+        slot_id,
+    )
+
+
 # --- DeviceOutput: last_frame tracking ---
 
 
 @pytest.mark.asyncio
 async def test_device_output_records_last_frame():
     """DeviceOutput records last written frame and clears it on clear()."""
-    device = AsyncMock()
-    device.set_image = AsyncMock()
-    device.clear_slot = AsyncMock()
+    command_service = FakeHardwareCommandService()
 
-    output = DeviceOutput(device, "0,0")
+    output = _make_output(command_service=command_service)
     assert output.last_frame is None
 
     await output.write(b"frame1")
     assert output.last_frame == b"frame1"
-    device.set_image.assert_called_once_with("0,0", b"frame1")
+    command_service.set_image.assert_called_once_with("dev", "0,0", b"frame1")
 
     await output.write(b"frame2")
     assert output.last_frame == b"frame2"
 
     await output.clear()
     assert output.last_frame is None
-    device.clear_slot.assert_called_once_with("0,0")
+    command_service.clear_slot.assert_called_once_with("dev", "0,0")
 
 
 # --- CommandRouter content updates ---
@@ -57,8 +77,8 @@ def router_with_mocks():
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
 
-    output = DeviceOutput(AsyncMock(), "0,0")
-    image_format = HWSImageFormat(width=72, height=72)
+    output = _make_output()
+    image_format = WireHWSImageFormat(width=72, height=72)
 
     def no_start_soon(*args, **kwargs):
         pass  # don't run overlay expiry in tests
@@ -84,8 +104,8 @@ async def test_render_no_op_when_image_format_none():
     render_service.build_request = MagicMock(return_value=object())
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
-    device = AsyncMock()
-    output = DeviceOutput(device, "B1")
+    command_service = FakeHardwareCommandService()
+    output = _make_output("B1", command_service=command_service)
     router = CommandRouter(
         store=store,
         render_service=render_service,
@@ -96,7 +116,7 @@ async def test_render_no_op_when_image_format_none():
     )
     await router.set_title("Back")
     assert output.last_frame is None
-    device.set_image.assert_not_called()
+    command_service.set_image.assert_not_called()
     render_dispatcher.submit_request.assert_not_called()
 
 
@@ -181,8 +201,8 @@ async def test_get_settings_hydrates_from_persistence():
     render_service.build_request = MagicMock(return_value=object())
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
-    output = DeviceOutput(AsyncMock(), "0,0")
-    image_format = HWSImageFormat(width=72, height=72)
+    output = _make_output()
+    image_format = WireHWSImageFormat(width=72, height=72)
 
     class FakeSettingsService:
         def __init__(self):
@@ -239,8 +259,8 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
     render_service.build_request = MagicMock(return_value=object())
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
-    output = DeviceOutput(AsyncMock(), "0,0")
-    image_format = HWSImageFormat(width=72, height=72)
+    output = _make_output()
+    image_format = WireHWSImageFormat(width=72, height=72)
 
     class FailingSettingsService:
         async def exists(self, target):
@@ -303,8 +323,8 @@ async def test_hydrate_settings_migrates_legacy_key_to_composite(monkeypatch, tm
     render_service.build_request = MagicMock(return_value=object())
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
-    output = DeviceOutput(AsyncMock(), "0,0")
-    image_format = HWSImageFormat(width=72, height=72)
+    output = _make_output()
+    image_format = WireHWSImageFormat(width=72, height=72)
 
     router = CommandRouter(
         store=store,

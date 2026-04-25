@@ -3,7 +3,6 @@ from collections.abc import Callable
 
 import anyio
 from deckr.core.component import BaseComponent, RunContext
-from deckr.core.messaging import EventBus
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
 from deckr.plugin.messages import (
@@ -16,8 +15,13 @@ from deckr.plugin.messages import (
     controller_address,
     extract_device_id,
 )
+from deckr.transports.bus import EventBus
 
 from deckr.controller._device_manager import DeviceManager
+from deckr.controller._hardware_service import (
+    HardwareCommandService,
+    HardwareDeviceRegistry,
+)
 from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderBackend,
@@ -43,6 +47,8 @@ class ControllerService(BaseComponent):
     ):
         super().__init__()
         self._driver_bus = driver_bus
+        self._device_registry = HardwareDeviceRegistry()
+        self._command_service = HardwareCommandService(driver_bus)
         self._config_service = config_service
         self._settings_service = settings_service
         self._controller_id = controller_id
@@ -81,7 +87,8 @@ class ControllerService(BaseComponent):
         if self._plugin_bus is None:
             return
         async with self._plugin_bus.subscribe() as stream:
-            async for event in stream:
+            async for envelope in stream:
+                event = envelope.message
                 try:
                     if isinstance(event, ActionsChangedEvent):
                         controller_contexts = await self._controller_contexts.values()
@@ -117,12 +124,15 @@ class ControllerService(BaseComponent):
 
     async def _event_loop(self):
         async with self._driver_bus.subscribe() as subscribe:
-            async for event in subscribe:
-                if isinstance(event, hw_events.DeviceConnectedEvent):
-                    await self.on_device_connected(event)
-                elif isinstance(event, hw_events.DeviceDisconnectedEvent):
-                    await self.on_device_disconnected(event)
-                elif hasattr(event, "device_id"):
+            async for envelope in subscribe:
+                event = envelope.message
+                if isinstance(event, hw_events.DeviceConnectedMessage):
+                    device = self._device_registry.connect(event)
+                    await self.on_device_connected(device)
+                elif isinstance(event, hw_events.DeviceDisconnectedMessage):
+                    self._device_registry.disconnect(event.device_id)
+                    await self.on_device_disconnected(event.device_id)
+                elif isinstance(event, hw_events.HARDWARE_INPUT_MESSAGE_TYPES):
                     device_id = event.device_id
                     ctrl_ctx = await self._controller_contexts.get(device_id)
                     if ctrl_ctx is not None:
@@ -150,9 +160,8 @@ class ControllerService(BaseComponent):
         if self._render_backend is not None:
             await self._render_backend.aclose()
 
-    async def _device_lifecycle(self, event: hw_events.DeviceConnectedEvent) -> None:
+    async def _device_lifecycle(self, device: hw_events.WireHWDevice) -> None:
         """Run device setup, config listener, and wait for disconnect."""
-        device = event.device
         stream = self._config_service.subscribe(device.id)
         first = await anext(stream)
         if first is None:
@@ -161,6 +170,7 @@ class ControllerService(BaseComponent):
         ctrl_ctx = DeviceManager(
             controller_id=self._controller_id,
             device=device,
+            command_service=self._command_service,
             config=first,
             manager=self._action_registry,
             plugin_bus=self._plugin_bus,
@@ -181,18 +191,18 @@ class ControllerService(BaseComponent):
         finally:
             self._device_disconnect_events.pop(device.id, None)
 
-    async def on_device_connected(self, event: hw_events.DeviceConnectedEvent):
-        logger.info("Starting controller service for device %s", event.device_id)
-        self._start_soon(self._device_lifecycle, event)
+    async def on_device_connected(self, device: hw_events.WireHWDevice):
+        logger.info("Starting controller service for device %s", device.id)
+        self._start_soon(self._device_lifecycle, device)
 
-    async def on_device_disconnected(self, event: hw_events.DeviceDisconnectedEvent):
-        ctrl_ctx = await self._controller_contexts.get(event.device_id)
+    async def on_device_disconnected(self, device_id: str):
+        ctrl_ctx = await self._controller_contexts.get(device_id)
         try:
             if ctrl_ctx is not None:
                 await ctrl_ctx.clear_page()
         finally:
-            await self._controller_contexts.delete(event.device_id)
-            disconnect_ev = self._device_disconnect_events.get(event.device_id)
+            await self._controller_contexts.delete(device_id)
+            disconnect_ev = self._device_disconnect_events.get(device_id)
             if disconnect_ev is not None:
                 disconnect_ev.set()
-            logger.info("Stopped controller service for device %s", event.device_id)
+            logger.info("Stopped controller service for device %s", device_id)

@@ -6,7 +6,6 @@ import logging
 from typing import TYPE_CHECKING
 
 from deckr.core.component import BaseComponent, RunContext
-from deckr.core.messaging import EventBus
 from deckr.plugin.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
@@ -15,6 +14,7 @@ from deckr.plugin.messages import (
     HostMessage,
     parse_host_address,
 )
+from deckr.transports.bus import EventBus
 
 from deckr.controller.plugin.builtin import BuiltinRegistry
 from deckr.controller.plugin.provider import ActionMetadata
@@ -189,7 +189,8 @@ class ActionRegistry(BaseComponent):
 
     async def _subscription_loop(self) -> None:
         async with self._event_bus.subscribe() as stream:
-            async for event in stream:
+            async for envelope in stream:
+                event = envelope.message
                 if not isinstance(event, HostMessage):
                     continue
                 if not event.for_controller(self._controller_id):

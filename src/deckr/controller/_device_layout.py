@@ -1,4 +1,4 @@
-"""Device layout descriptor: classifies HWDevice slots into image grid, buttons, encoders."""
+"""Device layout descriptor: classifies hardware metadata slots."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import HWDevice, HWSImageFormat
+    from deckr.hardware.events import WireHWDevice, WireHWSImageFormat
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,7 @@ class SlotInfo:
     slot_id: str
     row: int
     col: int
-    image_format: HWSImageFormat
+    image_format: WireHWSImageFormat
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class ButtonInfo:
     """Non-image button (e.g. B1, B2, B3 on Mirabox N3)."""
 
     slot_id: str
-    gestures: frozenset[str]
+    gestures: list[str]
 
 
 @dataclass(frozen=True)
@@ -52,8 +52,8 @@ class EncoderInfo:
     """Rotary encoder / dial; may have an optional display."""
 
     slot_id: str
-    gestures: frozenset[str]
-    image_format: HWSImageFormat | None
+    gestures: list[str]
+    image_format: WireHWSImageFormat | None
 
 
 @dataclass(frozen=True)
@@ -73,7 +73,7 @@ _IMAGE_GRID_TYPES = frozenset({"key", "touch_dial", "touch_strip", "screen"})
 _ENCODER_TYPES = frozenset({"encoder", "touch_dial"})
 
 
-def build_device_layout(device: HWDevice) -> DeviceLayout:
+def build_device_layout(device: WireHWDevice) -> DeviceLayout:
     """Classify device slots into image grid, buttons, and encoders. Pure function of slot list."""
     image_slots: list[SlotInfo] = []
     button_infos: list[ButtonInfo] = []

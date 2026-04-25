@@ -18,7 +18,9 @@ from deckr.controller._state_store import (
 from deckr.controller.settings import SettingsService, SettingsTarget
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import HWDevice, HWSImageFormat
+    from deckr.hardware.events import WireHWSImageFormat
+
+    from deckr.controller._hardware_service import HardwareCommandService
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +28,14 @@ logger = logging.getLogger(__name__)
 class DeviceOutput:
     """Thin wrapper: writes bytes to device; records last frame per slot."""
 
-    def __init__(self, device: "HWDevice", slot_id: str):
-        self._device = device
+    def __init__(
+        self,
+        command_service: "HardwareCommandService",
+        device_id: str,
+        slot_id: str,
+    ):
+        self._command_service = command_service
+        self._device_id = device_id
         self._slot_id = slot_id
         self.last_frame: bytes | None = None
 
@@ -36,11 +44,11 @@ class DeviceOutput:
         return self._slot_id
 
     async def write(self, frame: bytes) -> None:
-        await self._device.set_image(self._slot_id, frame)
+        await self._command_service.set_image(self._device_id, self._slot_id, frame)
         self.last_frame = frame
 
     async def clear(self) -> None:
-        await self._device.clear_slot(self._slot_id)
+        await self._command_service.clear_slot(self._device_id, self._slot_id)
         self.last_frame = None
 
 
@@ -53,7 +61,7 @@ class CommandRouter:
         render_service: RenderService,
         render_dispatcher: RenderDispatcher,
         output: DeviceOutput,
-        image_format: "HWSImageFormat | None",
+        image_format: "WireHWSImageFormat | None",
         start_soon: Callable,
         *,
         settings_service: SettingsService | None = None,
