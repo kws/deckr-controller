@@ -5,7 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from deckr.plugin.manifest import StateOverride, TitleOptions
+from deckr.plugin.rendering import TitleOptions
+
+
+@dataclass
+class RenderContent:
+    """Current render declaration for one control context."""
+
+    title: str | None = None
+    image: str | None = None
+    title_options: TitleOptions | None = None
 
 
 @dataclass
@@ -21,8 +30,7 @@ class ControlStateStore:
 
     def __init__(self, context_id: str):
         self.context_id = context_id
-        self.state_index: int = 0
-        self.overrides: dict[int, StateOverride] = {}
+        self.content = RenderContent()
         self.overlay: TransientOverlay | None = None
         self.settings: dict = {}
-        self.title_options: TitleOptions | None = None
+        self.default_title_options: TitleOptions | None = None

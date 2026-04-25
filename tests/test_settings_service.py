@@ -31,28 +31,6 @@ async def test_context_settings_round_trip_and_subscription(tmp_path):
     assert second == {"volume": 50}
     await stream.aclose()
 
-
-@pytest.mark.asyncio
-async def test_plugin_global_settings_round_trip_and_subscription(tmp_path):
-    service = FileBackedSettingsService(settings_dir=tmp_path)
-    target = SettingsTarget.for_plugin_global(
-        controller_id="controller-main",
-        plugin_uuid="com.example.plugin",
-    )
-
-    stream = service.subscribe(target)
-    first = await anext(stream)
-    assert first == {}
-
-    merged = await service.merge(target, {"token": "abc"})
-    assert merged == {"token": "abc"}
-    assert await service.get(target) == {"token": "abc"}
-
-    second = await anext(stream)
-    assert second == {"token": "abc"}
-    await stream.aclose()
-
-
 @pytest.mark.asyncio
 async def test_prune_context_targets_removes_stale_rows(tmp_path):
     service = FileBackedSettingsService(settings_dir=tmp_path)

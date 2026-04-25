@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from deckr.plugin.rendering import TitleOptions
 from deckr.plugin.types import (
     DynamicPageDescriptor,
     SlotBinding,
 )
 
-from deckr.controller._state_store import TitleOptions
 from deckr.controller.config._data import (
     DeviceConfig,
 )
@@ -21,7 +21,7 @@ from deckr.controller.config._data import (
 def _config_title_options_to_store(
     opts: ConfigTitleOptions | None,
 ) -> TitleOptions | None:
-    """Convert config TitleOptions to state-store TitleOptions."""
+    """Convert config TitleOptions to plugin/rendering TitleOptions."""
     if opts is None:
         return None
     return TitleOptions(

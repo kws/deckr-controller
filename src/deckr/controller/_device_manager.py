@@ -8,7 +8,6 @@ import anyio
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
 from deckr.plugin.events import PageAppear, PageDisappear
-from deckr.plugin.manifest import TitleOptions as ManifestTitleOptions
 from deckr.plugin.messages import (
     CLOSE_PAGE,
     HERE_ARE_SETTINGS,
@@ -19,12 +18,10 @@ from deckr.plugin.messages import (
     SET_IMAGE,
     SET_PAGE,
     SET_SETTINGS,
-    SET_STATE,
     SET_TITLE,
     SHOW_ALERT,
     SHOW_OK,
     SLEEP_SCREEN,
-    SWITCH_TO_PROFILE,
     WAKE_SCREEN,
     HostMessage,
     build_context_id,
@@ -34,6 +31,7 @@ from deckr.plugin.messages import (
     extract_slot_id,
     host_address,
 )
+from deckr.plugin.rendering import title_options_from_wire
 from deckr.plugin.types import make_dynamic_page_id
 
 from deckr.controller._binding_validator import (
@@ -80,22 +78,12 @@ def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
         return None
     slots: list[SlotBinding] = []
     for s in slots_data:
-        to_data = s.get("titleOptions")
-        title_opts = None
-        if to_data:
-            title_opts = ManifestTitleOptions(
-                font_family=to_data.get("fontFamily"),
-                font_size=to_data.get("fontSize"),
-                font_style=to_data.get("fontStyle"),
-                title_color=to_data.get("titleColor"),
-                title_alignment=to_data.get("titleAlignment"),
-            )
         slots.append(
             SlotBinding(
                 slot_id=s.get("slotId", ""),
                 action_uuid=s.get("actionUuid", ""),
                 settings=dict(s.get("settings", {})),
-                title_options=title_opts,
+                title_options=title_options_from_wire(s.get("titleOptions")),
             )
         )
     return DynamicPageDescriptor(
@@ -322,12 +310,6 @@ class DeviceManager:
                     settings_target,
                     dict(binding.settings),
                 )
-        global_settings_target = None
-        if action_meta.plugin_uuid:
-            global_settings_target = SettingsTarget.for_plugin_global(
-                controller_id=self._controller_id,
-                plugin_uuid=action_meta.plugin_uuid,
-            )
         builtin_action = None
         if action_meta.host_id == "builtin" and hasattr(
             self.manager, "get_builtin_action"
@@ -346,11 +328,9 @@ class DeviceManager:
             render_dispatcher=self._render_dispatcher,
             settings_service=self._settings_service,
             context_settings_target=settings_target,
-            global_settings_target=global_settings_target,
             profile_id=profile_id,
             page_id=page_id,
             title_options=binding.title_options,
-            manifest_defaults_raw=action_meta.manifest_defaults,
             builtin_action=builtin_action,
         )
         await self.action_contexts.set(slot.id, ctx)
@@ -436,20 +416,19 @@ class DeviceManager:
             else {}
         )
         event = PageAppear(
-            action=owner.owner_action_uuid,
             context=owner.page_context_id,
-            device=self.device.id,
             page_id=owner.page_id,
-            owner_profile=owner.owner_profile,
-            owner_page=owner.owner_page,
             timeout_ms=owner.timeout_ms,
-            settings=settings,
         )
         msg = HostMessage(
             from_id=controller_address(self._controller_id),
             to_id=host_address(owner.owner_host_id),
             type=PAGE_APPEAR,
-            payload={"event": event.model_dump()},
+            payload={
+                "actionUuid": owner.owner_action_uuid,
+                "settings": settings,
+                "event": event.model_dump(by_alias=True),
+            },
         )
         await self._plugin_bus.send(msg)
 
@@ -457,9 +436,7 @@ class DeviceManager:
         if owner.owner_host_id == "builtin":
             return
         event = PageDisappear(
-            action=owner.owner_action_uuid,
             context=owner.page_context_id,
-            device=self.device.id,
             page_id=owner.page_id,
             reason=reason,
         )
@@ -467,7 +444,10 @@ class DeviceManager:
             from_id=controller_address(self._controller_id),
             to_id=host_address(owner.owner_host_id),
             type=PAGE_DISAPPEAR,
-            payload={"event": event.model_dump()},
+            payload={
+                "actionUuid": owner.owner_action_uuid,
+                "event": event.model_dump(by_alias=True),
+            },
         )
         await self._plugin_bus.send(msg)
 
@@ -942,15 +922,12 @@ class DeviceManager:
         if msg_type == SET_TITLE:
             await router.set_title(
                 payload.get("text", ""),
-                state=payload.get("state"),
+                title_options=title_options_from_wire(
+                    payload.get("titleOptions", payload.get("title_options"))
+                ),
             )
         elif msg_type == SET_IMAGE:
-            await router.set_image(
-                payload.get("image", ""),
-                state=payload.get("state"),
-            )
-        elif msg_type == SET_STATE:
-            await router.set_state(payload.get("state", 0))
+            await router.set_image(payload.get("image", ""))
         elif msg_type == SHOW_ALERT:
             await router.show_alert()
         elif msg_type == SHOW_OK:
@@ -982,7 +959,7 @@ class DeviceManager:
                 in_reply_to=msg.message_id,
             )
             await self._plugin_bus.send(resp)
-        elif msg_type in (SET_PAGE, SWITCH_TO_PROFILE):
+        elif msg_type == SET_PAGE:
             await self.set_page(
                 profile=payload.get("profile", "default"),
                 page=payload.get("page", 0),

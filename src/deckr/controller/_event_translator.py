@@ -83,7 +83,7 @@ class EventTranslator:
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_key_down",
-            plugin_event=KeyDown(context=context, key=slot_id),
+            plugin_event=KeyDown(context=context, slot_id=slot_id),
             gesture="key_down",
         )
 
@@ -97,7 +97,7 @@ class EventTranslator:
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_key_up",
-            plugin_event=KeyUp(context=context, key=slot_id),
+            plugin_event=KeyUp(context=context, slot_id=slot_id),
             gesture="key_up",
         )
 
@@ -113,7 +113,7 @@ class EventTranslator:
             method_name="on_dial_rotate",
             plugin_event=DialRotate(
                 context=context,
-                dial=slot_id,
+                slot_id=slot_id,
                 direction=event.direction,
             ),
             gesture="encoder_rotate",
@@ -129,7 +129,7 @@ class EventTranslator:
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_touch_tap",
-            plugin_event=TouchTap(context=context, touch=slot_id),
+            plugin_event=TouchTap(context=context, slot_id=slot_id),
             gesture="touch_tap",
         )
 
@@ -145,7 +145,7 @@ class EventTranslator:
             method_name="on_touch_swipe",
             plugin_event=TouchSwipe(
                 context=context,
-                touch=slot_id,
+                slot_id=slot_id,
                 direction=event.direction,
             ),
             gesture="touch_swipe",

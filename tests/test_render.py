@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 from deckr.hardware.events import HWSImageFormat
+from deckr.plugin.rendering import TitleOptions
 
 from deckr.controller._render import (
     RenderModel,
@@ -16,8 +17,7 @@ from deckr.controller._render import (
 )
 from deckr.controller._state_store import (
     ControlStateStore,
-    StateOverride,
-    TitleOptions,
+    RenderContent,
     TransientOverlay,
 )
 
@@ -159,11 +159,10 @@ def test_parse_font_size_invalid_raises():
 
 
 def test_resolve_title_options_from_override():
-    """When override has title_options, it flows to RenderModel."""
+    """When current content has title_options, it flows to RenderModel."""
     store = ControlStateStore(context_id="dev.0,0")
-    store.state_index = 0
     opts = TitleOptions(font_family="Roboto", font_size=20)
-    store.overrides[0] = StateOverride(title="Hello", title_options=opts)
+    store.content = RenderContent(title="Hello", title_options=opts)
 
     model = resolve(store)
     assert model.title == "Hello"
@@ -171,26 +170,27 @@ def test_resolve_title_options_from_override():
 
 
 def test_resolve_title_options_fallback_to_store():
-    """When override has title but no title_options, use store.title_options."""
+    """When content has a title but no title_options, use store defaults."""
     store = ControlStateStore(context_id="dev.0,0")
-    store.state_index = 0
-    store.title_options = TitleOptions(font_family="Inter", title_color="#FF0000")
-    store.overrides[0] = StateOverride(title="Hello")  # no title_options
+    store.default_title_options = TitleOptions(
+        font_family="Inter",
+        title_color="#FF0000",
+    )
+    store.content = RenderContent(title="Hello")
 
     model = resolve(store)
     assert model.title == "Hello"
-    assert model.title_options is store.title_options
+    assert model.title_options is store.default_title_options
     assert model.title_options.font_family == "Inter"
     assert model.title_options.title_color == "#FF0000"
 
 
 def test_resolve_title_options_override_takes_precedence():
-    """Override title_options takes precedence over store when both present."""
+    """Explicit content title_options take precedence over store defaults."""
     store = ControlStateStore(context_id="dev.0,0")
-    store.state_index = 0
-    store.title_options = TitleOptions(font_family="StoreFont")
+    store.default_title_options = TitleOptions(font_family="StoreFont")
     override_opts = TitleOptions(font_family="OverrideFont")
-    store.overrides[0] = StateOverride(title="Hi", title_options=override_opts)
+    store.content = RenderContent(title="Hi", title_options=override_opts)
 
     model = resolve(store)
     assert model.title_options.font_family == "OverrideFont"

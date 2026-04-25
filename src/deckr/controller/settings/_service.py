@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 dirs = PlatformDirs("deckr", "deckr", version="1.0")
 
-SettingsScope = Literal["context", "plugin_global"]
+SettingsScope = Literal["context"]
 
 
 def resolve_default_settings_dir() -> Path:
@@ -31,8 +31,6 @@ def _safe_filename(value: str) -> str:
 
 
 def _store_key(target: SettingsTarget) -> str:
-    if target.scope == "plugin_global":
-        return target.as_key()
     return f"controller={target.controller_id}|{target.as_key()}"
 
 
@@ -76,26 +74,8 @@ class SettingsTarget:
             legacy_context_id=legacy_context_id,
         )
 
-    @classmethod
-    def for_plugin_global(
-        cls,
-        *,
-        controller_id: str,
-        plugin_uuid: str,
-    ) -> SettingsTarget:
-        return cls(
-            scope="plugin_global",
-            controller_id=controller_id,
-            plugin_uuid=plugin_uuid,
-        )
-
     def as_key(self) -> str:
         """Stable storage key for this target."""
-
-        if self.scope == "plugin_global":
-            if not self.plugin_uuid:
-                raise ValueError("plugin_uuid is required for plugin-global settings")
-            return f"controller={self.controller_id}|plugin={self.plugin_uuid}"
 
         required = {
             "device_id": self.device_id,
@@ -321,8 +301,6 @@ class FileBackedSettingsService:
             await send.aclose()
 
     def _db_path_for_target(self, target: SettingsTarget) -> Path:
-        if target.scope == "plugin_global":
-            return self._settings_dir / f"{_safe_filename(target.controller_id)}.globals.json"
         assert target.device_id is not None
         return self._db_path_for_context_device(target.device_id)
 
@@ -374,7 +352,7 @@ class FileBackedSettingsService:
     def _write_value_locked(self, target: SettingsTarget, value: dict[str, Any]) -> None:
         db = self._db_for_path(self._db_path_for_target(target))
         payload = {
-            "kind": "settings" if target.scope == "context" else "global_settings",
+            "kind": "settings",
             "key": target.as_key(),
             "value": dict(value),
             "controller_id": target.controller_id,
@@ -390,10 +368,7 @@ class FileBackedSettingsService:
 
     def _row_query(self, target: SettingsTarget):
         query = Query()
-        kind = "settings" if target.scope == "context" else "global_settings"
-        base = (query.kind == kind) & (query.key == target.as_key())
-        if target.scope != "context":
-            return base
+        base = (query.kind == "settings") & (query.key == target.as_key())
         return base & (
             (query.controller_id == target.controller_id)
             | (~query.controller_id.exists())

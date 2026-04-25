@@ -19,7 +19,7 @@ class GoToPageAction(PluginAction):
 
     async def on_key_up(self, event: KeyUp, context: PluginContext):
         settings = await context.get_settings()
-        await context.switch_to_profile(
+        await context.set_page(
             profile=getattr(settings, "profile", "default"),
             page=getattr(settings, "page", 0),
         )

@@ -19,7 +19,7 @@ from invariant import (
     ref,
 )
 
-from deckr.controller._state_store import ControlStateStore, StateOverride, TitleOptions
+from deckr.controller._state_store import ControlStateStore, RenderContent, TitleOptions
 from deckr.controller._title_defaults import (
     DEFAULT_FONT_FAMILY,
     DEFAULT_FONT_SIZE,
@@ -81,46 +81,36 @@ class RenderResult:
     error: str | None = None
 
 
-def _state_override_to_model(
-    override: StateOverride, store_title_options: TitleOptions | None = None
+def _content_to_model(
+    content: RenderContent, default_title_options: TitleOptions | None = None
 ) -> RenderModel:
-    """Build RenderModel from a StateOverride; priority image > title."""
-    if override.image is not None:
-        return RenderModel(image=override.image)
-    if override.title is not None:
-        if override.title == "":
+    """Build RenderModel from the current render content."""
+    if content.image is not None:
+        return RenderModel(image=content.image)
+    if content.title is not None:
+        if content.title == "":
             return RenderModel(overlay_type="blank")
         opts = (
-            override.title_options
-            if override.title_options is not None
-            else store_title_options
+            content.title_options
+            if content.title_options is not None
+            else default_title_options
         )
-        return RenderModel(title=override.title, title_options=opts)
+        return RenderModel(title=content.title, title_options=opts)
     return RenderModel()
 
 
 def resolve(
     store: ControlStateStore,
-    manifest_defaults: dict[int, StateOverride] | None = None,
     now: float | None = None,
 ) -> RenderModel:
-    """Pure function: declarations → RenderModel. Priority: overlay > override > manifest > blank."""
+    """Pure function: declarations → RenderModel."""
     if now is None:
         now = time.monotonic()
 
     if store.overlay is not None and now < store.overlay.expires_at:
         return RenderModel(overlay_type=store.overlay.type)
 
-    override = store.overrides.get(store.state_index)
-    if override is not None:
-        return _state_override_to_model(override, store.title_options)
-
-    if manifest_defaults:
-        manifest = manifest_defaults.get(store.state_index)
-        if manifest is not None:
-            return _state_override_to_model(manifest, store.title_options)
-
-    return RenderModel()
+    return _content_to_model(store.content, store.default_title_options)
 
 
 def _hex_to_rgba(hex_color: str) -> tuple[int, int, int, int]:
@@ -139,7 +129,7 @@ def _hex_to_rgba(hex_color: str) -> tuple[int, int, int, int]:
 def _font_style_to_weight_and_style(
     font_style: str | None,
 ) -> tuple[int | None, str]:
-    """Map Elgato font_style to (weight, style) for gfx:render_text."""
+    """Map title font_style strings to render-text weight/style values."""
     if not font_style or font_style == "Regular":
         return (400, "normal")
     if font_style == "Bold":

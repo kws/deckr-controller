@@ -42,7 +42,7 @@ class TestEventTranslator:
         assert out.gesture == "key_down"
         assert isinstance(out.plugin_event, KeyDown)
         assert out.plugin_event.context == build_context_id(CONTROLLER_ID, "d1", "1,2")
-        assert out.plugin_event.key == "1,2"
+        assert out.plugin_event.slot_id == "1,2"
 
     def test_key_up_event(self, translator):
         event = hw_events.KeyUpEvent(device_id="d1", key_id="0,0")
@@ -53,7 +53,7 @@ class TestEventTranslator:
         assert out.gesture == "key_up"
         assert isinstance(out.plugin_event, KeyUp)
         assert out.plugin_event.context == build_context_id(CONTROLLER_ID, "d1", "0,0")
-        assert out.plugin_event.key == "0,0"
+        assert out.plugin_event.slot_id == "0,0"
 
     def test_dial_rotate_event(self, translator):
         event = hw_events.DialRotateEvent(
@@ -68,7 +68,7 @@ class TestEventTranslator:
         assert out.plugin_event.context == build_context_id(
             CONTROLLER_ID, "d1", "dial1"
         )
-        assert out.plugin_event.dial == "dial1"
+        assert out.plugin_event.slot_id == "dial1"
         assert out.plugin_event.direction == "clockwise"
 
         event_cc = hw_events.DialRotateEvent(
@@ -89,7 +89,7 @@ class TestEventTranslator:
         assert out.plugin_event.context == build_context_id(
             CONTROLLER_ID, "d1", "TouchStrip"
         )
-        assert out.plugin_event.touch == "TouchStrip"
+        assert out.plugin_event.slot_id == "TouchStrip"
 
     def test_touch_swipe_event(self, translator):
         event = hw_events.TouchSwipeEvent(
@@ -104,7 +104,7 @@ class TestEventTranslator:
         assert out.plugin_event.context == build_context_id(
             CONTROLLER_ID, "d1", "strip"
         )
-        assert out.plugin_event.touch == "strip"
+        assert out.plugin_event.slot_id == "strip"
         assert out.plugin_event.direction == "left"
 
         event_r = hw_events.TouchSwipeEvent(

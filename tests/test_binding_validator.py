@@ -192,7 +192,6 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
         return_value=ActionMetadata(
             uuid="deckr.plugin.builtin.gotopage",
             host_id="python",
-            manifest_defaults=None,
         )
     )
 
@@ -266,7 +265,6 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
             return ActionMetadata(
                 uuid=action.uuid,
                 host_id="python",
-                manifest_defaults=None,
             )
         return None
 

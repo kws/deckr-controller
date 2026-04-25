@@ -1,10 +1,11 @@
-"""Targeted tests for CommandRouter state routing, overlay race safety, and DeviceOutput."""
+"""Targeted tests for CommandRouter routing, overlay race safety, and DeviceOutput."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 from deckr.hardware.events import HWSImageFormat
+from deckr.plugin.rendering import TitleOptions
 
 from deckr.controller import _persistence
 from deckr.controller._command_router import CommandRouter, DeviceOutput
@@ -13,7 +14,6 @@ from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import (
     ControlStateStore,
-    StateOverride,
     TransientOverlay,
 )
 from deckr.controller.settings import FileBackedSettingsService, SettingsTarget
@@ -43,7 +43,7 @@ async def test_device_output_records_last_frame():
     device.clear_slot.assert_called_once_with("0,0")
 
 
-# --- CommandRouter: Elgato-compatible state targeting ---
+# --- CommandRouter content updates ---
 
 
 @pytest_asyncio.fixture
@@ -79,7 +79,7 @@ async def test_render_no_op_when_image_format_none():
     """When image_format is None (non-image control), _render does not write to output."""
     store = ControlStateStore(context_id="dev.B1")
     store.settings = {}
-    store.overrides[0] = StateOverride(title="Back")
+    store.content.title = "Back"
     render_service = MagicMock(spec=RenderService)
     render_service.build_request = MagicMock(return_value=object())
     render_dispatcher = MagicMock(spec=RenderDispatcher)
@@ -101,41 +101,42 @@ async def test_render_no_op_when_image_format_none():
 
 
 @pytest.mark.asyncio
-async def test_set_title_uses_current_state_index_when_state_omitted(router_with_mocks):
-    """When state is omitted, set_title targets current state_index (Elgato default)."""
+async def test_set_title_updates_current_content(router_with_mocks):
+    """set_title updates the current render content."""
     router = router_with_mocks
-    router._store.state_index = 1
     await router.set_title("State1Title")
-    assert (
-        router._store.overrides.get(0) is None
-        or router._store.overrides[0].title is None
-    )
-    assert router._store.overrides.get(1) is not None
-    assert router._store.overrides[1].title == "State1Title"
+    assert router._store.content.title == "State1Title"
+    assert router._store.content.image is None
 
 
 @pytest.mark.asyncio
-async def test_set_title_respects_explicit_state(router_with_mocks):
-    """Explicit state parameter targets that state (Elgato setTitle(state=n))."""
+async def test_set_title_applies_explicit_title_options(router_with_mocks):
+    """set_title can update title styling alongside the text."""
     router = router_with_mocks
-    router._store.state_index = 0
-    await router.set_title("ForState2", state=2)
-    assert router._store.overrides.get(2) is not None
-    assert router._store.overrides[2].title == "ForState2"
-    # state 0 unchanged
-    assert (
-        router._store.overrides.get(0) is None
-        or router._store.overrides[0].title is None
-    )
+    title_options = TitleOptions(font_family="Audiowide", font_size="85vw")
+    await router.set_title("Styled", title_options=title_options)
+    assert router._store.content.title == "Styled"
+    assert router._store.content.title_options == title_options
 
 
 @pytest.mark.asyncio
-async def test_set_image_respects_explicit_state(router_with_mocks):
-    """Explicit state parameter for set_image targets that state."""
+async def test_set_title_without_title_options_clears_explicit_options(router_with_mocks):
+    """A plain title update should fall back to binding defaults instead of reusing old explicit styles."""
     router = router_with_mocks
-    await router.set_image("https://example.com/img.png", state=1)
-    assert router._store.overrides.get(1) is not None
-    assert router._store.overrides[1].image == "https://example.com/img.png"
+    await router.set_title("Styled", title_options=TitleOptions(font_family="Inter"))
+    await router.set_title("Plain")
+    assert router._store.content.title == "Plain"
+    assert router._store.content.title_options is None
+
+
+@pytest.mark.asyncio
+async def test_set_image_replaces_title_content(router_with_mocks):
+    """set_image replaces title content with an explicit image."""
+    router = router_with_mocks
+    await router.set_title("Styled", title_options=TitleOptions(font_family="Inter"))
+    await router.set_image("https://example.com/img.png")
+    assert router._store.content.image == "https://example.com/img.png"
+    assert router._store.content.title is None
 
 
 @pytest.mark.asyncio

@@ -9,12 +9,8 @@ from deckr.hardware import events as hw_events
 from deckr.plugin.messages import (
     ALL_HOSTS,
     COMMAND_MESSAGE_TYPES,
-    GLOBAL_SETTINGS_MESSAGE_TYPES,
-    HERE_ARE_GLOBAL_SETTINGS,
     HOST_ONLINE,
     REQUEST_ACTIONS,
-    REQUEST_GLOBAL_SETTINGS,
-    SET_GLOBAL_SETTINGS,
     ActionsChangedEvent,
     HostMessage,
     controller_address,
@@ -28,7 +24,7 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.plugin.action_registry import ActionRegistry
-from deckr.controller.settings import SettingsService, SettingsTarget
+from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)
 
@@ -68,39 +64,6 @@ class ControllerService(BaseComponent):
         if ctrl_ctx is not None:
             await ctrl_ctx.handle_command(msg)
 
-    async def _handle_global_settings_command(self, msg: HostMessage) -> None:
-        """Handle controller-scoped plugin global settings commands."""
-
-        plugin_uuid = str(msg.payload.get("pluginUuid", "")).strip()
-        if not plugin_uuid:
-            return
-        target = SettingsTarget.for_plugin_global(
-            controller_id=self._controller_id,
-            plugin_uuid=plugin_uuid,
-        )
-        if msg.type == REQUEST_GLOBAL_SETTINGS:
-            settings = await self._settings_service.get(target)
-        elif msg.type == SET_GLOBAL_SETTINGS:
-            settings = await self._settings_service.merge(
-                target,
-                dict(msg.payload.get("settings", {})),
-            )
-        else:
-            return
-
-        await self._plugin_bus.send(
-            HostMessage(
-                from_id=controller_address(self._controller_id),
-                to_id=msg.from_id,
-                type=HERE_ARE_GLOBAL_SETTINGS,
-                payload={
-                    "pluginUuid": plugin_uuid,
-                    "settings": settings,
-                },
-                in_reply_to=msg.message_id,
-            )
-        )
-
     async def _handle_host_online(self, msg: HostMessage) -> None:
         if self._plugin_bus is None:
             return
@@ -139,9 +102,6 @@ class ControllerService(BaseComponent):
                         continue
                     if event.type == HOST_ONLINE:
                         await self._handle_host_online(event)
-                        continue
-                    if event.type in GLOBAL_SETTINGS_MESSAGE_TYPES:
-                        await self._handle_global_settings_command(event)
                         continue
                     if event.type in COMMAND_MESSAGE_TYPES:
                         await self._handle_plugin_command(event)

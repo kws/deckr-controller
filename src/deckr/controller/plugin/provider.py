@@ -14,9 +14,6 @@ class ActionMetadata:
     host_id: str
     name: str | None = None
     plugin_uuid: str | None = None
-    controllers: list[str] | None = None
-    property_inspector_path: str | None = None
-    manifest_defaults: dict | None = None
 
 
 class PluginManager(Protocol):

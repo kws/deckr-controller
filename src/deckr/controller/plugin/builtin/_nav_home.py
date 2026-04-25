@@ -14,4 +14,4 @@ class NavHomeAction(PluginAction):
         pass
 
     async def on_key_up(self, event: KeyUp, context: PluginContext):
-        await context.switch_to_profile(profile="default", page=0)
+        await context.set_page(profile="default", page=0)

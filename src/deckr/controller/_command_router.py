@@ -7,12 +7,12 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
+from deckr.plugin.rendering import TitleOptions
 
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import (
     ControlStateStore,
-    StateOverride,
     TransientOverlay,
 )
 from deckr.controller.settings import SettingsService, SettingsTarget
@@ -58,7 +58,6 @@ class CommandRouter:
         *,
         settings_service: SettingsService | None = None,
         settings_target: SettingsTarget | None = None,
-        manifest_defaults: dict[int, StateOverride] | None = None,
     ):
         self._store = store
         self._render_service = render_service
@@ -69,18 +68,12 @@ class CommandRouter:
         self._overlay_token: int = 0
         self._settings_service = settings_service
         self._settings_target = settings_target
-        self._manifest_defaults = manifest_defaults
         self._settings_hydrated = False
-
-    def _ensure_override(self, state_index: int) -> StateOverride:
-        if state_index not in self._store.overrides:
-            self._store.overrides[state_index] = StateOverride()
-        return self._store.overrides[state_index]
 
     async def _render(self) -> None:
         if self._image_format is None:
             return
-        model = resolve(self._store, manifest_defaults=self._manifest_defaults)
+        model = resolve(self._store)
         request = self._render_service.build_request(
             model,
             self._image_format,
@@ -98,22 +91,20 @@ class CommandRouter:
         """Trigger resolve → encode → write (e.g. after willAppear)."""
         await self._render()
 
-    async def set_title(self, text: str, state: int | None = None) -> None:
-        target = state if state is not None else self._store.state_index
-        override = self._ensure_override(target)
-        override.title = text
-        override.image = None
+    async def set_title(
+        self,
+        text: str,
+        *,
+        title_options: TitleOptions | None = None,
+    ) -> None:
+        self._store.content.title = text
+        self._store.content.image = None
+        self._store.content.title_options = title_options
         await self._render()
 
-    async def set_image(self, image: str, state: int | None = None) -> None:
-        target = state if state is not None else self._store.state_index
-        override = self._ensure_override(target)
-        override.image = image
-        override.title = None
-        await self._render()
-
-    async def set_state(self, state: int) -> None:
-        self._store.state_index = state
+    async def set_image(self, image: str) -> None:
+        self._store.content.image = image
+        self._store.content.title = None
         await self._render()
 
     async def show_alert(self) -> None:
@@ -160,7 +151,7 @@ class CommandRouter:
 
         self._settings_hydrated = True
 
-    async def set_settings(self, settings: dict) -> None:
+    async def set_settings(self, settings: dict) -> SimpleNamespace:
         """Merge settings and persist. Fail-fast: on persistence write failure we do not update in-memory store."""
         if not self._settings_hydrated:
             await self.hydrate_settings()
@@ -186,6 +177,7 @@ class CommandRouter:
 
         self._store.settings = merged
         self._settings_hydrated = True
+        return SimpleNamespace(**self._store.settings)
 
     async def get_settings(self) -> SimpleNamespace:
         if not self._settings_hydrated:
