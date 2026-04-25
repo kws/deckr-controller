@@ -5,14 +5,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from deckr.hardware import events as hw_events
-from deckr.plugin.events import (
+from deckr.python_plugin.events import (
     DialRotate,
     KeyDown,
     KeyUp,
     TouchSwipe,
     TouchTap,
 )
-from deckr.plugin.messages import build_context_id as _build_context_id
+from deckr.pluginhost.messages import build_context_id as _build_context_id
 
 
 def build_context_id(controller_id: str, device_id: str, slot_id: str) -> str:

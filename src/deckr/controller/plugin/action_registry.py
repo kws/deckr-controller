@@ -6,22 +6,22 @@ import logging
 from typing import TYPE_CHECKING
 
 from deckr.core.component import BaseComponent, RunContext
-from deckr.plugin.messages import (
+from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
     HOST_OFFLINE,
     ActionDescriptor,
-    ActionsChangedEvent,
     HostMessage,
     parse_host_address,
 )
 from deckr.transports.bus import EventBus
 
 from deckr.controller.plugin.builtin import BuiltinRegistry
+from deckr.controller.plugin.events import ActionsChangedEvent
 from deckr.controller.plugin.provider import ActionMetadata
 
 if TYPE_CHECKING:
-    from deckr.plugin.interface import PluginAction
+    from deckr.python_plugin.interface import PluginAction
 
 logger = logging.getLogger(__name__)
 

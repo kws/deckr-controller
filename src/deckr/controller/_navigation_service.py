@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deckr.plugin.messages import (
+from deckr.pluginhost.messages import (
     DynamicPageDescriptor,
     SlotBinding,
     TitleOptions,

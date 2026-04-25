@@ -3,7 +3,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from deckr.hardware import events as hw_events
-from deckr.plugin.events import (
+from deckr.python_plugin.events import (
     DialRotate,
     KeyDown,
     KeyUp,
@@ -13,8 +13,8 @@ from deckr.plugin.events import (
     WillAppear,
     WillDisappear,
 )
-from deckr.plugin.interface import ControlContext as ControlContextProtocol
-from deckr.plugin.messages import (
+from deckr.python_plugin.interface import ControlContext as ControlContextProtocol
+from deckr.pluginhost.messages import (
     DIAL_ROTATE,
     KEY_DOWN,
     KEY_UP,
@@ -38,7 +38,7 @@ from deckr.controller.plugin.builtin._context import BuiltInPluginContext
 from deckr.controller.settings import SettingsService, SettingsTarget
 
 if TYPE_CHECKING:
-    from deckr.plugin.interface import PluginAction
+    from deckr.python_plugin.interface import PluginAction
 
     from deckr.controller._device_manager import DeviceManager
 

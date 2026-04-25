@@ -5,12 +5,11 @@ import anyio
 from deckr.core.component import BaseComponent, RunContext
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
-from deckr.plugin.messages import (
+from deckr.pluginhost.messages import (
     ALL_HOSTS,
     COMMAND_MESSAGE_TYPES,
     HOST_ONLINE,
     REQUEST_ACTIONS,
-    ActionsChangedEvent,
     HostMessage,
     controller_address,
     extract_device_id,
@@ -28,6 +27,7 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.plugin.action_registry import ActionRegistry
+from deckr.controller.plugin.events import ActionsChangedEvent
 from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)

@@ -1,7 +1,7 @@
 """Builtin actions: run in controller with privileged access."""
 
-from deckr.plugin.interface import PluginAction
-from deckr.plugin.messages import ActionDescriptor
+from deckr.python_plugin.interface import PluginAction
+from deckr.pluginhost.messages import ActionDescriptor
 
 from deckr.controller.plugin.builtin._goto import GoToPageAction
 from deckr.controller.plugin.builtin._nav_home import NavHomeAction

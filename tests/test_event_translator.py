@@ -2,7 +2,7 @@
 
 import pytest
 from deckr.hardware import events as hw_events
-from deckr.plugin.events import DialRotate, KeyDown, KeyUp, TouchSwipe, TouchTap
+from deckr.python_plugin.events import DialRotate, KeyDown, KeyUp, TouchSwipe, TouchTap
 
 from deckr.controller._event_translator import (
     EventTranslator,

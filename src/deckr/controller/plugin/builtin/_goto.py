@@ -1,6 +1,6 @@
 import anyio
-from deckr.plugin.events import KeyUp, WillAppear, WillDisappear
-from deckr.plugin.interface import PluginAction, PluginContext
+from deckr.python_plugin.events import KeyUp, WillAppear, WillDisappear
+from deckr.python_plugin.interface import PluginAction, PluginContext
 
 
 class GoToPageAction(PluginAction):

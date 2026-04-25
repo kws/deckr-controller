@@ -17,3 +17,16 @@ def settings_tmp_dir(monkeypatch, tmp_path):
 
     monkeypatch.setenv("DECKR_SETTINGS_DIR", str(tmp_path))
     yield tmp_path
+
+
+@pytest.fixture
+def persistence_tmp_dir(monkeypatch, tmp_path):
+    """Patch controller persistence to use a temp dir."""
+    from deckr.controller import _persistence
+
+    class TmpDirs:
+        user_data_dir = str(tmp_path)
+
+    monkeypatch.setenv("DECKR_SETTINGS_DIR", str(tmp_path))
+    monkeypatch.setattr(_persistence, "dirs", TmpDirs())
+    yield tmp_path

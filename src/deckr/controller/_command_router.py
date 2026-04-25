@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
-from deckr.plugin.messages import TitleOptions
+from deckr.pluginhost.messages import TitleOptions
 
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher

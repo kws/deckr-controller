@@ -7,8 +7,8 @@ from typing import Any
 import anyio
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
-from deckr.plugin.events import PageAppear, PageDisappear
-from deckr.plugin.messages import (
+from deckr.python_plugin.events import PageAppear, PageDisappear
+from deckr.pluginhost.messages import (
     CLOSE_PAGE,
     HERE_ARE_SETTINGS,
     OPEN_PAGE,

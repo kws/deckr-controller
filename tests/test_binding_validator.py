@@ -10,7 +10,7 @@ from deckr.hardware.events import (
     HardwareImageFormat,
     HardwareSlot,
 )
-from deckr.plugin.messages import SlotBinding
+from deckr.pluginhost.messages import SlotBinding
 from deckr.transports.bus import EventBus
 
 from deckr.controller._binding_validator import (

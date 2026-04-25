@@ -3,8 +3,8 @@
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from deckr.plugin.interface import PluginContext as PluginContextProtocol
-from deckr.plugin.messages import DynamicPageDescriptor, TitleOptions
+from deckr.python_plugin.interface import PluginContext as PluginContextProtocol
+from deckr.pluginhost.messages import DynamicPageDescriptor, TitleOptions
 
 from deckr.controller._command_router import CommandRouter
 from deckr.controller.settings import SettingsService
