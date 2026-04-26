@@ -7,6 +7,7 @@ import pytest
 from deckr.hardware.events import (
     HardwareCoordinates,
     HardwareDevice,
+    HardwareDeviceRef,
     HardwareImageFormat,
     HardwareSlot,
 )
@@ -41,8 +42,13 @@ def _make_device(
         id=device_id,
         name="Test",
         hid=f"mock:{device_id}",
+        fingerprint=f"fingerprint:{device_id}",
         slots=slots or [_make_slot("0,0")],
     )
+
+
+def _hardware_ref(device: HardwareDevice) -> HardwareDeviceRef:
+    return HardwareDeviceRef(manager_id="manager-main", device_id=device.id)
 
 
 class _ImmediateRenderBackend:
@@ -185,6 +191,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     config = DeviceConfig(
         id="test-dev",
         name="Test",
+        match={"fingerprint": "fingerprint:test-dev"},
         profiles=[
             Profile(
                 name="default",
@@ -218,6 +225,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=command_service,
         config=config,
         manager=registry,
@@ -244,6 +252,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
     config = DeviceConfig(
         id="test-dev",
         name="Test",
+        match={"fingerprint": "fingerprint:test-dev"},
         profiles=[
             Profile(
                 name="default",
@@ -286,6 +295,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=command_service,
             config=config,
             manager=registry,

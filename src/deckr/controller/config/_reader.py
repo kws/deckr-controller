@@ -25,8 +25,8 @@ def load_all_configs():
         yield load_config(file)
 
 
-def get_config(device_id: str) -> DeviceConfig | None:
+def get_config(config_id: str) -> DeviceConfig | None:
     for cfg in load_all_configs():
-        if cfg.id == device_id:
+        if cfg.id == config_id:
             return cfg
     return None

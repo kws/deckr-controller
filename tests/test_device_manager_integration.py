@@ -45,18 +45,18 @@ def _plugin_bus() -> EventBus:
     return EventBus("plugin_messages")
 
 
-def _context_id(device_id: str = "test-device", slot_id: str = "0,0") -> str:
-    return build_context_id(CONTROLLER_ID, device_id, slot_id)
+def _context_id(config_id: str = "test-device", slot_id: str = "0,0") -> str:
+    return build_context_id(CONTROLLER_ID, config_id, slot_id)
 
 
 def _plugin_command(
     message_type: str,
     payload: dict | None = None,
     *,
-    device_id: str = "test-device",
+    config_id: str = "test-device",
     slot_id: str = "0,0",
 ) -> DeckrMessage:
-    context_id = _context_id(device_id, slot_id)
+    context_id = _context_id(config_id, slot_id)
     return plugin_message(
         sender=HOST_ADDR,
         recipient=CONTROLLER_ADDR,
@@ -109,7 +109,15 @@ def _make_mock_device(
         id=device_id,
         name="Test Device",
         hid=f"mock:{device_id}",
+        fingerprint=f"fingerprint:{device_id}",
         slots=slots,
+    )
+
+
+def _hardware_ref(device: HardwareDevice) -> hw_events.HardwareDeviceRef:
+    return hw_events.HardwareDeviceRef(
+        manager_id="manager-main",
+        device_id=device.id,
     )
 
 
@@ -451,6 +459,7 @@ def device_config_set_image():
     return DeviceConfig(
         id="test-device",
         name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
         profiles=[
             Profile(
                 name="default",
@@ -492,6 +501,7 @@ async def test_key_press_renders_to_device(
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=command_service,
             config=device_config_set_image,
             manager=registry,
@@ -539,6 +549,7 @@ async def test_set_image_last_write_wins_same_slot(
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=command_service,
             config=device_config_set_image,
             manager=registry,
@@ -602,6 +613,7 @@ async def test_key_down_event_delivered_to_plugin(
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
         profiles=[
             Profile(
                 name="default",
@@ -624,6 +636,7 @@ async def test_key_down_event_delivered_to_plugin(
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
@@ -660,6 +673,7 @@ async def test_settings_isolated_by_page_same_slot(persistence_tmp_dir):
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
         profiles=[
             Profile(
                 name="default",
@@ -695,6 +709,7 @@ async def test_settings_isolated_by_page_same_slot(persistence_tmp_dir):
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
@@ -737,6 +752,7 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
         profiles=[
             Profile(
                 name="default",
@@ -768,6 +784,7 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
@@ -812,6 +829,7 @@ async def test_set_page_reconciles_and_prunes_stale_settings(
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=FakeHardwareCommandService(),
             config=device_config_set_image,
             manager=registry,
@@ -820,7 +838,7 @@ async def test_set_page_reconciles_and_prunes_stale_settings(
         )
         stale_target = SettingsTarget.for_context(
             controller_id=CONTROLLER_ID,
-            device_id="test-device",
+            config_id="test-device",
             profile_id="stale-profile",
             page_id="9",
             slot_id="0,0",
@@ -881,6 +899,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_slot(
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
         profiles=[
             Profile(
                 name="default",
@@ -907,6 +926,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_slot(
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
@@ -955,6 +975,7 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
         profiles=[
             Profile(
                 name="default",
@@ -978,6 +999,7 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=command_service,
             config=config,
             manager=registry,

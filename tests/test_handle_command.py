@@ -8,6 +8,7 @@ from deckr.contracts.messages import DeckrMessage
 from deckr.hardware.events import (
     HardwareCoordinates,
     HardwareDevice,
+    HardwareDeviceRef,
     HardwareImageFormat,
     HardwareSlot,
 )
@@ -44,18 +45,18 @@ def _plugin_bus() -> EventBus:
     return EventBus("plugin_messages")
 
 
-def _context_id(device_id: str = "test-device", slot_id: str = "0,0") -> str:
-    return build_context_id(CONTROLLER_ID, device_id, slot_id)
+def _context_id(config_id: str = "test-device", slot_id: str = "0,0") -> str:
+    return build_context_id(CONTROLLER_ID, config_id, slot_id)
 
 
 def _command_message(
     message_type: str,
     payload: dict | None = None,
     *,
-    device_id: str = "test-device",
+    config_id: str = "test-device",
     slot_id: str = "0,0",
 ) -> DeckrMessage:
-    context_id = _context_id(device_id, slot_id)
+    context_id = _context_id(config_id, slot_id)
     return plugin_message(
         sender=HOST_ADDR,
         recipient=CONTROLLER_ADDR,
@@ -87,8 +88,13 @@ def _make_mock_device(device_id: str = "test-device", with_buttons: bool = False
         id=device_id,
         name="Test Device",
         hid=f"mock:{device_id}",
+        fingerprint=f"fingerprint:{device_id}",
         slots=slots,
     )
+
+
+def _hardware_ref(device: HardwareDevice):
+    return HardwareDeviceRef(manager_id="manager-main", device_id=device.id)
 
 
 class FakeHardwareCommandService:
@@ -113,6 +119,7 @@ def _minimal_config(device_id: str = "test-device") -> DeviceConfig:
     return DeviceConfig(
         id=device_id,
         name="Test Device",
+        match={"fingerprint": f"fingerprint:{device_id}"},
         profiles=[
             Profile(
                 name="default",
@@ -148,6 +155,7 @@ async def test_handle_command_sleep_screen_calls_device(persistence_tmp_dir):
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=command_service,
         config=_minimal_config(),
         manager=registry,
@@ -178,6 +186,7 @@ async def test_handle_command_wake_screen_calls_device(persistence_tmp_dir):
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=command_service,
         config=_minimal_config(),
         manager=registry,
@@ -207,6 +216,7 @@ async def test_handle_command_open_page(persistence_tmp_dir):
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=FakeHardwareCommandService(),
         config=_minimal_config(),
         manager=registry,
@@ -247,6 +257,7 @@ async def test_open_page_emits_page_events_and_close(persistence_tmp_dir):
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=FakeHardwareCommandService(),
         config=_minimal_config(),
         manager=registry,
@@ -305,6 +316,7 @@ async def test_widget_page_timeout_returns_to_owner(persistence_tmp_dir):
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
         profiles=[
             Profile(
                 name="default",
@@ -332,6 +344,7 @@ async def test_widget_page_timeout_returns_to_owner(persistence_tmp_dir):
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
+            hardware_ref=_hardware_ref(device),
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
@@ -381,6 +394,7 @@ async def test_handle_command_set_page(persistence_tmp_dir):
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=FakeHardwareCommandService(),
         config=config,
         manager=registry,
@@ -399,8 +413,8 @@ async def test_handle_command_set_page(persistence_tmp_dir):
 
 
 @pytest.mark.asyncio
-async def test_handle_command_ignores_wrong_device(persistence_tmp_dir):
-    """Commands with contextId for another device are ignored."""
+async def test_handle_command_ignores_wrong_config(persistence_tmp_dir):
+    """Commands with contextId for another config are ignored."""
     device = _make_mock_device("test-device")
     command_service = FakeHardwareCommandService()
     plugin_bus = _plugin_bus()
@@ -414,6 +428,7 @@ async def test_handle_command_ignores_wrong_device(persistence_tmp_dir):
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=command_service,
         config=_minimal_config(),
         manager=registry,
@@ -422,7 +437,7 @@ async def test_handle_command_ignores_wrong_device(persistence_tmp_dir):
     )
     await manager.set_page(profile="default", page=0)
 
-    msg = _command_message(SLEEP_SCREEN, device_id="other-device")
+    msg = _command_message(SLEEP_SCREEN, config_id="other-config")
     await manager.handle_command(msg)
 
     command_service.sleep_screen.assert_not_called()
@@ -492,6 +507,7 @@ async def test_handle_command_all_command_types_handled(persistence_tmp_dir):
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
+        hardware_ref=_hardware_ref(device),
         command_service=FakeHardwareCommandService(),
         config=_minimal_config(),
         manager=registry,

@@ -20,6 +20,7 @@ def device_config():
     return DeviceConfig(
         id="dev1",
         name="Test Device",
+        match={"fingerprint": "fingerprint-dev1"},
         profiles=[
             Profile(
                 name="default",
@@ -78,6 +79,7 @@ def test_resolve_static_bindings_includes_title_options():
     config = DeviceConfig(
         id="dev1",
         name="Test",
+        match={"fingerprint": "fingerprint-dev1"},
         profiles=[
             Profile(
                 name="default",

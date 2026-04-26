@@ -50,8 +50,17 @@ def _load_config_file(path: Path) -> DeviceConfig | None:
 class DeviceConfigService(Protocol):
     """Configuration service: subscribe to receive config and change notifications."""
 
-    def subscribe(self, device_id: str) -> AsyncIterator[DeviceConfig | None]:
-        """Subscribe to config for a device.
+    async def match_device(
+        self,
+        *,
+        fingerprint: str,
+        manager_id: str,
+    ) -> DeviceConfig | None:
+        """Return the best controller config for a live hardware device."""
+        ...
+
+    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+        """Subscribe to config by controller-local config id.
 
         First emission: current config (or None if not found).
         Subsequent emissions: full config on each change (or None if removed).
@@ -69,8 +78,8 @@ class FileBackedDeviceConfigService(BaseComponent):
         self._config_dir = (
             config_dir if config_dir is not None else resolve_default_config_dir()
         )
-        self._path_to_device: dict[Path, str] = {}
-        self._device_to_config: dict[str, DeviceConfig] = {}
+        self._path_to_config: dict[Path, str] = {}
+        self._config_by_id: dict[str, DeviceConfig] = {}
         self._subscribers: dict[
             str, set[anyio.abc.ObjectSendStream[DeviceConfig | None]]
         ] = {}
@@ -89,63 +98,96 @@ class FileBackedDeviceConfigService(BaseComponent):
         if self._stop_event is not None:
             self._stop_event.set()
 
-    def subscribe(self, device_id: str) -> AsyncIterator[DeviceConfig | None]:
-        """Subscribe to config for a device. First emission is current; subsequent are updates."""
-        return self._subscribe_impl(device_id)
+    async def match_device(
+        self,
+        *,
+        fingerprint: str,
+        manager_id: str,
+    ) -> DeviceConfig | None:
+        await self._scan_configs()
+        async with self._lock:
+            candidates = [
+                config
+                for config in self._config_by_id.values()
+                if config.enabled
+                and config.match.fingerprint == fingerprint
+                and config.match.manager_id in {None, manager_id}
+            ]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda config: config.match.manager_id is not None,
+            reverse=True,
+        )
+        best_specificity = candidates[0].match.manager_id is not None
+        best = [
+            config
+            for config in candidates
+            if (config.match.manager_id is not None) == best_specificity
+        ]
+        if len(best) > 1:
+            ids = ", ".join(sorted(config.id for config in best))
+            raise ValueError(
+                f"Ambiguous device config match for fingerprint {fingerprint!r} "
+                f"manager {manager_id!r}: {ids}"
+            )
+        return best[0]
+
+    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+        return self._subscribe_impl(config_id)
 
     async def _subscribe_impl(
-        self, device_id: str
+        self, config_id: str
     ) -> AsyncIterator[DeviceConfig | None]:
         send, receive = anyio.create_memory_object_stream[DeviceConfig | None](
             max_buffer_size=32
         )
         async with self._lock:
-            if device_id not in self._subscribers:
-                self._subscribers[device_id] = set()
-            self._subscribers[device_id].add(send)
+            if config_id not in self._subscribers:
+                self._subscribers[config_id] = set()
+            self._subscribers[config_id].add(send)
 
         try:
             # Send initial config
-            cfg = await self._load_device_config(device_id)
+            cfg = await self._load_config(config_id)
             await send.send(cfg)
 
             async for value in receive:
                 yield value
         finally:
             async with self._lock:
-                subs = self._subscribers.get(device_id)
+                subs = self._subscribers.get(config_id)
                 if subs is not None:
                     subs.discard(send)
                     if not subs:
-                        del self._subscribers[device_id]
+                        del self._subscribers[config_id]
             await send.aclose()
 
-    async def _load_device_config(self, device_id: str) -> DeviceConfig | None:
-        """Load config for device from cache or by scanning files."""
+    async def _load_config(self, config_id: str) -> DeviceConfig | None:
         async with self._lock:
-            if device_id in self._device_to_config:
-                return self._device_to_config[device_id]
+            if config_id in self._config_by_id:
+                return self._config_by_id[config_id]
         await self._scan_configs()
         async with self._lock:
-            return self._device_to_config.get(device_id)
+            return self._config_by_id.get(config_id)
 
     async def _scan_configs(self) -> None:
         """Scan config_dir for .yml files and update caches."""
-        path_to_device: dict[Path, str] = {}
-        device_to_config: dict[str, DeviceConfig] = {}
+        path_to_config: dict[Path, str] = {}
+        config_by_id: dict[str, DeviceConfig] = {}
         for path in self._config_dir.glob("*.yml"):
             cfg = _load_config_file(path)
             if cfg is not None:
-                path_to_device[path] = cfg.id
-                device_to_config[cfg.id] = cfg
+                path_to_config[path] = cfg.id
+                config_by_id[cfg.id] = cfg
         for path in self._config_dir.glob("*.yaml"):
             cfg = _load_config_file(path)
             if cfg is not None:
-                path_to_device[path] = cfg.id
-                device_to_config[cfg.id] = cfg
+                path_to_config[path] = cfg.id
+                config_by_id[cfg.id] = cfg
         async with self._lock:
-            self._path_to_device = path_to_device
-            self._device_to_config = device_to_config
+            self._path_to_config = path_to_config
+            self._config_by_id = config_by_id
 
     async def _watch_loop(self) -> None:
         """Background task: watch config_dir and emit to subscribers on changes."""
@@ -174,31 +216,31 @@ class FileBackedDeviceConfigService(BaseComponent):
             ]
         ] = []
         async with self._lock:
-            affected_device_ids: set[str] = set()
+            affected_config_ids: set[str] = set()
             for change, path_str in changes:
                 path = Path(path_str)
                 if change == Change.deleted:
-                    device_id = self._path_to_device.pop(path, None)
-                    if device_id is not None:
-                        self._device_to_config.pop(device_id, None)
-                        affected_device_ids.add(device_id)
+                    config_id = self._path_to_config.pop(path, None)
+                    if config_id is not None:
+                        self._config_by_id.pop(config_id, None)
+                        affected_config_ids.add(config_id)
                 else:
                     # added or modified
-                    old_device_id = self._path_to_device.get(path)
+                    old_config_id = self._path_to_config.get(path)
                     cfg = _load_config_file(path)
                     if cfg is not None:
-                        if old_device_id is not None and old_device_id != cfg.id:
-                            affected_device_ids.add(old_device_id)
-                        self._path_to_device[path] = cfg.id
-                        self._device_to_config[cfg.id] = cfg
-                        affected_device_ids.add(cfg.id)
-                    elif old_device_id is not None:
+                        if old_config_id is not None and old_config_id != cfg.id:
+                            affected_config_ids.add(old_config_id)
+                        self._path_to_config[path] = cfg.id
+                        self._config_by_id[cfg.id] = cfg
+                        affected_config_ids.add(cfg.id)
+                    elif old_config_id is not None:
                         # Parse error: keep previous config, do not emit
                         pass
 
-            for device_id in affected_device_ids:
-                config = self._device_to_config.get(device_id)
-                subs = self._subscribers.get(device_id, set())
+            for config_id in affected_config_ids:
+                config = self._config_by_id.get(config_id)
+                subs = self._subscribers.get(config_id, set())
                 if subs:
                     to_send.append((config, set(subs)))
 
@@ -208,11 +250,6 @@ class FileBackedDeviceConfigService(BaseComponent):
                     await send.send(config)
                 except Exception:
                     logger.exception("Failed to send config update to subscriber")
-
-
-# Backward-compatible aliases for existing imports.
-ConfigService = DeviceConfigService
-FileSystemConfigService = FileBackedDeviceConfigService
 
 
 class NullDeviceConfigService(BaseComponent):
@@ -227,7 +264,17 @@ class NullDeviceConfigService(BaseComponent):
     async def stop(self) -> None:
         return
 
-    def subscribe(self, device_id: str) -> AsyncIterator[DeviceConfig | None]:
+    async def match_device(
+        self,
+        *,
+        fingerprint: str,
+        manager_id: str,
+    ) -> DeviceConfig | None:
+        del fingerprint, manager_id
+        return None
+
+    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+        del config_id
         return self._subscribe_impl()
 
     async def _subscribe_impl(self) -> AsyncIterator[DeviceConfig | None]:

@@ -1,4 +1,4 @@
-"""Tests for FileSystemConfigService subscribe and file watch behavior."""
+"""Tests for FileBackedDeviceConfigService subscribe and matching behavior."""
 
 import anyio
 import pytest
@@ -6,19 +6,31 @@ import yaml
 from deckr.core.component import RunContext
 
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
-from deckr.controller.config._service import FileSystemConfigService
+from deckr.controller.config._service import FileBackedDeviceConfigService
 
 
 @pytest.fixture
 def config_service(tmp_path):
-    """FileSystemConfigService with temp config dir (not started)."""
-    return FileSystemConfigService(config_dir=tmp_path)
+    """FileBackedDeviceConfigService with temp config dir (not started)."""
+    return FileBackedDeviceConfigService(config_dir=tmp_path)
 
 
-def _make_config(device_id: str, name: str = "Test") -> DeviceConfig:
+def _make_config(
+    config_id: str,
+    name: str = "Test",
+    *,
+    fingerprint: str | None = None,
+    manager_id: str | None = None,
+    enabled: bool = True,
+) -> DeviceConfig:
     return DeviceConfig(
-        id=device_id,
+        id=config_id,
         name=name,
+        match={
+            "fingerprint": fingerprint or f"fingerprint-{config_id}",
+            "manager_id": manager_id,
+        },
+        enabled=enabled,
         profiles=[
             Profile(
                 name="default",
@@ -183,3 +195,84 @@ def test_navigation_service_update_config():
     assert nav.current_page == StaticPageRef(profile_name="default", page_index=0)
     assert transition.arriving == nav.current_page
     assert nav._config.name == "Config2"
+
+
+@pytest.mark.asyncio
+async def test_match_device_prefers_manager_specific_config(config_service, tmp_path):
+    generic = _make_config("generic", fingerprint="serial-a")
+    specific = _make_config(
+        "specific",
+        fingerprint="serial-a",
+        manager_id="room-a",
+    )
+    (tmp_path / "generic.yml").write_text(_config_to_yaml(generic))
+    (tmp_path / "specific.yml").write_text(_config_to_yaml(specific))
+
+    match = await config_service.match_device(
+        fingerprint="serial-a",
+        manager_id="room-a",
+    )
+
+    assert match is not None
+    assert match.id == "specific"
+
+
+@pytest.mark.asyncio
+async def test_match_device_uses_fingerprint_only_config_for_other_manager(
+    config_service,
+    tmp_path,
+):
+    generic = _make_config("generic", fingerprint="serial-a")
+    specific = _make_config(
+        "specific",
+        fingerprint="serial-a",
+        manager_id="room-a",
+    )
+    (tmp_path / "generic.yml").write_text(_config_to_yaml(generic))
+    (tmp_path / "specific.yml").write_text(_config_to_yaml(specific))
+
+    match = await config_service.match_device(
+        fingerprint="serial-a",
+        manager_id="room-b",
+    )
+
+    assert match is not None
+    assert match.id == "generic"
+
+
+@pytest.mark.asyncio
+async def test_match_device_rejects_ambiguous_same_specificity(
+    config_service,
+    tmp_path,
+):
+    one = _make_config("one", fingerprint="serial-a")
+    two = _make_config("two", fingerprint="serial-a")
+    (tmp_path / "one.yml").write_text(_config_to_yaml(one))
+    (tmp_path / "two.yml").write_text(_config_to_yaml(two))
+
+    with pytest.raises(ValueError, match="Ambiguous device config match"):
+        await config_service.match_device(
+            fingerprint="serial-a",
+            manager_id="room-a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_match_device_ignores_disabled_configs(config_service, tmp_path):
+    disabled = _make_config(
+        "disabled",
+        fingerprint="serial-a",
+        manager_id="room-a",
+        enabled=False,
+    )
+    generic = _make_config("generic", fingerprint="serial-a")
+    (tmp_path / "disabled.yml").write_text(_config_to_yaml(disabled))
+    (tmp_path / "generic.yml").write_text(_config_to_yaml(generic))
+
+    match = await config_service.match_device(
+        fingerprint="serial-a",
+        manager_id="room-a",
+    )
+
+    assert match is not None
+    assert match.id == "generic"

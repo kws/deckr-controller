@@ -51,6 +51,7 @@ class ControlContext(ControlContextProtocol):
         self,
         controller_id: str,
         device: hw_events.HardwareDevice,
+        config_id: str,
         command_service: HardwareCommandService,
         host_id: str,
         action_uuid: str,
@@ -70,6 +71,7 @@ class ControlContext(ControlContextProtocol):
     ):
         self._controller_id = controller_id
         self.device = device
+        self.config_id = config_id
         self._command_service = command_service
         self.host_id = host_id
         self.action_uuid = action_uuid
@@ -82,12 +84,12 @@ class ControlContext(ControlContextProtocol):
         self.settings_target = context_settings_target
 
         self._store = ControlStateStore(
-            context_id=build_context_id(controller_id, device.id, slot.id)
+            context_id=build_context_id(controller_id, config_id, slot.id)
         )
         self._store.settings = dict(settings)
         self._store.default_title_options = title_options
 
-        output = DeviceOutput(command_service, device.id, slot.id)
+        output = DeviceOutput(command_service, config_id, slot.id)
         render_service = RenderService()
         self._router = CommandRouter(
             store=self._store,
@@ -102,7 +104,7 @@ class ControlContext(ControlContextProtocol):
         self.plugin_context = BuiltInPluginContext(
             router=self._router,
             command_service=command_service,
-            device_id=device.id,
+            config_id=config_id,
             manager=manager,
             context_id=self.id,
             settings_service=settings_service,
@@ -110,7 +112,7 @@ class ControlContext(ControlContextProtocol):
 
     @property
     def id(self) -> str:
-        return build_context_id(self._controller_id, self.device.id, self.slot.id)
+        return build_context_id(self._controller_id, self.config_id, self.slot.id)
 
     def _slot_info(self) -> SlotInfo:
         image_format = None

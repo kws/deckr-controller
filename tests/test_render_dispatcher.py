@@ -121,7 +121,7 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
     async with anyio.create_task_group() as tg:
         dispatcher = RenderDispatcher(
             command_service=command_service,
-            device_id="dev",
+            config_id="dev",
             backend=backend,
             start_soon=tg.start_soon,
         )
@@ -175,7 +175,7 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
     async with anyio.create_task_group() as tg:
         dispatcher = RenderDispatcher(
             command_service=command_service,
-            device_id="dev",
+            config_id="dev",
             backend=backend,
             start_soon=tg.start_soon,
         )

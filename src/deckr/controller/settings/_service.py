@@ -38,47 +38,44 @@ def _store_key(target: SettingsTarget) -> str:
 class SettingsTarget:
     scope: SettingsScope
     controller_id: str
-    device_id: str | None = None
+    config_id: str | None = None
     profile_id: str | None = None
     page_id: str | None = None
     slot_id: str | None = None
     action_uuid: str | None = None
     dynamic_page_uuid: str | None = None
     plugin_uuid: str | None = None
-    legacy_context_id: str | None = None
 
     @classmethod
     def for_context(
         cls,
         *,
         controller_id: str,
-        device_id: str,
+        config_id: str,
         profile_id: str,
         page_id: str,
         slot_id: str,
         action_uuid: str,
         dynamic_page_uuid: str | None = None,
         plugin_uuid: str | None = None,
-        legacy_context_id: str | None = None,
     ) -> SettingsTarget:
         return cls(
             scope="context",
             controller_id=controller_id,
-            device_id=device_id,
+            config_id=config_id,
             profile_id=profile_id,
             page_id=page_id,
             slot_id=slot_id,
             action_uuid=action_uuid,
             dynamic_page_uuid=dynamic_page_uuid,
             plugin_uuid=plugin_uuid,
-            legacy_context_id=legacy_context_id,
         )
 
     def as_key(self) -> str:
         """Stable storage key for this target."""
 
         required = {
-            "device_id": self.device_id,
+            "config_id": self.config_id,
             "profile_id": self.profile_id,
             "page_id": self.page_id,
             "slot_id": self.slot_id,
@@ -89,7 +86,7 @@ class SettingsTarget:
             raise ValueError(f"Missing context settings fields: {', '.join(missing)}")
 
         parts = [
-            f"device={self.device_id}",
+            f"config={self.config_id}",
             f"profile={self.profile_id}",
             f"page={self.page_id}",
             f"slot={self.slot_id}",
@@ -148,7 +145,7 @@ class InMemorySettingsService:
         self,
         *,
         controller_id: str,
-        device_id: str,
+        config_id: str,
         valid_keys: set[str],
     ) -> int:
         async with self._lock:
@@ -157,7 +154,7 @@ class InMemorySettingsService:
                 for key, target in self._targets_by_key.items()
                 if target.scope == "context"
                 and target.controller_id == controller_id
-                and target.device_id == device_id
+                and target.config_id == config_id
                 and target.as_key() not in valid_keys
             ]
             for key in to_remove:
@@ -221,12 +218,7 @@ class FileBackedSettingsService:
         async with self._lock:
             db = self._db_for_path(self._db_path_for_target(target))
             row = db.get(self._row_query(target))
-            if row is not None:
-                return True
-            if target.scope != "context" or not target.legacy_context_id:
-                return False
-            legacy = db.get(Query().key == target.legacy_context_id)
-            return legacy is not None and legacy.get("kind") != "settings"
+            return row is not None
 
     async def get(self, target: SettingsTarget) -> dict[str, Any]:
         async with self._lock:
@@ -251,10 +243,10 @@ class FileBackedSettingsService:
         self,
         *,
         controller_id: str,
-        device_id: str,
+        config_id: str,
         valid_keys: set[str],
     ) -> int:
-        path = self._db_path_for_context_device(device_id)
+        path = self._db_path_for_context_config(config_id)
         if not path.exists():
             return 0
 
@@ -266,7 +258,7 @@ class FileBackedSettingsService:
                     (Query().controller_id == controller_id)
                     | (~Query().controller_id.exists())
                 )
-                & (Query().device_id == device_id)
+                & (Query().config_id == config_id)
             )
             stale_ids = [row.doc_id for row in rows if row.get("key") not in valid_keys]
             if not stale_ids:
@@ -301,11 +293,11 @@ class FileBackedSettingsService:
             await send.aclose()
 
     def _db_path_for_target(self, target: SettingsTarget) -> Path:
-        assert target.device_id is not None
-        return self._db_path_for_context_device(target.device_id)
+        assert target.config_id is not None
+        return self._db_path_for_context_config(target.config_id)
 
-    def _db_path_for_context_device(self, device_id: str) -> Path:
-        return self._settings_dir / f"{_safe_filename(device_id)}.json"
+    def _db_path_for_context_config(self, config_id: str) -> Path:
+        return self._settings_dir / f"{_safe_filename(config_id)}.json"
 
     def _db_for_path(self, path: Path) -> TinyDB:
         db = self._db_by_path.get(path)
@@ -324,30 +316,7 @@ class FileBackedSettingsService:
                 return dict(value)
             return {}
 
-        if target.scope == "context":
-            return self._migrate_legacy_context_value_locked(db, target)
         return {}
-
-    def _migrate_legacy_context_value_locked(
-        self,
-        db: TinyDB,
-        target: SettingsTarget,
-    ) -> dict[str, Any]:
-        legacy_key = target.legacy_context_id
-        if not legacy_key:
-            return {}
-
-        row = db.get(Query().key == legacy_key)
-        if row is None or row.get("kind") == "settings":
-            return {}
-
-        value = row.get("value")
-        if not isinstance(value, dict):
-            return {}
-
-        self._write_value_locked(target, value)
-        db.remove(doc_ids=[row.doc_id])
-        return dict(value)
 
     def _write_value_locked(self, target: SettingsTarget, value: dict[str, Any]) -> None:
         db = self._db_for_path(self._db_path_for_target(target))
@@ -356,7 +325,7 @@ class FileBackedSettingsService:
             "key": target.as_key(),
             "value": dict(value),
             "controller_id": target.controller_id,
-            "device_id": target.device_id,
+            "config_id": target.config_id,
             "profile_id": target.profile_id,
             "page_id": target.page_id,
             "slot_id": target.slot_id,

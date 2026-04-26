@@ -33,9 +33,9 @@ from deckr.pluginhost.messages import (
     make_dynamic_page_id,
     plugin_message,
     plugin_payload,
+    subject_config_id,
     subject_context_id,
     subject_controller_id,
-    subject_device_id,
     subject_slot_id,
 )
 from deckr.python_plugin.events import PageAppear, PageDisappear
@@ -129,6 +129,7 @@ class DeviceManager:
         *,
         controller_id: str,
         device: hw_events.HardwareDevice,
+        hardware_ref: hw_events.HardwareDeviceRef,
         command_service: HardwareCommandService,
         config: DeviceConfig,
         manager: PluginManager,
@@ -142,6 +143,8 @@ class DeviceManager:
     ):
         self._controller_id = controller_id
         self.device = device
+        self.hardware_ref = hardware_ref
+        self.config_id = config.id
         self._command_service = command_service
         self.config = config
         self.manager = manager
@@ -152,7 +155,7 @@ class DeviceManager:
         self._render_backend = render_backend or ThreadRenderBackend()
         self._render_dispatcher = RenderDispatcher(
             command_service=command_service,
-            device_id=device.id,
+            config_id=self.config_id,
             backend=self._render_backend,
             start_soon=start_soon,
         )
@@ -174,16 +177,16 @@ class DeviceManager:
             return
         model = RenderModel(overlay_type="unavailable")
         render_service = RenderService()
-        output = DeviceOutput(self._command_service, self.device.id, slot.id)
+        output = DeviceOutput(self._command_service, self.config_id, slot.id)
         request = render_service.build_request(
             model,
             slot.image_format,
-            context_id=build_context_id(self._controller_id, self.device.id, slot.id),
+            context_id=build_context_id(self._controller_id, self.config_id, slot.id),
             slot_id=slot.id,
         )
         await self._render_dispatcher.submit_request(
             slot_id=slot.id,
-            context_id=build_context_id(self._controller_id, self.device.id, slot.id),
+            context_id=build_context_id(self._controller_id, self.config_id, slot.id),
             request=request,
             output=output,
         )
@@ -203,9 +206,9 @@ class DeviceManager:
             await self._render_dispatcher.clear_slot(
                 slot_id,
                 context_id=build_context_id(
-                    self._controller_id, self.device.id, slot_id
+                    self._controller_id, self.config_id, slot_id
                 ),
-                output=DeviceOutput(self._command_service, self.device.id, slot_id),
+                output=DeviceOutput(self._command_service, self.config_id, slot_id),
             )
 
     async def _slot_id_for_context(self, context_id: str) -> str | None:
@@ -221,11 +224,11 @@ class DeviceManager:
             await self._render_dispatcher.clear_slot(
                 slot_info.slot_id,
                 context_id=build_context_id(
-                    self._controller_id, self.device.id, slot_info.slot_id
+                    self._controller_id, self.config_id, slot_info.slot_id
                 ),
                 output=DeviceOutput(
                     self._command_service,
-                    self.device.id,
+                    self.config_id,
                     slot_info.slot_id,
                 ),
             )
@@ -234,11 +237,11 @@ class DeviceManager:
                 await self._render_dispatcher.clear_slot(
                     enc.slot_id,
                     context_id=build_context_id(
-                        self._controller_id, self.device.id, enc.slot_id
+                        self._controller_id, self.config_id, enc.slot_id
                     ),
                     output=DeviceOutput(
                         self._command_service,
-                        self.device.id,
+                        self.config_id,
                         enc.slot_id,
                     ),
                 )
@@ -251,18 +254,16 @@ class DeviceManager:
         control: Control,
         plugin_uuid: str | None = None,
         dynamic_page_uuid: str | None = None,
-        legacy_context_id: str | None = None,
     ) -> SettingsTarget:
         return SettingsTarget.for_context(
             controller_id=self._controller_id,
-            device_id=self.device.id,
+            config_id=self.config_id,
             profile_id=profile_name,
             page_id=str(page_index),
             slot_id=control.slot,
             action_uuid=control.action,
             dynamic_page_uuid=dynamic_page_uuid,
             plugin_uuid=plugin_uuid,
-            legacy_context_id=legacy_context_id,
         )
 
     def _build_context_settings_target_for_binding(
@@ -273,18 +274,16 @@ class DeviceManager:
         binding: SlotBinding,
         plugin_uuid: str | None = None,
         dynamic_page_uuid: str | None = None,
-        legacy_context_id: str | None = None,
     ) -> SettingsTarget:
         return SettingsTarget.for_context(
             controller_id=self._controller_id,
-            device_id=self.device.id,
+            config_id=self.config_id,
             profile_id=profile_id,
             page_id=page_id,
             slot_id=binding.slot_id,
             action_uuid=binding.action_uuid,
             dynamic_page_uuid=dynamic_page_uuid,
             plugin_uuid=plugin_uuid,
-            legacy_context_id=legacy_context_id,
         )
 
     async def _try_resolve_binding(
@@ -310,18 +309,12 @@ class DeviceManager:
                 binding.action_uuid,
             )
             return False
-        legacy_context_id = build_context_id(
-            self._controller_id,
-            self.device.id,
-            binding.slot_id,
-        )
         settings_target = self._build_context_settings_target_for_binding(
             profile_id=profile_id,
             page_id=page_id,
             binding=binding,
             plugin_uuid=action_meta.plugin_uuid,
             dynamic_page_uuid=dynamic_page_uuid,
-            legacy_context_id=legacy_context_id,
         )
         if seed_config:
             target_exists = await self._settings_service.exists(settings_target)
@@ -338,6 +331,7 @@ class DeviceManager:
         ctx = ControlContext(
             controller_id=self._controller_id,
             device=self.device,
+            config_id=self.config_id,
             command_service=self._command_service,
             host_id=action_meta.host_id,
             action_uuid=action_meta.uuid,
@@ -382,7 +376,7 @@ class DeviceManager:
         return valid_keys
 
     async def _reconcile_persistence(self) -> None:
-        """Prune stale persisted context settings for this device."""
+        """Prune stale persisted context settings for this config."""
 
         prune = getattr(self._settings_service, "prune_context_targets", None)
         if not callable(prune):
@@ -390,12 +384,12 @@ class DeviceManager:
         valid_keys = self._build_valid_settings_keys()
         pruned = await prune(
             controller_id=self._controller_id,
-            device_id=self.device.id,
+            config_id=self.config_id,
             valid_keys=valid_keys,
         )
         if pruned > 0:
             logger.info(
-                "Pruned %d stale settings records for %s", pruned, self.device.id
+                "Pruned %d stale settings records for %s", pruned, self.config_id
             )
 
     def _resolve_widget_timeout_ms(self, profile_name: str, page_index: int) -> int:
@@ -594,7 +588,7 @@ class DeviceManager:
                     logger.error(
                         "Slot %s not found on device %s",
                         binding.slot_id,
-                        self.device.id,
+                        self.config_id,
                     )
                     continue
                 if not await self._try_resolve_binding(
@@ -732,7 +726,7 @@ class DeviceManager:
             timeout_ms = self._resolve_widget_timeout_ms(ctx.profile_id, owner_page)
             page_id = descriptor.page_id or make_dynamic_page_id()
             page_context_id = build_context_id(
-                self._controller_id, self.device.id, f"page:{make_dynamic_page_id()}"
+                self._controller_id, self.config_id, f"page:{make_dynamic_page_id()}"
             )
             descriptor = DynamicPageDescriptor(page_id=page_id, slots=descriptor.slots)
 
@@ -827,8 +821,8 @@ class DeviceManager:
             dynamic_page_uuid = current_page.page_id
 
         logger.info(
-            "Re-evaluating page bindings for device=%s page=%s after actions change +%s -%s",
-            self.device.id,
+            "Re-evaluating page bindings for config=%s page=%s after actions change +%s -%s",
+            self.config_id,
             page_id,
             registered,
             unregistered,
@@ -880,8 +874,8 @@ class DeviceManager:
             and context_controller_id != self._controller_id
         ):
             return
-        device_id = subject_device_id(msg.subject)
-        if device_id != self.device.id:
+        config_id = subject_config_id(msg.subject)
+        if config_id != self.config_id:
             return
         msg_type = msg.message_type
 
@@ -965,13 +959,13 @@ class DeviceManager:
                 page=payload.get("page", 0),
             )
         elif msg_type == SLEEP_SCREEN:
-            await self._command_service.sleep_screen(self.device.id)
+            await self._command_service.sleep_screen(self.config_id)
         elif msg_type == WAKE_SCREEN:
-            await self._command_service.wake_screen(self.device.id)
+            await self._command_service.wake_screen(self.config_id)
 
     async def on_event(self, message: DeckrMessage):
         event = hw_events.hardware_body_from_message(message)
-        translated = self._translator.translate(event, self.device.id)
+        translated = self._translator.translate(event, self.config_id)
         if translated is None:
             return
         if self._dynamic_page_owner is not None:

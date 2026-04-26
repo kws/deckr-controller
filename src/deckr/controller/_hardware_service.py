@@ -1,32 +1,66 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from deckr.contracts.messages import hardware_manager_address
 from deckr.hardware import events as hw_events
 from deckr.transports.bus import EventBus
 
 
+@dataclass(frozen=True, slots=True)
+class LiveHardwareDevice:
+    config_id: str
+    ref: hw_events.HardwareDeviceRef
+    device: hw_events.HardwareDevice
+
+
 class HardwareDeviceRegistry:
-    """Controller-local cache of connected hardware metadata."""
+    """Controller-local cache of live hardware metadata by config id and live ref."""
 
     def __init__(self) -> None:
-        self._devices: dict[str, hw_events.HardwareDevice] = {}
+        self._devices_by_config: dict[str, LiveHardwareDevice] = {}
+        self._config_by_ref: dict[hw_events.HardwareDeviceRef, str] = {}
 
     def connect(
         self,
-        envelope,
-        message: hw_events.DeviceConnectedMessage,
-    ) -> hw_events.HardwareDevice:
-        device_id = hw_events.subject_device_id(envelope.subject)
-        if device_id is None:
-            raise ValueError("Hardware device connection is missing subject deviceId")
-        info = message.device.model_copy(update={"id": device_id})
-        self._devices[device_id] = info
-        return info
+        *,
+        config_id: str,
+        ref: hw_events.HardwareDeviceRef,
+        device: hw_events.HardwareDevice,
+    ) -> LiveHardwareDevice:
+        self.disconnect_config(config_id)
+        live = LiveHardwareDevice(config_id=config_id, ref=ref, device=device)
+        self._devices_by_config[config_id] = live
+        self._config_by_ref[ref] = config_id
+        return live
 
-    def disconnect(self, device_id: str) -> hw_events.HardwareDevice | None:
-        return self._devices.pop(device_id, None)
+    def disconnect_config(self, config_id: str) -> LiveHardwareDevice | None:
+        live = self._devices_by_config.pop(config_id, None)
+        if live is not None:
+            self._config_by_ref.pop(live.ref, None)
+        return live
 
-    def get(self, device_id: str) -> hw_events.HardwareDevice | None:
-        return self._devices.get(device_id)
+    def disconnect_ref(self, ref: hw_events.HardwareDeviceRef) -> LiveHardwareDevice | None:
+        config_id = self._config_by_ref.pop(ref, None)
+        if config_id is None:
+            return None
+        return self._devices_by_config.pop(config_id, None)
+
+    def get(self, config_id: str) -> LiveHardwareDevice | None:
+        return self._devices_by_config.get(config_id)
+
+    def get_by_ref(self, ref: hw_events.HardwareDeviceRef) -> LiveHardwareDevice | None:
+        config_id = self._config_by_ref.get(ref)
+        if config_id is None:
+            return None
+        return self._devices_by_config.get(config_id)
+
+    def for_manager(self, manager_id: str) -> tuple[LiveHardwareDevice, ...]:
+        return tuple(
+            live
+            for live in self._devices_by_config.values()
+            if live.ref.manager_id == manager_id
+        )
 
 
 class HardwareCommandService:
@@ -35,68 +69,76 @@ class HardwareCommandService:
     def __init__(self, event_bus: EventBus, *, controller_id: str) -> None:
         self._event_bus = event_bus
         self._controller_id = controller_id
-        self._manager_by_device_id: dict[str, str] = {}
+        self._ref_by_config_id: dict[str, hw_events.HardwareDeviceRef] = {}
 
-    def register_device(self, envelope) -> None:
-        manager_id = hw_events.subject_manager_id(envelope.subject)
-        device_id = hw_events.subject_device_id(envelope.subject)
-        if manager_id is None or device_id is None:
-            return
-        self._manager_by_device_id[device_id] = manager_id
+    def register_device(self, *, config_id: str, ref: hw_events.HardwareDeviceRef) -> None:
+        self._ref_by_config_id[config_id] = ref
 
-    def unregister_device(self, device_id: str) -> None:
-        self._manager_by_device_id.pop(device_id, None)
+    def unregister_config(self, config_id: str) -> None:
+        self._ref_by_config_id.pop(config_id, None)
 
-    def _manager_id_for(self, device_id: str) -> str:
-        manager_id = self._manager_by_device_id.get(device_id)
-        if manager_id is None:
-            raise LookupError(f"No hardware manager route for device {device_id!r}")
-        return manager_id
+    async def _ref_for(self, config_id: str) -> hw_events.HardwareDeviceRef:
+        ref = self._ref_by_config_id.get(config_id)
+        if ref is None:
+            raise LookupError(f"No live hardware route for config {config_id!r}")
+        endpoint = hardware_manager_address(ref.manager_id)
+        route = await self._event_bus.route_table.route_for(endpoint)
+        if route is None:
+            raise LookupError(
+                f"Hardware manager endpoint {endpoint} is not reachable"
+            )
+        return ref
 
-    async def set_image(self, device_id: str, slot_id: str, image: bytes) -> None:
+    async def set_image(self, config_id: str, slot_id: str, image: bytes) -> None:
+        ref = await self._ref_for(config_id)
         await self._event_bus.send(
-            hw_events.hardware_command_message(
+            hw_events.hardware_command_for_control(
                 controller_id=self._controller_id,
-                manager_id=self._manager_id_for(device_id),
+                ref=hw_events.HardwareControlRef(
+                    manager_id=ref.manager_id,
+                    device_id=ref.device_id,
+                    control_id=slot_id,
+                    control_kind="slot",
+                ),
                 message_type=hw_events.SET_IMAGE,
-                device_id=device_id,
                 body=hw_events.SetImageMessage(slot_id=slot_id, image=image),
-                control_id=slot_id,
-                control_kind="slot",
             )
         )
 
-    async def clear_slot(self, device_id: str, slot_id: str) -> None:
+    async def clear_slot(self, config_id: str, slot_id: str) -> None:
+        ref = await self._ref_for(config_id)
         await self._event_bus.send(
-            hw_events.hardware_command_message(
+            hw_events.hardware_command_for_control(
                 controller_id=self._controller_id,
-                manager_id=self._manager_id_for(device_id),
+                ref=hw_events.HardwareControlRef(
+                    manager_id=ref.manager_id,
+                    device_id=ref.device_id,
+                    control_id=slot_id,
+                    control_kind="slot",
+                ),
                 message_type=hw_events.CLEAR_SLOT,
-                device_id=device_id,
                 body=hw_events.ClearSlotMessage(slot_id=slot_id),
-                control_id=slot_id,
-                control_kind="slot",
             )
         )
 
-    async def sleep_screen(self, device_id: str) -> None:
+    async def sleep_screen(self, config_id: str) -> None:
+        ref = await self._ref_for(config_id)
         await self._event_bus.send(
-            hw_events.hardware_command_message(
+            hw_events.hardware_command_for_device(
                 controller_id=self._controller_id,
-                manager_id=self._manager_id_for(device_id),
+                ref=ref,
                 message_type=hw_events.SLEEP_SCREEN,
-                device_id=device_id,
                 body=hw_events.SleepScreenMessage(),
             )
         )
 
-    async def wake_screen(self, device_id: str) -> None:
+    async def wake_screen(self, config_id: str) -> None:
+        ref = await self._ref_for(config_id)
         await self._event_bus.send(
-            hw_events.hardware_command_message(
+            hw_events.hardware_command_for_device(
                 controller_id=self._controller_id,
-                manager_id=self._manager_id_for(device_id),
+                ref=ref,
                 message_type=hw_events.WAKE_SCREEN,
-                device_id=device_id,
                 body=hw_events.WakeScreenMessage(),
             )
         )

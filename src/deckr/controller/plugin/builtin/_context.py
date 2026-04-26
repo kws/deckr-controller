@@ -3,8 +3,8 @@
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from deckr.python_plugin.interface import PluginContext as PluginContextProtocol
 from deckr.pluginhost.messages import DynamicPageDescriptor, TitleOptions
+from deckr.python_plugin.interface import PluginContext as PluginContextProtocol
 
 from deckr.controller._command_router import CommandRouter
 from deckr.controller.settings import SettingsService
@@ -21,14 +21,14 @@ class BuiltInPluginContext(PluginContextProtocol):
         self,
         router: CommandRouter,
         command_service: "HardwareCommandService",
-        device_id: str,
+        config_id: str,
         manager: "DeviceManager",
         context_id: str,
         settings_service: SettingsService | None = None,
     ):
         self._router = router
         self._command_service = command_service
-        self._device_id = device_id
+        self._config_id = config_id
         self._manager = manager
         self._context_id = context_id
         self._settings_service = settings_service
@@ -58,10 +58,10 @@ class BuiltInPluginContext(PluginContextProtocol):
         return await self._router.get_settings()
 
     async def sleep_screen(self) -> None:
-        await self._command_service.sleep_screen(self._device_id)
+        await self._command_service.sleep_screen(self._config_id)
 
     async def wake_screen(self) -> None:
-        await self._command_service.wake_screen(self._device_id)
+        await self._command_service.wake_screen(self._config_id)
 
     async def set_page(
         self,

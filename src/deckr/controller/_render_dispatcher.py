@@ -141,12 +141,12 @@ class RenderDispatcher:
         self,
         *,
         command_service: HardwareCommandService,
-        device_id: str,
+        config_id: str,
         backend: RenderBackend,
         start_soon,
     ):
         self._command_service = command_service
-        self._device_id = device_id
+        self._config_id = config_id
         self._backend = backend
         self._start_soon = start_soon
         self._lock = anyio.Lock()
@@ -212,7 +212,7 @@ class RenderDispatcher:
             if target_output is not None:
                 await target_output.clear()
             else:
-                await self._command_service.clear_slot(self._device_id, slot_id)
+                await self._command_service.clear_slot(self._config_id, slot_id)
         return generation
 
     async def _run_slot(self, slot_id: str, request: RenderRequest) -> None:
@@ -257,7 +257,7 @@ class RenderDispatcher:
                 await target_output.write(result.frame)
             else:
                 await self._command_service.set_image(
-                    self._device_id,
+                    self._config_id,
                     result.slot_id,
                     result.frame,
                 )

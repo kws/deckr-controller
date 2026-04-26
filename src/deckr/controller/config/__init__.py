@@ -1,19 +1,16 @@
-from ._data import Control, DeviceConfig, Page, Profile
+from ._data import Control, DeviceConfig, DeviceConfigMatch, Page, Profile
 from ._service import (
-    ConfigService,
     DeviceConfigService,
     FileBackedDeviceConfigService,
-    FileSystemConfigService,
     NullDeviceConfigService,
 )
 
 __all__ = [
-    "ConfigService",
     "Control",
     "DeviceConfig",
+    "DeviceConfigMatch",
     "DeviceConfigService",
     "FileBackedDeviceConfigService",
-    "FileSystemConfigService",
     "NullDeviceConfigService",
     "Page",
     "Profile",

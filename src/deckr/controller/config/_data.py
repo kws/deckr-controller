@@ -31,7 +31,14 @@ class Profile(BaseModel):
     widget_timeout_ms: int | None = None
 
 
+class DeviceConfigMatch(BaseModel):
+    fingerprint: str
+    manager_id: str | None = None
+
+
 class DeviceConfig(BaseModel):
     id: str
     name: str
+    match: DeviceConfigMatch
+    enabled: bool = True
     profiles: list[Profile]

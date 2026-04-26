@@ -31,11 +31,11 @@ class DeviceOutput:
     def __init__(
         self,
         command_service: "HardwareCommandService",
-        device_id: str,
+        config_id: str,
         slot_id: str,
     ):
         self._command_service = command_service
-        self._device_id = device_id
+        self._config_id = config_id
         self._slot_id = slot_id
         self.last_frame: bytes | None = None
 
@@ -44,11 +44,11 @@ class DeviceOutput:
         return self._slot_id
 
     async def write(self, frame: bytes) -> None:
-        await self._command_service.set_image(self._device_id, self._slot_id, frame)
+        await self._command_service.set_image(self._config_id, self._slot_id, frame)
         self.last_frame = frame
 
     async def clear(self) -> None:
-        await self._command_service.clear_slot(self._device_id, self._slot_id)
+        await self._command_service.clear_slot(self._config_id, self._slot_id)
         self.last_frame = None
 
 

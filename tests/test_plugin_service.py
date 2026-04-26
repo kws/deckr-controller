@@ -377,11 +377,11 @@ async def test_controller_sends_request_actions_on_startup():
 
     bus.send = capture_send
     from deckr.controller._controller_service import ControllerService
-    from deckr.controller.config import FileSystemConfigService
+    from deckr.controller.config import FileBackedDeviceConfigService
     from deckr.controller.settings import InMemorySettingsService
 
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
-    config_service = FileSystemConfigService()
+    config_service = FileBackedDeviceConfigService()
     settings_service = InMemorySettingsService()
     controller = ControllerService(
         driver_bus=_hardware_bus(),
@@ -492,12 +492,12 @@ async def test_host_handles_request_actions_and_emits():
 async def test_controller_empty_hosts_starts_ok():
     """ControllerService starts without plugin hosts (hosts are loaded by service_runner)."""
     from deckr.controller._controller_service import ControllerService
-    from deckr.controller.config import FileSystemConfigService
+    from deckr.controller.config import FileBackedDeviceConfigService
     from deckr.controller.settings import InMemorySettingsService
 
     bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
-    config_service = FileSystemConfigService()
+    config_service = FileBackedDeviceConfigService()
     settings_service = InMemorySettingsService()
     controller = ControllerService(
         driver_bus=_hardware_bus(),

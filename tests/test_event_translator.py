@@ -17,11 +17,11 @@ class TestBuildContextId:
     def test_format(self):
         assert (
             build_context_id(CONTROLLER_ID, "dev-1", "0,0")
-            == "controller=controller-main|device=dev-1|slot=0%2C0"
+            == "controller=controller-main|config=dev-1|slot=0%2C0"
         )
         assert (
             build_context_id(CONTROLLER_ID, "6603:1007:abc", "TouchStrip")
-            == "controller=controller-main|device=6603%3A1007%3Aabc|slot=TouchStrip"
+            == "controller=controller-main|config=6603%3A1007%3Aabc|slot=TouchStrip"
         )
 
 

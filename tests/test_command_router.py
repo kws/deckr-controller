@@ -7,16 +7,14 @@ import pytest_asyncio
 from deckr.hardware.events import HardwareImageFormat
 from deckr.pluginhost.messages import TitleOptions
 
-from deckr.controller import _persistence
 from deckr.controller._command_router import CommandRouter, DeviceOutput
-from deckr.controller._persistence import ControllerPersistence
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import (
     ControlStateStore,
     TransientOverlay,
 )
-from deckr.controller.settings import FileBackedSettingsService, SettingsTarget
+from deckr.controller.settings import SettingsTarget
 
 
 class FakeHardwareCommandService:
@@ -30,12 +28,12 @@ class FakeHardwareCommandService:
 def _make_output(
     slot_id: str = "0,0",
     *,
-    device_id: str = "dev",
+    config_id: str = "config-dev",
     command_service: FakeHardwareCommandService | None = None,
 ) -> DeviceOutput:
     return DeviceOutput(
         command_service or FakeHardwareCommandService(),
-        device_id,
+        config_id,
         slot_id,
     )
 
@@ -53,14 +51,14 @@ async def test_device_output_records_last_frame():
 
     await output.write(b"frame1")
     assert output.last_frame == b"frame1"
-    command_service.set_image.assert_called_once_with("dev", "0,0", b"frame1")
+    command_service.set_image.assert_called_once_with("config-dev", "0,0", b"frame1")
 
     await output.write(b"frame2")
     assert output.last_frame == b"frame2"
 
     await output.clear()
     assert output.last_frame is None
-    command_service.clear_slot.assert_called_once_with("dev", "0,0")
+    command_service.clear_slot.assert_called_once_with("config-dev", "0,0")
 
 
 # --- CommandRouter content updates ---
@@ -221,7 +219,7 @@ async def test_get_settings_hydrates_from_persistence():
     settings_service = FakeSettingsService()
     target = SettingsTarget.for_context(
         controller_id="controller-main",
-        device_id="dev",
+        config_id="config-dev",
         profile_id="default",
         page_id="0",
         slot_id="0,0",
@@ -274,7 +272,7 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
 
     target = SettingsTarget.for_context(
         controller_id="controller-main",
-        device_id="dev",
+        config_id="config-dev",
         profile_id="default",
         page_id="0",
         slot_id="0,0",
@@ -295,49 +293,3 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
         await router.set_settings({"new": 2})
 
     assert store.settings == {"existing": 1}
-
-
-@pytest.mark.asyncio
-async def test_hydrate_settings_migrates_legacy_key_to_composite(monkeypatch, tmp_path):
-    """When no composite row exists, hydrate reads legacy context_id key and migrates to composite then deletes legacy."""
-    store = ControlStateStore(context_id="dev.slot0")
-    store.settings = {"from_config": "a"}
-
-    class TmpDirs:
-        user_data_dir = str(tmp_path)
-
-    monkeypatch.setattr(_persistence, "dirs", TmpDirs())
-    legacy = ControllerPersistence("dev")
-    legacy.set_value("dev.slot0", {"legacy_key": 100})
-
-    target = SettingsTarget.for_context(
-        controller_id="controller-main",
-        device_id="dev",
-        profile_id="default",
-        page_id="0",
-        slot_id="slot0",
-        action_uuid="action",
-        legacy_context_id="dev.slot0",
-    )
-    render_service = MagicMock(spec=RenderService)
-    render_service.build_request = MagicMock(return_value=object())
-    render_dispatcher = MagicMock(spec=RenderDispatcher)
-    render_dispatcher.submit_request = AsyncMock()
-    output = _make_output()
-    image_format = HardwareImageFormat(width=72, height=72)
-
-    router = CommandRouter(
-        store=store,
-        render_service=render_service,
-        render_dispatcher=render_dispatcher,
-        output=output,
-        image_format=image_format,
-        start_soon=lambda *args, **kwargs: None,
-        settings_service=FileBackedSettingsService(settings_dir=tmp_path),
-        settings_target=target,
-    )
-
-    settings = await router.get_settings()
-    assert settings.from_config == "a"
-    assert settings.legacy_key == 100
-    assert legacy.get_value("dev.slot0") is None
