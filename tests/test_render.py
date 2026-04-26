@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 import pytest
-from deckr.hardware.events import HardwareImageFormat
+from deckr.hardware.messages import HardwareImageFormat
 from deckr.pluginhost.messages import TitleOptions
 
 from deckr.controller._render import (

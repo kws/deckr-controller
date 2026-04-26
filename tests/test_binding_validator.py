@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
-from deckr.hardware.events import (
+from deckr.hardware.messages import (
     HardwareCoordinates,
     HardwareDevice,
     HardwareDeviceRef,

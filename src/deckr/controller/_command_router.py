@@ -18,7 +18,7 @@ from deckr.controller._state_store import (
 from deckr.controller.settings import SettingsService, SettingsTarget
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import HardwareImageFormat
+    from deckr.hardware.messages import HardwareImageFormat
 
     from deckr.controller._hardware_service import HardwareCommandService
 

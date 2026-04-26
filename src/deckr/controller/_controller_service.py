@@ -9,7 +9,7 @@ from deckr.contracts.messages import (
     plugin_hosts_broadcast,
 )
 from deckr.core.util.anyio import AsyncMap
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 from deckr.pluginhost.messages import (
     COMMAND_MESSAGE_TYPES,
     HOST_ONLINE,
@@ -93,7 +93,7 @@ class ControllerService(BaseComponent):
                 sender=controller_address(self._controller_id),
                 recipient=msg.sender,
                 message_type=REQUEST_ACTIONS,
-                payload={},
+                body={},
                 subject=plugin_actions_subject(),
             )
         )
@@ -138,19 +138,19 @@ class ControllerService(BaseComponent):
     async def _event_loop(self):
         async with self._driver_bus.subscribe() as subscribe:
             async for message in subscribe:
-                event = hw_events.hardware_body_from_message(message)
-                if isinstance(event, hw_events.DeviceConnectedMessage):
+                event = hw_messages.hardware_body_from_message(message)
+                if isinstance(event, hw_messages.DeviceConnectedMessage):
                     await self._handle_device_connected(message, event)
-                elif isinstance(event, hw_events.DeviceDisconnectedMessage):
-                    ref = hw_events.hardware_device_ref_from_message(message)
+                elif isinstance(event, hw_messages.DeviceDisconnectedMessage):
+                    ref = hw_messages.hardware_device_ref_from_message(message)
                     if ref is None:
                         continue
                     live = self._device_registry.disconnect_ref(ref)
                     if live is not None:
                         self._command_service.unregister_config(live.config_id)
                         await self.on_device_disconnected(live.config_id)
-                elif isinstance(event, hw_events.HARDWARE_INPUT_MESSAGE_TYPES):
-                    ref = hw_events.hardware_device_ref_from_message(message)
+                elif isinstance(event, hw_messages.HARDWARE_INPUT_MESSAGE_TYPES):
+                    ref = hw_messages.hardware_device_ref_from_message(message)
                     if ref is None:
                         continue
                     live = self._device_registry.get_by_ref(ref)
@@ -163,9 +163,9 @@ class ControllerService(BaseComponent):
     async def _handle_device_connected(
         self,
         message: DeckrMessage,
-        event: hw_events.DeviceConnectedMessage,
+        event: hw_messages.DeviceConnectedMessage,
     ) -> None:
-        ref = hw_events.hardware_device_ref_from_message(message)
+        ref = hw_messages.hardware_device_ref_from_message(message)
         if ref is None:
             logger.warning("Ignoring deviceConnected without hardware subject ref")
             return
@@ -224,7 +224,7 @@ class ControllerService(BaseComponent):
                 sender=controller_address(self._controller_id),
                 recipient=plugin_hosts_broadcast(),
                 message_type=REQUEST_ACTIONS,
-                payload={},
+                body={},
                 subject=plugin_actions_subject(),
             )
             logger.info("Requesting actions from all hosts")

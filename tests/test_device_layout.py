@@ -2,7 +2,11 @@
 
 from unittest.mock import MagicMock
 
-from deckr.hardware.events import HardwareCoordinates, HardwareImageFormat, HardwareSlot
+from deckr.hardware.messages import (
+    HardwareCoordinates,
+    HardwareImageFormat,
+    HardwareSlot,
+)
 
 from deckr.controller._device_layout import (
     ImageGrid,

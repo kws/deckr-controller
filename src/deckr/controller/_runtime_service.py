@@ -42,12 +42,12 @@ class ControllerRuntimeService(BaseComponent):
         *,
         runtime_name: str,
         runtime: ControllerRuntime,
-        hardware_events: EventBus,
+        hardware_messages: EventBus,
         plugin_messages: EventBus,
     ) -> None:
         super().__init__(name=runtime_name)
         self._runtime = runtime
-        self._hardware_events = hardware_events
+        self._hardware_messages = hardware_messages
         self._plugin_messages = plugin_messages
         self._component_manager = ComponentManager()
 
@@ -73,7 +73,7 @@ class ControllerRuntimeService(BaseComponent):
         await self._component_manager.add_component(action_registry)
 
         controller_service = ControllerService(
-            driver_bus=self._hardware_events,
+            driver_bus=self._hardware_messages,
             config_service=config_service,
             settings_service=settings_service,
             controller_id=self._runtime.controller_id,
@@ -116,7 +116,7 @@ def component_factory(context: ComponentContext):
     return ControllerRuntimeService(
         runtime_name=context.runtime_name,
         runtime=runtime,
-        hardware_events=context.require_lane("hardware_events"),
+        hardware_messages=context.require_lane("hardware_messages"),
         plugin_messages=context.require_lane("plugin_messages"),
     )
 
@@ -124,8 +124,8 @@ component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="deckr.controller",
         config_prefix="deckr.controller",
-        consumes=("hardware_events", "plugin_messages"),
-        publishes=("hardware_events", "plugin_messages"),
+        consumes=("hardware_messages", "plugin_messages"),
+        publishes=("hardware_messages", "plugin_messages"),
     ),
     factory=component_factory,
 )

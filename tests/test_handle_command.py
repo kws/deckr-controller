@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 from deckr.contracts.messages import DeckrMessage
-from deckr.hardware.events import (
+from deckr.hardware.messages import (
     HardwareCoordinates,
     HardwareDevice,
     HardwareDeviceRef,
@@ -33,6 +33,7 @@ from deckr.pluginhost.messages import (
     plugin_message,
 )
 from deckr.transports.bus import EventBus
+from pydantic import ValidationError
 
 from deckr.controller._device_manager import DeviceManager, _descriptor_from_payload
 from deckr.controller._navigation_service import StaticPageRef
@@ -71,7 +72,7 @@ def _command_message(
         sender=sender,
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
-        payload={"contextId": context_id, **(payload or {})},
+        body=payload or {},
         subject=context_subject(context_id),
     )
 
@@ -333,20 +334,86 @@ async def test_open_page_emits_page_events_and_close(persistence_tmp_dir):
         raise AssertionError(f"Timed out waiting for {event_type}")
 
     async with plugin_bus.subscribe() as stream:
-        await manager.handle_command(
-            _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
-        )
+        open_command = _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+        await manager.handle_command(open_command)
         event = await _await_event(stream, PAGE_APPEAR)
         assert event.message_type == PAGE_APPEAR
+        assert event.causation_id == open_command.message_id
 
-        await manager.handle_command(
-            _command_message(CLOSE_PAGE)
-        )
+        close_command = _command_message(CLOSE_PAGE)
+        await manager.handle_command(close_command)
         event = await _await_event(stream, PAGE_DISAPPEAR)
         assert event.message_type == PAGE_DISAPPEAR
+        assert event.causation_id == close_command.message_id
 
     current = manager._nav.current_page
     assert isinstance(current, StaticPageRef)
+
+
+@pytest.mark.asyncio
+async def test_open_page_replacement_events_set_causation(persistence_tmp_dir):
+    device = _make_mock_device()
+    plugin_bus = _plugin_bus()
+    config = _minimal_config()
+    config.profiles[0].pages.append(
+        Page(controls=[Control(slot="0,0", action=NoopAction.uuid, settings={})])
+    )
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=ActionMetadata(
+            uuid=NoopAction.uuid,
+            host_id="python",
+        )
+    )
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=config,
+        manager=registry,
+        plugin_bus=plugin_bus,
+        start_soon=lambda fn, *a, **k: None,
+    )
+    await manager.set_page(profile="default", page=0)
+
+    descriptor_payload = {
+        "pageId": "test-page-2",
+        "slots": [
+            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        ],
+    }
+
+    async def _await_event(stream, event_type: str) -> DeckrMessage:
+        with anyio.fail_after(1.0):
+            async for event in stream:
+                if isinstance(event, DeckrMessage) and event.message_type == event_type:
+                    return event
+        raise AssertionError(f"Timed out waiting for {event_type}")
+
+    async with plugin_bus.subscribe() as stream:
+        await manager.handle_command(
+            _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+        )
+        await _await_event(stream, PAGE_APPEAR)
+
+        replacement_payload = {
+            "pageId": "test-page-3",
+            "slots": [
+                {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+            ],
+        }
+        replacement_command = _command_message(
+            OPEN_PAGE,
+            {"descriptor": replacement_payload},
+        )
+        await manager.handle_command(replacement_command)
+        event = await _await_event(stream, PAGE_DISAPPEAR)
+        assert event.message_type == PAGE_DISAPPEAR
+        assert event.causation_id == replacement_command.message_id
+        event = await _await_event(stream, PAGE_APPEAR)
+        assert event.message_type == PAGE_APPEAR
+        assert event.causation_id == replacement_command.message_id
 
 
 @pytest.mark.asyncio
@@ -666,13 +733,12 @@ async def test_handle_command_rejects_dynamic_page_settings_for_wrong_host_or_ac
                 context_id=owner.page_context_id,
             )
         )
-        await manager.handle_command(
+        with pytest.raises(ValidationError):
             _command_message(
                 SET_SETTINGS,
                 {"settings": {"blocked": "action"}, "actionUuid": "other.action"},
                 context_id=owner.page_context_id,
             )
-        )
         with anyio.move_on_after(0.05) as scope:
             await stream.receive()
 
@@ -724,33 +790,31 @@ async def test_handle_command_rejects_non_host_and_reserved_senders(
 
 
 @pytest.mark.asyncio
-async def test_handle_command_rejects_action_uuid_mismatch(persistence_tmp_dir):
+async def test_command_body_rejects_action_uuid_retargeting(persistence_tmp_dir):
     manager = _make_manager()
     await manager.set_page(profile="default", page=0)
     ctx = await _active_context(manager)
 
-    await manager.handle_command(
+    with pytest.raises(ValidationError):
         _command_message(
             SET_IMAGE,
             {"image": "blocked", "actionUuid": "other.action"},
         )
-    )
 
     assert ctx._router._store.content.image is None
 
 
 @pytest.mark.asyncio
-async def test_handle_command_rejects_payload_slot_retargeting(persistence_tmp_dir):
+async def test_command_body_rejects_slot_retargeting(persistence_tmp_dir):
     manager = _make_manager()
     await manager.set_page(profile="default", page=0)
     ctx = await _active_context(manager)
 
-    await manager.handle_command(
+    with pytest.raises(ValidationError):
         _command_message(
             SET_TITLE,
             {"text": "blocked", "slot": "1,0"},
         )
-    )
 
     assert ctx._router._store.content.title is None
 

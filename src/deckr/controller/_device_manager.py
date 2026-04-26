@@ -1,6 +1,6 @@
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,7 +11,7 @@ from deckr.contracts.messages import (
     parse_host_address,
 )
 from deckr.core.util.anyio import AsyncMap
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 from deckr.pluginhost.messages import (
     CLOSE_PAGE,
     HERE_ARE_SETTINGS,
@@ -28,6 +28,7 @@ from deckr.pluginhost.messages import (
     SLEEP_SCREEN,
     WAKE_SCREEN,
     DynamicPageDescriptor,
+    SettingsBody,
     SlotBinding,
     TitleOptions,
     build_context_id,
@@ -35,8 +36,8 @@ from deckr.pluginhost.messages import (
     controller_address,
     host_address,
     make_dynamic_page_id,
+    plugin_body_dict,
     plugin_message,
-    plugin_payload,
     subject_config_id,
     subject_context_id,
     subject_controller_id,
@@ -100,7 +101,7 @@ def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
         return None
 
 
-def _find_slot(device: hw_events.HardwareDevice, slot_id: str) -> hw_events.HardwareSlot | None:
+def _find_slot(device: hw_messages.HardwareDevice, slot_id: str) -> hw_messages.HardwareSlot | None:
     for slot in device.slots:
         if slot.id == slot_id:
             return slot
@@ -142,8 +143,8 @@ class DeviceManager:
         self,
         *,
         controller_id: str,
-        device: hw_events.HardwareDevice,
-        hardware_ref: hw_events.HardwareDeviceRef,
+        device: hw_messages.HardwareDevice,
+        hardware_ref: hw_messages.HardwareDeviceRef,
         command_service: HardwareCommandService,
         config: DeviceConfig,
         manager: PluginManager,
@@ -185,7 +186,7 @@ class DeviceManager:
         self._nav_lock = anyio.Lock()
         self._start_soon(self._page_timeout_loop)
 
-    async def _render_unavailable_to_slot(self, slot: hw_events.HardwareSlot) -> None:
+    async def _render_unavailable_to_slot(self, slot: hw_messages.HardwareSlot) -> None:
         """Render 'not available' overlay to a slot (e.g. when action is missing)."""
         if slot.image_format is None:
             return
@@ -303,7 +304,7 @@ class DeviceManager:
     async def _try_resolve_binding(
         self,
         binding: SlotBinding,
-        slot: hw_events.HardwareSlot,
+        slot: hw_messages.HardwareSlot,
         *,
         profile_id: str,
         page_id: str,
@@ -436,7 +437,12 @@ class DeviceManager:
                     context_id=owner.page_context_id, reason="timeout"
                 )
 
-    async def _emit_page_appear(self, owner: DynamicPageOwner) -> None:
+    async def _emit_page_appear(
+        self,
+        owner: DynamicPageOwner,
+        *,
+        causation_id: str | None = None,
+    ) -> None:
         if owner.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
             return
         settings = (
@@ -453,16 +459,28 @@ class DeviceManager:
             sender=controller_address(self._controller_id),
             recipient=host_address(owner.owner_host_id),
             message_type=PAGE_APPEAR,
-            payload={
-                "actionUuid": owner.owner_action_uuid,
+            body={
                 "settings": settings,
-                "event": event.model_dump(by_alias=True),
+                "event": event.model_dump(
+                    by_alias=True,
+                    exclude={"context"},
+                ),
             },
-            subject=context_subject(owner.page_context_id),
+            subject=context_subject(
+                owner.page_context_id,
+                action_uuid=owner.owner_action_uuid,
+            ),
+            causation_id=causation_id,
         )
         await self._plugin_bus.send(msg)
 
-    async def _emit_page_disappear(self, owner: DynamicPageOwner, reason: str) -> None:
+    async def _emit_page_disappear(
+        self,
+        owner: DynamicPageOwner,
+        reason: str,
+        *,
+        causation_id: str | None = None,
+    ) -> None:
         if owner.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
             return
         event = PageDisappear(
@@ -474,19 +492,34 @@ class DeviceManager:
             sender=controller_address(self._controller_id),
             recipient=host_address(owner.owner_host_id),
             message_type=PAGE_DISAPPEAR,
-            payload={
-                "actionUuid": owner.owner_action_uuid,
-                "event": event.model_dump(by_alias=True),
+            body={
+                "event": event.model_dump(
+                    by_alias=True,
+                    exclude={"context"},
+                ),
             },
-            subject=context_subject(owner.page_context_id),
+            subject=context_subject(
+                owner.page_context_id,
+                action_uuid=owner.owner_action_uuid,
+            ),
+            causation_id=causation_id,
         )
         await self._plugin_bus.send(msg)
 
-    async def _finalize_dynamic_page(self, reason: str) -> None:
+    async def _finalize_dynamic_page(
+        self,
+        reason: str,
+        *,
+        causation_id: str | None = None,
+    ) -> None:
         owner = self._dynamic_page_owner
         if owner is None:
             return
-        await self._emit_page_disappear(owner, reason)
+        await self._emit_page_disappear(
+            owner,
+            reason,
+            causation_id=causation_id,
+        )
         self._dynamic_page_owner = None
 
     async def _execute_transition(
@@ -624,6 +657,7 @@ class DeviceManager:
         descriptor: DynamicPageDescriptor | None = None,
         close_dynamic: bool = True,
         close_reason: str = "navigate",
+        causation_id: str | None = None,
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor). Caller must hold _nav_lock."""
         await self._reconcile_persistence()
@@ -639,7 +673,10 @@ class DeviceManager:
             )
         ok = await self._execute_transition(transition)
         if ok and owner_to_close is not None:
-            await self._finalize_dynamic_page(close_reason)
+            await self._finalize_dynamic_page(
+                close_reason,
+                causation_id=causation_id,
+            )
         return ok
 
     async def set_page(
@@ -648,6 +685,7 @@ class DeviceManager:
         profile: str | None = None,
         page: int | None = None,
         descriptor: DynamicPageDescriptor | None = None,
+        causation_id: str | None = None,
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor)."""
         async with self._nav_lock:
@@ -657,6 +695,7 @@ class DeviceManager:
                 descriptor=descriptor,
                 close_dynamic=True,
                 close_reason="navigate",
+                causation_id=causation_id,
             )
 
     async def open_page(
@@ -664,6 +703,7 @@ class DeviceManager:
         *,
         descriptor: DynamicPageDescriptor,
         context_id: str,
+        causation_id: str | None = None,
     ) -> None:
         """Open a widget-owned dynamic page anchored to the owner's profile page."""
         if not descriptor or not descriptor.slots:
@@ -698,10 +738,14 @@ class DeviceManager:
                             settings_target=current_owner.settings_target,
                         ),
                         reason="replaced",
+                        causation_id=causation_id,
                     )
                     current_owner.page_id = page_id
                     current_owner.last_activity = self._clock()
-                    await self._emit_page_appear(current_owner)
+                    await self._emit_page_appear(
+                        current_owner,
+                        causation_id=causation_id,
+                    )
 
             if owner is not None and context_id in {
                 owner.page_context_id,
@@ -764,18 +808,32 @@ class DeviceManager:
             )
             if ok:
                 if owner is not None:
-                    await self._emit_page_disappear(owner, reason="replaced")
+                    await self._emit_page_disappear(
+                        owner,
+                        reason="replaced",
+                        causation_id=causation_id,
+                    )
                 self._dynamic_page_owner = new_owner
-                await self._emit_page_appear(new_owner)
+                await self._emit_page_appear(new_owner, causation_id=causation_id)
 
-    async def close_page(self, *, context_id: str, reason: str = "close") -> None:
+    async def close_page(
+        self,
+        *,
+        context_id: str,
+        reason: str = "close",
+        causation_id: str | None = None,
+    ) -> None:
         """Close the active widget page and return to its owner profile page."""
         async with self._nav_lock:
             owner = self._dynamic_page_owner
             if owner is None:
                 logger.info("No owner for dynamic page")
                 return
-            await self._emit_page_disappear(owner, reason=reason)
+            await self._emit_page_disappear(
+                owner,
+                reason=reason,
+                causation_id=causation_id,
+            )
             self._dynamic_page_owner = None
             await self._set_page_locked(
                 profile=owner.owner_profile,
@@ -894,17 +952,9 @@ class DeviceManager:
             return None
         return host_id
 
-    def _payload_action_uuid(self, payload: Mapping[str, Any]) -> str | None:
-        value = payload.get("actionUuid")
-        if value is None:
-            return None
-        action_uuid = str(value).strip()
-        return action_uuid or None
-
     async def _authorize_plugin_command(
         self,
         msg: DeckrMessage,
-        payload: Mapping[str, Any],
         *,
         context_id: str,
     ) -> AuthorizedCommandTarget | None:
@@ -913,20 +963,6 @@ class DeviceManager:
             return None
 
         subject_slot = subject_slot_id(msg.subject)
-        payload_slot = payload.get("slot")
-        if payload_slot is not None and (
-            subject_slot is None or str(payload_slot) != subject_slot
-        ):
-            logger.warning(
-                "Ignoring plugin command %s from %s with payload slot %r that does not match context slot %r",
-                msg.message_type,
-                msg.sender,
-                payload_slot,
-                subject_slot,
-            )
-            return None
-
-        action_uuid = self._payload_action_uuid(payload)
         owner = self._dynamic_page_owner
         if owner is not None and context_id in {
             owner.page_context_id,
@@ -938,15 +974,6 @@ class DeviceManager:
                     msg.message_type,
                     sender_host_id,
                     owner.owner_host_id,
-                )
-                return None
-            if action_uuid is not None and action_uuid != owner.owner_action_uuid:
-                logger.warning(
-                    "Ignoring plugin command %s from host %s with actionUuid %r for dynamic page owned by action %s",
-                    msg.message_type,
-                    sender_host_id,
-                    action_uuid,
-                    owner.owner_action_uuid,
                 )
                 return None
             return AuthorizedCommandTarget(
@@ -991,17 +1018,6 @@ class DeviceManager:
             )
             return None
 
-        if action_uuid is not None and action_uuid != ctx.action_uuid:
-            logger.warning(
-                "Ignoring plugin command %s from host %s with actionUuid %r for context %s owned by action %s",
-                msg.message_type,
-                sender_host_id,
-                action_uuid,
-                context_id,
-                ctx.action_uuid,
-            )
-            return None
-
         return AuthorizedCommandTarget(
             sender_host_id=sender_host_id,
             context_id=context_id,
@@ -1011,8 +1027,8 @@ class DeviceManager:
 
     async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a command message from a plugin host (setTitle, setImage, etc.)."""
-        payload = plugin_payload(msg)
-        context_id = subject_context_id(msg.subject) or str(payload.get("contextId", ""))
+        payload = plugin_body_dict(msg)
+        context_id = subject_context_id(msg.subject) or ""
         if not context_id:
             return
         context_controller_id = subject_controller_id(msg.subject)
@@ -1027,35 +1043,37 @@ class DeviceManager:
         msg_type = msg.message_type
         authorization = await self._authorize_plugin_command(
             msg,
-            payload,
             context_id=context_id,
         )
         if authorization is None:
             return
 
         async def send_settings_response(settings: dict) -> None:
-            resp = plugin_message(
+            await self._plugin_bus.reply_to(
+                msg,
                 sender=controller_address(self._controller_id),
-                recipient=msg.sender,
                 message_type=HERE_ARE_SETTINGS,
-                payload={
-                    "contextId": context_id,
-                    "settings": settings,
-                },
+                body=SettingsBody(settings=settings).to_dict(),
                 subject=context_subject(context_id),
-                in_reply_to=msg.message_id,
             )
-            await self._plugin_bus.send(resp)
 
         if msg_type == OPEN_PAGE:
             desc_data = payload.get("descriptor")
             descriptor = _descriptor_from_payload(desc_data) if desc_data else None
             if descriptor is not None:
-                await self.open_page(descriptor=descriptor, context_id=context_id)
+                await self.open_page(
+                    descriptor=descriptor,
+                    context_id=context_id,
+                    causation_id=msg.message_id,
+                )
             return
 
         if msg_type == CLOSE_PAGE:
-            await self.close_page(context_id=context_id, reason="close")
+            await self.close_page(
+                context_id=context_id,
+                reason="close",
+                causation_id=msg.message_id,
+            )
             return
 
         owner = authorization.dynamic_owner
@@ -1109,6 +1127,7 @@ class DeviceManager:
             await self.set_page(
                 profile=payload.get("profile", "default"),
                 page=payload.get("page", 0),
+                causation_id=msg.message_id,
             )
         elif msg_type == SLEEP_SCREEN:
             await self._command_service.sleep_screen(self.config_id)
@@ -1116,7 +1135,7 @@ class DeviceManager:
             await self._command_service.wake_screen(self.config_id)
 
     async def on_event(self, message: DeckrMessage):
-        event = hw_events.hardware_body_from_message(message)
+        event = hw_messages.hardware_body_from_message(message)
         translated = self._translator.translate(event, self.config_id)
         if translated is None:
             return

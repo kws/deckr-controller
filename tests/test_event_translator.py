@@ -1,7 +1,7 @@
 """Unit tests for EventTranslator and build_context_id."""
 
 import pytest
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 from deckr.python_plugin.events import DialRotate, KeyDown, KeyUp, TouchSwipe, TouchTap
 
 from deckr.controller._event_translator import (
@@ -33,7 +33,7 @@ class TestEventTranslator:
         return EventTranslator(CONTROLLER_ID)
 
     def test_key_down_event(self, translator):
-        event = hw_events.KeyDownMessage(key_id="1,2")
+        event = hw_messages.KeyDownMessage(key_id="1,2")
         out = translator.translate(event, "d1")
         assert out is not None
         assert isinstance(out, TranslatedEvent)
@@ -45,7 +45,7 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "1,2"
 
     def test_key_up_event(self, translator):
-        event = hw_events.KeyUpMessage(key_id="0,0")
+        event = hw_messages.KeyUpMessage(key_id="0,0")
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "0,0"
@@ -56,7 +56,7 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "0,0"
 
     def test_dial_rotate_event(self, translator):
-        event = hw_events.DialRotateMessage(dial_id="dial1", direction="clockwise")
+        event = hw_messages.DialRotateMessage(dial_id="dial1", direction="clockwise")
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "dial1"
@@ -69,7 +69,7 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "dial1"
         assert out.plugin_event.direction == "clockwise"
 
-        event_cc = hw_events.DialRotateMessage(
+        event_cc = hw_messages.DialRotateMessage(
             dial_id="d2", direction="counterclockwise"
         )
         out_cc = translator.translate(event_cc, "d1")
@@ -77,7 +77,7 @@ class TestEventTranslator:
         assert out_cc.plugin_event.direction == "counterclockwise"
 
     def test_touch_tap_event(self, translator):
-        event = hw_events.TouchTapMessage(touch_id="TouchStrip")
+        event = hw_messages.TouchTapMessage(touch_id="TouchStrip")
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "TouchStrip"
@@ -90,7 +90,7 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "TouchStrip"
 
     def test_touch_swipe_event(self, translator):
-        event = hw_events.TouchSwipeMessage(touch_id="strip", direction="left")
+        event = hw_messages.TouchSwipeMessage(touch_id="strip", direction="left")
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "strip"
@@ -103,13 +103,13 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "strip"
         assert out.plugin_event.direction == "left"
 
-        event_r = hw_events.TouchSwipeMessage(touch_id="strip", direction="right")
+        event_r = hw_messages.TouchSwipeMessage(touch_id="strip", direction="right")
         out_r = translator.translate(event_r, "d1")
         assert out_r is not None
         assert out_r.plugin_event.direction == "right"
 
     def test_non_interaction_events_return_none(self, translator):
-        event = hw_events.DeviceDisconnectedMessage()
+        event = hw_messages.DeviceDisconnectedMessage()
         assert translator.translate(event, "d1") is None
 
     def test_gesture_unsupported_returns_none(self):
@@ -120,7 +120,7 @@ class TestEventTranslator:
             CONTROLLER_ID,
             is_gesture_supported=no_gestures,
         )
-        event = hw_events.KeyUpMessage(key_id="0,0")
+        event = hw_messages.KeyUpMessage(key_id="0,0")
         assert translator.translate(event, "d1") is None
 
     def test_gesture_supported_filter(self):
@@ -133,13 +133,13 @@ class TestEventTranslator:
         )
         assert (
             translator.translate(
-                hw_events.KeyUpMessage(key_id="0,0"), "d1"
+                hw_messages.KeyUpMessage(key_id="0,0"), "d1"
             )
             is not None
         )
         assert (
             translator.translate(
-                hw_events.KeyDownMessage(key_id="0,0"), "d1"
+                hw_messages.KeyDownMessage(key_id="0,0"), "d1"
             )
             is None
         )

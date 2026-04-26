@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import anyio
-from deckr.hardware.events import HardwareImageFormat
+from deckr.hardware.messages import HardwareImageFormat
 from invariant import (
     Node,
     SubGraphNode,

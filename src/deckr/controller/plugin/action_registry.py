@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from deckr.components import BaseComponent, RunContext
@@ -17,8 +17,8 @@ from deckr.pluginhost.messages import (
     ACTIONS_UNREGISTERED,
     HOST_OFFLINE,
     ActionDescriptor,
+    plugin_body_dict,
     plugin_message_for_controller,
-    plugin_payload,
 )
 from deckr.transports.bus import EventBus
 
@@ -114,7 +114,6 @@ class ActionRegistry(BaseComponent):
     def _host_id_from_sender(
         self,
         msg: DeckrMessage,
-        payload: Mapping[str, object],
         *,
         message_type: str,
     ) -> str | None:
@@ -133,30 +132,29 @@ class ActionRegistry(BaseComponent):
                 host_id,
             )
             return None
-        payload_host_id = payload.get("hostId")
-        if payload_host_id is not None and payload_host_id != host_id:
+        subject_host_id = msg.subject.identifiers.get("hostId")
+        if subject_host_id is not None and subject_host_id != host_id:
             logger.warning(
-                "Ignoring %s from %s with mismatched payload hostId %r",
+                "Ignoring %s from %s with mismatched subject hostId %r",
                 message_type,
                 msg.sender,
-                payload_host_id,
+                subject_host_id,
             )
             return None
         return host_id
 
     async def _handle_actions_registered(self, msg: DeckrMessage) -> None:
         """Handle actionsRegistered. Add actions to registry."""
-        payload = plugin_payload(msg)
+        body = plugin_body_dict(msg)
         host_id = self._host_id_from_sender(
             msg,
-            payload,
             message_type=ACTIONS_REGISTERED,
         )
         if not host_id:
             return
         touched: list[str] = []
         seen: set[str] = set()
-        actions = payload.get("actions", [])
+        actions = body.get("actions", [])
         for a in actions:
             try:
                 descriptor = ActionDescriptor.model_validate(a)
@@ -177,7 +175,7 @@ class ActionRegistry(BaseComponent):
                 if qualified not in seen:
                     touched.append(qualified)
                     seen.add(qualified)
-        action_uuids = payload.get("actionUuids", [])
+        action_uuids = body.get("actionUuids", [])
         for action_uuid in action_uuids:
             qualified = _qualified_id(host_id, action_uuid)
             if qualified not in self._action_registry:
@@ -201,15 +199,14 @@ class ActionRegistry(BaseComponent):
 
     async def _handle_actions_unregistered(self, msg: DeckrMessage) -> None:
         """Handle actionsUnregistered. Remove actions from registry."""
-        payload = plugin_payload(msg)
+        body = plugin_body_dict(msg)
         host_id = self._host_id_from_sender(
             msg,
-            payload,
             message_type=ACTIONS_UNREGISTERED,
         )
         if not host_id:
             return
-        action_uuids = payload.get("actionUuids", [])
+        action_uuids = body.get("actionUuids", [])
         removed: list[str] = []
         for action_uuid in action_uuids:
             qualified = _qualified_id(host_id, action_uuid)
@@ -248,10 +245,8 @@ class ActionRegistry(BaseComponent):
 
     async def _handle_host_offline(self, msg: DeckrMessage) -> None:
         """Handle graceful hostOffline as a lifecycle hint."""
-        payload = plugin_payload(msg)
         host_id = self._host_id_from_sender(
             msg,
-            payload,
             message_type=HOST_OFFLINE,
         )
         if not host_id:

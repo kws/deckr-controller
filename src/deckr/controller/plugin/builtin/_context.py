@@ -38,17 +38,16 @@ class BuiltInPluginContext(PluginContextProtocol):
         text: str,
         *,
         title_options: TitleOptions | None = None,
-        slot: str | None = None,
     ) -> None:
         await self._router.set_title(text, title_options=title_options)
 
-    async def set_image(self, image: str, *, slot: str | None = None) -> None:
+    async def set_image(self, image: str) -> None:
         await self._router.set_image(image)
 
-    async def show_alert(self, *, slot: str | None = None) -> None:
+    async def show_alert(self) -> None:
         await self._router.show_alert()
 
-    async def show_ok(self, *, slot: str | None = None) -> None:
+    async def show_ok(self) -> None:
         await self._router.show_ok()
 
     async def set_settings(self, settings: dict) -> SimpleNamespace:

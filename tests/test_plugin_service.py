@@ -38,12 +38,11 @@ def _plugin_bus() -> EventBus:
 
 
 def _hardware_bus() -> EventBus:
-    return EventBus("hardware_events")
+    return EventBus("hardware_messages")
 
 
-def _actions_payload(host_id: str = "test_host") -> dict:
+def _actions_payload() -> dict:
     return {
-        "hostId": host_id,
         "actionUuids": [StubAction.uuid],
         "actions": [{"uuid": StubAction.uuid}],
     }
@@ -52,48 +51,48 @@ def _actions_payload(host_id: str = "test_host") -> dict:
 def _actions_registered_message(
     *,
     host_id: str = "test_host",
-    payload_host_id: str | None = None,
+    subject_host_id: str | None = None,
     recipient=CONTROLLER_ADDR,
 ) -> DeckrMessage:
-    payload_host_id = host_id if payload_host_id is None else payload_host_id
+    subject_host_id = host_id if subject_host_id is None else subject_host_id
     return plugin_message(
         sender=host_address(host_id),
         recipient=recipient,
         message_type=ACTIONS_REGISTERED,
-        payload=_actions_payload(payload_host_id),
-        subject=plugin_actions_subject(host_id),
+        body=_actions_payload(),
+        subject=plugin_actions_subject(subject_host_id),
     )
 
 
 def _actions_unregistered_message(
     *,
     host_id: str = "test_host",
-    payload_host_id: str | None = None,
+    subject_host_id: str | None = None,
     recipient=CONTROLLER_ADDR,
 ) -> DeckrMessage:
-    payload_host_id = host_id if payload_host_id is None else payload_host_id
+    subject_host_id = host_id if subject_host_id is None else subject_host_id
     return plugin_message(
         sender=host_address(host_id),
         recipient=recipient,
         message_type=ACTIONS_UNREGISTERED,
-        payload={"hostId": payload_host_id, "actionUuids": [StubAction.uuid]},
-        subject=plugin_actions_subject(host_id),
+        body={"actionUuids": [StubAction.uuid]},
+        subject=plugin_actions_subject(subject_host_id),
     )
 
 
 def _host_offline_message(
     *,
     host_id: str = "test_host",
-    payload_host_id: str | None = None,
+    subject_host_id: str | None = None,
     recipient=CONTROLLER_ADDR,
 ) -> DeckrMessage:
-    payload_host_id = host_id if payload_host_id is None else payload_host_id
+    subject_host_id = host_id if subject_host_id is None else subject_host_id
     return plugin_message(
         sender=host_address(host_id),
         recipient=recipient,
         message_type=HOST_OFFLINE,
-        payload={"hostId": payload_host_id},
-        subject=plugin_actions_subject(host_id),
+        body={},
+        subject=plugin_actions_subject(subject_host_id),
     )
 
 
@@ -102,7 +101,7 @@ def _request_actions_message() -> DeckrMessage:
         sender=CONTROLLER_ADDR,
         recipient=plugin_hosts_broadcast(),
         message_type=REQUEST_ACTIONS,
-        payload={},
+        body={},
         subject=plugin_actions_subject(),
     )
 
@@ -214,8 +213,8 @@ async def test_actions_registered_with_controller_broadcast_populates_registry()
 
 
 @pytest.mark.asyncio
-async def test_actions_registered_rejects_payload_host_id_mismatch():
-    """actionsRegistered ownership comes from sender, and mismatched payload is rejected."""
+async def test_actions_registered_rejects_subject_host_id_mismatch():
+    """actionsRegistered ownership comes from sender, and mismatched subject is rejected."""
     bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
@@ -225,7 +224,7 @@ async def test_actions_registered_rejects_payload_host_id_mismatch():
     await registry.start(ctx)
 
     await registry._handle_actions_registered(
-        _actions_registered_message(host_id="actual", payload_host_id="spoofed")
+        _actions_registered_message(host_id="actual", subject_host_id="spoofed")
     )
 
     assert await registry.get_action(f"actual::{StubAction.uuid}") is None
@@ -281,8 +280,8 @@ async def test_actions_unregistered_removes_from_registry():
 
 
 @pytest.mark.asyncio
-async def test_actions_unregistered_rejects_payload_host_id_mismatch():
-    """A sender cannot unregister another host's actions through payload hostId."""
+async def test_actions_unregistered_rejects_subject_host_id_mismatch():
+    """A sender cannot unregister another host's actions through subject hostId."""
     bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
@@ -297,7 +296,7 @@ async def test_actions_unregistered_rejects_payload_host_id_mismatch():
     assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
 
     await registry._handle_actions_unregistered(
-        _actions_unregistered_message(host_id="attacker", payload_host_id="victim")
+        _actions_unregistered_message(host_id="attacker", subject_host_id="victim")
     )
 
     assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
@@ -305,8 +304,8 @@ async def test_actions_unregistered_rejects_payload_host_id_mismatch():
 
 
 @pytest.mark.asyncio
-async def test_host_offline_rejects_payload_host_id_mismatch():
-    """A sender cannot offline another host's actions through payload hostId."""
+async def test_host_offline_rejects_subject_host_id_mismatch():
+    """A sender cannot offline another host's actions through subject hostId."""
     bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
@@ -319,7 +318,7 @@ async def test_host_offline_rejects_payload_host_id_mismatch():
         _actions_registered_message(host_id="victim")
     )
     await registry._handle_host_offline(
-        _host_offline_message(host_id="attacker", payload_host_id="victim")
+        _host_offline_message(host_id="attacker", subject_host_id="victim")
     )
 
     assert await registry.get_action(f"victim::{StubAction.uuid}") is not None

@@ -2,7 +2,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 from deckr.pluginhost.messages import (
     DIAL_ROTATE,
     KEY_DOWN,
@@ -46,16 +46,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _without_wire_context(payload: dict) -> dict:
+    event = payload.get("event")
+    if not isinstance(event, dict) or "context" not in event:
+        return payload
+    return {
+        **payload,
+        "event": {key: value for key, value in event.items() if key != "context"},
+    }
+
+
 class ControlContext(ControlContextProtocol):
     def __init__(
         self,
         controller_id: str,
-        device: hw_events.HardwareDevice,
+        device: hw_messages.HardwareDevice,
         config_id: str,
         command_service: HardwareCommandService,
         host_id: str,
         action_uuid: str,
-        slot: hw_events.HardwareSlot,
+        slot: hw_messages.HardwareSlot,
         settings: dict,
         manager: "DeviceManager",
         plugin_bus: Any,
@@ -141,13 +151,12 @@ class ControlContext(ControlContextProtocol):
         if self._builtin_action is not None:
             await self._deliver_to_builtin(msg_type, payload)
             return
-        payload = {**payload, "actionUuid": self.action_uuid}
         msg = plugin_message(
             sender=controller_address(self._controller_id),
             recipient=host_address(self.host_id),
             message_type=msg_type,
-            payload=payload,
-            subject=context_subject(self.id),
+            body=_without_wire_context(payload),
+            subject=context_subject(self.id, action_uuid=self.action_uuid),
         )
         await self._plugin_bus.send(msg)
 

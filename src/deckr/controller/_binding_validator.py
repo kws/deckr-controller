@@ -8,9 +8,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deckr.hardware.events import HardwareDevice, HardwareSlot
-    from deckr.python_plugin.interface import PluginAction
+    from deckr.hardware.messages import HardwareDevice, HardwareSlot
     from deckr.pluginhost.messages import SlotBinding
+    from deckr.python_plugin.interface import PluginAction
 
 logger = logging.getLogger(__name__)
 

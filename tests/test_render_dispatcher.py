@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
-from deckr.hardware.events import HardwareImageFormat
+from deckr.hardware.messages import HardwareImageFormat
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
 from invariant_gfx.artifacts import BlobArtifact

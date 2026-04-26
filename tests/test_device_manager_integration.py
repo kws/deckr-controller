@@ -7,8 +7,8 @@ import pytest
 import pytest_asyncio
 from deckr.components import RunContext
 from deckr.contracts.messages import DeckrMessage
-from deckr.hardware import events as hw_events
-from deckr.hardware.events import (
+from deckr.hardware import messages as hw_messages
+from deckr.hardware.messages import (
     HardwareCoordinates,
     HardwareDevice,
     HardwareImageFormat,
@@ -21,9 +21,11 @@ from deckr.pluginhost.messages import (
     controller_address,
     host_address,
     plugin_actions_subject,
+    plugin_body_dict,
     plugin_message,
     plugin_message_for_host,
-    plugin_payload,
+    subject_action_uuid,
+    subject_context_id,
 )
 from deckr.transports.bus import EventBus
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
@@ -61,7 +63,7 @@ def _plugin_command(
         sender=HOST_ADDR,
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
-        payload={"contextId": context_id, **(payload or {})},
+        body=payload or {},
         subject=context_subject(context_id),
     )
 
@@ -71,8 +73,7 @@ def _actions_registered_message(action_uuid: str) -> DeckrMessage:
         sender=HOST_ADDR,
         recipient=CONTROLLER_ADDR,
         message_type=ACTIONS_REGISTERED,
-        payload={
-            "hostId": HOST_ID,
+        body={
             "actionUuids": [action_uuid],
             "actions": [{"uuid": action_uuid}],
         },
@@ -114,8 +115,8 @@ def _make_mock_device(
     )
 
 
-def _hardware_ref(device: HardwareDevice) -> hw_events.HardwareDeviceRef:
-    return hw_events.HardwareDeviceRef(
+def _hardware_ref(device: HardwareDevice) -> hw_messages.HardwareDeviceRef:
+    return hw_messages.HardwareDeviceRef(
         manager_id="manager-main",
         device_id=device.id,
     )
@@ -263,6 +264,7 @@ class MockPluginHost:
 
         def event_from_payload(event_type, payload):
             event_data = payload.get("event", payload)
+            event_data = {**event_data, "context": context_id}
             return event_type.model_validate(event_data)
 
         HOST_MSG_TYPES = frozenset(
@@ -294,16 +296,18 @@ class MockPluginHost:
                         _actions_registered_message(self._action.uuid)
                     )
                 elif msg.message_type == HERE_ARE_SETTINGS:
-                    payload = plugin_payload(msg)
-                    context_id = payload.get("contextId", "")
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
                     settings = payload.get("settings", {})
                     if context_id:
                         self._registry.deliver_settings(context_id, settings)
                 elif msg.message_type == WILL_APPEAR:
-                    payload = plugin_payload(msg)
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
                     event_data = payload.get("event", payload)
+                    event_data = {**event_data, "context": context_id}
                     ev = WillAppear.model_validate(event_data)
-                    action_uuid = payload.get("actionUuid", "")
+                    action_uuid = subject_action_uuid(msg.subject) or ""
                     action = await self._get_action(action_uuid)
                     if action is None:
                         return
@@ -313,10 +317,12 @@ class MockPluginHost:
                     )
                     await action.on_will_appear(ev, ctx)
                 elif msg.message_type == WILL_DISAPPEAR:
-                    payload = plugin_payload(msg)
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
                     event_data = payload.get("event", payload)
+                    event_data = {**event_data, "context": context_id}
                     ev = WillDisappear.model_validate(event_data)
-                    action_uuid = payload.get("actionUuid", "")
+                    action_uuid = subject_action_uuid(msg.subject) or ""
                     action = await self._get_action(action_uuid)
                     if action is None:
                         return
@@ -328,8 +334,9 @@ class MockPluginHost:
                         finally:
                             self._registry.remove(context_id)
                 elif msg.message_type == KEY_UP:
-                    payload = plugin_payload(msg)
-                    action_uuid = payload.get("actionUuid", "")
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
+                    action_uuid = subject_action_uuid(msg.subject) or ""
                     ev = event_from_payload(KeyUp, payload)
                     action = await self._get_action(action_uuid)
                     if action is not None and hasattr(action, "on_key_up"):
@@ -340,8 +347,9 @@ class MockPluginHost:
                             )
                         await action.on_key_up(ev, ctx)
                 elif msg.message_type == KEY_DOWN:
-                    payload = plugin_payload(msg)
-                    action_uuid = payload.get("actionUuid", "")
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
+                    action_uuid = subject_action_uuid(msg.subject) or ""
                     ev = event_from_payload(KeyDown, payload)
                     action = await self._get_action(action_uuid)
                     if action is not None and hasattr(action, "on_key_down"):
@@ -352,8 +360,9 @@ class MockPluginHost:
                             )
                         await action.on_key_down(ev, ctx)
                 elif msg.message_type == DIAL_ROTATE:
-                    payload = plugin_payload(msg)
-                    action_uuid = payload.get("actionUuid", "")
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
+                    action_uuid = subject_action_uuid(msg.subject) or ""
                     ev = event_from_payload(DialRotate, payload)
                     action = await self._get_action(action_uuid)
                     if action is not None and hasattr(action, "on_dial_rotate"):
@@ -364,8 +373,9 @@ class MockPluginHost:
                             )
                         await action.on_dial_rotate(ev, ctx)
                 elif msg.message_type == TOUCH_TAP:
-                    payload = plugin_payload(msg)
-                    action_uuid = payload.get("actionUuid", "")
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
+                    action_uuid = subject_action_uuid(msg.subject) or ""
                     ev = event_from_payload(TouchTap, payload)
                     action = await self._get_action(action_uuid)
                     if action is not None and hasattr(action, "on_touch_tap"):
@@ -376,8 +386,9 @@ class MockPluginHost:
                             )
                         await action.on_touch_tap(ev, ctx)
                 elif msg.message_type == TOUCH_SWIPE:
-                    payload = plugin_payload(msg)
-                    action_uuid = payload.get("actionUuid", "")
+                    payload = plugin_body_dict(msg)
+                    context_id = subject_context_id(msg.subject) or ""
+                    action_uuid = subject_action_uuid(msg.subject) or ""
                     ev = event_from_payload(TouchSwipe, payload)
                     action = await self._get_action(action_uuid)
                     if action is not None and hasattr(action, "on_touch_swipe"):
@@ -647,10 +658,10 @@ async def test_key_down_event_delivered_to_plugin(
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.1)
         await manager.on_event(
-            hw_events.KeyDownMessage(device_id="test-device", key_id="0,0")
+            hw_messages.KeyDownMessage(device_id="test-device", key_id="0,0")
         )
         await manager.on_event(
-            hw_events.KeyUpMessage(device_id="test-device", key_id="0,0")
+            hw_messages.KeyUpMessage(device_id="test-device", key_id="0,0")
         )
     expected_context = build_context_id(CONTROLLER_ID, "test-device", "0,0")
     assert ("key_down", expected_context, "0,0") in received
