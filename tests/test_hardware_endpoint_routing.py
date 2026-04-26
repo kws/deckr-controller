@@ -128,17 +128,21 @@ async def test_route_loss_cleans_only_configs_for_lost_manager_endpoint():
     controller._command_service.register_device(config_id="config-room-b", ref=ref_b)
     await bus.route_table.claim_endpoint(
         endpoint=hardware_manager_address("room-a"),
+        lane="hardware_events",
         client_id="websocket:room-a",
         client_kind="remote",
         transport_kind="websocket",
         transport_id="ws-main",
+        claim_source="message_sender",
     )
     await bus.route_table.claim_endpoint(
         endpoint=hardware_manager_address("room-b"),
+        lane="hardware_events",
         client_id="websocket:room-b",
         client_kind="remote",
         transport_kind="websocket",
         transport_id="ws-main",
+        claim_source="message_sender",
     )
 
     async with anyio.create_task_group() as tg:

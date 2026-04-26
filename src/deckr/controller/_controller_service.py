@@ -201,6 +201,8 @@ class ControllerService(BaseComponent):
             async for event in stream:
                 if event.event_type != "endpointUnreachable" or event.endpoint is None:
                     continue
+                if event.lane != self._driver_bus.lane:
+                    continue
                 manager_id = parse_hardware_manager_address(event.endpoint)
                 if manager_id is None:
                     continue

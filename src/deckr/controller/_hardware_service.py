@@ -82,7 +82,10 @@ class HardwareCommandService:
         if ref is None:
             raise LookupError(f"No live hardware route for config {config_id!r}")
         endpoint = hardware_manager_address(ref.manager_id)
-        route = await self._event_bus.route_table.route_for(endpoint)
+        route = await self._event_bus.route_table.route_for(
+            endpoint,
+            lane=self._event_bus.lane,
+        )
         if route is None:
             raise LookupError(
                 f"Hardware manager endpoint {endpoint} is not reachable"

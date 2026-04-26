@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
 from deckr.contracts.messages import DeckrMessage, parse_host_address
@@ -18,7 +18,11 @@ from deckr.pluginhost.messages import (
 )
 from deckr.transports.bus import EventBus
 
-from deckr.controller.plugin.builtin import BuiltinRegistry
+from deckr.controller.plugin.builtin import (
+    BUILTIN_ACTION_PROVIDER_ID,
+    RESERVED_BUILTIN_PROVIDER_IDS,
+    BuiltinRegistry,
+)
 from deckr.controller.plugin.events import ActionsChangedEvent
 from deckr.controller.plugin.provider import ActionMetadata
 
@@ -53,21 +57,28 @@ class ActionRegistry(BaseComponent):
         self._controller_id = controller_id
         self._on_actions_changed = on_actions_changed
         self._builtin_registry = BuiltinRegistry()
+        self._builtin_action_registry: dict[str, ActionDescriptor] = {}
         self._action_registry: dict[str, tuple[str, ActionDescriptor]] = {}
 
     async def get_action(self, address: str) -> ActionMetadata | None:
-        """Resolve by address: host_id::action_id (host-specific) or action_id (host-agnostic)."""
+        """Resolve plugin-host actions and internal builtin provider actions."""
         if "::" in address:
-            entry = self._action_registry.get(address)
-            if entry is None:
+            provider_id, _, action_uuid = address.partition("::")
+            if provider_id in RESERVED_BUILTIN_PROVIDER_IDS:
+                return self._builtin_action_metadata(action_uuid)
+            plugin_entry = self._action_registry.get(address)
+            if plugin_entry is None:
                 return None
-            host_id, descriptor = entry
+            host_id, descriptor = plugin_entry
             return ActionMetadata(
                 uuid=descriptor.uuid,
                 host_id=host_id,
                 name=descriptor.name,
                 plugin_uuid=descriptor.plugin_uuid,
             )
+        builtin = self._builtin_action_metadata(address)
+        if builtin is not None:
+            return builtin
         for key, (host_id, descriptor) in self._action_registry.items():
             if key.endswith(f"::{address}"):
                 return ActionMetadata(
@@ -78,6 +89,17 @@ class ActionRegistry(BaseComponent):
                 )
         return None
 
+    def _builtin_action_metadata(self, action_uuid: str) -> ActionMetadata | None:
+        descriptor = self._builtin_action_registry.get(action_uuid)
+        if descriptor is None:
+            return None
+        return ActionMetadata(
+            uuid=descriptor.uuid,
+            host_id=BUILTIN_ACTION_PROVIDER_ID,
+            name=descriptor.name,
+            plugin_uuid=descriptor.plugin_uuid,
+        )
+
     def get_builtin_action(self, uuid: str) -> PluginAction | None:
         """Return builtin action instance for direct dispatch."""
         return self._builtin_registry.get_action(uuid)
@@ -86,12 +108,48 @@ class ActionRegistry(BaseComponent):
         if self._on_actions_changed is not None:
             await self._on_actions_changed(event)
 
+    def _host_id_from_sender(
+        self,
+        msg: DeckrMessage,
+        payload: Mapping[str, object],
+        *,
+        message_type: str,
+    ) -> str | None:
+        host_id = parse_host_address(msg.sender)
+        if host_id is None:
+            logger.warning(
+                "Ignoring %s from invalid host address %s",
+                message_type,
+                msg.sender,
+            )
+            return None
+        if host_id in RESERVED_BUILTIN_PROVIDER_IDS:
+            logger.warning(
+                "Ignoring %s from route-owned host using reserved provider id %s",
+                message_type,
+                host_id,
+            )
+            return None
+        payload_host_id = payload.get("hostId")
+        if payload_host_id is not None and payload_host_id != host_id:
+            logger.warning(
+                "Ignoring %s from %s with mismatched payload hostId %r",
+                message_type,
+                msg.sender,
+                payload_host_id,
+            )
+            return None
+        return host_id
+
     async def _handle_actions_registered(self, msg: DeckrMessage) -> None:
         """Handle actionsRegistered. Add actions to registry."""
         payload = plugin_payload(msg)
-        host_id = payload.get("hostId") or parse_host_address(msg.sender)
+        host_id = self._host_id_from_sender(
+            msg,
+            payload,
+            message_type=ACTIONS_REGISTERED,
+        )
         if not host_id:
-            logger.warning("Ignoring actionsRegistered from invalid host address %s", msg.sender)
             return
         touched: list[str] = []
         seen: set[str] = set()
@@ -141,12 +199,12 @@ class ActionRegistry(BaseComponent):
     async def _handle_actions_unregistered(self, msg: DeckrMessage) -> None:
         """Handle actionsUnregistered. Remove actions from registry."""
         payload = plugin_payload(msg)
-        host_id = payload.get("hostId") or parse_host_address(msg.sender)
+        host_id = self._host_id_from_sender(
+            msg,
+            payload,
+            message_type=ACTIONS_UNREGISTERED,
+        )
         if not host_id:
-            logger.warning(
-                "Ignoring actionsUnregistered from invalid host address %s",
-                msg.sender,
-            )
             return
         action_uuids = payload.get("actionUuids", [])
         removed: list[str] = []
@@ -166,13 +224,7 @@ class ActionRegistry(BaseComponent):
                 ActionsChangedEvent(registered=[], unregistered=removed)
             )
 
-    async def _handle_host_offline(self, msg: DeckrMessage) -> None:
-        """Remove all actions for a host when the transport reports it offline."""
-        payload = plugin_payload(msg)
-        host_id = payload.get("hostId") or parse_host_address(msg.sender)
-        if not host_id:
-            logger.warning("Ignoring hostOffline from invalid host address %s", msg.sender)
-            return
+    async def _remove_host_actions(self, host_id: str, *, reason: str) -> None:
         removed = [
             qualified
             for qualified, (entry_host_id, _) in self._action_registry.items()
@@ -182,28 +234,55 @@ class ActionRegistry(BaseComponent):
             del self._action_registry[qualified]
         if removed:
             logger.warning(
-                "Host %s went offline; removing %d actions", host_id, len(removed)
+                "Host %s became unavailable via %s; removing %d actions",
+                host_id,
+                reason,
+                len(removed),
             )
             await self._publish_actions_changed(
                 ActionsChangedEvent(registered=[], unregistered=removed)
             )
+
+    async def _handle_host_offline(self, msg: DeckrMessage) -> None:
+        """Handle graceful hostOffline as a lifecycle hint."""
+        payload = plugin_payload(msg)
+        host_id = self._host_id_from_sender(
+            msg,
+            payload,
+            message_type=HOST_OFFLINE,
+        )
+        if not host_id:
+            return
+        await self._remove_host_actions(host_id, reason="hostOffline")
 
     async def start(self, ctx: RunContext) -> None:
         start_soon = getattr(ctx.tg, "start_soon", None)
         if start_soon is None:
             raise RuntimeError("ActionRegistry requires start_soon in RunContext")
 
-        # Register builtin actions first
+        self._builtin_action_registry.clear()
         for action_uuid in self._builtin_registry.provides_actions():
             descriptor = self._builtin_registry.get_action_descriptor(action_uuid)
             if descriptor:
-                qualified = _qualified_id("builtin", action_uuid)
-                self._action_registry[qualified] = (
-                    "builtin",
-                    descriptor,
-                )
+                self._builtin_action_registry[action_uuid] = descriptor
 
         start_soon(self._subscription_loop)
+        start_soon(self._route_event_loop)
+
+    async def _route_event_loop(self) -> None:
+        async with self._event_bus.route_table.subscribe() as stream:
+            async for event in stream:
+                if event.event_type != "endpointUnreachable" or event.endpoint is None:
+                    continue
+                if event.lane != self._event_bus.lane:
+                    continue
+                host_id = parse_host_address(event.endpoint)
+                if host_id is None:
+                    continue
+                await self._remove_host_actions(
+                    host_id,
+                    reason=event.reason or "routeLoss",
+                )
 
     async def _subscription_loop(self) -> None:
         async with self._event_bus.subscribe() as stream:
@@ -228,3 +307,4 @@ class ActionRegistry(BaseComponent):
 
     async def stop(self) -> None:
         self._action_registry.clear()
+        self._builtin_action_registry.clear()

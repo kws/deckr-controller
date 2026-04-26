@@ -9,6 +9,7 @@ from deckr.core.component import RunContext
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
+    HOST_OFFLINE,
     REQUEST_ACTIONS,
     ActionDescriptor,
     DeckrMessage,
@@ -22,6 +23,10 @@ from deckr.python_plugin.interface import PluginAction
 from deckr.transports.bus import EventBus
 
 from deckr.controller.plugin.action_registry import ActionRegistry
+from deckr.controller.plugin.builtin import (
+    BUILTIN_ACTION_PROVIDER_ID,
+    LEGACY_BUILTIN_ACTION_PROVIDER_ID,
+)
 from deckr.controller.plugin.events import ActionsChangedEvent
 
 CONTROLLER_ID = "controller-main"
@@ -47,13 +52,15 @@ def _actions_payload(host_id: str = "test_host") -> dict:
 def _actions_registered_message(
     *,
     host_id: str = "test_host",
+    payload_host_id: str | None = None,
     recipient=CONTROLLER_ADDR,
 ) -> DeckrMessage:
+    payload_host_id = host_id if payload_host_id is None else payload_host_id
     return plugin_message(
         sender=host_address(host_id),
         recipient=recipient,
         message_type=ACTIONS_REGISTERED,
-        payload=_actions_payload(host_id),
+        payload=_actions_payload(payload_host_id),
         subject=plugin_actions_subject(host_id),
     )
 
@@ -61,13 +68,31 @@ def _actions_registered_message(
 def _actions_unregistered_message(
     *,
     host_id: str = "test_host",
+    payload_host_id: str | None = None,
     recipient=CONTROLLER_ADDR,
 ) -> DeckrMessage:
+    payload_host_id = host_id if payload_host_id is None else payload_host_id
     return plugin_message(
         sender=host_address(host_id),
         recipient=recipient,
         message_type=ACTIONS_UNREGISTERED,
-        payload={"hostId": host_id, "actionUuids": [StubAction.uuid]},
+        payload={"hostId": payload_host_id, "actionUuids": [StubAction.uuid]},
+        subject=plugin_actions_subject(host_id),
+    )
+
+
+def _host_offline_message(
+    *,
+    host_id: str = "test_host",
+    payload_host_id: str | None = None,
+    recipient=CONTROLLER_ADDR,
+) -> DeckrMessage:
+    payload_host_id = host_id if payload_host_id is None else payload_host_id
+    return plugin_message(
+        sender=host_address(host_id),
+        recipient=recipient,
+        message_type=HOST_OFFLINE,
+        payload={"hostId": payload_host_id},
         subject=plugin_actions_subject(host_id),
     )
 
@@ -189,6 +214,51 @@ async def test_actions_registered_with_controller_broadcast_populates_registry()
 
 
 @pytest.mark.asyncio
+async def test_actions_registered_rejects_payload_host_id_mismatch():
+    """actionsRegistered ownership comes from sender, and mismatched payload is rejected."""
+    bus = _plugin_bus()
+    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    stopping = anyio.Event()
+    mock_tg = MagicMock()
+    mock_tg.start_soon = lambda fn, *a, **k: None
+    ctx = RunContext(tg=mock_tg, stopping=stopping)
+    await registry.start(ctx)
+
+    await registry._handle_actions_registered(
+        _actions_registered_message(host_id="actual", payload_host_id="spoofed")
+    )
+
+    assert await registry.get_action(f"actual::{StubAction.uuid}") is None
+    assert await registry.get_action(f"spoofed::{StubAction.uuid}") is None
+    assert await registry.get_action(StubAction.uuid) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reserved_host_id",
+    [BUILTIN_ACTION_PROVIDER_ID, LEGACY_BUILTIN_ACTION_PROVIDER_ID],
+)
+async def test_actions_registered_rejects_reserved_builtin_provider_sender(
+    reserved_host_id: str,
+):
+    """Route-owned plugin hosts cannot use reserved builtin provider ids."""
+    bus = _plugin_bus()
+    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    stopping = anyio.Event()
+    mock_tg = MagicMock()
+    mock_tg.start_soon = lambda fn, *a, **k: None
+    ctx = RunContext(tg=mock_tg, stopping=stopping)
+    await registry.start(ctx)
+
+    await registry._handle_actions_registered(
+        _actions_registered_message(host_id=reserved_host_id)
+    )
+
+    assert await registry.get_action(f"{reserved_host_id}::{StubAction.uuid}") is None
+    assert await registry.get_action(StubAction.uuid) is None
+
+
+@pytest.mark.asyncio
 async def test_actions_unregistered_removes_from_registry():
     """actionsUnregistered message removes actions from registry."""
     bus = _plugin_bus()
@@ -208,6 +278,51 @@ async def test_actions_unregistered_removes_from_registry():
         _actions_unregistered_message()
     )
     assert await registry.get_action(StubAction.uuid) is None
+
+
+@pytest.mark.asyncio
+async def test_actions_unregistered_rejects_payload_host_id_mismatch():
+    """A sender cannot unregister another host's actions through payload hostId."""
+    bus = _plugin_bus()
+    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    stopping = anyio.Event()
+    mock_tg = MagicMock()
+    mock_tg.start_soon = lambda fn, *a, **k: None
+    ctx = RunContext(tg=mock_tg, stopping=stopping)
+    await registry.start(ctx)
+
+    await registry._handle_actions_registered(
+        _actions_registered_message(host_id="victim")
+    )
+    assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
+
+    await registry._handle_actions_unregistered(
+        _actions_unregistered_message(host_id="attacker", payload_host_id="victim")
+    )
+
+    assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
+    assert await registry.get_action(f"attacker::{StubAction.uuid}") is None
+
+
+@pytest.mark.asyncio
+async def test_host_offline_rejects_payload_host_id_mismatch():
+    """A sender cannot offline another host's actions through payload hostId."""
+    bus = _plugin_bus()
+    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    stopping = anyio.Event()
+    mock_tg = MagicMock()
+    mock_tg.start_soon = lambda fn, *a, **k: None
+    ctx = RunContext(tg=mock_tg, stopping=stopping)
+    await registry.start(ctx)
+
+    await registry._handle_actions_registered(
+        _actions_registered_message(host_id="victim")
+    )
+    await registry._handle_host_offline(
+        _host_offline_message(host_id="attacker", payload_host_id="victim")
+    )
+
+    assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
 
 
 @pytest.mark.asyncio
@@ -284,6 +399,124 @@ async def test_actions_unregistered_emits_actions_changed_event():
     assert len(received_events) == 1
     assert received_events[0].registered == []
     assert received_events[0].unregistered == [f"test_host::{StubAction.uuid}"]
+
+
+@pytest.mark.asyncio
+async def test_host_route_loss_unregisters_actions_without_host_offline():
+    """Abrupt route loss removes host actions through the route control plane."""
+    bus = _plugin_bus()
+    received_events = []
+
+    async def on_actions_changed(event: ActionsChangedEvent) -> None:
+        received_events.append(event)
+
+    registry = ActionRegistry(
+        event_bus=bus,
+        controller_id=CONTROLLER_ID,
+        on_actions_changed=on_actions_changed,
+    )
+    stopping = anyio.Event()
+
+    async with anyio.create_task_group() as tg:
+        ctx = RunContext(tg=tg, stopping=stopping)
+        await registry.start(ctx)
+        await anyio.sleep(0.01)
+
+        await bus.route_table.claim_endpoint(
+            endpoint=host_address("test_host"),
+            lane="plugin_messages",
+            client_id="websocket:test_host",
+            client_kind="remote",
+            transport_kind="websocket",
+            transport_id="ws-main",
+            claim_source="message_sender",
+        )
+        await bus.send(_actions_registered_message(recipient=controllers_broadcast()))
+        with anyio.fail_after(1.0):
+            while len(received_events) < 1:
+                await anyio.sleep(0.01)
+        assert received_events[0].registered == [f"test_host::{StubAction.uuid}"]
+        received_events.clear()
+
+        await bus.route_table.client_disconnected("websocket:test_host")
+        with anyio.fail_after(1.0):
+            while len(received_events) < 1:
+                await anyio.sleep(0.01)
+
+        tg.cancel_scope.cancel()
+
+    assert len(received_events) == 1
+    assert received_events[0].registered == []
+    assert received_events[0].unregistered == [f"test_host::{StubAction.uuid}"]
+    assert await registry.get_action(StubAction.uuid) is None
+
+
+@pytest.mark.asyncio
+async def test_host_builtin_route_loss_does_not_remove_builtin_actions():
+    """Builtins are an internal provider namespace, not route-owned host actions."""
+    bus = _plugin_bus()
+    received_events = []
+
+    async def on_actions_changed(event: ActionsChangedEvent) -> None:
+        received_events.append(event)
+
+    registry = ActionRegistry(
+        event_bus=bus,
+        controller_id=CONTROLLER_ID,
+        on_actions_changed=on_actions_changed,
+    )
+    stopping = anyio.Event()
+
+    async with anyio.create_task_group() as tg:
+        ctx = RunContext(tg=tg, stopping=stopping)
+        await registry.start(ctx)
+        await anyio.sleep(0.01)
+
+        builtin = await registry.get_action("deckr.plugin.builtin.gotopage")
+        assert builtin is not None
+        assert builtin.host_id == BUILTIN_ACTION_PROVIDER_ID
+
+        await bus.route_table.claim_endpoint(
+            endpoint=host_address("builtin"),
+            lane="plugin_messages",
+            client_id="websocket:builtin",
+            client_kind="remote",
+            transport_kind="websocket",
+            transport_id="ws-main",
+            claim_source="message_sender",
+        )
+        await bus.route_table.client_disconnected("websocket:builtin")
+        await anyio.sleep(0.05)
+
+        tg.cancel_scope.cancel()
+
+    builtin = await registry.get_action("deckr.plugin.builtin.gotopage")
+    assert builtin is not None
+    assert builtin.host_id == BUILTIN_ACTION_PROVIDER_ID
+    assert received_events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_id",
+    [BUILTIN_ACTION_PROVIDER_ID, LEGACY_BUILTIN_ACTION_PROVIDER_ID],
+)
+async def test_builtin_actions_resolve_by_provider_qualified_address(provider_id: str):
+    bus = _plugin_bus()
+    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    stopping = anyio.Event()
+    mock_tg = MagicMock()
+    mock_tg.start_soon = lambda fn, *a, **k: None
+    ctx = RunContext(tg=mock_tg, stopping=stopping)
+    await registry.start(ctx)
+
+    action = await registry.get_action(
+        f"{provider_id}::deckr.plugin.builtin.gotopage"
+    )
+
+    assert action is not None
+    assert action.uuid == "deckr.plugin.builtin.gotopage"
+    assert action.host_id == BUILTIN_ACTION_PROVIDER_ID
 
 
 @pytest.mark.asyncio

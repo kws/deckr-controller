@@ -6,6 +6,15 @@ from deckr.pluginhost.messages import ActionDescriptor
 from deckr.controller.plugin.builtin._goto import GoToPageAction
 from deckr.controller.plugin.builtin._nav_home import NavHomeAction
 
+BUILTIN_ACTION_PROVIDER_ID = "deckr.controller.builtin"
+LEGACY_BUILTIN_ACTION_PROVIDER_ID = "builtin"
+RESERVED_BUILTIN_PROVIDER_IDS = frozenset(
+    {
+        BUILTIN_ACTION_PROVIDER_ID,
+        LEGACY_BUILTIN_ACTION_PROVIDER_ID,
+    }
+)
+
 
 class BuiltinRegistry:
     """Registry of builtin actions. Resolved by controller before plugin hosts."""

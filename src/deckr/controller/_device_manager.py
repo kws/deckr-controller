@@ -62,6 +62,7 @@ from deckr.controller._render_dispatcher import (
     ThreadRenderBackend,
 )
 from deckr.controller.config._data import Control, DeviceConfig, Profile
+from deckr.controller.plugin.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.plugin.context import ControlContext
 from deckr.controller.plugin.provider import PluginManager
 from deckr.controller.settings import (
@@ -324,7 +325,7 @@ class DeviceManager:
                     dict(binding.settings),
                 )
         builtin_action = None
-        if action_meta.host_id == "builtin" and hasattr(
+        if action_meta.host_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
             self.manager, "get_builtin_action"
         ):
             builtin_action = self.manager.get_builtin_action(action_meta.uuid)
@@ -423,7 +424,7 @@ class DeviceManager:
                 )
 
     async def _emit_page_appear(self, owner: DynamicPageOwner) -> None:
-        if owner.owner_host_id == "builtin":
+        if owner.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
             return
         settings = (
             await self._settings_service.get(owner.settings_target)
@@ -449,7 +450,7 @@ class DeviceManager:
         await self._plugin_bus.send(msg)
 
     async def _emit_page_disappear(self, owner: DynamicPageOwner, reason: str) -> None:
-        if owner.owner_host_id == "builtin":
+        if owner.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
             return
         event = PageDisappear(
             context=owner.page_context_id,
