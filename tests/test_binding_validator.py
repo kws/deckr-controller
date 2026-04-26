@@ -214,7 +214,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     def start_soon(*args, **kwargs):
         pass
 
-    plugin_bus = EventBus()
+    plugin_bus = EventBus("plugin_messages")
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
@@ -281,7 +281,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
 
     registry.get_action = get_action
 
-    plugin_bus = EventBus()
+    plugin_bus = EventBus("plugin_messages")
     async with anyio.create_task_group() as tg:
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,

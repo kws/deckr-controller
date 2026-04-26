@@ -2,17 +2,19 @@ import logging
 from collections.abc import Callable
 
 import anyio
+from deckr.contracts.messages import DeckrMessage, plugin_hosts_broadcast
 from deckr.core.component import BaseComponent, RunContext
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
 from deckr.pluginhost.messages import (
-    ALL_HOSTS,
     COMMAND_MESSAGE_TYPES,
     HOST_ONLINE,
     REQUEST_ACTIONS,
-    HostMessage,
     controller_address,
-    extract_device_id,
+    plugin_actions_subject,
+    plugin_message,
+    plugin_message_for_controller,
+    subject_device_id,
 )
 from deckr.transports.bus import EventBus
 
@@ -48,10 +50,13 @@ class ControllerService(BaseComponent):
         super().__init__()
         self._driver_bus = driver_bus
         self._device_registry = HardwareDeviceRegistry()
-        self._command_service = HardwareCommandService(driver_bus)
         self._config_service = config_service
         self._settings_service = settings_service
         self._controller_id = controller_id
+        self._command_service = HardwareCommandService(
+            driver_bus,
+            controller_id=controller_id,
+        )
         self._controller_contexts = AsyncMap[str, DeviceManager]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
@@ -59,84 +64,94 @@ class ControllerService(BaseComponent):
         self._start_soon: Callable | None = None
         self._render_backend = render_backend
 
-    async def _handle_plugin_command(self, msg: HostMessage) -> None:
+    async def _handle_plugin_command(self, msg: DeckrMessage) -> None:
         """Route command messages to the appropriate DeviceManager."""
-        if msg.type not in COMMAND_MESSAGE_TYPES:
+        if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
-        payload = msg.payload
-        context_id = payload.get("contextId", "")
-        device_id = extract_device_id(context_id)
+        device_id = subject_device_id(msg.subject)
+        if device_id is None:
+            logger.warning(
+                "Ignoring plugin command %s without device subject from %s",
+                msg.message_type,
+                msg.sender,
+            )
+            return
         ctrl_ctx = await self._controller_contexts.get(device_id)
         if ctrl_ctx is not None:
             await ctrl_ctx.handle_command(msg)
 
-    async def _handle_host_online(self, msg: HostMessage) -> None:
+    async def _handle_host_online(self, msg: DeckrMessage) -> None:
         if self._plugin_bus is None:
             return
         await self._plugin_bus.send(
-            HostMessage(
-                from_id=controller_address(self._controller_id),
-                to_id=msg.from_id,
-                type=REQUEST_ACTIONS,
+            plugin_message(
+                sender=controller_address(self._controller_id),
+                recipient=msg.sender,
+                message_type=REQUEST_ACTIONS,
                 payload={},
+                subject=plugin_actions_subject(),
             )
         )
+
+    async def handle_actions_changed_event(self, event: ActionsChangedEvent) -> None:
+        controller_contexts = await self._controller_contexts.values()
+        logger.info(
+            "Applying ActionsChangedEvent to %d device(s): +%s -%s",
+            len(controller_contexts),
+            event.registered,
+            event.unregistered,
+        )
+        for ctrl_ctx in controller_contexts:
+            await ctrl_ctx.on_actions_changed(event.registered, event.unregistered)
 
     async def _plugin_subscription_loop(self) -> None:
         """Subscribe to plugin bus and route command messages to DeviceManagers."""
         if self._plugin_bus is None:
             return
         async with self._plugin_bus.subscribe() as stream:
-            async for envelope in stream:
-                event = envelope.message
+            async for event in stream:
                 try:
-                    if isinstance(event, ActionsChangedEvent):
-                        controller_contexts = await self._controller_contexts.values()
-                        logger.info(
-                            "Applying ActionsChangedEvent to %d device(s): +%s -%s",
-                            len(controller_contexts),
-                            event.registered,
-                            event.unregistered,
-                        )
-                        for ctrl_ctx in controller_contexts:
-                            await ctrl_ctx.on_actions_changed(
-                                event.registered, event.unregistered
-                            )
+                    if not isinstance(event, DeckrMessage):
                         continue
-                    if not isinstance(event, HostMessage):
+                    if not plugin_message_for_controller(event, self._controller_id):
                         continue
-                    if not event.for_controller(self._controller_id):
-                        continue
-                    if event.type == HOST_ONLINE:
+                    if event.message_type == HOST_ONLINE:
                         await self._handle_host_online(event)
                         continue
-                    if event.type in COMMAND_MESSAGE_TYPES:
+                    if event.message_type in COMMAND_MESSAGE_TYPES:
                         await self._handle_plugin_command(event)
                 except Exception:
-                    if isinstance(event, HostMessage):
+                    if isinstance(event, DeckrMessage):
                         logger.exception(
                             "Error handling plugin message %s from %s",
-                            event.type,
-                            event.from_id,
+                            event.message_type,
+                            event.sender,
                         )
                     else:
                         logger.exception("Error handling plugin bus event")
 
     async def _event_loop(self):
         async with self._driver_bus.subscribe() as subscribe:
-            async for envelope in subscribe:
-                event = envelope.message
+            async for message in subscribe:
+                event = hw_events.hardware_body_from_message(message)
                 if isinstance(event, hw_events.DeviceConnectedMessage):
-                    device = self._device_registry.connect(event)
+                    self._command_service.register_device(message)
+                    device = self._device_registry.connect(message, event)
                     await self.on_device_connected(device)
                 elif isinstance(event, hw_events.DeviceDisconnectedMessage):
-                    self._device_registry.disconnect(event.device_id)
-                    await self.on_device_disconnected(event.device_id)
+                    device_id = hw_events.subject_device_id(message.subject)
+                    if device_id is None:
+                        continue
+                    self._device_registry.disconnect(device_id)
+                    self._command_service.unregister_device(device_id)
+                    await self.on_device_disconnected(device_id)
                 elif isinstance(event, hw_events.HARDWARE_INPUT_MESSAGE_TYPES):
-                    device_id = event.device_id
+                    device_id = hw_events.subject_device_id(message.subject)
+                    if device_id is None:
+                        continue
                     ctrl_ctx = await self._controller_contexts.get(device_id)
                     if ctrl_ctx is not None:
-                        await ctrl_ctx.on_event(event)
+                        await ctrl_ctx.on_event(message)
 
     async def start(self, ctx: RunContext):
         self._start_soon = ctx.tg.start_soon
@@ -144,11 +159,12 @@ class ControllerService(BaseComponent):
             self._render_backend = ProcessPoolRenderBackend()
         if self._plugin_bus is not None:
             ctx.tg.start_soon(self._plugin_subscription_loop)
-            request_msg = HostMessage(
-                from_id=controller_address(self._controller_id),
-                to_id=ALL_HOSTS,
-                type=REQUEST_ACTIONS,
+            request_msg = plugin_message(
+                sender=controller_address(self._controller_id),
+                recipient=plugin_hosts_broadcast(),
+                message_type=REQUEST_ACTIONS,
                 payload={},
+                subject=plugin_actions_subject(),
             )
             logger.info("Requesting actions from all hosts")
             await self._plugin_bus.send(request_msg)

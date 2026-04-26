@@ -1,37 +1,83 @@
 """DeviceManager integration tests. Uses mock devices (no VirtualDevice)."""
 
+from unittest.mock import AsyncMock, MagicMock
+
+import anyio
 import pytest
 import pytest_asyncio
-import anyio
-from unittest.mock import MagicMock, AsyncMock
-
-from deckr.controller._device_manager import DeviceManager
-from deckr.controller._render import RenderResult
-from deckr.transports.bus import EventBus
+from deckr.contracts.messages import DeckrMessage
 from deckr.core.component import RunContext
-from deckr.controller.plugin.provider import ActionMetadata
-from deckr.controller.settings import SettingsTarget
-from deckr.controller.config._data import DeviceConfig, Profile, Page, Control
 from deckr.hardware import events as hw_events
 from deckr.hardware.events import (
     HardwareCoordinates,
-    HardwareImageFormat,
     HardwareDevice,
+    HardwareImageFormat,
     HardwareSlot,
 )
-from invariant import Node, SubGraphNode, dump_graph_output_data_uri
-from invariant.params import ref
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     build_context_id,
+    context_subject,
     controller_address,
     host_address,
+    plugin_actions_subject,
+    plugin_message,
+    plugin_message_for_host,
+    plugin_payload,
 )
+from deckr.transports.bus import EventBus
+from invariant import Node, SubGraphNode, dump_graph_output_data_uri
+from invariant.params import ref
+
+from deckr.controller._device_manager import DeviceManager
+from deckr.controller._render import RenderResult
+from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
+from deckr.controller.plugin.provider import ActionMetadata
+from deckr.controller.settings import SettingsTarget
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
 HOST_ID = "python"
 HOST_ADDR = host_address(HOST_ID)
+
+
+def _plugin_bus() -> EventBus:
+    return EventBus("plugin_messages")
+
+
+def _context_id(device_id: str = "test-device", slot_id: str = "0,0") -> str:
+    return build_context_id(CONTROLLER_ID, device_id, slot_id)
+
+
+def _plugin_command(
+    message_type: str,
+    payload: dict | None = None,
+    *,
+    device_id: str = "test-device",
+    slot_id: str = "0,0",
+) -> DeckrMessage:
+    context_id = _context_id(device_id, slot_id)
+    return plugin_message(
+        sender=HOST_ADDR,
+        recipient=CONTROLLER_ADDR,
+        message_type=message_type,
+        payload={"contextId": context_id, **(payload or {})},
+        subject=context_subject(context_id),
+    )
+
+
+def _actions_registered_message(action_uuid: str) -> DeckrMessage:
+    return plugin_message(
+        sender=HOST_ADDR,
+        recipient=CONTROLLER_ADDR,
+        message_type=ACTIONS_REGISTERED,
+        payload={
+            "hostId": HOST_ID,
+            "actionUuids": [action_uuid],
+            "actions": [{"uuid": action_uuid}],
+        },
+        subject=plugin_actions_subject(HOST_ID),
+    )
 
 
 def _make_slot(
@@ -170,7 +216,6 @@ class MockPluginHost:
             PluginContextRegistry,
         )
         from deckr.plugin_hosts.python.message_context import MessagePluginContext
-        from deckr.pluginhost.messages import ACTIONS_REGISTERED, HostMessage
 
         def create_context(*, context_id: str, settings: dict | None = None):
             return MessagePluginContext(
@@ -184,29 +229,9 @@ class MockPluginHost:
         self._registry = PluginContextRegistry(create_context)
         ctx.tg.start_soon(self._subscription_loop)
         await self._ensure_plugins()
-        actions = [{"uuid": self._action.uuid}]
-        msg = HostMessage(
-            from_id=HOST_ADDR,
-            to_id=CONTROLLER_ADDR,
-            type=ACTIONS_REGISTERED,
-            payload={
-                "hostId": self.name,
-                "actionUuids": [self._action.uuid],
-                "actions": actions,
-            },
-        )
-        await self._event_bus.send(msg)
+        await self._event_bus.send(_actions_registered_message(self._action.uuid))
 
     async def _subscription_loop(self):
-        from deckr.python_plugin.events import (
-            DialRotate,
-            KeyDown,
-            KeyUp,
-            TouchSwipe,
-            TouchTap,
-            WillAppear,
-            WillDisappear,
-        )
         from deckr.pluginhost.messages import (
             DIAL_ROTATE,
             HERE_ARE_SETTINGS,
@@ -217,7 +242,15 @@ class MockPluginHost:
             TOUCH_TAP,
             WILL_APPEAR,
             WILL_DISAPPEAR,
-            HostMessage,
+        )
+        from deckr.python_plugin.events import (
+            DialRotate,
+            KeyDown,
+            KeyUp,
+            TouchSwipe,
+            TouchTap,
+            WillAppear,
+            WillDisappear,
         )
 
         def event_from_payload(event_type, payload):
@@ -240,34 +273,26 @@ class MockPluginHost:
         if self._event_bus is None or self._registry is None:
             return
         async with self._event_bus.subscribe() as stream:
-            async for envelope in stream:
-                event = envelope.message
-                if not isinstance(event, HostMessage) or not event.for_host(self.name):
+            async for event in stream:
+                if not isinstance(event, DeckrMessage) or not plugin_message_for_host(
+                    event, self.name
+                ):
                     continue
-                if event.type not in HOST_MSG_TYPES:
+                if event.message_type not in HOST_MSG_TYPES:
                     continue
                 msg = event
-                if msg.type == REQUEST_ACTIONS:
-                    payload = {
-                        "hostId": self.name,
-                        "actionUuids": [self._action.uuid],
-                        "actions": [{"uuid": self._action.uuid}],
-                    }
-                    resp = HostMessage(
-                        from_id=HOST_ADDR,
-                        to_id=CONTROLLER_ADDR,
-                        type=ACTIONS_REGISTERED,
-                        payload=payload,
+                if msg.message_type == REQUEST_ACTIONS:
+                    await self._event_bus.send(
+                        _actions_registered_message(self._action.uuid)
                     )
-                    await self._event_bus.send(resp)
-                elif msg.type == HERE_ARE_SETTINGS:
-                    payload = msg.payload
+                elif msg.message_type == HERE_ARE_SETTINGS:
+                    payload = plugin_payload(msg)
                     context_id = payload.get("contextId", "")
                     settings = payload.get("settings", {})
                     if context_id:
                         self._registry.deliver_settings(context_id, settings)
-                elif msg.type == WILL_APPEAR:
-                    payload = msg.payload
+                elif msg.message_type == WILL_APPEAR:
+                    payload = plugin_payload(msg)
                     event_data = payload.get("event", payload)
                     ev = WillAppear.model_validate(event_data)
                     action_uuid = payload.get("actionUuid", "")
@@ -279,8 +304,8 @@ class MockPluginHost:
                         ev.context, settings=dict(settings)
                     )
                     await action.on_will_appear(ev, ctx)
-                elif msg.type == WILL_DISAPPEAR:
-                    payload = msg.payload
+                elif msg.message_type == WILL_DISAPPEAR:
+                    payload = plugin_payload(msg)
                     event_data = payload.get("event", payload)
                     ev = WillDisappear.model_validate(event_data)
                     action_uuid = payload.get("actionUuid", "")
@@ -294,8 +319,8 @@ class MockPluginHost:
                             await action.on_will_disappear(ev, ctx)
                         finally:
                             self._registry.remove(context_id)
-                elif msg.type == KEY_UP:
-                    payload = msg.payload
+                elif msg.message_type == KEY_UP:
+                    payload = plugin_payload(msg)
                     action_uuid = payload.get("actionUuid", "")
                     ev = event_from_payload(KeyUp, payload)
                     action = await self._get_action(action_uuid)
@@ -306,8 +331,8 @@ class MockPluginHost:
                                 ev.context, settings=None
                             )
                         await action.on_key_up(ev, ctx)
-                elif msg.type == KEY_DOWN:
-                    payload = msg.payload
+                elif msg.message_type == KEY_DOWN:
+                    payload = plugin_payload(msg)
                     action_uuid = payload.get("actionUuid", "")
                     ev = event_from_payload(KeyDown, payload)
                     action = await self._get_action(action_uuid)
@@ -318,8 +343,8 @@ class MockPluginHost:
                                 ev.context, settings=None
                             )
                         await action.on_key_down(ev, ctx)
-                elif msg.type == DIAL_ROTATE:
-                    payload = msg.payload
+                elif msg.message_type == DIAL_ROTATE:
+                    payload = plugin_payload(msg)
                     action_uuid = payload.get("actionUuid", "")
                     ev = event_from_payload(DialRotate, payload)
                     action = await self._get_action(action_uuid)
@@ -330,8 +355,8 @@ class MockPluginHost:
                                 ev.context, settings=None
                             )
                         await action.on_dial_rotate(ev, ctx)
-                elif msg.type == TOUCH_TAP:
-                    payload = msg.payload
+                elif msg.message_type == TOUCH_TAP:
+                    payload = plugin_payload(msg)
                     action_uuid = payload.get("actionUuid", "")
                     ev = event_from_payload(TouchTap, payload)
                     action = await self._get_action(action_uuid)
@@ -342,8 +367,8 @@ class MockPluginHost:
                                 ev.context, settings=None
                             )
                         await action.on_touch_tap(ev, ctx)
-                elif msg.type == TOUCH_SWIPE:
-                    payload = msg.payload
+                elif msg.message_type == TOUCH_SWIPE:
+                    payload = plugin_payload(msg)
                     action_uuid = payload.get("actionUuid", "")
                     ev = event_from_payload(TouchSwipe, payload)
                     action = await self._get_action(action_uuid)
@@ -369,7 +394,7 @@ class MockPluginService:
 
     def __init__(self, action=None, start_soon=None):
         self._action = action or SetImageOnAppearAction()
-        self._bus = EventBus()
+        self._bus = _plugin_bus()
         self._start_soon = start_soon
         self._adapter = None
         self._command_handler = None
@@ -387,14 +412,13 @@ class MockPluginService:
         start_soon(self._command_subscription_loop)
 
     async def _command_subscription_loop(self):
-        from deckr.pluginhost.messages import COMMAND_MESSAGE_TYPES, HostMessage
+        from deckr.pluginhost.messages import COMMAND_MESSAGE_TYPES
 
         async with self._bus.subscribe() as stream:
-            async for envelope in stream:
-                event = envelope.message
+            async for event in stream:
                 if (
-                    isinstance(event, HostMessage)
-                    and event.type in COMMAND_MESSAGE_TYPES
+                    isinstance(event, DeckrMessage)
+                    and event.message_type in COMMAND_MESSAGE_TYPES
                 ):
                     if self._command_handler is not None:
                         await self._command_handler(event)
@@ -451,7 +475,7 @@ async def test_key_press_renders_to_device(
     device_config_set_image, persistence_tmp_dir
 ):
     """Graph-backed setImage returns promptly and the frame is written asynchronously."""
-    from deckr.pluginhost.messages import HostMessage, SET_IMAGE
+    from deckr.pluginhost.messages import SET_IMAGE
 
     device = _make_mock_device()
     registry = MagicMock()
@@ -461,7 +485,7 @@ async def test_key_press_renders_to_device(
             host_id="python",
         )
     )
-    plugin_bus = EventBus()
+    plugin_bus = _plugin_bus()
     command_service = FakeHardwareCommandService()
 
     async with anyio.create_task_group() as tg:
@@ -476,15 +500,7 @@ async def test_key_press_renders_to_device(
         )
         await manager.set_page(profile="default", page=0)
         baseline_calls = command_service.set_image.call_count
-        msg = HostMessage(
-            from_id=HOST_ADDR,
-            to_id=CONTROLLER_ADDR,
-            type=SET_IMAGE,
-            payload={
-                "contextId": build_context_id(CONTROLLER_ID, "test-device", "0,0"),
-                "image": _solid_key_image(),
-            },
-        )
+        msg = _plugin_command(SET_IMAGE, {"image": _solid_key_image()})
         with anyio.fail_after(0.2):
             await manager.handle_command(msg)
 
@@ -505,10 +521,10 @@ async def test_set_image_last_write_wins_same_slot(
     device_config_set_image, persistence_tmp_dir
 ):
     """Rapid successive graph-backed setImage commands only apply the newest frame."""
-    from deckr.pluginhost.messages import HostMessage, SET_IMAGE
+    from deckr.pluginhost.messages import SET_IMAGE
 
     device = _make_mock_device()
-    plugin_bus = EventBus()
+    plugin_bus = _plugin_bus()
     registry = MagicMock()
     registry.get_action = AsyncMock(
         return_value=ActionMetadata(
@@ -533,15 +549,7 @@ async def test_set_image_last_write_wins_same_slot(
         await manager.set_page(profile="default", page=0)
         initial_generation = manager._render_dispatcher._slots["0,0"].generation
 
-        msg = HostMessage(
-            from_id=HOST_ADDR,
-            to_id=CONTROLLER_ADDR,
-            type=SET_IMAGE,
-            payload={
-                "contextId": build_context_id(CONTROLLER_ID, "test-device", "0,0"),
-                "image": _solid_key_image(),
-            },
-        )
+        msg = _plugin_command(SET_IMAGE, {"image": _solid_key_image()})
 
         await manager.handle_command(msg)
         await manager.handle_command(msg)
@@ -647,7 +655,7 @@ async def test_settings_isolated_by_page_same_slot(persistence_tmp_dir):
             host_id="python",
         )
     )
-    plugin_bus = EventBus()
+    plugin_bus = _plugin_bus()
 
     config = DeviceConfig(
         id="test-device",
@@ -724,7 +732,7 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
             host_id="python",
         )
     )
-    plugin_bus = EventBus()
+    plugin_bus = _plugin_bus()
 
     config = DeviceConfig(
         id="test-device",
@@ -795,7 +803,7 @@ async def test_set_page_reconciles_and_prunes_stale_settings(
             host_id="python",
         )
     )
-    plugin_bus = EventBus()
+    plugin_bus = _plugin_bus()
     async with anyio.create_task_group():
 
         def start_soon(*args, **kwargs):
@@ -867,7 +875,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_slot(
 ):
     """When action becomes available, on_actions_changed creates context for previously unavailable slot."""
     device = _make_mock_device()
-    plugin_bus = EventBus()
+    plugin_bus = _plugin_bus()
     registry = ConfigurableActionRegistry()
     # Initially no action - slot will show unavailable
     config = DeviceConfig(
@@ -935,7 +943,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_slot(
 async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_dir):
     """When action becomes unavailable, on_actions_changed removes context and renders unavailable."""
     device = _make_mock_device()
-    plugin_bus = EventBus()
+    plugin_bus = _plugin_bus()
     registry = ConfigurableActionRegistry()
     registry.add_action(
         ACTION_X_UUID,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from deckr.hardware import events as hw_events
+from deckr.pluginhost.messages import build_context_id as _build_context_id
 from deckr.python_plugin.events import (
     DialRotate,
     KeyDown,
@@ -12,7 +13,6 @@ from deckr.python_plugin.events import (
     TouchSwipe,
     TouchTap,
 )
-from deckr.pluginhost.messages import build_context_id as _build_context_id
 
 
 def build_context_id(controller_id: str, device_id: str, slot_id: str) -> str:
@@ -54,12 +54,9 @@ class EventTranslator:
     ) -> TranslatedEvent | None:
         """
         Translate a hardware event to plugin dispatch metadata.
-        Returns None if event is not an interaction type or device_id does not match.
+        Returns None if event is not an interaction type.
         Caller is responsible for resolving action context by slot_id.
         """
-        if event.device_id != device_id:
-            return None
-
         if isinstance(event, hw_events.KeyDownMessage):
             return self._translate_key_down(event, device_id)
         if isinstance(event, hw_events.KeyUpMessage):

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
+from deckr.contracts.messages import DeckrMessage, parse_host_address
 from deckr.core.component import BaseComponent, RunContext
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
     HOST_OFFLINE,
     ActionDescriptor,
-    HostMessage,
-    parse_host_address,
+    plugin_message_for_controller,
+    plugin_payload,
 )
 from deckr.transports.bus import EventBus
 
@@ -39,10 +41,17 @@ class ActionRegistry(BaseComponent):
     - action_id: host-agnostic (first available match)
     """
 
-    def __init__(self, event_bus: EventBus, *, controller_id: str):
+    def __init__(
+        self,
+        event_bus: EventBus,
+        *,
+        controller_id: str,
+        on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]] | None = None,
+    ):
         super().__init__(name="ActionRegistry")
         self._event_bus = event_bus
         self._controller_id = controller_id
+        self._on_actions_changed = on_actions_changed
         self._builtin_registry = BuiltinRegistry()
         self._action_registry: dict[str, tuple[str, ActionDescriptor]] = {}
 
@@ -73,12 +82,16 @@ class ActionRegistry(BaseComponent):
         """Return builtin action instance for direct dispatch."""
         return self._builtin_registry.get_action(uuid)
 
-    async def _handle_actions_registered(self, msg: HostMessage) -> None:
+    async def _publish_actions_changed(self, event: ActionsChangedEvent) -> None:
+        if self._on_actions_changed is not None:
+            await self._on_actions_changed(event)
+
+    async def _handle_actions_registered(self, msg: DeckrMessage) -> None:
         """Handle actionsRegistered. Add actions to registry."""
-        payload = msg.payload
-        host_id = payload.get("hostId") or parse_host_address(msg.from_id)
+        payload = plugin_payload(msg)
+        host_id = payload.get("hostId") or parse_host_address(msg.sender)
         if not host_id:
-            logger.warning("Ignoring actionsRegistered from invalid host address %s", msg.from_id)
+            logger.warning("Ignoring actionsRegistered from invalid host address %s", msg.sender)
             return
         touched: list[str] = []
         seen: set[str] = set()
@@ -121,18 +134,18 @@ class ActionRegistry(BaseComponent):
                 host_id,
                 touched,
             )
-            await self._event_bus.send(
+            await self._publish_actions_changed(
                 ActionsChangedEvent(registered=touched, unregistered=[])
             )
 
-    async def _handle_actions_unregistered(self, msg: HostMessage) -> None:
+    async def _handle_actions_unregistered(self, msg: DeckrMessage) -> None:
         """Handle actionsUnregistered. Remove actions from registry."""
-        payload = msg.payload
-        host_id = payload.get("hostId") or parse_host_address(msg.from_id)
+        payload = plugin_payload(msg)
+        host_id = payload.get("hostId") or parse_host_address(msg.sender)
         if not host_id:
             logger.warning(
                 "Ignoring actionsUnregistered from invalid host address %s",
-                msg.from_id,
+                msg.sender,
             )
             return
         action_uuids = payload.get("actionUuids", [])
@@ -149,16 +162,16 @@ class ActionRegistry(BaseComponent):
                 host_id,
                 removed,
             )
-            await self._event_bus.send(
+            await self._publish_actions_changed(
                 ActionsChangedEvent(registered=[], unregistered=removed)
             )
 
-    async def _handle_host_offline(self, msg: HostMessage) -> None:
+    async def _handle_host_offline(self, msg: DeckrMessage) -> None:
         """Remove all actions for a host when the transport reports it offline."""
-        payload = msg.payload
-        host_id = payload.get("hostId") or parse_host_address(msg.from_id)
+        payload = plugin_payload(msg)
+        host_id = payload.get("hostId") or parse_host_address(msg.sender)
         if not host_id:
-            logger.warning("Ignoring hostOffline from invalid host address %s", msg.from_id)
+            logger.warning("Ignoring hostOffline from invalid host address %s", msg.sender)
             return
         removed = [
             qualified
@@ -171,7 +184,7 @@ class ActionRegistry(BaseComponent):
             logger.warning(
                 "Host %s went offline; removing %d actions", host_id, len(removed)
             )
-            await self._event_bus.send(
+            await self._publish_actions_changed(
                 ActionsChangedEvent(registered=[], unregistered=removed)
             )
 
@@ -194,24 +207,23 @@ class ActionRegistry(BaseComponent):
 
     async def _subscription_loop(self) -> None:
         async with self._event_bus.subscribe() as stream:
-            async for envelope in stream:
-                event = envelope.message
-                if not isinstance(event, HostMessage):
+            async for event in stream:
+                if not isinstance(event, DeckrMessage):
                     continue
-                if not event.for_controller(self._controller_id):
+                if not plugin_message_for_controller(event, self._controller_id):
                     continue
                 try:
-                    if event.type == ACTIONS_REGISTERED:
+                    if event.message_type == ACTIONS_REGISTERED:
                         await self._handle_actions_registered(event)
-                    elif event.type == ACTIONS_UNREGISTERED:
+                    elif event.message_type == ACTIONS_UNREGISTERED:
                         await self._handle_actions_unregistered(event)
-                    elif event.type == HOST_OFFLINE:
+                    elif event.message_type == HOST_OFFLINE:
                         await self._handle_host_offline(event)
                 except Exception:
                     logger.exception(
                         "Error handling message %s from %s",
-                        event.type,
-                        event.from_id,
+                        event.message_type,
+                        event.sender,
                     )
 
     async def stop(self) -> None:

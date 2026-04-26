@@ -3,6 +3,21 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from deckr.hardware import events as hw_events
+from deckr.pluginhost.messages import (
+    DIAL_ROTATE,
+    KEY_DOWN,
+    KEY_UP,
+    TOUCH_SWIPE,
+    TOUCH_TAP,
+    WILL_APPEAR,
+    WILL_DISAPPEAR,
+    TitleOptions,
+    build_context_id,
+    context_subject,
+    controller_address,
+    host_address,
+    plugin_message,
+)
 from deckr.python_plugin.events import (
     DialRotate,
     KeyDown,
@@ -14,20 +29,6 @@ from deckr.python_plugin.events import (
     WillDisappear,
 )
 from deckr.python_plugin.interface import ControlContext as ControlContextProtocol
-from deckr.pluginhost.messages import (
-    DIAL_ROTATE,
-    KEY_DOWN,
-    KEY_UP,
-    TOUCH_SWIPE,
-    TOUCH_TAP,
-    WILL_APPEAR,
-    WILL_DISAPPEAR,
-    HostMessage,
-    TitleOptions,
-    build_context_id,
-    controller_address,
-    host_address,
-)
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._hardware_service import HardwareCommandService
@@ -139,11 +140,12 @@ class ControlContext(ControlContextProtocol):
             await self._deliver_to_builtin(msg_type, payload)
             return
         payload = {**payload, "actionUuid": self.action_uuid}
-        msg = HostMessage(
-            from_id=controller_address(self._controller_id),
-            to_id=host_address(self.host_id),
-            type=msg_type,
+        msg = plugin_message(
+            sender=controller_address(self._controller_id),
+            recipient=host_address(self.host_id),
+            message_type=msg_type,
             payload=payload,
+            subject=context_subject(self.id),
         )
         await self._plugin_bus.send(msg)
 

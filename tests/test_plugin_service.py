@@ -1,28 +1,85 @@
 """Tests for PluginService aggregator and plugin hosts."""
 
-import pytest
-import anyio
 from unittest.mock import MagicMock
 
+import anyio
+import pytest
+from deckr.contracts.messages import controllers_broadcast, plugin_hosts_broadcast
+from deckr.core.component import RunContext
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
-    ActionDescriptor,
-    ALL_CONTROLLERS,
-    ALL_HOSTS,
     REQUEST_ACTIONS,
-    HostMessage,
+    ActionDescriptor,
+    DeckrMessage,
     controller_address,
     host_address,
+    plugin_actions_subject,
+    plugin_message,
+    plugin_message_for_host,
 )
+from deckr.python_plugin.interface import PluginAction
+from deckr.transports.bus import EventBus
+
 from deckr.controller.plugin.action_registry import ActionRegistry
 from deckr.controller.plugin.events import ActionsChangedEvent
-from deckr.transports.bus import EventBus
-from deckr.core.component import RunContext
-from deckr.python_plugin.interface import PluginAction
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
+
+
+def _plugin_bus() -> EventBus:
+    return EventBus("plugin_messages")
+
+
+def _hardware_bus() -> EventBus:
+    return EventBus("hardware_events")
+
+
+def _actions_payload(host_id: str = "test_host") -> dict:
+    return {
+        "hostId": host_id,
+        "actionUuids": [StubAction.uuid],
+        "actions": [{"uuid": StubAction.uuid}],
+    }
+
+
+def _actions_registered_message(
+    *,
+    host_id: str = "test_host",
+    recipient=CONTROLLER_ADDR,
+) -> DeckrMessage:
+    return plugin_message(
+        sender=host_address(host_id),
+        recipient=recipient,
+        message_type=ACTIONS_REGISTERED,
+        payload=_actions_payload(host_id),
+        subject=plugin_actions_subject(host_id),
+    )
+
+
+def _actions_unregistered_message(
+    *,
+    host_id: str = "test_host",
+    recipient=CONTROLLER_ADDR,
+) -> DeckrMessage:
+    return plugin_message(
+        sender=host_address(host_id),
+        recipient=recipient,
+        message_type=ACTIONS_UNREGISTERED,
+        payload={"hostId": host_id, "actionUuids": [StubAction.uuid]},
+        subject=plugin_actions_subject(host_id),
+    )
+
+
+def _request_actions_message() -> DeckrMessage:
+    return plugin_message(
+        sender=CONTROLLER_ADDR,
+        recipient=plugin_hosts_broadcast(),
+        message_type=REQUEST_ACTIONS,
+        payload={},
+        subject=plugin_actions_subject(),
+    )
 
 
 class StubAction:
@@ -69,7 +126,7 @@ class StubPluginHost:
 @pytest.mark.asyncio
 async def test_action_registry_aggregates_get_action():
     """ActionRegistry returns ActionMetadata from registry (populated by actionsRegistered)."""
-    bus = EventBus()
+    bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
@@ -94,7 +151,7 @@ async def test_action_registry_aggregates_get_action():
 @pytest.mark.asyncio
 async def test_actions_registered_populates_registry():
     """actionsRegistered message populates action registry."""
-    bus = EventBus()
+    bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
@@ -102,20 +159,7 @@ async def test_actions_registered_populates_registry():
     ctx = RunContext(tg=mock_tg, stopping=stopping)
     await registry.start(ctx)
 
-    msg = HostMessage(
-        from_id=host_address("test_host"),
-        to_id=CONTROLLER_ADDR,
-        type=ACTIONS_REGISTERED,
-        payload={
-            "hostId": "test_host",
-            "actionUuids": [StubAction.uuid],
-            "actions": [
-                {
-                    "uuid": StubAction.uuid,
-                }
-            ],
-        },
-    )
+    msg = _actions_registered_message()
     await registry._handle_actions_registered(msg)
 
     meta = await registry.get_action(StubAction.uuid)
@@ -125,9 +169,9 @@ async def test_actions_registered_populates_registry():
 
 
 @pytest.mark.asyncio
-async def test_actions_registered_with_all_controllers_populates_registry():
-    """actionsRegistered with to=all_controllers is handled by controller."""
-    bus = EventBus()
+async def test_actions_registered_with_controller_broadcast_populates_registry():
+    """actionsRegistered with controller broadcast recipient is handled."""
+    bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
@@ -135,20 +179,7 @@ async def test_actions_registered_with_all_controllers_populates_registry():
     ctx = RunContext(tg=mock_tg, stopping=stopping)
     await registry.start(ctx)
 
-    msg = HostMessage(
-        from_id=host_address("test_host"),
-        to_id=ALL_CONTROLLERS,
-        type=ACTIONS_REGISTERED,
-        payload={
-            "hostId": "test_host",
-            "actionUuids": [StubAction.uuid],
-            "actions": [
-                {
-                    "uuid": StubAction.uuid,
-                }
-            ],
-        },
-    )
+    msg = _actions_registered_message(recipient=controllers_broadcast())
     await registry._handle_actions_registered(msg)
 
     meta = await registry.get_action(StubAction.uuid)
@@ -160,7 +191,7 @@ async def test_actions_registered_with_all_controllers_populates_registry():
 @pytest.mark.asyncio
 async def test_actions_unregistered_removes_from_registry():
     """actionsUnregistered message removes actions from registry."""
-    bus = EventBus()
+    bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
@@ -169,70 +200,38 @@ async def test_actions_unregistered_removes_from_registry():
     await registry.start(ctx)
 
     await registry._handle_actions_registered(
-        HostMessage(
-            from_id=host_address("test_host"),
-            to_id=CONTROLLER_ADDR,
-            type=ACTIONS_REGISTERED,
-            payload={
-                "hostId": "test_host",
-                "actionUuids": [StubAction.uuid],
-                "actions": [
-                    {
-                        "uuid": StubAction.uuid,
-                    }
-                ],
-            },
-        )
+        _actions_registered_message()
     )
     assert await registry.get_action(StubAction.uuid) is not None
 
     await registry._handle_actions_unregistered(
-        HostMessage(
-            from_id=host_address("test_host"),
-            to_id=CONTROLLER_ADDR,
-            type=ACTIONS_UNREGISTERED,
-            payload={"hostId": "test_host", "actionUuids": [StubAction.uuid]},
-        )
+        _actions_unregistered_message()
     )
     assert await registry.get_action(StubAction.uuid) is None
 
 
 @pytest.mark.asyncio
 async def test_actions_registered_emits_actions_changed_event():
-    """actionsRegistered message causes ActionsChangedEvent to be emitted on the bus."""
-    bus = EventBus()
+    """actionsRegistered message publishes an ActionsChangedEvent through the callback."""
+    bus = _plugin_bus()
     received_events = []
 
-    async def capture_events():
-        async with bus.subscribe() as stream:
-            async for envelope in stream:
-                event = envelope.message
-                if isinstance(event, ActionsChangedEvent):
-                    received_events.append(event)
+    async def on_actions_changed(event: ActionsChangedEvent) -> None:
+        received_events.append(event)
 
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(
+        event_bus=bus,
+        controller_id=CONTROLLER_ID,
+        on_actions_changed=on_actions_changed,
+    )
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
         ctx = RunContext(tg=tg, stopping=stopping)
         await registry.start(ctx)
-        tg.start_soon(capture_events)
         await anyio.sleep(0.01)
 
-        msg = HostMessage(
-            from_id=host_address("test_host"),
-            to_id=ALL_CONTROLLERS,
-            type=ACTIONS_REGISTERED,
-            payload={
-                "hostId": "test_host",
-                "actionUuids": [StubAction.uuid],
-                "actions": [
-                    {
-                        "uuid": StubAction.uuid,
-                    }
-                ],
-            },
-        )
+        msg = _actions_registered_message(recipient=controllers_broadcast())
         await bus.send(msg)
         await anyio.sleep(0.05)
 
@@ -245,39 +244,27 @@ async def test_actions_registered_emits_actions_changed_event():
 
 @pytest.mark.asyncio
 async def test_actions_unregistered_emits_actions_changed_event():
-    """actionsUnregistered message causes ActionsChangedEvent to be emitted on the bus."""
-    bus = EventBus()
+    """actionsUnregistered message publishes an ActionsChangedEvent through the callback."""
+    bus = _plugin_bus()
     received_events = []
 
-    async def capture_events():
-        async with bus.subscribe() as stream:
-            async for envelope in stream:
-                event = envelope.message
-                if isinstance(event, ActionsChangedEvent):
-                    received_events.append(event)
+    async def on_actions_changed(event: ActionsChangedEvent) -> None:
+        received_events.append(event)
 
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(
+        event_bus=bus,
+        controller_id=CONTROLLER_ID,
+        on_actions_changed=on_actions_changed,
+    )
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
         ctx = RunContext(tg=tg, stopping=stopping)
         await registry.start(ctx)
-        tg.start_soon(capture_events)
         await anyio.sleep(0.01)
 
         # First register the action
-        await bus.send(
-            HostMessage(
-                from_id=host_address("test_host"),
-                to_id=ALL_CONTROLLERS,
-                type=ACTIONS_REGISTERED,
-                payload={
-                    "hostId": "test_host",
-                    "actionUuids": [StubAction.uuid],
-                    "actions": [{"uuid": StubAction.uuid}],
-                },
-            )
-        )
+        await bus.send(_actions_registered_message(recipient=controllers_broadcast()))
         with anyio.fail_after(1.0):
             while len(received_events) < 1:
                 await anyio.sleep(0.01)
@@ -286,12 +273,7 @@ async def test_actions_unregistered_emits_actions_changed_event():
 
         # Then unregister
         await bus.send(
-            HostMessage(
-                from_id=host_address("test_host"),
-                to_id=ALL_CONTROLLERS,
-                type=ACTIONS_UNREGISTERED,
-                payload={"hostId": "test_host", "actionUuids": [StubAction.uuid]},
-            )
+            _actions_unregistered_message(recipient=controllers_broadcast())
         )
         with anyio.fail_after(1.0):
             while len(received_events) < 1:
@@ -307,11 +289,6 @@ async def test_actions_unregistered_emits_actions_changed_event():
 @pytest.mark.asyncio
 async def test_host_lifecycle_register_then_unregister():
     """Full lifecycle: host emits actionsRegistered on start, actionsUnregistered on stop."""
-    from deckr.pluginhost.messages import (
-        HostMessage,
-        ACTIONS_REGISTERED,
-        ACTIONS_UNREGISTERED,
-    )
 
     HOST_MSG_TYPES = frozenset(
         {
@@ -336,56 +313,31 @@ async def test_host_lifecycle_register_then_unregister():
 
         async def start(self, ctx):
             ctx.tg.start_soon(self._subscription_loop)
-            payload = {
-                "hostId": self.name,
-                "actionUuids": [StubAction.uuid],
-                "actions": [{"uuid": StubAction.uuid}],
-            }
-            msg = HostMessage(
-                from_id=host_address(self.name),
-                to_id=CONTROLLER_ADDR,
-                type=ACTIONS_REGISTERED,
-                payload=payload,
-            )
-            await self._event_bus.send(msg)
+            await self._event_bus.send(_actions_registered_message(host_id=self.name))
 
         async def _subscription_loop(self):
             if self._event_bus is None:
                 return
             async with self._event_bus.subscribe() as stream:
-                async for envelope in stream:
-                    event = envelope.message
-                    if not isinstance(event, HostMessage) or not event.for_host(
-                        self.name
+                async for event in stream:
+                    if not isinstance(event, DeckrMessage) or not plugin_message_for_host(
+                        event, self.name
                     ):
                         continue
-                    if event.type not in HOST_MSG_TYPES:
+                    if event.message_type not in HOST_MSG_TYPES:
                         continue
                     # Minimal: only handle requestActions for this test
-                    if event.type == "requestActions":
-                        payload = {
-                            "hostId": self.name,
-                            "actionUuids": [StubAction.uuid],
-                            "actions": [{"uuid": StubAction.uuid}],
-                        }
-                        resp = HostMessage(
-                            from_id=host_address(self.name),
-                            to_id=CONTROLLER_ADDR,
-                            type=ACTIONS_REGISTERED,
-                            payload=payload,
+                    if event.message_type == "requestActions":
+                        await self._event_bus.send(
+                            _actions_registered_message(host_id=self.name)
                         )
-                        await self._event_bus.send(resp)
 
         async def stop(self):
-            msg = HostMessage(
-                from_id=host_address(self.name),
-                to_id=CONTROLLER_ADDR,
-                type=ACTIONS_UNREGISTERED,
-                payload={"hostId": self.name, "actionUuids": [StubAction.uuid]},
+            await self._event_bus.send(
+                _actions_unregistered_message(host_id=self.name)
             )
-            await self._event_bus.send(msg)
 
-    bus = EventBus()
+    bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
@@ -413,9 +365,9 @@ async def test_host_lifecycle_register_then_unregister():
 
 @pytest.mark.asyncio
 async def test_controller_sends_request_actions_on_startup():
-    """ControllerService sends requestActions to all_hosts when it comes online."""
+    """ControllerService sends requestActions to plugin-host broadcast on startup."""
     sent_messages = []
-    bus = EventBus()
+    bus = _plugin_bus()
 
     original_send = bus.send
 
@@ -432,7 +384,7 @@ async def test_controller_sends_request_actions_on_startup():
     config_service = FileSystemConfigService()
     settings_service = InMemorySettingsService()
     controller = ControllerService(
-        driver_bus=EventBus(),
+        driver_bus=_hardware_bus(),
         config_service=config_service,
         settings_service=settings_service,
         controller_id=CONTROLLER_ID,
@@ -447,20 +399,20 @@ async def test_controller_sends_request_actions_on_startup():
     await controller.start(ctx)
 
     request_actions_sent = any(
-        getattr(m, "type", None) == REQUEST_ACTIONS
-        and getattr(m, "to_id", None) == ALL_HOSTS
-        and getattr(m, "from_id", None) == CONTROLLER_ADDR
+        isinstance(m, DeckrMessage)
+        and m.message_type == REQUEST_ACTIONS
+        and m.recipient == plugin_hosts_broadcast()
+        and m.sender == CONTROLLER_ADDR
         for m in sent_messages
     )
     assert request_actions_sent, (
-        f"Expected requestActions to all_hosts; got: {[(getattr(m, 'type'), getattr(m, 'to_id')) for m in sent_messages]}"
+        f"Expected requestActions broadcast to plugin hosts; got: {sent_messages}"
     )
 
 
 @pytest.mark.asyncio
 async def test_host_handles_request_actions_and_emits():
     """When host receives requestActions, it sends actionsRegistered on the bus."""
-    from deckr.pluginhost.messages import HostMessage, ACTIONS_REGISTERED
 
     emit_called = []
     HOST_MSG_TYPES = frozenset(
@@ -491,33 +443,23 @@ async def test_host_handles_request_actions_and_emits():
             if self._event_bus is None:
                 return
             async with self._event_bus.subscribe() as stream:
-                async for envelope in stream:
-                    event = envelope.message
-                    if not isinstance(event, HostMessage) or not event.for_host(
-                        self.name
+                async for event in stream:
+                    if not isinstance(event, DeckrMessage) or not plugin_message_for_host(
+                        event, self.name
                     ):
                         continue
-                    if event.type not in HOST_MSG_TYPES:
+                    if event.message_type not in HOST_MSG_TYPES:
                         continue
-                    if event.type == "requestActions":
+                    if event.message_type == "requestActions":
                         emit_called.append(True)
-                        payload = {
-                            "hostId": self.name,
-                            "actionUuids": [StubAction.uuid],
-                            "actions": [{"uuid": StubAction.uuid}],
-                        }
-                        msg = HostMessage(
-                            from_id=host_address(self.name),
-                            to_id=CONTROLLER_ADDR,
-                            type=ACTIONS_REGISTERED,
-                            payload=payload,
+                        await self._event_bus.send(
+                            _actions_registered_message(host_id=self.name)
                         )
-                        await self._event_bus.send(msg)
 
         async def stop(self):
             pass
 
-    bus = EventBus()
+    bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
@@ -534,14 +476,8 @@ async def test_host_handles_request_actions_and_emits():
         await host.start(host_ctx)
         await anyio.sleep(0.02)
 
-        # Send requestActions to all_hosts (simulates controller startup)
-        request_msg = HostMessage(
-            from_id=CONTROLLER_ADDR,
-            to_id=ALL_HOSTS,
-            type=REQUEST_ACTIONS,
-            payload={},
-        )
-        await bus.send(request_msg)
+        # Send requestActions to plugin hosts (simulates controller startup).
+        await bus.send(_request_actions_message())
         await anyio.sleep(0.05)
 
         assert len(emit_called) == 1, "Host should have sent actionsRegistered"
@@ -559,12 +495,12 @@ async def test_controller_empty_hosts_starts_ok():
     from deckr.controller.config import FileSystemConfigService
     from deckr.controller.settings import InMemorySettingsService
 
-    bus = EventBus()
+    bus = _plugin_bus()
     registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
     config_service = FileSystemConfigService()
     settings_service = InMemorySettingsService()
     controller = ControllerService(
-        driver_bus=EventBus(),
+        driver_bus=_hardware_bus(),
         config_service=config_service,
         settings_service=settings_service,
         controller_id=CONTROLLER_ID,

@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
+from deckr.contracts.messages import DeckrMessage
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
-from deckr.python_plugin.events import PageAppear, PageDisappear
 from deckr.pluginhost.messages import (
     CLOSE_PAGE,
     HERE_ARE_SETTINGS,
@@ -24,17 +24,21 @@ from deckr.pluginhost.messages import (
     SLEEP_SCREEN,
     WAKE_SCREEN,
     DynamicPageDescriptor,
-    HostMessage,
     SlotBinding,
     TitleOptions,
     build_context_id,
+    context_subject,
     controller_address,
-    extract_controller_id,
-    extract_device_id,
-    extract_slot_id,
     host_address,
     make_dynamic_page_id,
+    plugin_message,
+    plugin_payload,
+    subject_context_id,
+    subject_controller_id,
+    subject_device_id,
+    subject_slot_id,
 )
+from deckr.python_plugin.events import PageAppear, PageDisappear
 from pydantic import ValidationError
 
 from deckr.controller._binding_validator import (
@@ -203,6 +207,12 @@ class DeviceManager:
                 ),
                 output=DeviceOutput(self._command_service, self.device.id, slot_id),
             )
+
+    async def _slot_id_for_context(self, context_id: str) -> str | None:
+        for slot_id, ctx in await self.action_contexts.items():
+            if ctx.id == context_id:
+                return slot_id
+        return None
 
     async def _clear_all_image_slots(self) -> None:
         """Clear all image-capable slots before rendering new page. Prevents stale content."""
@@ -431,15 +441,16 @@ class DeviceManager:
             page_id=owner.page_id,
             timeout_ms=owner.timeout_ms,
         )
-        msg = HostMessage(
-            from_id=controller_address(self._controller_id),
-            to_id=host_address(owner.owner_host_id),
-            type=PAGE_APPEAR,
+        msg = plugin_message(
+            sender=controller_address(self._controller_id),
+            recipient=host_address(owner.owner_host_id),
+            message_type=PAGE_APPEAR,
             payload={
                 "actionUuid": owner.owner_action_uuid,
                 "settings": settings,
                 "event": event.model_dump(by_alias=True),
             },
+            subject=context_subject(owner.page_context_id),
         )
         await self._plugin_bus.send(msg)
 
@@ -451,14 +462,15 @@ class DeviceManager:
             page_id=owner.page_id,
             reason=reason,
         )
-        msg = HostMessage(
-            from_id=controller_address(self._controller_id),
-            to_id=host_address(owner.owner_host_id),
-            type=PAGE_DISAPPEAR,
+        msg = plugin_message(
+            sender=controller_address(self._controller_id),
+            recipient=host_address(owner.owner_host_id),
+            message_type=PAGE_DISAPPEAR,
             payload={
                 "actionUuid": owner.owner_action_uuid,
                 "event": event.model_dump(by_alias=True),
             },
+            subject=context_subject(owner.page_context_id),
         )
         await self._plugin_bus.send(msg)
 
@@ -691,7 +703,10 @@ class DeviceManager:
                 await _replace_dynamic_page(owner)
                 return
 
-            slot_id = extract_slot_id(context_id)
+            slot_id = await self._slot_id_for_context(context_id)
+            if slot_id is None:
+                logger.warning("open_page ignored: no active context for %s", context_id)
+                return
             ctx = await self.action_contexts.get(slot_id)
             if ctx is None:
                 logger.warning("open_page ignored: no active context for %s", slot_id)
@@ -853,22 +868,36 @@ class DeviceManager:
             transition = self._nav.update_config(config)
             await self._execute_transition(transition, config_changed=True)
 
-    async def handle_command(self, msg: HostMessage) -> None:
+    async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a command message from a plugin host (setTitle, setImage, etc.)."""
-        payload = msg.payload
-        context_id = payload.get("contextId", "")
+        payload = plugin_payload(msg)
+        context_id = subject_context_id(msg.subject) or str(payload.get("contextId", ""))
         if not context_id:
             return
-        context_controller_id = extract_controller_id(context_id)
+        context_controller_id = subject_controller_id(msg.subject)
         if (
             context_controller_id is not None
             and context_controller_id != self._controller_id
         ):
             return
-        device_id = extract_device_id(context_id)
+        device_id = subject_device_id(msg.subject)
         if device_id != self.device.id:
             return
-        msg_type = msg.type
+        msg_type = msg.message_type
+
+        async def send_settings_response(settings: dict) -> None:
+            resp = plugin_message(
+                sender=controller_address(self._controller_id),
+                recipient=msg.sender,
+                message_type=HERE_ARE_SETTINGS,
+                payload={
+                    "contextId": context_id,
+                    "settings": settings,
+                },
+                subject=context_subject(context_id),
+                in_reply_to=msg.message_id,
+            )
+            await self._plugin_bus.send(resp)
 
         if msg_type == OPEN_PAGE:
             desc_data = payload.get("descriptor")
@@ -893,37 +922,19 @@ class DeviceManager:
                     if target is not None
                     else {}
                 )
-                resp = HostMessage(
-                    from_id=controller_address(self._controller_id),
-                    to_id=msg.from_id,
-                    type=HERE_ARE_SETTINGS,
-                    payload={
-                        "contextId": context_id,
-                        "settings": new_settings,
-                    },
-                    in_reply_to=msg.message_id,
-                )
-                await self._plugin_bus.send(resp)
+                await send_settings_response(new_settings)
             elif msg_type == REQUEST_SETTINGS:
                 current_settings = (
                     await self._settings_service.get(owner.settings_target)
                     if owner.settings_target is not None
                     else {}
                 )
-                resp = HostMessage(
-                    from_id=controller_address(self._controller_id),
-                    to_id=msg.from_id,
-                    type=HERE_ARE_SETTINGS,
-                    payload={
-                        "contextId": context_id,
-                        "settings": current_settings,
-                    },
-                    in_reply_to=msg.message_id,
-                )
-                await self._plugin_bus.send(resp)
+                await send_settings_response(current_settings)
             return
 
-        slot_id = payload.get("slot") or extract_slot_id(context_id)
+        slot_id = payload.get("slot") or subject_slot_id(msg.subject)
+        if not slot_id:
+            return
         ctx = await self.action_contexts.get(slot_id)
         if ctx is None:
             return
@@ -944,30 +955,10 @@ class DeviceManager:
         elif msg_type == SET_SETTINGS:
             await router.set_settings(payload.get("settings", {}))
             settings = await router.get_settings()
-            resp = HostMessage(
-                from_id=controller_address(self._controller_id),
-                to_id=msg.from_id,
-                type=HERE_ARE_SETTINGS,
-                payload={
-                    "contextId": context_id,
-                    "settings": vars(settings),
-                },
-                in_reply_to=msg.message_id,
-            )
-            await self._plugin_bus.send(resp)
+            await send_settings_response(vars(settings))
         elif msg_type == REQUEST_SETTINGS:
             settings = await router.get_settings()
-            resp = HostMessage(
-                from_id=controller_address(self._controller_id),
-                to_id=msg.from_id,
-                type=HERE_ARE_SETTINGS,
-                payload={
-                    "contextId": context_id,
-                    "settings": vars(settings),
-                },
-                in_reply_to=msg.message_id,
-            )
-            await self._plugin_bus.send(resp)
+            await send_settings_response(vars(settings))
         elif msg_type == SET_PAGE:
             await self.set_page(
                 profile=payload.get("profile", "default"),
@@ -978,7 +969,8 @@ class DeviceManager:
         elif msg_type == WAKE_SCREEN:
             await self._command_service.wake_screen(self.device.id)
 
-    async def on_event(self, event: hw_events.HardwareTransportMessage):
+    async def on_event(self, message: DeckrMessage):
+        event = hw_events.hardware_body_from_message(message)
         translated = self._translator.translate(event, self.device.id)
         if translated is None:
             return
