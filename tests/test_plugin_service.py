@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 
 import anyio
 import pytest
+from deckr.components import RunContext
 from deckr.contracts.messages import controllers_broadcast, plugin_hosts_broadcast
-from deckr.core.component import RunContext
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import anyio
 import pytest
-from deckr.core.component import ComponentManager
-from deckr.core.components import InactiveComponent, activate_components
+from deckr.components import (
+    InactiveComponent,
+    resolve_component_host_plan,
+    start_components,
+)
 from deckr.core.config import ConfigDocument
+from deckr.runtime import Deckr
 from deckr.transports.bus import EventBus
 
 from deckr.controller._runtime_service import build_controller_runtime, component
@@ -21,29 +24,27 @@ async def test_controller_component_uses_shared_lanes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "deckr.core.components.available_component_ids",
+        "deckr.components._host.available_component_ids",
         lambda: ["deckr.controller"],
     )
     monkeypatch.setattr(
-        "deckr.core.components.load_component_definition",
+        "deckr.components._host.load_component_definition",
         lambda component_id: component,
     )
 
     document = _document({"deckr": {"controller": {"id": "controller-main"}}})
-    component_manager = ComponentManager()
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(component_manager.run)
-        await anyio.sleep(0.01)
-
-        result = await activate_components(document, component_manager)
-
-        assert [created.name for created in result.components] == ["deckr.controller"]
+    plan = resolve_component_host_plan(document)
+    async with Deckr(
+        lane_contracts=plan.lane_contracts,
+        lanes=plan.lane_names,
+        route_expiry_interval=0.01,
+    ) as deckr, start_components(deckr, plan) as result:
+        assert [created.name for created in result.components] == [
+            "deckr.controller"
+        ]
         assert set(result.lane_names) == {"hardware_events", "plugin_messages"}
         assert isinstance(result.get_lane("hardware_events"), EventBus)
         assert isinstance(result.get_lane("plugin_messages"), EventBus)
-
-        tg.cancel_scope.cancel()
 
 
 def test_controller_component_can_be_disabled_explicitly() -> None:

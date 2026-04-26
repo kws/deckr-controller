@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 import pytest_asyncio
+from deckr.components import RunContext
 from deckr.contracts.messages import DeckrMessage
-from deckr.core.component import RunContext
 from deckr.hardware import events as hw_events
 from deckr.hardware.events import (
     HardwareCoordinates,

@@ -4,12 +4,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from deckr.core.component import BaseComponent, Component, ComponentManager, RunContext
-from deckr.core.components import (
+from deckr.components import (
+    BaseComponent,
+    Component,
     ComponentContext,
     ComponentDefinition,
+    ComponentManager,
     ComponentManifest,
     InactiveComponent,
+    RunContext,
 )
 from deckr.core.util.runtime_id import require_runtime_id
 from deckr.transports.bus import EventBus

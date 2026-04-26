@@ -2,12 +2,12 @@ import logging
 from collections.abc import Callable
 
 import anyio
+from deckr.components import BaseComponent, RunContext
 from deckr.contracts.messages import (
     DeckrMessage,
     parse_hardware_manager_address,
     plugin_hosts_broadcast,
 )
-from deckr.core.component import BaseComponent, RunContext
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
 from deckr.pluginhost.messages import (

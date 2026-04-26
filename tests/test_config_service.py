@@ -3,7 +3,7 @@
 import anyio
 import pytest
 import yaml
-from deckr.core.component import RunContext
+from deckr.components import RunContext
 
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.config._service import FileBackedDeviceConfigService

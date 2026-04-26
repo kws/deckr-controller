@@ -9,7 +9,7 @@ from typing import Protocol
 
 import anyio
 import yaml
-from deckr.core.component import BaseComponent, RunContext
+from deckr.components import BaseComponent, RunContext
 from decouple import config as decouple_config
 from watchfiles import Change, awatch
 

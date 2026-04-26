@@ -6,12 +6,12 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
+from deckr.components import BaseComponent, RunContext
 from deckr.contracts.messages import (
     RESERVED_BUILTIN_PROVIDER_IDS,
     DeckrMessage,
     parse_host_address,
 )
-from deckr.core.component import BaseComponent, RunContext
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
