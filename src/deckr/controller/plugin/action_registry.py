@@ -6,7 +6,11 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
-from deckr.contracts.messages import DeckrMessage, parse_host_address
+from deckr.contracts.messages import (
+    RESERVED_BUILTIN_PROVIDER_IDS,
+    DeckrMessage,
+    parse_host_address,
+)
 from deckr.core.component import BaseComponent, RunContext
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
@@ -20,7 +24,6 @@ from deckr.transports.bus import EventBus
 
 from deckr.controller.plugin.builtin import (
     BUILTIN_ACTION_PROVIDER_ID,
-    RESERVED_BUILTIN_PROVIDER_IDS,
     BuiltinRegistry,
 )
 from deckr.controller.plugin.events import ActionsChangedEvent

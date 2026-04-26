@@ -18,7 +18,11 @@ from deckr.pluginhost.messages import (
     OPEN_PAGE,
     PAGE_APPEAR,
     PAGE_DISAPPEAR,
+    REQUEST_SETTINGS,
+    SET_IMAGE,
     SET_PAGE,
+    SET_SETTINGS,
+    SET_TITLE,
     SLEEP_SCREEN,
     WAKE_SCREEN,
     DynamicPageDescriptor,
@@ -33,6 +37,10 @@ from deckr.transports.bus import EventBus
 from deckr.controller._device_manager import DeviceManager, _descriptor_from_payload
 from deckr.controller._navigation_service import StaticPageRef
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
+from deckr.controller.plugin.builtin import (
+    BUILTIN_ACTION_PROVIDER_ID,
+    LEGACY_BUILTIN_ACTION_PROVIDER_ID,
+)
 from deckr.controller.plugin.provider import ActionMetadata
 
 CONTROLLER_ID = "controller-main"
@@ -55,10 +63,12 @@ def _command_message(
     *,
     config_id: str = "test-device",
     slot_id: str = "0,0",
+    sender=HOST_ADDR,
+    context_id: str | None = None,
 ) -> DeckrMessage:
-    context_id = _context_id(config_id, slot_id)
+    context_id = context_id or _context_id(config_id, slot_id)
     return plugin_message(
-        sender=HOST_ADDR,
+        sender=sender,
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
         payload={"contextId": context_id, **(payload or {})},
@@ -137,6 +147,48 @@ def _minimal_config(device_id: str = "test-device") -> DeviceConfig:
             )
         ],
     )
+
+
+def _registry_for_action(
+    *,
+    host_id: str = HOST_ID,
+    action_uuid: str = NoopAction.uuid,
+) -> MagicMock:
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=ActionMetadata(
+            uuid=action_uuid,
+            host_id=host_id,
+        )
+    )
+    return registry
+
+
+def _make_manager(
+    *,
+    command_service: FakeHardwareCommandService | None = None,
+    plugin_bus: EventBus | None = None,
+    registry: MagicMock | None = None,
+    config: DeviceConfig | None = None,
+    device: HardwareDevice | None = None,
+) -> DeviceManager:
+    device = device or _make_mock_device()
+    return DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=command_service or FakeHardwareCommandService(),
+        config=config or _minimal_config(device.id),
+        manager=registry or _registry_for_action(),
+        plugin_bus=plugin_bus or _plugin_bus(),
+        start_soon=lambda fn, *a, **k: None,
+    )
+
+
+async def _active_context(manager: DeviceManager, slot_id: str = "0,0"):
+    ctx = await manager.action_contexts.get(slot_id)
+    assert ctx is not None
+    return ctx
 
 
 @pytest.mark.asyncio
@@ -441,6 +493,266 @@ async def test_handle_command_ignores_wrong_config(persistence_tmp_dir):
     await manager.handle_command(msg)
 
     command_service.sleep_screen.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_different_host_for_title_and_image(
+    persistence_tmp_dir,
+):
+    manager = _make_manager()
+    await manager.set_page(profile="default", page=0)
+    ctx = await _active_context(manager)
+
+    await manager.handle_command(
+        _command_message(
+            SET_TITLE,
+            {"text": "attacker title"},
+            sender=host_address("attacker"),
+        )
+    )
+    await manager.handle_command(
+        _command_message(
+            SET_IMAGE,
+            {"image": "attacker image"},
+            sender=host_address("attacker"),
+        )
+    )
+
+    assert ctx._router._store.content.title is None
+    assert ctx._router._store.content.image is None
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_different_host_for_settings(
+    persistence_tmp_dir,
+):
+    plugin_bus = _plugin_bus()
+    manager = _make_manager(plugin_bus=plugin_bus)
+    await manager.set_page(profile="default", page=0)
+    ctx = await _active_context(manager)
+
+    async with plugin_bus.subscribe() as stream:
+        await manager.handle_command(
+            _command_message(
+                SET_SETTINGS,
+                {"settings": {"owner": "attacker"}},
+                sender=host_address("attacker"),
+            )
+        )
+        await manager.handle_command(
+            _command_message(
+                REQUEST_SETTINGS,
+                sender=host_address("attacker"),
+            )
+        )
+        with anyio.move_on_after(0.05) as scope:
+            await stream.receive()
+
+    assert scope.cancel_called
+    settings = await ctx._router.get_settings()
+    assert vars(settings) == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_different_host_for_page_commands(
+    persistence_tmp_dir,
+):
+    config = _minimal_config()
+    config.profiles[0].pages.append(
+        Page(controls=[Control(slot="0,0", action=NoopAction.uuid, settings={})])
+    )
+    manager = _make_manager(config=config)
+    await manager.set_page(profile="default", page=0)
+
+    await manager.handle_command(
+        _command_message(
+            SET_PAGE,
+            {"page": 1},
+            sender=host_address("attacker"),
+        )
+    )
+    current = manager._nav.current_page
+    assert isinstance(current, StaticPageRef) and current.page_index == 0
+
+    descriptor_payload = {
+        "pageId": "attacker-page",
+        "slots": [
+            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        ],
+    }
+    await manager.handle_command(
+        _command_message(
+            OPEN_PAGE,
+            {"descriptor": descriptor_payload},
+            sender=host_address("attacker"),
+        )
+    )
+    assert isinstance(manager._nav.current_page, StaticPageRef)
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_different_host_for_dynamic_page_close_and_replace(
+    persistence_tmp_dir,
+):
+    manager = _make_manager()
+    await manager.set_page(profile="default", page=0)
+    descriptor_payload = {
+        "pageId": "owner-page",
+        "slots": [
+            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        ],
+    }
+    await manager.handle_command(
+        _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+    )
+    owner = manager._dynamic_page_owner
+    assert owner is not None
+    assert isinstance(manager._nav.current_page, DynamicPageDescriptor)
+
+    replacement_payload = {
+        "pageId": "attacker-replacement",
+        "slots": [
+            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        ],
+    }
+    await manager.handle_command(
+        _command_message(
+            OPEN_PAGE,
+            {"descriptor": replacement_payload},
+            sender=host_address("attacker"),
+            context_id=owner.page_context_id,
+        )
+    )
+    current = manager._nav.current_page
+    assert isinstance(current, DynamicPageDescriptor)
+    assert current.page_id == "owner-page"
+
+    await manager.handle_command(
+        _command_message(
+            CLOSE_PAGE,
+            sender=host_address("attacker"),
+            context_id=owner.page_context_id,
+        )
+    )
+    assert isinstance(manager._nav.current_page, DynamicPageDescriptor)
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_dynamic_page_settings_for_wrong_host_or_action(
+    persistence_tmp_dir,
+):
+    plugin_bus = _plugin_bus()
+    manager = _make_manager(plugin_bus=plugin_bus)
+    await manager.set_page(profile="default", page=0)
+    descriptor_payload = {
+        "pageId": "settings-page",
+        "slots": [
+            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        ],
+    }
+    await manager.handle_command(
+        _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+    )
+    owner = manager._dynamic_page_owner
+    assert owner is not None
+    assert owner.settings_target is not None
+
+    async with plugin_bus.subscribe() as stream:
+        await manager.handle_command(
+            _command_message(
+                SET_SETTINGS,
+                {"settings": {"blocked": "host"}},
+                sender=host_address("attacker"),
+                context_id=owner.page_context_id,
+            )
+        )
+        await manager.handle_command(
+            _command_message(
+                SET_SETTINGS,
+                {"settings": {"blocked": "action"}, "actionUuid": "other.action"},
+                context_id=owner.page_context_id,
+            )
+        )
+        with anyio.move_on_after(0.05) as scope:
+            await stream.receive()
+
+    assert scope.cancel_called
+    assert await manager._settings_service.get(owner.settings_target) == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_different_host_for_power_commands(
+    persistence_tmp_dir,
+):
+    command_service = FakeHardwareCommandService()
+    manager = _make_manager(command_service=command_service)
+    await manager.set_page(profile="default", page=0)
+
+    await manager.handle_command(
+        _command_message(SLEEP_SCREEN, sender=host_address("attacker"))
+    )
+    await manager.handle_command(
+        _command_message(WAKE_SCREEN, sender=host_address("attacker"))
+    )
+
+    command_service.sleep_screen.assert_not_called()
+    command_service.wake_screen.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sender",
+    [
+        CONTROLLER_ADDR,
+        host_address(BUILTIN_ACTION_PROVIDER_ID),
+        host_address(LEGACY_BUILTIN_ACTION_PROVIDER_ID),
+    ],
+)
+async def test_handle_command_rejects_non_host_and_reserved_senders(
+    sender,
+    persistence_tmp_dir,
+):
+    manager = _make_manager()
+    await manager.set_page(profile="default", page=0)
+    ctx = await _active_context(manager)
+
+    await manager.handle_command(
+        _command_message(SET_IMAGE, {"image": "blocked"}, sender=sender)
+    )
+
+    assert ctx._router._store.content.image is None
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_action_uuid_mismatch(persistence_tmp_dir):
+    manager = _make_manager()
+    await manager.set_page(profile="default", page=0)
+    ctx = await _active_context(manager)
+
+    await manager.handle_command(
+        _command_message(
+            SET_IMAGE,
+            {"image": "blocked", "actionUuid": "other.action"},
+        )
+    )
+
+    assert ctx._router._store.content.image is None
+
+
+@pytest.mark.asyncio
+async def test_handle_command_rejects_payload_slot_retargeting(persistence_tmp_dir):
+    manager = _make_manager()
+    await manager.set_page(profile="default", page=0)
+    ctx = await _active_context(manager)
+
+    await manager.handle_command(
+        _command_message(
+            SET_TITLE,
+            {"text": "blocked", "slot": "1,0"},
+        )
+    )
+
+    assert ctx._router._store.content.title is None
 
 
 # --- _descriptor_from_payload unit tests ---

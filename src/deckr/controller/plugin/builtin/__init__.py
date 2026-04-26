@@ -1,19 +1,22 @@
 """Builtin actions: run in controller with privileged access."""
 
-from deckr.python_plugin.interface import PluginAction
+from deckr.contracts.messages import (
+    BUILTIN_ACTION_PROVIDER_ID,
+    LEGACY_BUILTIN_ACTION_PROVIDER_ID,
+    RESERVED_BUILTIN_PROVIDER_IDS,
+)
 from deckr.pluginhost.messages import ActionDescriptor
+from deckr.python_plugin.interface import PluginAction
 
 from deckr.controller.plugin.builtin._goto import GoToPageAction
 from deckr.controller.plugin.builtin._nav_home import NavHomeAction
 
-BUILTIN_ACTION_PROVIDER_ID = "deckr.controller.builtin"
-LEGACY_BUILTIN_ACTION_PROVIDER_ID = "builtin"
-RESERVED_BUILTIN_PROVIDER_IDS = frozenset(
-    {
-        BUILTIN_ACTION_PROVIDER_ID,
-        LEGACY_BUILTIN_ACTION_PROVIDER_ID,
-    }
-)
+__all__ = [
+    "BUILTIN_ACTION_PROVIDER_ID",
+    "LEGACY_BUILTIN_ACTION_PROVIDER_ID",
+    "RESERVED_BUILTIN_PROVIDER_IDS",
+    "BuiltinRegistry",
+]
 
 
 class BuiltinRegistry:

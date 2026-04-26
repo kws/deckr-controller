@@ -1,11 +1,15 @@
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import anyio
-from deckr.contracts.messages import DeckrMessage
+from deckr.contracts.messages import (
+    RESERVED_BUILTIN_PROVIDER_IDS,
+    DeckrMessage,
+    parse_host_address,
+)
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import events as hw_events
 from deckr.pluginhost.messages import (
@@ -122,6 +126,15 @@ class DynamicPageOwner:
     timeout_ms: int
     last_activity: float
     settings_target: SettingsTarget | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AuthorizedCommandTarget:
+    sender_host_id: str
+    context_id: str
+    slot_id: str | None = None
+    context: ControlContext | None = None
+    dynamic_owner: DynamicPageOwner | None = None
 
 
 class DeviceManager:
@@ -863,6 +876,139 @@ class DeviceManager:
             transition = self._nav.update_config(config)
             await self._execute_transition(transition, config_changed=True)
 
+    def _command_sender_host_id(self, msg: DeckrMessage) -> str | None:
+        host_id = parse_host_address(msg.sender)
+        if host_id is None:
+            logger.warning(
+                "Ignoring plugin command %s from non-host sender %s",
+                msg.message_type,
+                msg.sender,
+            )
+            return None
+        if host_id in RESERVED_BUILTIN_PROVIDER_IDS:
+            logger.warning(
+                "Ignoring plugin command %s from route-owned host using reserved provider id %s",
+                msg.message_type,
+                host_id,
+            )
+            return None
+        return host_id
+
+    def _payload_action_uuid(self, payload: Mapping[str, Any]) -> str | None:
+        value = payload.get("actionUuid")
+        if value is None:
+            return None
+        action_uuid = str(value).strip()
+        return action_uuid or None
+
+    async def _authorize_plugin_command(
+        self,
+        msg: DeckrMessage,
+        payload: Mapping[str, Any],
+        *,
+        context_id: str,
+    ) -> AuthorizedCommandTarget | None:
+        sender_host_id = self._command_sender_host_id(msg)
+        if sender_host_id is None:
+            return None
+
+        subject_slot = subject_slot_id(msg.subject)
+        payload_slot = payload.get("slot")
+        if payload_slot is not None and (
+            subject_slot is None or str(payload_slot) != subject_slot
+        ):
+            logger.warning(
+                "Ignoring plugin command %s from %s with payload slot %r that does not match context slot %r",
+                msg.message_type,
+                msg.sender,
+                payload_slot,
+                subject_slot,
+            )
+            return None
+
+        action_uuid = self._payload_action_uuid(payload)
+        owner = self._dynamic_page_owner
+        if owner is not None and context_id in {
+            owner.page_context_id,
+            owner.owner_context_id,
+        }:
+            if sender_host_id != owner.owner_host_id:
+                logger.warning(
+                    "Ignoring plugin command %s from host %s for dynamic page owned by host %s",
+                    msg.message_type,
+                    sender_host_id,
+                    owner.owner_host_id,
+                )
+                return None
+            if action_uuid is not None and action_uuid != owner.owner_action_uuid:
+                logger.warning(
+                    "Ignoring plugin command %s from host %s with actionUuid %r for dynamic page owned by action %s",
+                    msg.message_type,
+                    sender_host_id,
+                    action_uuid,
+                    owner.owner_action_uuid,
+                )
+                return None
+            return AuthorizedCommandTarget(
+                sender_host_id=sender_host_id,
+                context_id=context_id,
+                dynamic_owner=owner,
+            )
+
+        if msg.message_type == CLOSE_PAGE and owner is not None:
+            logger.warning(
+                "Ignoring closePage from host %s for non-owner context %s",
+                sender_host_id,
+                context_id,
+            )
+            return None
+
+        if subject_slot is None:
+            logger.warning(
+                "Ignoring plugin command %s from %s without slot in context subject",
+                msg.message_type,
+                msg.sender,
+            )
+            return None
+
+        ctx = await self.action_contexts.get(subject_slot)
+        if ctx is None or ctx.id != context_id:
+            logger.warning(
+                "Ignoring plugin command %s from %s for inactive context %s",
+                msg.message_type,
+                msg.sender,
+                context_id,
+            )
+            return None
+
+        if sender_host_id != ctx.host_id:
+            logger.warning(
+                "Ignoring plugin command %s from host %s for context %s owned by host %s",
+                msg.message_type,
+                sender_host_id,
+                context_id,
+                ctx.host_id,
+            )
+            return None
+
+        if action_uuid is not None and action_uuid != ctx.action_uuid:
+            logger.warning(
+                "Ignoring plugin command %s from host %s with actionUuid %r for context %s owned by action %s",
+                msg.message_type,
+                sender_host_id,
+                action_uuid,
+                context_id,
+                ctx.action_uuid,
+            )
+            return None
+
+        return AuthorizedCommandTarget(
+            sender_host_id=sender_host_id,
+            context_id=context_id,
+            slot_id=subject_slot,
+            context=ctx,
+        )
+
     async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a command message from a plugin host (setTitle, setImage, etc.)."""
         payload = plugin_payload(msg)
@@ -879,6 +1025,13 @@ class DeviceManager:
         if config_id != self.config_id:
             return
         msg_type = msg.message_type
+        authorization = await self._authorize_plugin_command(
+            msg,
+            payload,
+            context_id=context_id,
+        )
+        if authorization is None:
+            return
 
         async def send_settings_response(settings: dict) -> None:
             resp = plugin_message(
@@ -905,7 +1058,7 @@ class DeviceManager:
             await self.close_page(context_id=context_id, reason="close")
             return
 
-        owner = self._dynamic_page_owner
+        owner = authorization.dynamic_owner
         if owner is not None and context_id == owner.page_context_id:
             if msg_type == SET_SETTINGS:
                 target = owner.settings_target
@@ -927,11 +1080,9 @@ class DeviceManager:
                 await send_settings_response(current_settings)
             return
 
-        slot_id = payload.get("slot") or subject_slot_id(msg.subject)
-        if not slot_id:
-            return
-        ctx = await self.action_contexts.get(slot_id)
-        if ctx is None:
+        slot_id = authorization.slot_id
+        ctx = authorization.context
+        if not slot_id or ctx is None:
             return
 
         router = ctx._router
