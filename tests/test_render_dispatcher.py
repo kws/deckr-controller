@@ -65,6 +65,7 @@ class ControlledBackend:
         await event.wait()
         return RenderResult(
             context_id=request.context_id,
+            binding_id=request.binding_id,
             slot_id=request.slot_id,
             generation=request.generation,
             frame=f"frame-{request.generation}".encode(),

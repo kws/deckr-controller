@@ -86,11 +86,13 @@ class CommandRouter:
             model,
             self._image_format,
             context_id=self._store.context_id,
+            binding_id=self._store.binding_id,
             slot_id=self._output.slot_id,
         )
         await self._render_dispatcher.submit_request(
             slot_id=self._output.slot_id,
             context_id=self._store.context_id,
+            binding_id=self._store.binding_id,
             request=request,
             output=self._output,
         )

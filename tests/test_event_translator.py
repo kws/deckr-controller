@@ -1,4 +1,4 @@
-"""Unit tests for EventTranslator and build_context_id."""
+"""Unit tests for EventTranslator."""
 
 import pytest
 from deckr.hardware import messages as hw_messages
@@ -7,22 +7,9 @@ from deckr.python_plugin.events import DialRotate, KeyDown, KeyUp, TouchSwipe, T
 from deckr.controller._event_translator import (
     EventTranslator,
     TranslatedEvent,
-    build_context_id,
 )
 
 CONTROLLER_ID = "controller-main"
-
-
-class TestBuildContextId:
-    def test_format(self):
-        assert (
-            build_context_id(CONTROLLER_ID, "dev-1", "0,0")
-            == "controller=controller-main|config=dev-1|slot=0%2C0"
-        )
-        assert (
-            build_context_id(CONTROLLER_ID, "6603:1007:abc", "TouchStrip")
-            == "controller=controller-main|config=6603%3A1007%3Aabc|slot=TouchStrip"
-        )
 
 
 class TestEventTranslator:
@@ -41,7 +28,7 @@ class TestEventTranslator:
         assert out.method_name == "on_key_down"
         assert out.gesture == "key_down"
         assert isinstance(out.plugin_event, KeyDown)
-        assert out.plugin_event.context == build_context_id(CONTROLLER_ID, "d1", "1,2")
+        assert out.plugin_event.context == ""
         assert out.plugin_event.slot_id == "1,2"
 
     def test_key_up_event(self, translator):
@@ -52,7 +39,7 @@ class TestEventTranslator:
         assert out.method_name == "on_key_up"
         assert out.gesture == "key_up"
         assert isinstance(out.plugin_event, KeyUp)
-        assert out.plugin_event.context == build_context_id(CONTROLLER_ID, "d1", "0,0")
+        assert out.plugin_event.context == ""
         assert out.plugin_event.slot_id == "0,0"
 
     def test_dial_rotate_event(self, translator):
@@ -63,9 +50,7 @@ class TestEventTranslator:
         assert out.method_name == "on_dial_rotate"
         assert out.gesture == "encoder_rotate"
         assert isinstance(out.plugin_event, DialRotate)
-        assert out.plugin_event.context == build_context_id(
-            CONTROLLER_ID, "d1", "dial1"
-        )
+        assert out.plugin_event.context == ""
         assert out.plugin_event.slot_id == "dial1"
         assert out.plugin_event.direction == "clockwise"
 
@@ -84,9 +69,7 @@ class TestEventTranslator:
         assert out.method_name == "on_touch_tap"
         assert out.gesture == "touch_tap"
         assert isinstance(out.plugin_event, TouchTap)
-        assert out.plugin_event.context == build_context_id(
-            CONTROLLER_ID, "d1", "TouchStrip"
-        )
+        assert out.plugin_event.context == ""
         assert out.plugin_event.slot_id == "TouchStrip"
 
     def test_touch_swipe_event(self, translator):
@@ -97,9 +80,7 @@ class TestEventTranslator:
         assert out.method_name == "on_touch_swipe"
         assert out.gesture == "touch_swipe"
         assert isinstance(out.plugin_event, TouchSwipe)
-        assert out.plugin_event.context == build_context_id(
-            CONTROLLER_ID, "d1", "strip"
-        )
+        assert out.plugin_event.context == ""
         assert out.plugin_event.slot_id == "strip"
         assert out.plugin_event.direction == "left"
 

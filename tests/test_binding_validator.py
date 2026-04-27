@@ -11,7 +11,7 @@ from deckr.hardware.messages import (
     HardwareImageFormat,
     HardwareSlot,
 )
-from deckr.pluginhost.messages import SlotBinding
+from deckr.pluginhost.messages import ControlBindingDescriptor
 from deckr.transports.bus import EventBus
 
 from deckr.controller._binding_validator import (
@@ -55,6 +55,7 @@ class _ImmediateRenderBackend:
     async def render(self, request):
         return RenderResult(
             context_id=request.context_id,
+            binding_id=request.binding_id,
             slot_id=request.slot_id,
             generation=request.generation,
             frame=b"frame",
@@ -104,8 +105,8 @@ async def test_validate_page_bindings_all_valid():
         return action
 
     bindings = [
-        SlotBinding(slot_id="0,0", action_uuid="action.a", settings={}),
-        SlotBinding(slot_id="0,1", action_uuid="action.b", settings={}),
+        ControlBindingDescriptor(control_id="0,0", action_uuid="action.a", settings={}),
+        ControlBindingDescriptor(control_id="0,1", action_uuid="action.b", settings={}),
     ]
     result = await validate_page_bindings(bindings, device, get_action)
     assert result.valid is True
@@ -123,7 +124,11 @@ async def test_validate_page_bindings_missing_slot():
     async def get_action(uuid: str):
         return action
 
-    bindings = [SlotBinding(slot_id="99,99", action_uuid="action.a", settings={})]
+    bindings = [
+        ControlBindingDescriptor(
+            control_id="99,99", action_uuid="action.a", settings={}
+        )
+    ]
     result = await validate_page_bindings(bindings, device, get_action)
     assert result.valid is False
     assert len(result.errors) == 1
@@ -139,7 +144,11 @@ async def test_validate_page_bindings_missing_action():
     async def get_action(uuid: str):
         return None
 
-    bindings = [SlotBinding(slot_id="0,0", action_uuid="nonexistent", settings={})]
+    bindings = [
+        ControlBindingDescriptor(
+            control_id="0,0", action_uuid="nonexistent", settings={}
+        )
+    ]
     result = await validate_page_bindings(bindings, device, get_action)
     assert result.valid is True  # Page can load (partial activation)
     assert result.has_blocking_errors is False

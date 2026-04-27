@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deckr.hardware.messages import HardwareDevice, HardwareSlot
-    from deckr.pluginhost.messages import SlotBinding
+    from deckr.pluginhost.messages import ControlBindingDescriptor
     from deckr.python_plugin.interface import PluginAction
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ def _slot_by_id(device: HardwareDevice, slot_id: str) -> HardwareSlot | None:
 
 
 async def validate_page_bindings(
-    bindings: list[SlotBinding],
+    bindings: list[ControlBindingDescriptor],
     device: HardwareDevice,
     get_action: Callable[[str], Awaitable[PluginAction | None]],
     profile_id: str | None = None,
@@ -93,12 +93,13 @@ async def validate_page_bindings(
     """Validate all bindings for a page: slot existence and action lookup."""
     result = ValidationResult(valid=True)
     for binding in bindings:
-        slot = _slot_by_id(device, binding.slot_id)
+        control_id = binding.control_id
+        slot = _slot_by_id(device, control_id)
         if slot is None:
             result.add_error(
                 code="slot_not_found",
-                message=f"slot '{binding.slot_id}' not found on device",
-                slot_id=binding.slot_id,
+                message=f"slot '{control_id}' not found on device",
+                slot_id=control_id,
                 action_uuid=binding.action_uuid,
                 profile_id=profile_id,
                 page_id=page_id,
@@ -110,7 +111,7 @@ async def validate_page_bindings(
             result.add_error(
                 code="action_not_found",
                 message=f"action '{binding.action_uuid}' not found",
-                slot_id=binding.slot_id,
+                slot_id=control_id,
                 action_uuid=binding.action_uuid,
                 profile_id=profile_id,
                 page_id=page_id,

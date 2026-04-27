@@ -12,7 +12,6 @@ from deckr.pluginhost.messages import (
     WILL_APPEAR,
     WILL_DISAPPEAR,
     TitleOptions,
-    build_context_id,
     context_subject,
     controller_address,
     host_address,
@@ -78,6 +77,10 @@ class ControlContext(ControlContextProtocol):
         page_id: str,
         title_options: TitleOptions | None = None,
         builtin_action: "PluginAction | None" = None,
+        action_instance_id: str,
+        binding_id: str,
+        context_id: str,
+        page_session_id: str | None = None,
     ):
         self._controller_id = controller_id
         self.device = device
@@ -85,6 +88,10 @@ class ControlContext(ControlContextProtocol):
         self._command_service = command_service
         self.host_id = host_id
         self.action_uuid = action_uuid
+        self.action_instance_id = action_instance_id
+        self.binding_id = binding_id
+        self._context_id = context_id
+        self.page_session_id = page_session_id
         self._builtin_action = builtin_action
         self.slot = slot
         self.manager = manager
@@ -94,7 +101,8 @@ class ControlContext(ControlContextProtocol):
         self.settings_target = context_settings_target
 
         self._store = ControlStateStore(
-            context_id=build_context_id(controller_id, config_id, slot.id)
+            context_id=context_id,
+            binding_id=binding_id,
         )
         self._store.settings = dict(settings)
         self._store.default_title_options = title_options
@@ -122,7 +130,7 @@ class ControlContext(ControlContextProtocol):
 
     @property
     def id(self) -> str:
-        return build_context_id(self._controller_id, self.config_id, self.slot.id)
+        return self._context_id
 
     def _slot_info(self) -> SlotInfo:
         image_format = None
@@ -156,7 +164,14 @@ class ControlContext(ControlContextProtocol):
             recipient=host_address(self.host_id),
             message_type=msg_type,
             body=_without_wire_context(payload),
-            subject=context_subject(self.id, action_uuid=self.action_uuid),
+            subject=context_subject(
+                self.id,
+                config_id=self.config_id,
+                action_instance_id=self.action_instance_id,
+                binding_id=self.binding_id,
+                page_session_id=self.page_session_id,
+                action_uuid=self.action_uuid,
+            ),
         )
         await self._plugin_bus.send(msg)
 

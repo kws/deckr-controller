@@ -75,5 +75,15 @@ class BuiltInPluginContext(PluginContextProtocol):
             descriptor=descriptor, context_id=self._context_id
         )
 
+    async def update_page(self, descriptor: DynamicPageDescriptor) -> None:
+        await self._manager.update_page(
+            descriptor=descriptor, context_id=self._context_id
+        )
+
+    async def replace_page(self, descriptor: DynamicPageDescriptor) -> None:
+        await self._manager.replace_page(
+            descriptor=descriptor, context_id=self._context_id
+        )
+
     async def close_page(self) -> None:
         await self._manager.close_page(context_id=self._context_id)

@@ -67,6 +67,7 @@ class RenderRequest:
     generation: int
     image_format: RenderImageFormat
     graph: dict[str, Any]
+    binding_id: str | None = None
     delay_ms: int = 0
 
 
@@ -78,6 +79,7 @@ class RenderResult:
     slot_id: str
     generation: int
     frame: bytes | None
+    binding_id: str | None = None
     error: str | None = None
 
 
@@ -294,6 +296,7 @@ def build_render_request(
     image_format: HardwareImageFormat,
     *,
     context_id: str = "",
+    binding_id: str | None = None,
     slot_id: str = "",
     generation: int = 0,
 ) -> RenderRequest | None:
@@ -305,6 +308,7 @@ def build_render_request(
 
     return RenderRequest(
         context_id=context_id,
+        binding_id=binding_id,
         slot_id=slot_id,
         generation=generation,
         image_format=_to_render_image_format(image_format),
@@ -358,6 +362,7 @@ class RenderService:
         image_format: HardwareImageFormat,
         *,
         context_id: str = "",
+        binding_id: str | None = None,
         slot_id: str = "",
         generation: int = 0,
     ) -> RenderRequest | None:
@@ -365,6 +370,7 @@ class RenderService:
             model,
             image_format,
             context_id=context_id,
+            binding_id=binding_id,
             slot_id=slot_id,
             generation=generation,
         )

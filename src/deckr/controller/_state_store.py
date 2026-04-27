@@ -28,8 +28,9 @@ class TransientOverlay:
 class ControlStateStore:
     """In-memory declarations for one control context."""
 
-    def __init__(self, context_id: str):
+    def __init__(self, context_id: str, binding_id: str | None = None):
         self.context_id = context_id
+        self.binding_id = binding_id
         self.content = RenderContent()
         self.overlay: TransientOverlay | None = None
         self.settings: dict = {}

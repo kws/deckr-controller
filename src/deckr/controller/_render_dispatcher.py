@@ -61,6 +61,7 @@ class ThreadRenderBackend:
             frame = await anyio.to_thread.run_sync(render_request_to_jpeg, request)
             return RenderResult(
                 context_id=request.context_id,
+                binding_id=request.binding_id,
                 slot_id=request.slot_id,
                 generation=request.generation,
                 frame=frame,
@@ -74,6 +75,7 @@ class ThreadRenderBackend:
             )
             return RenderResult(
                 context_id=request.context_id,
+                binding_id=request.binding_id,
                 slot_id=request.slot_id,
                 generation=request.generation,
                 frame=None,
@@ -101,6 +103,7 @@ class ProcessPoolRenderBackend:
             )
             return RenderResult(
                 context_id=request.context_id,
+                binding_id=request.binding_id,
                 slot_id=request.slot_id,
                 generation=request.generation,
                 frame=frame,
@@ -114,6 +117,7 @@ class ProcessPoolRenderBackend:
             )
             return RenderResult(
                 context_id=request.context_id,
+                binding_id=request.binding_id,
                 slot_id=request.slot_id,
                 generation=request.generation,
                 frame=None,
@@ -128,6 +132,7 @@ class ProcessPoolRenderBackend:
 class _SlotRenderState:
     generation: int = 0
     context_id: str | None = None
+    binding_id: str | None = None
     output: SlotOutput | None = None
     running: bool = False
     pending_request: RenderRequest | None = None
@@ -157,6 +162,7 @@ class RenderDispatcher:
         *,
         slot_id: str,
         context_id: str,
+        binding_id: str | None = None,
         request: RenderRequest | None,
         output: SlotOutput | None = None,
     ) -> int:
@@ -167,6 +173,7 @@ class RenderDispatcher:
             state.generation += 1
             generation = state.generation
             state.context_id = context_id
+            state.binding_id = binding_id
             if output is not None:
                 state.output = output
 
@@ -177,6 +184,7 @@ class RenderDispatcher:
             request = replace(
                 request,
                 context_id=context_id,
+                binding_id=binding_id,
                 slot_id=slot_id,
                 generation=generation,
             )
@@ -192,6 +200,7 @@ class RenderDispatcher:
         slot_id: str,
         *,
         context_id: str | None = None,
+        binding_id: str | None = None,
         output: SlotOutput | None = None,
     ) -> int:
         """Invalidate queued/running renders for a slot and clear the device slot."""
@@ -202,6 +211,7 @@ class RenderDispatcher:
             generation = state.generation
             if context_id is not None:
                 state.context_id = context_id
+            state.binding_id = binding_id
             if output is not None:
                 state.output = output
             state.pending_request = None
@@ -248,6 +258,8 @@ class RenderDispatcher:
                 if state.generation != result.generation:
                     return
                 if state.context_id != result.context_id:
+                    return
+                if state.binding_id != result.binding_id:
                     return
                 target_output = state.output
 

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from deckr.hardware import messages as hw_messages
-from deckr.pluginhost.messages import build_context_id as _build_context_id
 from deckr.python_plugin.events import (
     DialRotate,
     KeyDown,
@@ -13,11 +12,6 @@ from deckr.python_plugin.events import (
     TouchSwipe,
     TouchTap,
 )
-
-
-def build_context_id(controller_id: str, config_id: str, slot_id: str) -> str:
-    """Canonical controller-scoped context ID."""
-    return _build_context_id(controller_id, config_id, slot_id)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -76,11 +70,10 @@ class EventTranslator:
         slot_id = event.key_id
         if not self._is_gesture_supported(slot_id, "key_down"):
             return None
-        context = build_context_id(self._controller_id, config_id, slot_id)
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_key_down",
-            plugin_event=KeyDown(context=context, slot_id=slot_id),
+            plugin_event=KeyDown(context="", slot_id=slot_id),
             gesture="key_down",
         )
 
@@ -90,11 +83,10 @@ class EventTranslator:
         slot_id = event.key_id
         if not self._is_gesture_supported(slot_id, "key_up"):
             return None
-        context = build_context_id(self._controller_id, config_id, slot_id)
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_key_up",
-            plugin_event=KeyUp(context=context, slot_id=slot_id),
+            plugin_event=KeyUp(context="", slot_id=slot_id),
             gesture="key_up",
         )
 
@@ -104,12 +96,11 @@ class EventTranslator:
         slot_id = event.dial_id
         if not self._is_gesture_supported(slot_id, "encoder_rotate"):
             return None
-        context = build_context_id(self._controller_id, config_id, slot_id)
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_dial_rotate",
             plugin_event=DialRotate(
-                context=context,
+                context="",
                 slot_id=slot_id,
                 direction=event.direction,
             ),
@@ -122,11 +113,10 @@ class EventTranslator:
         slot_id = event.touch_id
         if not self._is_gesture_supported(slot_id, "touch_tap"):
             return None
-        context = build_context_id(self._controller_id, config_id, slot_id)
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_touch_tap",
-            plugin_event=TouchTap(context=context, slot_id=slot_id),
+            plugin_event=TouchTap(context="", slot_id=slot_id),
             gesture="touch_tap",
         )
 
@@ -136,12 +126,11 @@ class EventTranslator:
         slot_id = event.touch_id
         if not self._is_gesture_supported(slot_id, "touch_swipe"):
             return None
-        context = build_context_id(self._controller_id, config_id, slot_id)
         return TranslatedEvent(
             slot_id=slot_id,
             method_name="on_touch_swipe",
             plugin_event=TouchSwipe(
-                context=context,
+                context="",
                 slot_id=slot_id,
                 direction=event.direction,
             ),

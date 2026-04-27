@@ -16,7 +16,6 @@ from deckr.hardware.messages import (
 )
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
-    build_context_id,
     context_subject,
     controller_address,
     host_address,
@@ -47,24 +46,47 @@ def _plugin_bus() -> EventBus:
     return EventBus("plugin_messages")
 
 
-def _context_id(config_id: str = "test-device", slot_id: str = "0,0") -> str:
-    return build_context_id(CONTROLLER_ID, config_id, slot_id)
-
-
 def _plugin_command(
     message_type: str,
     payload: dict | None = None,
     *,
     config_id: str = "test-device",
-    slot_id: str = "0,0",
+    context_id: str,
+    action_instance_id: str,
+    binding_id: str,
+    page_session_id: str | None = None,
 ) -> DeckrMessage:
-    context_id = _context_id(config_id, slot_id)
     return plugin_message(
         sender=HOST_ADDR,
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
         body=payload or {},
-        subject=context_subject(context_id),
+        subject=context_subject(
+            context_id,
+            config_id=config_id,
+            action_instance_id=action_instance_id,
+            binding_id=binding_id,
+            page_session_id=page_session_id,
+        ),
+    )
+
+
+async def _plugin_command_for_active_binding(
+    manager: DeviceManager,
+    message_type: str,
+    payload: dict | None = None,
+    *,
+    slot_id: str = "0,0",
+) -> DeckrMessage:
+    ctx = await manager.action_contexts.get(slot_id)
+    assert ctx is not None
+    return _plugin_command(
+        message_type,
+        payload,
+        context_id=ctx.id,
+        action_instance_id=ctx.action_instance_id,
+        binding_id=ctx.binding_id,
+        page_session_id=ctx.page_session_id,
     )
 
 
@@ -165,6 +187,7 @@ class ControlledFrameBackend:
         await event.wait()
         return RenderResult(
             context_id=request.context_id,
+            binding_id=request.binding_id,
             slot_id=request.slot_id,
             generation=request.generation,
             frame=f"frame-{request.generation}".encode(),
@@ -521,7 +544,9 @@ async def test_key_press_renders_to_device(
         )
         await manager.set_page(profile="default", page=0)
         baseline_calls = command_service.set_image.call_count
-        msg = _plugin_command(SET_IMAGE, {"image": _solid_key_image()})
+        msg = await _plugin_command_for_active_binding(
+            manager, SET_IMAGE, {"image": _solid_key_image()}
+        )
         with anyio.fail_after(0.2):
             await manager.handle_command(msg)
 
@@ -571,7 +596,9 @@ async def test_set_image_last_write_wins_same_slot(
         await manager.set_page(profile="default", page=0)
         initial_generation = manager._render_dispatcher._slots["0,0"].generation
 
-        msg = _plugin_command(SET_IMAGE, {"image": _solid_key_image()})
+        msg = await _plugin_command_for_active_binding(
+            manager, SET_IMAGE, {"image": _solid_key_image()}
+        )
 
         await manager.handle_command(msg)
         await manager.handle_command(msg)
@@ -663,7 +690,7 @@ async def test_key_down_event_delivered_to_plugin(
         await manager.on_event(
             hw_messages.KeyUpMessage(device_id="test-device", key_id="0,0")
         )
-    expected_context = build_context_id(CONTROLLER_ID, "test-device", "0,0")
+    expected_context = received[0][1] if received else ""
     assert ("key_down", expected_context, "0,0") in received
     assert ("key_up", expected_context, "0,0") in received
 

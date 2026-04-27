@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 from deckr.contracts.messages import DeckrMessage
+from deckr.hardware import messages as hw_messages
 from deckr.hardware.messages import (
     HardwareCoordinates,
     HardwareDevice,
@@ -18,15 +19,16 @@ from deckr.pluginhost.messages import (
     OPEN_PAGE,
     PAGE_APPEAR,
     PAGE_DISAPPEAR,
+    REPLACE_PAGE,
     REQUEST_SETTINGS,
     SET_IMAGE,
     SET_PAGE,
     SET_SETTINGS,
     SET_TITLE,
     SLEEP_SCREEN,
+    UPDATE_PAGE,
     WAKE_SCREEN,
     DynamicPageDescriptor,
-    build_context_id,
     context_subject,
     controller_address,
     host_address,
@@ -54,26 +56,29 @@ def _plugin_bus() -> EventBus:
     return EventBus("plugin_messages")
 
 
-def _context_id(config_id: str = "test-device", slot_id: str = "0,0") -> str:
-    return build_context_id(CONTROLLER_ID, config_id, slot_id)
-
-
 def _command_message(
     message_type: str,
     payload: dict | None = None,
     *,
     config_id: str = "test-device",
-    slot_id: str = "0,0",
     sender=HOST_ADDR,
-    context_id: str | None = None,
+    context_id: str,
+    action_instance_id: str | None = None,
+    binding_id: str | None = None,
+    page_session_id: str | None = None,
 ) -> DeckrMessage:
-    context_id = context_id or _context_id(config_id, slot_id)
     return plugin_message(
         sender=sender,
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
         body=payload or {},
-        subject=context_subject(context_id),
+        subject=context_subject(
+            context_id,
+            config_id=config_id,
+            action_instance_id=action_instance_id,
+            binding_id=binding_id,
+            page_session_id=page_session_id,
+        ),
     )
 
 
@@ -192,6 +197,47 @@ async def _active_context(manager: DeviceManager, slot_id: str = "0,0"):
     return ctx
 
 
+async def _command_for_active_binding(
+    manager: DeviceManager,
+    message_type: str,
+    payload: dict | None = None,
+    *,
+    slot_id: str = "0,0",
+    sender=HOST_ADDR,
+    config_id: str = "test-device",
+) -> DeckrMessage:
+    ctx = await _active_context(manager, slot_id)
+    return _command_message(
+        message_type,
+        payload,
+        sender=sender,
+        config_id=config_id,
+        context_id=ctx.id,
+        action_instance_id=ctx.action_instance_id,
+        binding_id=ctx.binding_id,
+        page_session_id=ctx.page_session_id,
+    )
+
+
+def _command_for_page_session(
+    manager: DeviceManager,
+    message_type: str,
+    payload: dict | None = None,
+    *,
+    sender=HOST_ADDR,
+) -> DeckrMessage:
+    session = manager._dynamic_page_session
+    assert session is not None
+    return _command_message(
+        message_type,
+        payload,
+        sender=sender,
+        context_id=session.context_id,
+        action_instance_id=session.action_instance_id,
+        page_session_id=session.page_session_id,
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_command_sleep_screen_calls_device(persistence_tmp_dir):
     """SLEEP_SCREEN command publishes a hardware sleep command."""
@@ -217,7 +263,7 @@ async def test_handle_command_sleep_screen_calls_device(persistence_tmp_dir):
     )
     await manager.set_page(profile="default", page=0)
 
-    msg = _command_message(SLEEP_SCREEN)
+    msg = await _command_for_active_binding(manager, SLEEP_SCREEN)
     await manager.handle_command(msg)
 
     command_service.sleep_screen.assert_awaited_once_with("test-device")
@@ -248,7 +294,7 @@ async def test_handle_command_wake_screen_calls_device(persistence_tmp_dir):
     )
     await manager.set_page(profile="default", page=0)
 
-    msg = _command_message(WAKE_SCREEN)
+    msg = await _command_for_active_binding(manager, WAKE_SCREEN)
     await manager.handle_command(msg)
 
     command_service.wake_screen.assert_awaited_once_with("test-device")
@@ -283,17 +329,97 @@ async def test_handle_command_open_page(persistence_tmp_dir):
 
     descriptor_payload = {
         "pageId": "test-page-1",
-        "slots": [
-            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
-            {"slotId": "1,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+            {"controlId": "1,0", "actionUuid": NoopAction.uuid, "settings": {}},
         ],
     }
-    msg = _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+    msg = await _command_for_active_binding(
+        manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+    )
     await manager.handle_command(msg)
 
     current = manager._nav.current_page
     assert isinstance(current, DynamicPageDescriptor)
     assert current.page_id == "test-page-1"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_child_binding_can_reuse_opener_control_and_close_page(
+    persistence_tmp_dir,
+):
+    owner_action = "test.action.owner"
+    child_action = "test.action.child"
+    device = _make_mock_device()
+    plugin_bus = _plugin_bus()
+
+    async def get_action(uuid: str):
+        return ActionMetadata(uuid=uuid, host_id="python")
+
+    registry = MagicMock()
+    registry.get_action = AsyncMock(side_effect=get_action)
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(slot="0,0", action=owner_action, settings={})
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=config,
+        manager=registry,
+        plugin_bus=plugin_bus,
+        start_soon=lambda fn, *a, **k: None,
+    )
+    await manager.set_page(profile="default", page=0)
+    owner_ctx = await _active_context(manager)
+
+    descriptor_payload = {
+        "pageId": "child-page",
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": child_action, "settings": {}},
+        ],
+    }
+    await manager.handle_command(
+        await _command_for_active_binding(
+            manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+        )
+    )
+
+    child_ctx = await _active_context(manager)
+    assert child_ctx.id != owner_ctx.id
+    assert child_ctx.binding_id != owner_ctx.binding_id
+    assert child_ctx.page_session_id is not None
+    assert child_ctx.action_uuid == child_action
+
+    child_ctx.on_key_up = AsyncMock()
+    await manager.on_event(
+        hw_messages.hardware_input_message(
+            manager_id="manager-main",
+            device_id=device.id,
+            body=hw_messages.KeyUpMessage(key_id="0,0"),
+        )
+    )
+    child_ctx.on_key_up.assert_awaited_once()
+    event = child_ctx.on_key_up.await_args.args[0]
+    assert event.context == child_ctx.id
+
+    await manager.handle_command(await _command_for_active_binding(manager, CLOSE_PAGE))
+    assert isinstance(manager._nav.current_page, StaticPageRef)
 
 
 @pytest.mark.asyncio
@@ -321,8 +447,8 @@ async def test_open_page_emits_page_events_and_close(persistence_tmp_dir):
 
     descriptor_payload = {
         "pageId": "test-page-2",
-        "slots": [
-            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
         ],
     }
 
@@ -334,13 +460,15 @@ async def test_open_page_emits_page_events_and_close(persistence_tmp_dir):
         raise AssertionError(f"Timed out waiting for {event_type}")
 
     async with plugin_bus.subscribe() as stream:
-        open_command = _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+        open_command = await _command_for_active_binding(
+            manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+        )
         await manager.handle_command(open_command)
         event = await _await_event(stream, PAGE_APPEAR)
         assert event.message_type == PAGE_APPEAR
         assert event.causation_id == open_command.message_id
 
-        close_command = _command_message(CLOSE_PAGE)
+        close_command = await _command_for_active_binding(manager, CLOSE_PAGE)
         await manager.handle_command(close_command)
         event = await _await_event(stream, PAGE_DISAPPEAR)
         assert event.message_type == PAGE_DISAPPEAR
@@ -379,8 +507,8 @@ async def test_open_page_replacement_events_set_causation(persistence_tmp_dir):
 
     descriptor_payload = {
         "pageId": "test-page-2",
-        "slots": [
-            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
         ],
     }
 
@@ -393,18 +521,21 @@ async def test_open_page_replacement_events_set_causation(persistence_tmp_dir):
 
     async with plugin_bus.subscribe() as stream:
         await manager.handle_command(
-            _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+            await _command_for_active_binding(
+                manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+            )
         )
         await _await_event(stream, PAGE_APPEAR)
 
         replacement_payload = {
             "pageId": "test-page-3",
-            "slots": [
-                {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+            "bindings": [
+                {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
             ],
         }
-        replacement_command = _command_message(
-            OPEN_PAGE,
+        replacement_command = await _command_for_active_binding(
+            manager,
+            REPLACE_PAGE,
             {"descriptor": replacement_payload},
         )
         await manager.handle_command(replacement_command)
@@ -476,12 +607,14 @@ async def test_widget_page_timeout_returns_to_owner(persistence_tmp_dir):
 
         descriptor_payload = {
             "pageId": "timeout-page",
-            "slots": [
-                {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+            "bindings": [
+                {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
             ],
         }
         await manager.handle_command(
-            _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+            await _command_for_active_binding(
+                manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+            )
         )
         assert isinstance(manager._nav.current_page, DynamicPageDescriptor)
 
@@ -524,7 +657,7 @@ async def test_handle_command_set_page(persistence_tmp_dir):
     current = manager._nav.current_page
     assert isinstance(current, StaticPageRef) and current.page_index == 0
 
-    msg = _command_message(SET_PAGE, {"page": 1})
+    msg = await _command_for_active_binding(manager, SET_PAGE, {"page": 1})
     await manager.handle_command(msg)
 
     current = manager._nav.current_page
@@ -556,7 +689,9 @@ async def test_handle_command_ignores_wrong_config(persistence_tmp_dir):
     )
     await manager.set_page(profile="default", page=0)
 
-    msg = _command_message(SLEEP_SCREEN, config_id="other-config")
+    msg = await _command_for_active_binding(
+        manager, SLEEP_SCREEN, config_id="other-config"
+    )
     await manager.handle_command(msg)
 
     command_service.sleep_screen.assert_not_called()
@@ -571,14 +706,16 @@ async def test_handle_command_rejects_different_host_for_title_and_image(
     ctx = await _active_context(manager)
 
     await manager.handle_command(
-        _command_message(
+        await _command_for_active_binding(
+            manager,
             SET_TITLE,
             {"text": "attacker title"},
             sender=host_address("attacker"),
         )
     )
     await manager.handle_command(
-        _command_message(
+        await _command_for_active_binding(
+            manager,
             SET_IMAGE,
             {"image": "attacker image"},
             sender=host_address("attacker"),
@@ -600,14 +737,16 @@ async def test_handle_command_rejects_different_host_for_settings(
 
     async with plugin_bus.subscribe() as stream:
         await manager.handle_command(
-            _command_message(
+            await _command_for_active_binding(
+                manager,
                 SET_SETTINGS,
                 {"settings": {"owner": "attacker"}},
                 sender=host_address("attacker"),
             )
         )
         await manager.handle_command(
-            _command_message(
+            await _command_for_active_binding(
+                manager,
                 REQUEST_SETTINGS,
                 sender=host_address("attacker"),
             )
@@ -632,7 +771,8 @@ async def test_handle_command_rejects_different_host_for_page_commands(
     await manager.set_page(profile="default", page=0)
 
     await manager.handle_command(
-        _command_message(
+        await _command_for_active_binding(
+            manager,
             SET_PAGE,
             {"page": 1},
             sender=host_address("attacker"),
@@ -643,12 +783,13 @@ async def test_handle_command_rejects_different_host_for_page_commands(
 
     descriptor_payload = {
         "pageId": "attacker-page",
-        "slots": [
-            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
         ],
     }
     await manager.handle_command(
-        _command_message(
+        await _command_for_active_binding(
+            manager,
             OPEN_PAGE,
             {"descriptor": descriptor_payload},
             sender=host_address("attacker"),
@@ -665,29 +806,33 @@ async def test_handle_command_rejects_different_host_for_dynamic_page_close_and_
     await manager.set_page(profile="default", page=0)
     descriptor_payload = {
         "pageId": "owner-page",
-        "slots": [
-            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
         ],
     }
     await manager.handle_command(
-        _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+        await _command_for_active_binding(
+            manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+        )
     )
-    owner = manager._dynamic_page_owner
-    assert owner is not None
+    session = manager._dynamic_page_session
+    assert session is not None
     assert isinstance(manager._nav.current_page, DynamicPageDescriptor)
 
     replacement_payload = {
         "pageId": "attacker-replacement",
-        "slots": [
-            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
         ],
     }
     await manager.handle_command(
         _command_message(
-            OPEN_PAGE,
+            REPLACE_PAGE,
             {"descriptor": replacement_payload},
             sender=host_address("attacker"),
-            context_id=owner.page_context_id,
+            context_id=session.context_id,
+            action_instance_id=session.action_instance_id,
+            page_session_id=session.page_session_id,
         )
     )
     current = manager._nav.current_page
@@ -698,7 +843,9 @@ async def test_handle_command_rejects_different_host_for_dynamic_page_close_and_
         _command_message(
             CLOSE_PAGE,
             sender=host_address("attacker"),
-            context_id=owner.page_context_id,
+            context_id=session.context_id,
+            action_instance_id=session.action_instance_id,
+            page_session_id=session.page_session_id,
         )
     )
     assert isinstance(manager._nav.current_page, DynamicPageDescriptor)
@@ -713,16 +860,18 @@ async def test_handle_command_rejects_dynamic_page_settings_for_wrong_host_or_ac
     await manager.set_page(profile="default", page=0)
     descriptor_payload = {
         "pageId": "settings-page",
-        "slots": [
-            {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+        "bindings": [
+            {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
         ],
     }
     await manager.handle_command(
-        _command_message(OPEN_PAGE, {"descriptor": descriptor_payload})
+        await _command_for_active_binding(
+            manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+        )
     )
-    owner = manager._dynamic_page_owner
-    assert owner is not None
-    assert owner.settings_target is not None
+    session = manager._dynamic_page_session
+    assert session is not None
+    assert session.settings_target is not None
 
     async with plugin_bus.subscribe() as stream:
         await manager.handle_command(
@@ -730,20 +879,24 @@ async def test_handle_command_rejects_dynamic_page_settings_for_wrong_host_or_ac
                 SET_SETTINGS,
                 {"settings": {"blocked": "host"}},
                 sender=host_address("attacker"),
-                context_id=owner.page_context_id,
+                context_id=session.context_id,
+                action_instance_id=session.action_instance_id,
+                page_session_id=session.page_session_id,
             )
         )
         with pytest.raises(ValidationError):
             _command_message(
                 SET_SETTINGS,
                 {"settings": {"blocked": "action"}, "actionUuid": "other.action"},
-                context_id=owner.page_context_id,
+                context_id=session.context_id,
+                action_instance_id=session.action_instance_id,
+                page_session_id=session.page_session_id,
             )
         with anyio.move_on_after(0.05) as scope:
             await stream.receive()
 
     assert scope.cancel_called
-    assert await manager._settings_service.get(owner.settings_target) == {}
+    assert await manager._settings_service.get(session.settings_target) == {}
 
 
 @pytest.mark.asyncio
@@ -755,10 +908,14 @@ async def test_handle_command_rejects_different_host_for_power_commands(
     await manager.set_page(profile="default", page=0)
 
     await manager.handle_command(
-        _command_message(SLEEP_SCREEN, sender=host_address("attacker"))
+        await _command_for_active_binding(
+            manager, SLEEP_SCREEN, sender=host_address("attacker")
+        )
     )
     await manager.handle_command(
-        _command_message(WAKE_SCREEN, sender=host_address("attacker"))
+        await _command_for_active_binding(
+            manager, WAKE_SCREEN, sender=host_address("attacker")
+        )
     )
 
     command_service.sleep_screen.assert_not_called()
@@ -783,7 +940,9 @@ async def test_handle_command_rejects_non_host_and_reserved_senders(
     ctx = await _active_context(manager)
 
     await manager.handle_command(
-        _command_message(SET_IMAGE, {"image": "blocked"}, sender=sender)
+        await _command_for_active_binding(
+            manager, SET_IMAGE, {"image": "blocked"}, sender=sender
+        )
     )
 
     assert ctx._router._store.content.image is None
@@ -799,6 +958,9 @@ async def test_command_body_rejects_action_uuid_retargeting(persistence_tmp_dir)
         _command_message(
             SET_IMAGE,
             {"image": "blocked", "actionUuid": "other.action"},
+            context_id=ctx.id,
+            action_instance_id=ctx.action_instance_id,
+            binding_id=ctx.binding_id,
         )
 
     assert ctx._router._store.content.image is None
@@ -814,6 +976,9 @@ async def test_command_body_rejects_slot_retargeting(persistence_tmp_dir):
         _command_message(
             SET_TITLE,
             {"text": "blocked", "slot": "1,0"},
+            context_id=ctx.id,
+            action_instance_id=ctx.action_instance_id,
+            binding_id=ctx.binding_id,
         )
 
     assert ctx._router._store.content.title is None
@@ -822,22 +987,22 @@ async def test_command_body_rejects_slot_retargeting(persistence_tmp_dir):
 # --- _descriptor_from_payload unit tests ---
 
 
-def test_descriptor_from_payload_requires_slots():
-    """Descriptor without slots returns None."""
+def test_descriptor_from_payload_requires_bindings():
+    """Descriptor without bindings returns None."""
     data = {
         "pageId": "p1",
-        "slots": None,
+        "bindings": None,
     }
     assert _descriptor_from_payload(data) is None
 
 
-def test_descriptor_from_payload_with_slots():
-    """Descriptor with slots reconstructs SlotBindings."""
+def test_descriptor_from_payload_with_bindings():
+    """Descriptor with bindings reconstructs control bindings."""
     data = {
         "pageId": "p2",
-        "slots": [
+        "bindings": [
             {
-                "slotId": "0,0",
+                "controlId": "0,0",
                 "actionUuid": "slot.action",
                 "settings": {"key": "val"},
                 "titleOptions": {
@@ -852,14 +1017,14 @@ def test_descriptor_from_payload_with_slots():
     }
     desc = _descriptor_from_payload(data)
     assert desc is not None
-    assert desc.slots is not None
-    assert len(desc.slots) == 1
-    assert desc.slots[0].slot_id == "0,0"
-    assert desc.slots[0].action_uuid == "slot.action"
-    assert desc.slots[0].settings == {"key": "val"}
-    assert desc.slots[0].title_options is not None
-    assert desc.slots[0].title_options.font_family == "Inter"
-    assert desc.slots[0].title_options.font_size == 14
+    assert desc.bindings is not None
+    assert len(desc.bindings) == 1
+    assert desc.bindings[0].control_id == "0,0"
+    assert desc.bindings[0].action_uuid == "slot.action"
+    assert desc.bindings[0].settings == {"key": "val"}
+    assert desc.bindings[0].title_options is not None
+    assert desc.bindings[0].title_options.font_family == "Inter"
+    assert desc.bindings[0].title_options.font_size == 14
 
 
 def test_descriptor_from_payload_empty_returns_none():
@@ -893,17 +1058,34 @@ async def test_handle_command_all_command_types_handled(persistence_tmp_dir):
     await manager.set_page(profile="default", page=0)
 
     for msg_type in COMMAND_MESSAGE_TYPES:
+        await manager.set_page(profile="default", page=0)
         payload = {}
-        if msg_type == OPEN_PAGE:
+        if msg_type in {OPEN_PAGE, UPDATE_PAGE, REPLACE_PAGE}:
             payload["descriptor"] = {
                 "pageId": "p1",
-                "slots": [
-                    {"slotId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
-                    {"slotId": "1,0", "actionUuid": NoopAction.uuid, "settings": {}},
+                "bindings": [
+                    {"controlId": "0,0", "actionUuid": NoopAction.uuid, "settings": {}},
+                    {"controlId": "1,0", "actionUuid": NoopAction.uuid, "settings": {}},
                 ],
             }
         elif msg_type == SET_PAGE:
             payload["page"] = 0
 
-        msg = _command_message(msg_type, payload)
+        if msg_type in {UPDATE_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
+            await manager.handle_command(
+                await _command_for_active_binding(
+                    manager, OPEN_PAGE, {"descriptor": payload.get("descriptor") or {
+                        "pageId": "p1",
+                        "bindings": [
+                            {
+                                "controlId": "0,0",
+                                "actionUuid": NoopAction.uuid,
+                                "settings": {},
+                            }
+                        ],
+                    }}
+                )
+            )
+
+        msg = await _command_for_active_binding(manager, msg_type, payload)
         await manager.handle_command(msg)

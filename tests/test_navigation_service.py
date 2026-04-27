@@ -62,20 +62,20 @@ def test_set_page_replaces_current(device_config):
     assert nav.current_page == ref1
 
 
-def test_resolve_static_bindings_returns_slot_bindings(device_config):
+def test_resolve_static_bindings_returns_control_bindings(device_config):
     nav = NavigationService(device_config)
     ref = StaticPageRef(profile_name="default", page_index=0)
     bindings = nav.resolve_static_bindings(ref)
     assert len(bindings) == 2
-    assert bindings[0].slot_id == "0,0"
+    assert bindings[0].control_id == "0,0"
     assert bindings[0].action_uuid == "action.a"
     assert bindings[0].settings == {"x": 1}
-    assert bindings[1].slot_id == "0,1"
+    assert bindings[1].control_id == "0,1"
     assert bindings[1].action_uuid == "action.b"
 
 
 def test_resolve_static_bindings_includes_title_options():
-    """When Control has title_options, SlotBinding receives converted TitleOptions."""
+    """When Control has title_options, binding receives converted TitleOptions."""
     config = DeviceConfig(
         id="dev1",
         name="Test",
