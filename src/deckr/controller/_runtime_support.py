@@ -5,7 +5,7 @@ from deckr.controller.config import (
     FileBackedDeviceConfigService,
     NullDeviceConfigService,
 )
-from deckr.controller.settings import FileBackedSettingsService, InMemorySettingsService
+from deckr.controller.settings import InMemorySettingsService
 
 
 def build_config_service(config: ControllerRuntimeConfig):
@@ -16,7 +16,4 @@ def build_config_service(config: ControllerRuntimeConfig):
 
 
 def build_settings_service(config: ControllerRuntimeConfig):
-    settings = config.settings
-    if settings is None or settings.file is None:
-        return InMemorySettingsService()
-    return FileBackedSettingsService(settings_dir=settings.file.path)
+    return InMemorySettingsService()

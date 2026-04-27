@@ -11,22 +11,8 @@ def anyio_backend():
     return "anyio"
 
 
-@pytest.fixture(autouse=True)
-def settings_tmp_dir(monkeypatch, tmp_path):
-    """Keep file-backed settings writes inside a per-test temp directory."""
-
-    monkeypatch.setenv("DECKR_SETTINGS_DIR", str(tmp_path))
-    yield tmp_path
-
-
 @pytest.fixture
-def persistence_tmp_dir(monkeypatch, tmp_path):
-    """Patch controller persistence to use a temp dir."""
-    from deckr.controller import _persistence
+def persistence_tmp_dir(tmp_path):
+    """Legacy fixture name for tests that need an isolated scratch path."""
 
-    class TmpDirs:
-        user_data_dir = str(tmp_path)
-
-    monkeypatch.setenv("DECKR_SETTINGS_DIR", str(tmp_path))
-    monkeypatch.setattr(_persistence, "dirs", TmpDirs())
     yield tmp_path

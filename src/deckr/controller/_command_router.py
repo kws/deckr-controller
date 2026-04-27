@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
+from deckr.contracts.models import thaw_json
 from deckr.pluginhost.messages import TitleOptions
 
 from deckr.controller._render import RenderService, resolve
@@ -149,25 +150,25 @@ class CommandRouter:
             )
 
     async def hydrate_settings(self) -> None:
-        """Load settings from persistence into store. Precedence: config defaults, then persisted overrides (persisted wins)."""
+        """Load live runtime settings into store. Precedence: config, then runtime overlay."""
         if self._settings_hydrated:
             return
 
         if self._settings_service is not None and self._settings_target is not None:
-            persisted = await self._settings_service.get(self._settings_target)
-            merged = dict(self._store.settings)
-            merged.update(persisted)
+            overlay = await self._settings_service.get(self._settings_target)
+            merged = dict(thaw_json(self._store.settings))
+            merged.update(overlay)
             self._store.settings = merged
 
         self._settings_hydrated = True
 
     async def set_settings(self, settings: dict) -> SimpleNamespace:
-        """Merge settings and persist. Fail-fast: on persistence write failure we do not update in-memory store."""
+        """Merge settings into the live runtime overlay."""
         if not self._settings_hydrated:
             await self.hydrate_settings()
 
-        candidate = dict(self._store.settings)
-        candidate.update(settings)
+        candidate = dict(thaw_json(self._store.settings))
+        candidate.update(dict(thaw_json(settings)))
 
         merged = candidate
         if self._settings_service is not None and self._settings_target is not None:
@@ -180,7 +181,7 @@ class CommandRouter:
                 )
             except Exception:
                 logger.exception(
-                    "Failed to persist settings for context %s",
+                    "Failed to update runtime settings for context %s",
                     self._store.context_id,
                 )
                 raise

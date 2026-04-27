@@ -72,12 +72,12 @@ from deckr.controller._render_dispatcher import (
     RenderDispatcher,
     ThreadRenderBackend,
 )
-from deckr.controller.config._data import Control, DeviceConfig, Profile
+from deckr.controller.config._data import DeviceConfig, Profile
 from deckr.controller.plugin.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.plugin.context import ControlContext
 from deckr.controller.plugin.provider import PluginManager
 from deckr.controller.settings import (
-    FileBackedSettingsService,
+    InMemorySettingsService,
     SettingsService,
     SettingsTarget,
 )
@@ -212,12 +212,10 @@ class DeviceManager:
             backend=self._render_backend,
             start_soon=start_soon,
         )
-        self._settings_service = settings_service or FileBackedSettingsService()
+        self._settings_service = settings_service or InMemorySettingsService()
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
         self._nav = NavigationService(config)
-        # Keys for dynamic (plugin-defined) pages; add when setting such a page so they are not pruned.
-        self._dynamic_persistence_keys: set[str] = set()
         self._dynamic_page_session: DynamicPageSession | None = None
         self._binding_leases: dict[str, BindingLease] = {}
         self._binding_by_context: dict[str, str] = {}
@@ -255,7 +253,12 @@ class DeviceManager:
         logger.error(f"Profile {profile_name} not found. Returning the first profile.")
         return self.config.profiles[0]
 
-    async def _revoke_binding(self, binding_id: str) -> BindingLease | None:
+    async def _revoke_binding(
+        self,
+        binding_id: str,
+        *,
+        clear_output: bool = True,
+    ) -> BindingLease | None:
         lease = self._binding_leases.pop(binding_id, None)
         if lease is None:
             return None
@@ -270,12 +273,13 @@ class DeviceManager:
             context_id=lease.context_id,
             binding_id=lease.binding_id,
             output=DeviceOutput(self._command_service, self.config_id, lease.control_id),
+            clear_output=clear_output,
         )
         return lease
 
-    async def _revoke_active_bindings(self) -> None:
+    async def _revoke_active_bindings(self, *, clear_outputs: bool = True) -> None:
         for binding_id in list(self._binding_leases):
-            await self._revoke_binding(binding_id)
+            await self._revoke_binding(binding_id, clear_output=clear_outputs)
 
     async def _clear_all_image_slots(self) -> None:
         """Clear all image-capable slots before rendering new page. Prevents stale content."""
@@ -300,26 +304,6 @@ class DeviceManager:
                     ),
                 )
 
-    def _build_context_settings_target(
-        self,
-        *,
-        profile_name: str,
-        page_index: int,
-        control: Control,
-        plugin_uuid: str | None = None,
-        dynamic_page_uuid: str | None = None,
-    ) -> SettingsTarget:
-        return SettingsTarget.for_context(
-            controller_id=self._controller_id,
-            config_id=self.config_id,
-            profile_id=profile_name,
-            page_id=str(page_index),
-            slot_id=control.slot,
-            action_uuid=control.action,
-            dynamic_page_uuid=dynamic_page_uuid,
-            plugin_uuid=plugin_uuid,
-        )
-
     def _build_context_settings_target_for_binding(
         self,
         *,
@@ -327,7 +311,6 @@ class DeviceManager:
         page_id: str,
         binding: ControlBindingDescriptor,
         plugin_uuid: str | None = None,
-        dynamic_page_uuid: str | None = None,
     ) -> SettingsTarget:
         return SettingsTarget.for_context(
             controller_id=self._controller_id,
@@ -336,7 +319,6 @@ class DeviceManager:
             page_id=page_id,
             slot_id=binding.control_id,
             action_uuid=binding.action_uuid,
-            dynamic_page_uuid=dynamic_page_uuid,
             plugin_uuid=plugin_uuid,
         )
 
@@ -347,11 +329,9 @@ class DeviceManager:
         *,
         profile_id: str,
         page_id: str,
-        seed_config: bool,
         action_instance_id: str,
         page_session_id: str | None = None,
         persist_settings: bool = True,
-        dynamic_page_uuid: str | None = None,
     ) -> bool:
         """Resolve a binding: create ControlContext and call on_will_appear if action available.
         Returns True if context was created, False if action not found (caller should render unavailable).
@@ -372,18 +352,10 @@ class DeviceManager:
                 page_id=page_id,
                 binding=binding,
                 plugin_uuid=action_meta.plugin_uuid,
-                dynamic_page_uuid=dynamic_page_uuid,
             )
             if persist_settings
             else None
         )
-        if seed_config and settings_target is not None:
-            target_exists = await self._settings_service.exists(settings_target)
-            if not target_exists and binding.settings:
-                await self._settings_service.merge(
-                    settings_target,
-                    dict(binding.settings),
-                )
         builtin_action = None
         if action_meta.host_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
             self.manager, "get_builtin_action"
@@ -444,38 +416,6 @@ class DeviceManager:
             binding_id,
         )
         return True
-
-    def _build_valid_settings_keys(self) -> set[str]:
-        """Keys that are currently valid: config bindings plus active dynamic pages."""
-
-        valid_keys: set[str] = set(self._dynamic_persistence_keys)
-        for profile in self.config.profiles:
-            for page_index, page in enumerate(profile.pages):
-                for control in page.controls:
-                    key = self._build_context_settings_target(
-                        profile_name=profile.name,
-                        page_index=page_index,
-                        control=control,
-                    )
-                    valid_keys.add(key.as_key())
-        return valid_keys
-
-    async def _reconcile_persistence(self) -> None:
-        """Prune stale persisted context settings for this config."""
-
-        prune = getattr(self._settings_service, "prune_context_targets", None)
-        if not callable(prune):
-            return
-        valid_keys = self._build_valid_settings_keys()
-        pruned = await prune(
-            controller_id=self._controller_id,
-            config_id=self.config_id,
-            valid_keys=valid_keys,
-        )
-        if pruned > 0:
-            logger.info(
-                "Pruned %d stale settings records for %s", pruned, self.config_id
-            )
 
     def _resolve_widget_timeout_ms(self, profile_name: str, page_index: int) -> int:
         profile = self._find_profile(profile_name)
@@ -602,11 +542,9 @@ class DeviceManager:
         self,
         transition: PageTransition,
         *,
-        config_changed: bool = False,
         page_session: DynamicPageSession | None = None,
     ) -> bool:
         arriving = transition.arriving
-        seed_config = config_changed or transition.departing is None
 
         if isinstance(arriving, StaticPageRef):
             bindings = self._nav.resolve_static_bindings(arriving)
@@ -702,7 +640,6 @@ class DeviceManager:
                     slot,
                     profile_id=arriving.profile_name,
                     page_id=str(arriving.page_index),
-                    seed_config=seed_config,
                     action_instance_id=action_instance_id,
                 ):
                     await self._render_unavailable_to_slot(slot)
@@ -724,7 +661,6 @@ class DeviceManager:
                     slot,
                     profile_id="_dynamic",
                     page_id=arriving.page_id,
-                    seed_config=False,
                     action_instance_id=page_session.action_instance_id,
                     page_session_id=page_session.page_session_id,
                     persist_settings=False,
@@ -744,7 +680,6 @@ class DeviceManager:
         causation_id: str | None = None,
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor). Caller must hold _nav_lock."""
-        await self._reconcile_persistence()
         session_to_close = self._dynamic_page_session if close_dynamic else None
         if descriptor is not None:
             transition = self._nav.set_page(descriptor)
@@ -975,11 +910,12 @@ class DeviceManager:
                 causation_id=causation_id,
             )
 
-    async def clear_page(self):
+    async def clear_page(self, *, clear_outputs: bool = True):
         async with self._nav_lock:
             await self._finalize_dynamic_page(reason="clear")
-            await self._revoke_active_bindings()
-            await self._clear_all_image_slots()
+            await self._revoke_active_bindings(clear_outputs=clear_outputs)
+            if clear_outputs:
+                await self._clear_all_image_slots()
 
     async def on_actions_changed(
         self, registered: list[str], unregistered: list[str]
@@ -1069,7 +1005,6 @@ class DeviceManager:
                 slot,
                 profile_id=profile_id,
                 page_id=page_id,
-                seed_config=False,
                 action_instance_id=resolved_action_instance_id,
                 page_session_id=page_session_id,
                 persist_settings=persist_settings,
@@ -1088,11 +1023,21 @@ class DeviceManager:
             await self.clear_page()
             return
         async with self._nav_lock:
+            cleared = await self._settings_service.clear_config_targets(
+                controller_id=self._controller_id,
+                config_id=self.config_id,
+            )
+            if cleared:
+                logger.info(
+                    "Cleared %d runtime settings overlay(s) for %s after config change",
+                    cleared,
+                    self.config_id,
+                )
             self.config = config
             if self._dynamic_page_session is not None:
                 await self._finalize_dynamic_page(reason="config_change")
             transition = self._nav.update_config(config)
-            await self._execute_transition(transition, config_changed=True)
+            await self._execute_transition(transition)
 
     def _command_sender_host_id(self, msg: DeckrMessage) -> str | None:
         host_id = parse_host_address(msg.sender)

@@ -37,11 +37,9 @@ dependencies = [
     "justmyresource-lucide>=0.575.0",
     "justmytype>=0.3.0,<0.4.0",
     "pillow>=12.1.0,<13.0.0",
-    "platformdirs>=4.5.1,<5.0.0",
     "python-decouple>=3.8,<4.0",
     "pyyaml>=6.0.3,<7.0.0",
     "simpleeval>=1.0.3,<2.0.0",
-    "tinydb>=4.8.2,<5.0.0",
     "watchfiles>=1.1.1,<2.0.0",
 ]
 

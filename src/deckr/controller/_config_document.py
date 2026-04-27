@@ -6,10 +6,7 @@ from typing import Any
 
 from deckr.core.config import ConfigDocument
 from deckr.core.config import load_config_document as load_core_config
-from platformdirs import PlatformDirs
 from pydantic import BaseModel, ConfigDict
-
-_SETTINGS_DIRS = PlatformDirs("deckr", "deckr", version="1.0")
 
 _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 #
@@ -23,8 +20,6 @@ _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 
 [deckr.controller.device_config.file]
 path = "settings"
-
-[deckr.controller.settings.file]
 """
 
 
@@ -44,29 +39,16 @@ class DeviceConfigSection(_StrictModel):
     file: DeviceConfigFileSection | None = None
 
 
-class SettingsFileSection(_StrictModel):
-    path: Path | None = None
-
-
-class SettingsSection(_StrictModel):
-    file: SettingsFileSection | None = None
-
-
 class ControllerRuntimeConfig(_StrictModel):
     enabled: bool = True
     id: str | None = None
     device_config: DeviceConfigSection | None = None
-    settings: SettingsSection | None = None
 
 
 def _resolve_path(path: Path, *, base_dir: Path) -> Path:
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
-
-
-def _default_settings_dir() -> Path:
-    return Path(_SETTINGS_DIRS.user_data_dir).resolve()
 
 
 def _resolve_controller_paths(
@@ -79,13 +61,6 @@ def _resolve_controller_paths(
             controller.device_config.file.path,
             base_dir=base_dir,
         )
-
-    if controller.settings and controller.settings.file:
-        settings_path = controller.settings.file.path
-        if settings_path is None:
-            controller.settings.file.path = _default_settings_dir()
-        else:
-            controller.settings.file.path = _resolve_path(settings_path, base_dir=base_dir)
 
     return controller
 

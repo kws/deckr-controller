@@ -14,7 +14,7 @@ from deckr.controller.config import (
     FileBackedDeviceConfigService,
     NullDeviceConfigService,
 )
-from deckr.controller.settings import FileBackedSettingsService, InMemorySettingsService
+from deckr.controller.settings import InMemorySettingsService
 
 
 def test_build_services_disable_when_sections_are_absent(tmp_path: Path) -> None:
@@ -35,9 +35,6 @@ def test_build_services_enable_when_sections_are_present(tmp_path: Path) -> None
 
 [deckr.controller.device_config.file]
 path = "configs"
-
-    [deckr.controller.settings.file]
-path = "state"
 """.strip()
     )
     document = load_config_document(config_path)
@@ -48,5 +45,4 @@ path = "state"
 
     assert isinstance(config_service, FileBackedDeviceConfigService)
     assert config_service._config_dir == (tmp_path / "configs").resolve()
-    assert isinstance(settings_service, FileBackedSettingsService)
-    assert settings_service._settings_dir == (tmp_path / "state").resolve()
+    assert isinstance(settings_service, InMemorySettingsService)

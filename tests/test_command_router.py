@@ -191,7 +191,7 @@ async def test_overlay_expiry_respects_token(router_with_mocks):
 
 
 @pytest.mark.asyncio
-async def test_get_settings_hydrates_from_persistence():
+async def test_get_settings_hydrates_from_runtime_overlay():
     store = ControlStateStore(context_id="dev.slot0")
     store.settings = {"default_only": "x"}
 
@@ -211,10 +211,10 @@ async def test_get_settings_hydrates_from_persistence():
 
         async def get(self, target):
             self.calls += 1
-            return {"persisted": 42}
+            return {"runtime": 42}
 
         async def merge(self, target, patch):
-            return {"persisted": 42, **dict(patch)}
+            return {"runtime": 42, **dict(patch)}
 
     settings_service = FakeSettingsService()
     target = SettingsTarget.for_context(
@@ -239,12 +239,12 @@ async def test_get_settings_hydrates_from_persistence():
 
     settings = await router.get_settings()
     assert settings.default_only == "x"
-    assert settings.persisted == 42
+    assert settings.runtime == 42
     assert settings_service.calls == 1
 
-    # second read should not hit persistence again
+    # second read should not hit the runtime settings service again
     settings_again = await router.get_settings()
-    assert settings_again.persisted == 42
+    assert settings_again.runtime == 42
     assert settings_service.calls == 1
 
 

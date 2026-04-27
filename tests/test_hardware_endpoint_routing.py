@@ -157,3 +157,21 @@ async def test_route_loss_cleans_only_configs_for_lost_manager_endpoint():
     controller.on_device_disconnected.assert_awaited_once_with("config-room-a")
     assert controller._device_registry.get("config-room-a") is None
     assert controller._device_registry.get("config-room-b") is not None
+
+
+@pytest.mark.asyncio
+async def test_device_disconnect_tears_down_without_hardware_clears():
+    bus = EventBus("hardware_messages")
+    controller = ControllerService(
+        driver_bus=bus,
+        config_service=NullDeviceConfigService(),
+        settings_service=InMemorySettingsService(),
+        controller_id="controller-main",
+    )
+    ctrl_ctx = AsyncMock()
+    await controller._controller_contexts.set("config-room-a", ctrl_ctx)
+
+    await controller.on_device_disconnected("config-room-a")
+
+    ctrl_ctx.clear_page.assert_awaited_once_with(clear_outputs=False)
+    assert await controller._controller_contexts.get("config-room-a") is None

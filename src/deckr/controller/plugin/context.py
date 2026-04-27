@@ -2,6 +2,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from deckr.contracts.models import thaw_json
 from deckr.hardware import messages as hw_messages
 from deckr.pluginhost.messages import (
     DIAL_ROTATE,
@@ -104,7 +105,7 @@ class ControlContext(ControlContextProtocol):
             context_id=context_id,
             binding_id=binding_id,
         )
-        self._store.settings = dict(settings)
+        self._store.settings = dict(thaw_json(settings))
         self._store.default_title_options = title_options
 
         output = DeviceOutput(command_service, config_id, slot.id)

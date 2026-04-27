@@ -391,7 +391,11 @@ async def test_dynamic_child_binding_can_reuse_opener_control_and_close_page(
     descriptor_payload = {
         "pageId": "child-page",
         "bindings": [
-            {"controlId": "0,0", "actionUuid": child_action, "settings": {}},
+            {
+                "controlId": "0,0",
+                "actionUuid": child_action,
+                "settings": {"seed": "descriptor"},
+            },
         ],
     }
     await manager.handle_command(
@@ -405,6 +409,11 @@ async def test_dynamic_child_binding_can_reuse_opener_control_and_close_page(
     assert child_ctx.binding_id != owner_ctx.binding_id
     assert child_ctx.page_session_id is not None
     assert child_ctx.action_uuid == child_action
+    child_settings = await child_ctx.plugin_context.get_settings()
+    assert vars(child_settings) == {"seed": "descriptor"}
+    await child_ctx.plugin_context.set_settings({"seed": "runtime"})
+    runtime_child_settings = await child_ctx.plugin_context.get_settings()
+    assert vars(runtime_child_settings) == {"seed": "runtime"}
 
     child_ctx.on_key_up = AsyncMock()
     await manager.on_event(
@@ -420,6 +429,15 @@ async def test_dynamic_child_binding_can_reuse_opener_control_and_close_page(
 
     await manager.handle_command(await _command_for_active_binding(manager, CLOSE_PAGE))
     assert isinstance(manager._nav.current_page, StaticPageRef)
+
+    await manager.handle_command(
+        await _command_for_active_binding(
+            manager, OPEN_PAGE, {"descriptor": descriptor_payload}
+        )
+    )
+    reopened_child_ctx = await _active_context(manager)
+    reopened_settings = await reopened_child_ctx.plugin_context.get_settings()
+    assert vars(reopened_settings) == {"seed": "descriptor"}
 
 
 @pytest.mark.asyncio

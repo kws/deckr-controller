@@ -34,7 +34,6 @@ from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.plugin.provider import ActionMetadata
-from deckr.controller.settings import SettingsTarget
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
@@ -846,19 +845,62 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
 
 
 @pytest.mark.asyncio
-async def test_set_page_reconciles_and_prunes_stale_settings(
-    device_config_set_image, persistence_tmp_dir
-):
-    """set_page triggers _reconcile_persistence and prunes stale keys."""
+async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir):
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
         return_value=ActionMetadata(
-            uuid=SetImageOnAppearAction.uuid,
+            uuid=NoopAction.uuid,
             host_id="python",
         )
     )
     plugin_bus = _plugin_bus()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                slot="0,0",
+                                action=NoopAction.uuid,
+                                settings={
+                                    "label": "from-config",
+                                    "nested": {"role": {"page": "root"}},
+                                },
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+    reloaded_config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                slot="0,0",
+                                action=NoopAction.uuid,
+                                settings={"label": "from-reload"},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
     async with anyio.create_task_group():
 
         def start_soon(*args, **kwargs):
@@ -869,25 +911,81 @@ async def test_set_page_reconciles_and_prunes_stale_settings(
             device=device,
             hardware_ref=_hardware_ref(device),
             command_service=FakeHardwareCommandService(),
-            config=device_config_set_image,
+            config=config,
             manager=registry,
             plugin_bus=plugin_bus,
             start_soon=start_soon,
         )
-        stale_target = SettingsTarget.for_context(
-            controller_id=CONTROLLER_ID,
-            config_id="test-device",
-            profile_id="stale-profile",
-            page_id="9",
-            slot_id="0,0",
-            action_uuid="stale.action",
-        )
-        await manager._settings_service.merge(stale_target, {"stale": True})
-        assert await manager._settings_service.get(stale_target) == {"stale": True}
-
         await manager.set_page(profile="default", page=0)
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+        settings = await ctx.plugin_context.get_settings()
+        assert settings.label == "from-config"
+        assert settings.nested == {"role": {"page": "root"}}
 
-        assert await manager._settings_service.get(stale_target) == {}
+        await ctx.plugin_context.set_settings({"label": "runtime", "extra": True})
+        runtime_settings = await ctx.plugin_context.get_settings()
+        assert runtime_settings.label == "runtime"
+        assert runtime_settings.extra is True
+
+        await manager._on_config_changed(reloaded_config)
+        reloaded_ctx = await manager.action_contexts.get("0,0")
+        assert reloaded_ctx is not None
+        reloaded_settings = await reloaded_ctx.plugin_context.get_settings()
+        assert vars(reloaded_settings) == {"label": "from-reload"}
+
+
+@pytest.mark.asyncio
+async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tmp_dir):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=ActionMetadata(
+            uuid=NoopAction.uuid,
+            host_id="python",
+        )
+    )
+    command_service = FakeHardwareCommandService()
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=command_service,
+        config=DeviceConfig(
+            id="test-device",
+            name="Test Device",
+            match={"fingerprint": "fingerprint:test-device"},
+            profiles=[
+                Profile(
+                    name="default",
+                    pages=[
+                        Page(
+                            controls=[
+                                Control(
+                                    slot="0,0",
+                                    action=NoopAction.uuid,
+                                    settings={},
+                                )
+                            ]
+                        )
+                    ],
+                )
+            ],
+        ),
+        manager=registry,
+        plugin_bus=_plugin_bus(),
+        start_soon=lambda fn, *a, **k: None,
+    )
+
+    await manager.set_page(profile="default", page=0)
+    assert await manager.action_contexts.get("0,0") is not None
+    command_service.clear_slot.reset_mock()
+    command_service.clear_slot.side_effect = LookupError("No live hardware route")
+
+    await manager.clear_page(clear_outputs=False)
+
+    command_service.clear_slot.assert_not_awaited()
+    assert await manager.action_contexts.get("0,0") is None
 
 
 class ConfigurableActionRegistry:

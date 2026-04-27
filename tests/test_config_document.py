@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from platformdirs import PlatformDirs
 
 from deckr.controller import (
     controller_config_from_document,
@@ -26,11 +25,6 @@ def test_default_config_document_matches_builtin_defaults(
     assert controller.device_config is not None
     assert controller.device_config.file is not None
     assert controller.device_config.file.path == (tmp_path / "settings").resolve()
-    assert controller.settings is not None
-    assert controller.settings.file is not None
-    assert controller.settings.file.path == Path(
-        PlatformDirs("deckr", "deckr", version="1.0").user_data_dir
-    ).resolve()
     assert document.children("deckr.plugin_hosts") == {}
     assert document.children("deckr.drivers") == {}
 
@@ -46,9 +40,6 @@ id = "controller-main"
 
 [deckr.controller.device_config.file]
 path = "configs"
-
-[deckr.controller.settings.file]
-path = "state"
 
 [deckr.plugin_hosts.python.instances.main]
 host_id = "living-room"
@@ -71,9 +62,6 @@ port = 1884
     assert controller.device_config is not None
     assert controller.device_config.file is not None
     assert controller.device_config.file.path == (tmp_path / "configs").resolve()
-    assert controller.settings is not None
-    assert controller.settings.file is not None
-    assert controller.settings.file.path == (tmp_path / "state").resolve()
     plugin_host = document.namespace("deckr.plugin_hosts.python")
     assert plugin_host is not None
     assert plugin_host["instances"]["main"]["host_id"] == (

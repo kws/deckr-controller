@@ -202,6 +202,7 @@ class RenderDispatcher:
         context_id: str | None = None,
         binding_id: str | None = None,
         output: SlotOutput | None = None,
+        clear_output: bool = True,
     ) -> int:
         """Invalidate queued/running renders for a slot and clear the device slot."""
 
@@ -218,11 +219,12 @@ class RenderDispatcher:
             io_lock = state.io_lock
             target_output = state.output
 
-        async with io_lock:
-            if target_output is not None:
-                await target_output.clear()
-            else:
-                await self._command_service.clear_slot(self._config_id, slot_id)
+        if clear_output:
+            async with io_lock:
+                if target_output is not None:
+                    await target_output.clear()
+                else:
+                    await self._command_service.clear_slot(self._config_id, slot_id)
         return generation
 
     async def _run_slot(self, slot_id: str, request: RenderRequest) -> None:

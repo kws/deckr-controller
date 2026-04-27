@@ -292,7 +292,7 @@ class ControllerService(BaseComponent):
         ctrl_ctx = await self._controller_contexts.get(config_id)
         try:
             if ctrl_ctx is not None:
-                await ctrl_ctx.clear_page()
+                await ctrl_ctx.clear_page(clear_outputs=False)
         finally:
             await self._controller_contexts.delete(config_id)
             disconnect_ev = self._device_disconnect_events.get(config_id)

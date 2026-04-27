@@ -3,35 +3,25 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import anyio
-from decouple import config as decouple_config
-from platformdirs import PlatformDirs
-from tinydb import Query, TinyDB
+from deckr.contracts.models import thaw_json
 
 logger = logging.getLogger(__name__)
-
-dirs = PlatformDirs("deckr", "deckr", version="1.0")
 
 SettingsScope = Literal["context"]
 
 
-def resolve_default_settings_dir() -> Path:
-    """Resolve the default settings storage directory from env."""
-
-    return Path(
-        decouple_config("DECKR_SETTINGS_DIR", default=dirs.user_data_dir)
-    ).resolve()
-
-
-def _safe_filename(value: str) -> str:
-    return value.replace("/", "_").replace(":", "_")
-
-
 def _store_key(target: SettingsTarget) -> str:
     return f"controller={target.controller_id}|{target.as_key()}"
+
+
+def _settings_copy(value: dict[str, Any]) -> dict[str, Any]:
+    """Return a mutable JSON-shaped copy of settings-like data."""
+
+    copied = thaw_json(value)
+    return dict(copied) if isinstance(copied, dict) else {}
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -104,6 +94,8 @@ class SettingsService(Protocol):
         self, target: SettingsTarget, patch: dict[str, Any]
     ) -> dict[str, Any]: ...
     def subscribe(self, target: SettingsTarget) -> AsyncIterator[dict[str, Any]]: ...
+    async def clear_config_targets(self, *, controller_id: str, config_id: str) -> int:
+        ...
 
 
 class InMemorySettingsService:
@@ -123,31 +115,27 @@ class InMemorySettingsService:
 
     async def get(self, target: SettingsTarget) -> dict[str, Any]:
         async with self._lock:
-            return dict(self._values.get(_store_key(target), {}))
+            return _settings_copy(self._values.get(_store_key(target), {}))
 
     async def merge(
         self, target: SettingsTarget, patch: dict[str, Any]
     ) -> dict[str, Any]:
         async with self._lock:
             key = _store_key(target)
-            current = dict(self._values.get(key, {}))
-            current.update(dict(patch))
+            current = _settings_copy(self._values.get(key, {}))
+            current.update(_settings_copy(patch))
             self._values[key] = current
             self._targets_by_key[key] = target
             subscribers = set(self._subscribers.get(key, set()))
         await self._notify(subscribers, current)
-        return dict(current)
+        return _settings_copy(current)
 
     def subscribe(self, target: SettingsTarget) -> AsyncIterator[dict[str, Any]]:
         return self._subscribe_impl(target)
 
-    async def prune_context_targets(
-        self,
-        *,
-        controller_id: str,
-        config_id: str,
-        valid_keys: set[str],
-    ) -> int:
+    async def clear_config_targets(self, *, controller_id: str, config_id: str) -> int:
+        """Drop runtime overlays for a config so reloaded config values win."""
+
         async with self._lock:
             to_remove = [
                 key
@@ -155,7 +143,6 @@ class InMemorySettingsService:
                 if target.scope == "context"
                 and target.controller_id == controller_id
                 and target.config_id == config_id
-                and target.as_key() not in valid_keys
             ]
             for key in to_remove:
                 self._values.pop(key, None)
@@ -173,12 +160,12 @@ class InMemorySettingsService:
             if key not in self._subscribers:
                 self._subscribers[key] = set()
             self._subscribers[key].add(send)
-            current = dict(self._values.get(key, {}))
+            current = _settings_copy(self._values.get(key, {}))
         send.send_nowait(current)
 
         try:
             async for value in receive:
-                yield dict(value)
+                yield _settings_copy(value)
         finally:
             async with self._lock:
                 subscribers = self._subscribers.get(key)
@@ -195,161 +182,6 @@ class InMemorySettingsService:
     ) -> None:
         for send in subscribers:
             try:
-                await send.send(dict(snapshot))
-            except Exception:
-                logger.exception("Failed to notify settings subscriber")
-
-
-class FileBackedSettingsService:
-    """TinyDB-backed settings service with controller-friendly targets."""
-
-    def __init__(self, settings_dir: Path | None = None) -> None:
-        self._settings_dir = (
-            settings_dir if settings_dir is not None else resolve_default_settings_dir()
-        )
-        self._settings_dir.mkdir(parents=True, exist_ok=True)
-        self._db_by_path: dict[Path, TinyDB] = {}
-        self._subscribers: dict[
-            str, set[anyio.abc.ObjectSendStream[dict[str, Any]]]
-        ] = {}
-        self._lock = anyio.Lock()
-
-    async def exists(self, target: SettingsTarget) -> bool:
-        async with self._lock:
-            db = self._db_for_path(self._db_path_for_target(target))
-            row = db.get(self._row_query(target))
-            return row is not None
-
-    async def get(self, target: SettingsTarget) -> dict[str, Any]:
-        async with self._lock:
-            return dict(self._read_value_locked(target))
-
-    async def merge(
-        self, target: SettingsTarget, patch: dict[str, Any]
-    ) -> dict[str, Any]:
-        async with self._lock:
-            key = _store_key(target)
-            current = self._read_value_locked(target)
-            current.update(dict(patch))
-            self._write_value_locked(target, current)
-            subscribers = set(self._subscribers.get(key, set()))
-        await self._notify(subscribers, current)
-        return dict(current)
-
-    def subscribe(self, target: SettingsTarget) -> AsyncIterator[dict[str, Any]]:
-        return self._subscribe_impl(target)
-
-    async def prune_context_targets(
-        self,
-        *,
-        controller_id: str,
-        config_id: str,
-        valid_keys: set[str],
-    ) -> int:
-        path = self._db_path_for_context_config(config_id)
-        if not path.exists():
-            return 0
-
-        async with self._lock:
-            db = self._db_for_path(path)
-            rows = db.search(
-                (Query().kind == "settings")
-                & (
-                    (Query().controller_id == controller_id)
-                    | (~Query().controller_id.exists())
-                )
-                & (Query().config_id == config_id)
-            )
-            stale_ids = [row.doc_id for row in rows if row.get("key") not in valid_keys]
-            if not stale_ids:
-                return 0
-            removed = db.remove(doc_ids=stale_ids)
-        return len(removed)
-
-    async def _subscribe_impl(
-        self, target: SettingsTarget
-    ) -> AsyncIterator[dict[str, Any]]:
-        send, receive = anyio.create_memory_object_stream[dict[str, Any]](
-            max_buffer_size=32
-        )
-        key = _store_key(target)
-        async with self._lock:
-            if key not in self._subscribers:
-                self._subscribers[key] = set()
-            self._subscribers[key].add(send)
-            current = dict(self._read_value_locked(target))
-        send.send_nowait(current)
-
-        try:
-            async for value in receive:
-                yield dict(value)
-        finally:
-            async with self._lock:
-                subscribers = self._subscribers.get(key)
-                if subscribers is not None:
-                    subscribers.discard(send)
-                    if not subscribers:
-                        self._subscribers.pop(key, None)
-            await send.aclose()
-
-    def _db_path_for_target(self, target: SettingsTarget) -> Path:
-        assert target.config_id is not None
-        return self._db_path_for_context_config(target.config_id)
-
-    def _db_path_for_context_config(self, config_id: str) -> Path:
-        return self._settings_dir / f"{_safe_filename(config_id)}.json"
-
-    def _db_for_path(self, path: Path) -> TinyDB:
-        db = self._db_by_path.get(path)
-        if db is None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            db = TinyDB(path)
-            self._db_by_path[path] = db
-        return db
-
-    def _read_value_locked(self, target: SettingsTarget) -> dict[str, Any]:
-        db = self._db_for_path(self._db_path_for_target(target))
-        row = db.get(self._row_query(target))
-        if row is not None:
-            value = row.get("value")
-            if isinstance(value, dict):
-                return dict(value)
-            return {}
-
-        return {}
-
-    def _write_value_locked(self, target: SettingsTarget, value: dict[str, Any]) -> None:
-        db = self._db_for_path(self._db_path_for_target(target))
-        payload = {
-            "kind": "settings",
-            "key": target.as_key(),
-            "value": dict(value),
-            "controller_id": target.controller_id,
-            "config_id": target.config_id,
-            "profile_id": target.profile_id,
-            "page_id": target.page_id,
-            "slot_id": target.slot_id,
-            "action_uuid": target.action_uuid,
-            "dynamic_page_uuid": target.dynamic_page_uuid,
-            "plugin_uuid": target.plugin_uuid,
-        }
-        db.upsert(payload, self._row_query(target))
-
-    def _row_query(self, target: SettingsTarget):
-        query = Query()
-        base = (query.kind == "settings") & (query.key == target.as_key())
-        return base & (
-            (query.controller_id == target.controller_id)
-            | (~query.controller_id.exists())
-        )
-
-    async def _notify(
-        self,
-        subscribers: set[anyio.abc.ObjectSendStream[dict[str, Any]]],
-        snapshot: dict[str, Any],
-    ) -> None:
-        for send in subscribers:
-            try:
-                await send.send(dict(snapshot))
+                await send.send(_settings_copy(snapshot))
             except Exception:
                 logger.exception("Failed to notify settings subscriber")

@@ -200,6 +200,44 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
         tg.cancel_scope.cancel()
 
 
+@pytest.mark.asyncio
+async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
+    command_service = FakeHardwareCommandService()
+
+    backend = ControlledBackend()
+    output = DeviceOutput(command_service, "dev", "0,0")
+
+    async with anyio.create_task_group() as tg:
+        dispatcher = RenderDispatcher(
+            command_service=command_service,
+            config_id="dev",
+            backend=backend,
+            start_soon=tg.start_soon,
+        )
+        await dispatcher.submit_request(
+            slot_id="0,0",
+            context_id="ctx",
+            request=_solid_request(),
+            output=output,
+        )
+        with anyio.fail_after(1.0):
+            while backend.calls != [1]:
+                await anyio.sleep(0.01)
+
+        await dispatcher.clear_slot(
+            "0,0",
+            context_id="ctx",
+            output=output,
+            clear_output=False,
+        )
+        backend.release(1)
+        await anyio.sleep(0.05)
+
+        command_service.clear_slot.assert_not_awaited()
+        command_service.set_image.assert_not_awaited()
+        tg.cancel_scope.cancel()
+
+
 @pytest.mark.parametrize(
     ("model", "case_id"),
     [
