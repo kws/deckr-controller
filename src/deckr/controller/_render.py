@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import anyio
 from deckr.hardware.messages import HardwareImageFormat
 from invariant import (
     Node,
@@ -354,7 +353,7 @@ def render_request_to_jpeg(request: RenderRequest) -> bytes:
 
 
 class RenderService:
-    """Builds render requests and supports local compatibility encoding."""
+    """Builds render requests for the render dispatcher."""
 
     def build_request(
         self,
@@ -374,16 +373,3 @@ class RenderService:
             slot_id=slot_id,
             generation=generation,
         )
-
-    async def encode(
-        self, model: RenderModel, image_format: HardwareImageFormat
-    ) -> bytes | None:
-        """Compatibility path for tests and local tooling."""
-        try:
-            request = self.build_request(model, image_format)
-            if request is None:
-                return None
-            return await anyio.to_thread.run_sync(render_request_to_jpeg, request)
-        except Exception:
-            logger.exception("Failed to encode frame")
-            return None

@@ -1,14 +1,10 @@
 """Tests for render pipeline: resolve, _title_options_to_params, title_options flow."""
 
-from unittest.mock import patch
-
 import pytest
 from deckr.hardware.messages import HardwareImageFormat
 from deckr.pluginhost.messages import TitleOptions
 
 from deckr.controller._render import (
-    RenderModel,
-    RenderService,
     _font_style_to_weight_and_style,
     _hex_to_rgba,
     _parse_font_size,
@@ -206,18 +202,3 @@ def test_resolve_overlay_ignores_title_options():
     assert model.title is None
     assert model.title_options is None
 
-
-# --- RenderService.encode: isolate failures ---
-
-
-@pytest.mark.asyncio
-async def test_render_service_encode_graph_failure_returns_none():
-    """Encoding errors must not propagate; callers skip device write."""
-    fmt = HardwareImageFormat(width=72, height=72)
-    model = RenderModel(title="Hi", title_options=TitleOptions(font_size=12))
-    with patch(
-        "deckr.controller._render._graph_to_jpeg_bytes",
-        side_effect=ValueError("size must be positive, got 0"),
-    ):
-        out = await RenderService().encode(model, fmt)
-    assert out is None
