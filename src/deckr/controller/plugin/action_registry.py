@@ -12,6 +12,7 @@ from deckr.contracts.messages import (
     DeckrMessage,
     parse_host_address,
 )
+from deckr.lanes import EndpointLane
 from deckr.pluginhost.messages import (
     ACTIONS_REGISTERED,
     ACTIONS_UNREGISTERED,
@@ -20,7 +21,6 @@ from deckr.pluginhost.messages import (
     plugin_body_dict,
     plugin_message_for_controller,
 )
-from deckr.transports.bus import EventBus
 
 from deckr.controller.plugin.builtin import (
     BUILTIN_ACTION_PROVIDER_ID,
@@ -50,13 +50,13 @@ class ActionRegistry(BaseComponent):
 
     def __init__(
         self,
-        event_bus: EventBus,
+        endpoint: EndpointLane,
         *,
         controller_id: str,
         on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]] | None = None,
     ):
         super().__init__(name="ActionRegistry")
-        self._event_bus = event_bus
+        self._endpoint = endpoint
         self._controller_id = controller_id
         self._on_actions_changed = on_actions_changed
         self._builtin_registry = BuiltinRegistry()
@@ -265,25 +265,9 @@ class ActionRegistry(BaseComponent):
                 self._builtin_action_registry[action_uuid] = descriptor
 
         start_soon(self._subscription_loop)
-        start_soon(self._route_event_loop)
-
-    async def _route_event_loop(self) -> None:
-        async with self._event_bus.route_table.subscribe() as stream:
-            async for event in stream:
-                if event.event_type != "endpointUnreachable" or event.endpoint is None:
-                    continue
-                if event.lane != self._event_bus.lane:
-                    continue
-                host_id = parse_host_address(event.endpoint)
-                if host_id is None:
-                    continue
-                await self._remove_host_actions(
-                    host_id,
-                    reason=event.reason or "routeLoss",
-                )
 
     async def _subscription_loop(self) -> None:
-        async with self._event_bus.subscribe() as stream:
+        async with self._endpoint.subscribe() as stream:
             async for event in stream:
                 if not isinstance(event, DeckrMessage):
                     continue

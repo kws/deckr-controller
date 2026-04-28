@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
+from conftest import LaneHarness
 from deckr.hardware.messages import (
     HardwareCoordinates,
     HardwareDevice,
@@ -12,7 +13,6 @@ from deckr.hardware.messages import (
     HardwareSlot,
 )
 from deckr.pluginhost.messages import ControlBindingDescriptor
-from deckr.transports.bus import EventBus
 
 from deckr.controller._binding_validator import (
     ValidationError,
@@ -230,7 +230,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     def start_soon(*args, **kwargs):
         pass
 
-    plugin_bus = EventBus("plugin_messages")
+    plugin_bus = LaneHarness("plugin_messages", default_endpoint="host:python")
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
@@ -299,7 +299,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
 
     registry.get_action = get_action
 
-    plugin_bus = EventBus("plugin_messages")
+    plugin_bus = LaneHarness("plugin_messages", default_endpoint="host:python")
     async with anyio.create_task_group() as tg:
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,

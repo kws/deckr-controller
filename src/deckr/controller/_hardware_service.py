@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
-from deckr.contracts.messages import hardware_manager_address
 from deckr.hardware import messages as hw_messages
-from deckr.transports.bus import EventBus
+from deckr.lanes import EndpointLane
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,12 +64,15 @@ class HardwareDeviceRegistry:
             if live.ref.manager_id == manager_id
         )
 
+    def all(self) -> tuple[LiveHardwareDevice, ...]:
+        return tuple(self._devices_by_config.values())
+
 
 class HardwareCommandService:
     """Publishes hardware output commands onto the hardware lane."""
 
-    def __init__(self, event_bus: EventBus, *, controller_id: str) -> None:
-        self._event_bus = event_bus
+    def __init__(self, endpoint: EndpointLane, *, controller_id: str) -> None:
+        self._endpoint = endpoint
         self._controller_id = controller_id
         self._ref_by_config_id: dict[str, hw_messages.HardwareDeviceRef] = {}
 
@@ -77,24 +82,20 @@ class HardwareCommandService:
     def unregister_config(self, config_id: str) -> None:
         self._ref_by_config_id.pop(config_id, None)
 
-    async def _ref_for(self, config_id: str) -> hw_messages.HardwareDeviceRef:
+    async def _ref_for(self, config_id: str) -> hw_messages.HardwareDeviceRef | None:
         ref = self._ref_by_config_id.get(config_id)
         if ref is None:
-            raise LookupError(f"No live hardware route for config {config_id!r}")
-        endpoint = hardware_manager_address(ref.manager_id)
-        route = await self._event_bus.route_table.route_for(
-            endpoint,
-            lane=self._event_bus.lane,
-        )
-        if route is None:
-            raise LookupError(
-                f"Hardware manager endpoint {endpoint} is not reachable"
+            logger.info(
+                "Dropping hardware output for unavailable config %s",
+                config_id,
             )
         return ref
 
     async def set_image(self, config_id: str, slot_id: str, image: bytes) -> None:
         ref = await self._ref_for(config_id)
-        await self._event_bus.send(
+        if ref is None:
+            return
+        await self._endpoint.publish(
             hw_messages.hardware_command_for_control(
                 controller_id=self._controller_id,
                 ref=hw_messages.HardwareControlRef(
@@ -110,7 +111,9 @@ class HardwareCommandService:
 
     async def clear_slot(self, config_id: str, slot_id: str) -> None:
         ref = await self._ref_for(config_id)
-        await self._event_bus.send(
+        if ref is None:
+            return
+        await self._endpoint.publish(
             hw_messages.hardware_command_for_control(
                 controller_id=self._controller_id,
                 ref=hw_messages.HardwareControlRef(
@@ -126,7 +129,9 @@ class HardwareCommandService:
 
     async def sleep_screen(self, config_id: str) -> None:
         ref = await self._ref_for(config_id)
-        await self._event_bus.send(
+        if ref is None:
+            return
+        await self._endpoint.publish(
             hw_messages.hardware_command_for_device(
                 controller_id=self._controller_id,
                 ref=ref,
@@ -137,7 +142,9 @@ class HardwareCommandService:
 
     async def wake_screen(self, config_id: str) -> None:
         ref = await self._ref_for(config_id)
-        await self._event_bus.send(
+        if ref is None:
+            return
+        await self._endpoint.publish(
             hw_messages.hardware_command_for_device(
                 controller_id=self._controller_id,
                 ref=ref,

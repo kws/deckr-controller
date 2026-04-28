@@ -9,10 +9,11 @@ from deckr.components import (
     start_components,
 )
 from deckr.core.config import ConfigDocument
+from deckr.lanes import Lane
 from deckr.runtime import Deckr
-from deckr.transports.bus import EventBus
 
 from deckr.controller._runtime_service import build_controller_runtime, component
+from test_support.memory_lane_substrate import MemoryLaneSubstrate
 
 
 def _document(raw: dict) -> ConfigDocument:
@@ -34,17 +35,18 @@ async def test_controller_component_uses_shared_lanes(
 
     document = _document({"deckr": {"controller": {"id": "controller-main"}}})
     plan = resolve_component_host_plan(document)
+    substrate = MemoryLaneSubstrate(lane_contracts=plan.lane_contracts)
     async with Deckr(
         lane_contracts=plan.lane_contracts,
         lanes=plan.lane_names,
-        route_expiry_interval=0.01,
+        substrate=substrate,
     ) as deckr, start_components(deckr, plan) as result:
         assert [created.name for created in result.components] == [
             "deckr.controller"
         ]
         assert set(result.lane_names) == {"hardware_messages", "plugin_messages"}
-        assert isinstance(result.get_lane("hardware_messages"), EventBus)
-        assert isinstance(result.get_lane("plugin_messages"), EventBus)
+        assert isinstance(result.get_lane("hardware_messages"), Lane)
+        assert isinstance(result.get_lane("plugin_messages"), Lane)
 
 
 def test_controller_component_can_be_disabled_explicitly() -> None:

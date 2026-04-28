@@ -485,7 +485,7 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await self._plugin_bus.send(msg)
+        await self._plugin_bus.publish(msg)
 
     async def _emit_page_disappear(
         self,
@@ -520,7 +520,7 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await self._plugin_bus.send(msg)
+        await self._plugin_bus.publish(msg)
 
     async def _finalize_dynamic_page(
         self,
@@ -1184,7 +1184,6 @@ class DeviceManager:
         async def send_settings_response(settings: dict) -> None:
             await self._plugin_bus.reply_to(
                 msg,
-                sender=controller_address(self._controller_id),
                 message_type=HERE_ARE_SETTINGS,
                 body=SettingsBody(settings=settings).to_dict(),
                 subject=msg.subject,

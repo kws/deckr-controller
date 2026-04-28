@@ -174,7 +174,7 @@ class ControlContext(ControlContextProtocol):
                 action_uuid=self.action_uuid,
             ),
         )
-        await self._plugin_bus.send(msg)
+        await self._plugin_bus.publish(msg)
 
     async def _deliver_to_builtin(self, msg_type: str, payload: dict) -> None:
         """Deliver event directly to builtin action (no bus)."""

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 import pytest_asyncio
+from conftest import LaneHarness
 from deckr.components import RunContext
 from deckr.contracts.messages import DeckrMessage
 from deckr.hardware import messages as hw_messages
@@ -26,7 +27,6 @@ from deckr.pluginhost.messages import (
     subject_action_uuid,
     subject_context_id,
 )
-from deckr.transports.bus import EventBus
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
 
@@ -41,8 +41,8 @@ HOST_ID = "python"
 HOST_ADDR = host_address(HOST_ID)
 
 
-def _plugin_bus() -> EventBus:
-    return EventBus("plugin_messages")
+def _plugin_bus() -> LaneHarness:
+    return LaneHarness("plugin_messages", default_endpoint=HOST_ADDR)
 
 
 def _plugin_command(

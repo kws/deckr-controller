@@ -15,7 +15,8 @@ from deckr.components import (
     RunContext,
 )
 from deckr.core.util.runtime_id import require_runtime_id
-from deckr.transports.bus import EventBus
+from deckr.lanes import Lane
+from deckr.state import StateStore
 
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
@@ -42,13 +43,15 @@ class ControllerRuntimeService(BaseComponent):
         *,
         runtime_name: str,
         runtime: ControllerRuntime,
-        hardware_messages: EventBus,
-        plugin_messages: EventBus,
+        hardware_messages: Lane,
+        plugin_messages: Lane,
+        state: StateStore,
     ) -> None:
         super().__init__(name=runtime_name)
         self._runtime = runtime
         self._hardware_messages = hardware_messages
         self._plugin_messages = plugin_messages
+        self._state = state
         self._component_manager = ComponentManager()
 
     async def start(self, ctx: RunContext) -> None:
@@ -66,19 +69,26 @@ class ControllerRuntimeService(BaseComponent):
                 await controller_service.handle_actions_changed_event(event)
 
         action_registry = ActionRegistry(
-            event_bus=self._plugin_messages,
+            endpoint=self._plugin_messages.endpoint(
+                f"controller:{self._runtime.controller_id}"
+            ),
             controller_id=self._runtime.controller_id,
             on_actions_changed=on_actions_changed,
         )
         await self._component_manager.add_component(action_registry)
 
         controller_service = ControllerService(
-            driver_bus=self._hardware_messages,
+            hardware_endpoint=self._hardware_messages.endpoint(
+                f"controller:{self._runtime.controller_id}"
+            ),
+            state=self._state,
             config_service=config_service,
             settings_service=settings_service,
             controller_id=self._runtime.controller_id,
             action_registry=action_registry,
-            plugin_bus=self._plugin_messages,
+            plugin_endpoint=self._plugin_messages.endpoint(
+                f"controller:{self._runtime.controller_id}"
+            ),
         )
         await self._component_manager.add_component(controller_service)
 
@@ -118,6 +128,7 @@ def component_factory(context: ComponentContext):
         runtime=runtime,
         hardware_messages=context.require_lane("hardware_messages"),
         plugin_messages=context.require_lane("plugin_messages"),
+        state=context.state(),
     )
 
 component = ComponentDefinition(

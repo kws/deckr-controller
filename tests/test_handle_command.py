@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
+from conftest import LaneHarness
 from deckr.contracts.messages import DeckrMessage
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.messages import (
@@ -34,7 +35,6 @@ from deckr.pluginhost.messages import (
     host_address,
     plugin_message,
 )
-from deckr.transports.bus import EventBus
 from pydantic import ValidationError
 
 from deckr.controller._device_manager import DeviceManager, _descriptor_from_payload
@@ -52,8 +52,8 @@ HOST_ID = "python"
 HOST_ADDR = host_address(HOST_ID)
 
 
-def _plugin_bus() -> EventBus:
-    return EventBus("plugin_messages")
+def _plugin_bus() -> LaneHarness:
+    return LaneHarness("plugin_messages", default_endpoint=HOST_ADDR)
 
 
 def _command_message(
@@ -173,7 +173,7 @@ def _registry_for_action(
 def _make_manager(
     *,
     command_service: FakeHardwareCommandService | None = None,
-    plugin_bus: EventBus | None = None,
+    plugin_bus: LaneHarness | None = None,
     registry: MagicMock | None = None,
     config: DeviceConfig | None = None,
     device: HardwareDevice | None = None,

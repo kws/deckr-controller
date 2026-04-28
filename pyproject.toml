@@ -94,4 +94,5 @@ addopts = [
     "--cov=src/deckr",
     "--cov-report=term-missing",
 ]
+pythonpath = ["."]
 testpaths = ["tests"]

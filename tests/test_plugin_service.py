@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import anyio
 import pytest
+from conftest import LaneHarness
 from deckr.components import RunContext
 from deckr.contracts.messages import controllers_broadcast, plugin_hosts_broadcast
 from deckr.pluginhost.messages import (
@@ -20,7 +21,6 @@ from deckr.pluginhost.messages import (
     plugin_message_for_host,
 )
 from deckr.python_plugin.interface import PluginAction
-from deckr.transports.bus import EventBus
 
 from deckr.controller.plugin.action_registry import ActionRegistry
 from deckr.controller.plugin.builtin import (
@@ -33,12 +33,12 @@ CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
 
 
-def _plugin_bus() -> EventBus:
-    return EventBus("plugin_messages")
+def _plugin_bus() -> LaneHarness:
+    return LaneHarness("plugin_messages", default_endpoint="host:python")
 
 
-def _hardware_bus() -> EventBus:
-    return EventBus("hardware_messages")
+def _hardware_bus() -> LaneHarness:
+    return LaneHarness("hardware_messages", default_endpoint=CONTROLLER_ADDR)
 
 
 def _actions_payload() -> dict:
@@ -151,7 +151,7 @@ class StubPluginHost:
 async def test_action_registry_aggregates_get_action():
     """ActionRegistry returns ActionMetadata from registry (populated by actionsRegistered)."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -176,7 +176,7 @@ async def test_action_registry_aggregates_get_action():
 async def test_actions_registered_populates_registry():
     """actionsRegistered message populates action registry."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -196,7 +196,7 @@ async def test_actions_registered_populates_registry():
 async def test_actions_registered_with_controller_broadcast_populates_registry():
     """actionsRegistered with controller broadcast recipient is handled."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -216,7 +216,7 @@ async def test_actions_registered_with_controller_broadcast_populates_registry()
 async def test_actions_registered_rejects_subject_host_id_mismatch():
     """actionsRegistered ownership comes from sender, and mismatched subject is rejected."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -242,7 +242,7 @@ async def test_actions_registered_rejects_reserved_builtin_provider_sender(
 ):
     """Route-owned plugin hosts cannot use reserved builtin provider ids."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -261,7 +261,7 @@ async def test_actions_registered_rejects_reserved_builtin_provider_sender(
 async def test_actions_unregistered_removes_from_registry():
     """actionsUnregistered message removes actions from registry."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -283,7 +283,7 @@ async def test_actions_unregistered_removes_from_registry():
 async def test_actions_unregistered_rejects_subject_host_id_mismatch():
     """A sender cannot unregister another host's actions through subject hostId."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -307,7 +307,7 @@ async def test_actions_unregistered_rejects_subject_host_id_mismatch():
 async def test_host_offline_rejects_subject_host_id_mismatch():
     """A sender cannot offline another host's actions through subject hostId."""
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -334,7 +334,7 @@ async def test_actions_registered_emits_actions_changed_event():
         received_events.append(event)
 
     registry = ActionRegistry(
-        event_bus=bus,
+        endpoint=bus.endpoint(CONTROLLER_ADDR),
         controller_id=CONTROLLER_ID,
         on_actions_changed=on_actions_changed,
     )
@@ -366,7 +366,7 @@ async def test_actions_unregistered_emits_actions_changed_event():
         received_events.append(event)
 
     registry = ActionRegistry(
-        event_bus=bus,
+        endpoint=bus.endpoint(CONTROLLER_ADDR),
         controller_id=CONTROLLER_ID,
         on_actions_changed=on_actions_changed,
     )
@@ -401,8 +401,8 @@ async def test_actions_unregistered_emits_actions_changed_event():
 
 
 @pytest.mark.asyncio
-async def test_host_route_loss_unregisters_actions_without_host_offline():
-    """Abrupt route loss removes host actions through the route control plane."""
+async def test_host_offline_unregisters_actions():
+    """Host lifecycle messages remove host actions without a route table."""
     bus = _plugin_bus()
     received_events = []
 
@@ -410,7 +410,7 @@ async def test_host_route_loss_unregisters_actions_without_host_offline():
         received_events.append(event)
 
     registry = ActionRegistry(
-        event_bus=bus,
+        endpoint=bus.endpoint(CONTROLLER_ADDR),
         controller_id=CONTROLLER_ID,
         on_actions_changed=on_actions_changed,
     )
@@ -421,15 +421,6 @@ async def test_host_route_loss_unregisters_actions_without_host_offline():
         await registry.start(ctx)
         await anyio.sleep(0.01)
 
-        await bus.route_table.claim_endpoint(
-            endpoint=host_address("test_host"),
-            lane="plugin_messages",
-            client_id="websocket:test_host",
-            client_kind="remote",
-            transport_kind="websocket",
-            transport_id="ws-main",
-            claim_source="message_sender",
-        )
         await bus.send(_actions_registered_message(recipient=controllers_broadcast()))
         with anyio.fail_after(1.0):
             while len(received_events) < 1:
@@ -437,7 +428,7 @@ async def test_host_route_loss_unregisters_actions_without_host_offline():
         assert received_events[0].registered == [f"test_host::{StubAction.uuid}"]
         received_events.clear()
 
-        await bus.route_table.client_disconnected("websocket:test_host")
+        await bus.send(_host_offline_message(recipient=controllers_broadcast()))
         with anyio.fail_after(1.0):
             while len(received_events) < 1:
                 await anyio.sleep(0.01)
@@ -451,8 +442,8 @@ async def test_host_route_loss_unregisters_actions_without_host_offline():
 
 
 @pytest.mark.asyncio
-async def test_host_builtin_route_loss_does_not_remove_builtin_actions():
-    """Builtins are an internal provider namespace, not route-owned host actions."""
+async def test_host_offline_for_builtin_namespace_does_not_remove_builtin_actions():
+    """Builtins are an internal provider namespace, not host-owned actions."""
     bus = _plugin_bus()
     received_events = []
 
@@ -460,7 +451,7 @@ async def test_host_builtin_route_loss_does_not_remove_builtin_actions():
         received_events.append(event)
 
     registry = ActionRegistry(
-        event_bus=bus,
+        endpoint=bus.endpoint(CONTROLLER_ADDR),
         controller_id=CONTROLLER_ID,
         on_actions_changed=on_actions_changed,
     )
@@ -475,16 +466,12 @@ async def test_host_builtin_route_loss_does_not_remove_builtin_actions():
         assert builtin is not None
         assert builtin.host_id == BUILTIN_ACTION_PROVIDER_ID
 
-        await bus.route_table.claim_endpoint(
-            endpoint=host_address("builtin"),
-            lane="plugin_messages",
-            client_id="websocket:builtin",
-            client_kind="remote",
-            transport_kind="websocket",
-            transport_id="ws-main",
-            claim_source="message_sender",
+        await bus.send(
+            _host_offline_message(
+                host_id="builtin",
+                recipient=controllers_broadcast(),
+            )
         )
-        await bus.route_table.client_disconnected("websocket:builtin")
         await anyio.sleep(0.05)
 
         tg.cancel_scope.cancel()
@@ -502,7 +489,7 @@ async def test_host_builtin_route_loss_does_not_remove_builtin_actions():
 )
 async def test_builtin_actions_resolve_by_provider_qualified_address(provider_id: str):
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -570,7 +557,7 @@ async def test_host_lifecycle_register_then_unregister():
             )
 
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -596,32 +583,34 @@ async def test_host_lifecycle_register_then_unregister():
 
 
 @pytest.mark.asyncio
-async def test_controller_sends_request_actions_on_startup():
-    """ControllerService sends requestActions to plugin-host broadcast on startup."""
+async def test_controller_does_not_request_plugin_actions_on_sprint1_startup():
+    """Pluginhost discovery moves to Sprint 2 current-state catalogs."""
     sent_messages = []
     bus = _plugin_bus()
 
-    original_send = bus.send
+    original_publish = bus.publish
 
-    async def capture_send(msg):
+    async def capture_publish(msg):
         sent_messages.append(msg)
-        await original_send(msg)
+        await original_publish(msg)
 
-    bus.send = capture_send
+    bus.publish = capture_publish
     from deckr.controller._controller_service import ControllerService
     from deckr.controller.config import FileBackedDeviceConfigService
     from deckr.controller.settings import InMemorySettingsService
 
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     config_service = FileBackedDeviceConfigService()
     settings_service = InMemorySettingsService()
+    hardware = _hardware_bus()
     controller = ControllerService(
-        driver_bus=_hardware_bus(),
+        hardware_endpoint=hardware.endpoint(CONTROLLER_ADDR),
+        state=hardware.deckr.state(),
         config_service=config_service,
         settings_service=settings_service,
         controller_id=CONTROLLER_ID,
         action_registry=registry,
-        plugin_bus=bus,
+        plugin_endpoint=bus.endpoint(CONTROLLER_ADDR),
     )
     stopping = anyio.Event()
     mock_tg = MagicMock()
@@ -637,9 +626,7 @@ async def test_controller_sends_request_actions_on_startup():
         and m.sender == CONTROLLER_ADDR
         for m in sent_messages
     )
-    assert request_actions_sent, (
-        f"Expected requestActions broadcast to plugin hosts; got: {sent_messages}"
-    )
+    assert not request_actions_sent
 
 
 @pytest.mark.asyncio
@@ -692,7 +679,7 @@ async def test_host_handles_request_actions_and_emits():
             pass
 
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
@@ -708,7 +695,8 @@ async def test_host_handles_request_actions_and_emits():
         await host.start(host_ctx)
         await anyio.sleep(0.02)
 
-        # Send requestActions to plugin hosts (simulates controller startup).
+        # Exercise the legacy host response path directly; controller startup no
+        # longer emits requestActions during the Sprint 1 NATS proof.
         await bus.send(_request_actions_message())
         await anyio.sleep(0.05)
 
@@ -728,16 +716,18 @@ async def test_controller_empty_hosts_starts_ok():
     from deckr.controller.settings import InMemorySettingsService
 
     bus = _plugin_bus()
-    registry = ActionRegistry(event_bus=bus, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
     config_service = FileBackedDeviceConfigService()
     settings_service = InMemorySettingsService()
+    hardware = _hardware_bus()
     controller = ControllerService(
-        driver_bus=_hardware_bus(),
+        hardware_endpoint=hardware.endpoint(CONTROLLER_ADDR),
+        state=hardware.deckr.state(),
         config_service=config_service,
         settings_service=settings_service,
         controller_id=CONTROLLER_ID,
         action_registry=registry,
-        plugin_bus=bus,
+        plugin_endpoint=bus.endpoint(CONTROLLER_ADDR),
     )
     stopping = anyio.Event()
 
