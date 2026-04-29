@@ -69,9 +69,7 @@ class ControllerRuntimeService(BaseComponent):
                 await controller_service.handle_actions_changed_event(event)
 
         action_registry = ActionRegistry(
-            endpoint=self._plugin_messages.endpoint(
-                f"controller:{self._runtime.controller_id}"
-            ),
+            state=self._state,
             controller_id=self._runtime.controller_id,
             on_actions_changed=on_actions_changed,
         )

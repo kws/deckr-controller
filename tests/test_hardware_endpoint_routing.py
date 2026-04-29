@@ -13,10 +13,12 @@ from deckr.state import (
     EndpointPresence,
     HardwareInventory,
     HardwareInventoryDevice,
+    StateUnavailable,
     device_claim_key,
     presence_endpoint_key,
 )
 
+import deckr.controller._controller_service as controller_module
 from deckr.controller._controller_service import ControllerService, OwnedDeviceClaim
 from deckr.controller._hardware_service import (
     HardwareCommandService,
@@ -496,6 +498,47 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
     ctrl_ctx.clear_page.assert_awaited_once_with(clear_outputs=False)
     assert controller._device_registry.get("config-room-a") is None
     assert controller._command_service._ref_by_config_id == {}
+
+
+@pytest.mark.asyncio
+async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        state=bus.deckr.state(),
+        config_service=NullDeviceConfigService(),
+        settings_service=InMemorySettingsService(),
+        controller_id="controller-main",
+    )
+    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    controller._device_registry.connect(
+        config_id="config-room-a",
+        ref=ref,
+        device=_device("deck", "serial-a"),
+    )
+    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    claim_key = device_claim_key(manager_id="room-a", device_id="deck")
+    controller._owned_claims[claim_key] = OwnedDeviceClaim(
+        key=claim_key,
+        config_id="config-room-a",
+        ref=ref,
+        revision=1,
+    )
+    controller._stopping = anyio.Event()
+
+    async def unavailable_update(*args, **kwargs):
+        del args, kwargs
+        controller._stopping.set()
+        raise StateUnavailable("nats down")
+
+    monkeypatch.setattr(controller_module, "PRESENCE_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(controller._state, "update", unavailable_update)
+
+    await controller._claim_refresh_loop()
+
+    assert controller._device_registry.get("config-room-a") is not None
+    assert controller._command_service._ref_by_config_id["config-room-a"] == ref
+    assert claim_key in controller._owned_claims
 
 
 async def _put_presence(

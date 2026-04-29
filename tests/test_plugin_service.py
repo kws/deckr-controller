@@ -1,746 +1,242 @@
-"""Tests for PluginService aggregator and plugin hosts."""
+from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import anyio
 import pytest
 from conftest import LaneHarness
 from deckr.components import RunContext
-from deckr.contracts.messages import controllers_broadcast, plugin_hosts_broadcast
-from deckr.pluginhost.messages import (
-    ACTIONS_REGISTERED,
-    ACTIONS_UNREGISTERED,
-    HOST_OFFLINE,
-    REQUEST_ACTIONS,
-    ActionDescriptor,
-    DeckrMessage,
-    controller_address,
-    host_address,
-    plugin_actions_subject,
-    plugin_message,
-    plugin_message_for_host,
+from deckr.contracts.messages import host_address
+from deckr.pluginhost.messages import ActionDescriptor, PluginActionCatalog
+from deckr.state import (
+    EndpointPresence,
+    plugin_action_catalog_key,
+    presence_endpoint_key,
 )
-from deckr.python_plugin.interface import PluginAction
 
 from deckr.controller.plugin.action_registry import ActionRegistry
-from deckr.controller.plugin.builtin import (
-    BUILTIN_ACTION_PROVIDER_ID,
-    LEGACY_BUILTIN_ACTION_PROVIDER_ID,
-)
+from deckr.controller.plugin.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.plugin.events import ActionsChangedEvent
 
 CONTROLLER_ID = "controller-main"
-CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
+ACTION_UUID = "test.stub.action"
 
 
-def _plugin_bus() -> LaneHarness:
-    return LaneHarness("plugin_messages", default_endpoint="host:python")
+def _state_bus() -> LaneHarness:
+    return LaneHarness("plugin_messages", default_endpoint="controller:controller-main")
 
 
-def _hardware_bus() -> LaneHarness:
-    return LaneHarness("hardware_messages", default_endpoint=CONTROLLER_ADDR)
+def _presence(host_id: str, *, session_id: str = "session-1") -> EndpointPresence:
+    return EndpointPresence(
+        endpoint=host_address(host_id),
+        lane="plugin_messages",
+        sessionId=session_id,
+        timestamp=datetime.now(UTC),
+        ttlSeconds=15,
+        metadata={"runtime": "test"},
+    )
 
 
-def _actions_payload() -> dict:
-    return {
-        "actionUuids": [StubAction.uuid],
-        "actions": [{"uuid": StubAction.uuid}],
-    }
-
-
-def _actions_registered_message(
+def _catalog(
+    host_id: str,
     *,
-    host_id: str = "test_host",
-    subject_host_id: str | None = None,
-    recipient=CONTROLLER_ADDR,
-) -> DeckrMessage:
-    subject_host_id = host_id if subject_host_id is None else subject_host_id
-    return plugin_message(
-        sender=host_address(host_id),
-        recipient=recipient,
-        message_type=ACTIONS_REGISTERED,
-        body=_actions_payload(),
-        subject=plugin_actions_subject(subject_host_id),
-    )
-
-
-def _actions_unregistered_message(
-    *,
-    host_id: str = "test_host",
-    subject_host_id: str | None = None,
-    recipient=CONTROLLER_ADDR,
-) -> DeckrMessage:
-    subject_host_id = host_id if subject_host_id is None else subject_host_id
-    return plugin_message(
-        sender=host_address(host_id),
-        recipient=recipient,
-        message_type=ACTIONS_UNREGISTERED,
-        body={"actionUuids": [StubAction.uuid]},
-        subject=plugin_actions_subject(subject_host_id),
-    )
-
-
-def _host_offline_message(
-    *,
-    host_id: str = "test_host",
-    subject_host_id: str | None = None,
-    recipient=CONTROLLER_ADDR,
-) -> DeckrMessage:
-    subject_host_id = host_id if subject_host_id is None else subject_host_id
-    return plugin_message(
-        sender=host_address(host_id),
-        recipient=recipient,
-        message_type=HOST_OFFLINE,
-        body={},
-        subject=plugin_actions_subject(subject_host_id),
-    )
-
-
-def _request_actions_message() -> DeckrMessage:
-    return plugin_message(
-        sender=CONTROLLER_ADDR,
-        recipient=plugin_hosts_broadcast(),
-        message_type=REQUEST_ACTIONS,
-        body={},
-        subject=plugin_actions_subject(),
-    )
-
-
-class StubAction:
-    """Minimal PluginAction for testing."""
-
-    uuid: str = "test.stub.action"
-
-    async def on_will_appear(self, event, context):
-        pass
-
-    async def on_will_disappear(self, event, context):
-        pass
-
-    async def on_key_up(self, event, context):
-        pass
-
-    async def on_key_down(self, event, context):
-        pass
-
-
-class StubPluginHost:
-    """Minimal PluginHost that returns a known action."""
-
-    name: str = "stub"
-
-    def __init__(self, action: PluginAction | None = None):
-        self._action = action or StubAction()
-
-    async def start(self, ctx) -> None:
-        pass
-
-    async def stop(self) -> None:
-        pass
-
-    async def get_action(self, uuid: str) -> PluginAction | None:
-        if uuid == self._action.uuid:
-            return self._action
-        return None
-
-    async def emit_actions_registered(self, send) -> None:
-        pass
-
-
-@pytest.mark.asyncio
-async def test_action_registry_aggregates_get_action():
-    """ActionRegistry returns ActionMetadata from registry (populated by actionsRegistered)."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    # Manually populate registry (simulating actionsRegistered)
-    registry._action_registry[f"stub::{StubAction.uuid}"] = (
-        "stub",
-        ActionDescriptor(uuid=StubAction.uuid),
-    )
-
-    meta = await registry.get_action(StubAction.uuid)
-    assert meta is not None
-    assert meta.uuid == StubAction.uuid
-    assert meta.host_id == "stub"
-
-    assert await registry.get_action("nonexistent.uuid") is None
-
-
-@pytest.mark.asyncio
-async def test_actions_registered_populates_registry():
-    """actionsRegistered message populates action registry."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    msg = _actions_registered_message()
-    await registry._handle_actions_registered(msg)
-
-    meta = await registry.get_action(StubAction.uuid)
-    assert meta is not None
-    assert meta.uuid == StubAction.uuid
-    assert meta.host_id == "test_host"
-
-
-@pytest.mark.asyncio
-async def test_actions_registered_with_controller_broadcast_populates_registry():
-    """actionsRegistered with controller broadcast recipient is handled."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    msg = _actions_registered_message(recipient=controllers_broadcast())
-    await registry._handle_actions_registered(msg)
-
-    meta = await registry.get_action(StubAction.uuid)
-    assert meta is not None
-    assert meta.uuid == StubAction.uuid
-    assert meta.host_id == "test_host"
-
-
-@pytest.mark.asyncio
-async def test_actions_registered_rejects_subject_host_id_mismatch():
-    """actionsRegistered ownership comes from sender, and mismatched subject is rejected."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    await registry._handle_actions_registered(
-        _actions_registered_message(host_id="actual", subject_host_id="spoofed")
-    )
-
-    assert await registry.get_action(f"actual::{StubAction.uuid}") is None
-    assert await registry.get_action(f"spoofed::{StubAction.uuid}") is None
-    assert await registry.get_action(StubAction.uuid) is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "reserved_host_id",
-    [BUILTIN_ACTION_PROVIDER_ID, LEGACY_BUILTIN_ACTION_PROVIDER_ID],
-)
-async def test_actions_registered_rejects_reserved_builtin_provider_sender(
-    reserved_host_id: str,
-):
-    """Route-owned plugin hosts cannot use reserved builtin provider ids."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    await registry._handle_actions_registered(
-        _actions_registered_message(host_id=reserved_host_id)
-    )
-
-    assert await registry.get_action(f"{reserved_host_id}::{StubAction.uuid}") is None
-    assert await registry.get_action(StubAction.uuid) is None
-
-
-@pytest.mark.asyncio
-async def test_actions_unregistered_removes_from_registry():
-    """actionsUnregistered message removes actions from registry."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    await registry._handle_actions_registered(
-        _actions_registered_message()
-    )
-    assert await registry.get_action(StubAction.uuid) is not None
-
-    await registry._handle_actions_unregistered(
-        _actions_unregistered_message()
-    )
-    assert await registry.get_action(StubAction.uuid) is None
-
-
-@pytest.mark.asyncio
-async def test_actions_unregistered_rejects_subject_host_id_mismatch():
-    """A sender cannot unregister another host's actions through subject hostId."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    await registry._handle_actions_registered(
-        _actions_registered_message(host_id="victim")
-    )
-    assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
-
-    await registry._handle_actions_unregistered(
-        _actions_unregistered_message(host_id="attacker", subject_host_id="victim")
-    )
-
-    assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
-    assert await registry.get_action(f"attacker::{StubAction.uuid}") is None
-
-
-@pytest.mark.asyncio
-async def test_host_offline_rejects_subject_host_id_mismatch():
-    """A sender cannot offline another host's actions through subject hostId."""
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    await registry._handle_actions_registered(
-        _actions_registered_message(host_id="victim")
-    )
-    await registry._handle_host_offline(
-        _host_offline_message(host_id="attacker", subject_host_id="victim")
-    )
-
-    assert await registry.get_action(f"victim::{StubAction.uuid}") is not None
-
-
-@pytest.mark.asyncio
-async def test_actions_registered_emits_actions_changed_event():
-    """actionsRegistered message publishes an ActionsChangedEvent through the callback."""
-    bus = _plugin_bus()
-    received_events = []
-
-    async def on_actions_changed(event: ActionsChangedEvent) -> None:
-        received_events.append(event)
-
-    registry = ActionRegistry(
-        endpoint=bus.endpoint(CONTROLLER_ADDR),
-        controller_id=CONTROLLER_ID,
-        on_actions_changed=on_actions_changed,
-    )
-    stopping = anyio.Event()
-
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=stopping)
-        await registry.start(ctx)
-        await anyio.sleep(0.01)
-
-        msg = _actions_registered_message(recipient=controllers_broadcast())
-        await bus.send(msg)
-        await anyio.sleep(0.05)
-
-        tg.cancel_scope.cancel()
-
-    assert len(received_events) == 1
-    assert received_events[0].registered == [f"test_host::{StubAction.uuid}"]
-    assert received_events[0].unregistered == []
-
-
-@pytest.mark.asyncio
-async def test_actions_unregistered_emits_actions_changed_event():
-    """actionsUnregistered message publishes an ActionsChangedEvent through the callback."""
-    bus = _plugin_bus()
-    received_events = []
-
-    async def on_actions_changed(event: ActionsChangedEvent) -> None:
-        received_events.append(event)
-
-    registry = ActionRegistry(
-        endpoint=bus.endpoint(CONTROLLER_ADDR),
-        controller_id=CONTROLLER_ID,
-        on_actions_changed=on_actions_changed,
-    )
-    stopping = anyio.Event()
-
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=stopping)
-        await registry.start(ctx)
-        await anyio.sleep(0.01)
-
-        # First register the action
-        await bus.send(_actions_registered_message(recipient=controllers_broadcast()))
-        with anyio.fail_after(1.0):
-            while len(received_events) < 1:
-                await anyio.sleep(0.01)
-        assert received_events[0].registered == [f"test_host::{StubAction.uuid}"]
-        received_events.clear()
-
-        # Then unregister
-        await bus.send(
-            _actions_unregistered_message(recipient=controllers_broadcast())
-        )
-        with anyio.fail_after(1.0):
-            while len(received_events) < 1:
-                await anyio.sleep(0.01)
-
-        tg.cancel_scope.cancel()
-
-    assert len(received_events) == 1
-    assert received_events[0].registered == []
-    assert received_events[0].unregistered == [f"test_host::{StubAction.uuid}"]
-
-
-@pytest.mark.asyncio
-async def test_host_offline_unregisters_actions():
-    """Host lifecycle messages remove host actions without a route table."""
-    bus = _plugin_bus()
-    received_events = []
-
-    async def on_actions_changed(event: ActionsChangedEvent) -> None:
-        received_events.append(event)
-
-    registry = ActionRegistry(
-        endpoint=bus.endpoint(CONTROLLER_ADDR),
-        controller_id=CONTROLLER_ID,
-        on_actions_changed=on_actions_changed,
-    )
-    stopping = anyio.Event()
-
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=stopping)
-        await registry.start(ctx)
-        await anyio.sleep(0.01)
-
-        await bus.send(_actions_registered_message(recipient=controllers_broadcast()))
-        with anyio.fail_after(1.0):
-            while len(received_events) < 1:
-                await anyio.sleep(0.01)
-        assert received_events[0].registered == [f"test_host::{StubAction.uuid}"]
-        received_events.clear()
-
-        await bus.send(_host_offline_message(recipient=controllers_broadcast()))
-        with anyio.fail_after(1.0):
-            while len(received_events) < 1:
-                await anyio.sleep(0.01)
-
-        tg.cancel_scope.cancel()
-
-    assert len(received_events) == 1
-    assert received_events[0].registered == []
-    assert received_events[0].unregistered == [f"test_host::{StubAction.uuid}"]
-    assert await registry.get_action(StubAction.uuid) is None
-
-
-@pytest.mark.asyncio
-async def test_host_offline_for_builtin_namespace_does_not_remove_builtin_actions():
-    """Builtins are an internal provider namespace, not host-owned actions."""
-    bus = _plugin_bus()
-    received_events = []
-
-    async def on_actions_changed(event: ActionsChangedEvent) -> None:
-        received_events.append(event)
-
-    registry = ActionRegistry(
-        endpoint=bus.endpoint(CONTROLLER_ADDR),
-        controller_id=CONTROLLER_ID,
-        on_actions_changed=on_actions_changed,
-    )
-    stopping = anyio.Event()
-
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=stopping)
-        await registry.start(ctx)
-        await anyio.sleep(0.01)
-
-        builtin = await registry.get_action("deckr.plugin.builtin.gotopage")
-        assert builtin is not None
-        assert builtin.host_id == BUILTIN_ACTION_PROVIDER_ID
-
-        await bus.send(
-            _host_offline_message(
-                host_id="builtin",
-                recipient=controllers_broadcast(),
+    session_id: str = "session-1",
+    action_uuid: str = ACTION_UUID,
+) -> PluginActionCatalog:
+    return PluginActionCatalog(
+        hostId=host_id,
+        hostEndpoint=host_address(host_id),
+        sessionId=session_id,
+        timestamp=datetime.now(UTC),
+        ttlSeconds=15,
+        actions={
+            action_uuid: ActionDescriptor(
+                uuid=action_uuid,
+                name=f"Action {action_uuid}",
+                plugin_uuid="test.plugin",
             )
+        },
+    )
+
+
+async def _run_registry(registry: ActionRegistry, state, callback):
+    events: list[ActionsChangedEvent] = []
+
+    async def on_changed(event: ActionsChangedEvent) -> None:
+        events.append(event)
+
+    registry._on_actions_changed = on_changed
+    stopping = anyio.Event()
+    async with anyio.create_task_group() as tg:
+        await registry.start(RunContext(tg=tg, stopping=stopping))
+        await callback(events)
+        tg.cancel_scope.cancel()
+    del state
+
+
+@pytest.mark.asyncio
+async def test_action_registry_uses_catalog_only_with_matching_host_presence():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+
+    async def scenario(events):
+        await state.put(plugin_action_catalog_key("python"), _catalog("python"))
+        await anyio.sleep(0.05)
+        assert await registry.get_action(ACTION_UUID) is None
+
+        await state.put(
+            presence_endpoint_key(
+                lane="plugin_messages",
+                endpoint=host_address("python"),
+            ),
+            _presence("python"),
         )
-        await anyio.sleep(0.05)
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is None:
+                await anyio.sleep(0.01)
 
-        tg.cancel_scope.cancel()
-
-    builtin = await registry.get_action("deckr.plugin.builtin.gotopage")
-    assert builtin is not None
-    assert builtin.host_id == BUILTIN_ACTION_PROVIDER_ID
-    assert received_events == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "provider_id",
-    [BUILTIN_ACTION_PROVIDER_ID, LEGACY_BUILTIN_ACTION_PROVIDER_ID],
-)
-async def test_builtin_actions_resolve_by_provider_qualified_address(provider_id: str):
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    action = await registry.get_action(
-        f"{provider_id}::deckr.plugin.builtin.gotopage"
-    )
-
-    assert action is not None
-    assert action.uuid == "deckr.plugin.builtin.gotopage"
-    assert action.host_id == BUILTIN_ACTION_PROVIDER_ID
-
-
-@pytest.mark.asyncio
-async def test_host_lifecycle_register_then_unregister():
-    """Full lifecycle: host emits actionsRegistered on start, actionsUnregistered on stop."""
-
-    HOST_MSG_TYPES = frozenset(
-        {
-            "requestActions",
-            "getAction",
-            "willAppear",
-            "willDisappear",
-            "keyUp",
-            "keyDown",
-            "dialRotate",
-            "touchTap",
-            "touchSwipe",
-        }
-    )
-
-    class LifecycleHost:
-        name = "lifecycle_test"
-        _event_bus = None
-
-        def __init__(self, event_bus):
-            self._event_bus = event_bus
-
-        async def start(self, ctx):
-            ctx.tg.start_soon(self._subscription_loop)
-            await self._event_bus.send(_actions_registered_message(host_id=self.name))
-
-        async def _subscription_loop(self):
-            if self._event_bus is None:
-                return
-            async with self._event_bus.subscribe() as stream:
-                async for event in stream:
-                    if not isinstance(event, DeckrMessage) or not plugin_message_for_host(
-                        event, self.name
-                    ):
-                        continue
-                    if event.message_type not in HOST_MSG_TYPES:
-                        continue
-                    # Minimal: only handle requestActions for this test
-                    if event.message_type == "requestActions":
-                        await self._event_bus.send(
-                            _actions_registered_message(host_id=self.name)
-                        )
-
-        async def stop(self):
-            await self._event_bus.send(
-                _actions_unregistered_message(host_id=self.name)
-            )
-
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    host_ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(host_ctx)
-    host = LifecycleHost(bus)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(registry._subscription_loop)
-        await anyio.sleep(0.01)
-        await host.start(host_ctx)
-        await anyio.sleep(0.05)
-
-        meta = await registry.get_action(StubAction.uuid)
+        meta = await registry.get_action(ACTION_UUID)
         assert meta is not None
-        assert meta.host_id == "lifecycle_test"
+        assert meta.host_id == "python"
+        assert meta.plugin_uuid == "test.plugin"
+        assert events[-1].registered == ["python::test.stub.action"]
 
-        await host.stop()
-        await anyio.sleep(0.05)
-        assert await registry.get_action(StubAction.uuid) is None
-
-        tg.cancel_scope.cancel()
+    await _run_registry(registry, state, scenario)
 
 
 @pytest.mark.asyncio
-async def test_controller_does_not_request_plugin_actions_on_sprint1_startup():
-    """Pluginhost discovery moves to Sprint 2 current-state catalogs."""
-    sent_messages = []
-    bus = _plugin_bus()
+async def test_action_registry_rejects_mismatched_catalog_payload_identity():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
 
-    original_publish = bus.publish
+    async def scenario(events):
+        await state.put(
+            presence_endpoint_key(
+                lane="plugin_messages",
+                endpoint=host_address("python"),
+            ),
+            _presence("python"),
+        )
+        await state.put(plugin_action_catalog_key("python"), _catalog("other"))
+        await anyio.sleep(0.05)
 
-    async def capture_publish(msg):
-        sent_messages.append(msg)
-        await original_publish(msg)
+        assert await registry.get_action(ACTION_UUID) is None
+        assert events == []
 
-    bus.publish = capture_publish
-    from deckr.controller._controller_service import ControllerService
-    from deckr.controller.config import FileBackedDeviceConfigService
-    from deckr.controller.settings import InMemorySettingsService
+    await _run_registry(registry, state, scenario)
 
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    config_service = FileBackedDeviceConfigService()
-    settings_service = InMemorySettingsService()
-    hardware = _hardware_bus()
-    controller = ControllerService(
-        hardware_endpoint=hardware.endpoint(CONTROLLER_ADDR),
-        state=hardware.deckr.state(),
-        config_service=config_service,
-        settings_service=settings_service,
-        controller_id=CONTROLLER_ID,
-        action_registry=registry,
-        plugin_endpoint=bus.endpoint(CONTROLLER_ADDR),
+
+@pytest.mark.asyncio
+async def test_action_registry_catalog_delete_unregisters_actions():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+
+    async def scenario(events):
+        await state.put(
+            presence_endpoint_key(
+                lane="plugin_messages",
+                endpoint=host_address("python"),
+            ),
+            _presence("python"),
+        )
+        await state.put(plugin_action_catalog_key("python"), _catalog("python"))
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is None:
+                await anyio.sleep(0.01)
+
+        await state.delete(plugin_action_catalog_key("python"))
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is not None:
+                await anyio.sleep(0.01)
+
+        assert events[-1].unregistered == ["python::test.stub.action"]
+
+    await _run_registry(registry, state, scenario)
+
+
+@pytest.mark.asyncio
+async def test_action_registry_host_session_change_unregisters_stale_catalog():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+
+    async def scenario(events):
+        presence_key = presence_endpoint_key(
+            lane="plugin_messages",
+            endpoint=host_address("python"),
+        )
+        await state.put(presence_key, _presence("python", session_id="old"))
+        await state.put(
+            plugin_action_catalog_key("python"),
+            _catalog("python", session_id="old"),
+        )
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is None:
+                await anyio.sleep(0.01)
+
+        await state.put(presence_key, _presence("python", session_id="new"))
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is not None:
+                await anyio.sleep(0.01)
+
+        await state.put(
+            plugin_action_catalog_key("python"),
+            _catalog("python", session_id="new"),
+        )
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is None:
+                await anyio.sleep(0.01)
+
+        assert events[-2].unregistered == ["python::test.stub.action"]
+        assert events[-1].registered == ["python::test.stub.action"]
+
+    await _run_registry(registry, state, scenario)
+
+
+@pytest.mark.asyncio
+async def test_action_registry_broker_snapshot_removes_actions_after_presence_loss():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    events: list[ActionsChangedEvent] = []
+
+    async def on_changed(event: ActionsChangedEvent) -> None:
+        events.append(event)
+
+    registry._on_actions_changed = on_changed
+    presence_key = presence_endpoint_key(
+        lane="plugin_messages",
+        endpoint=host_address("python"),
     )
+    await state.put(presence_key, _presence("python"))
+    await state.put(plugin_action_catalog_key("python"), _catalog("python"))
+    await registry._reconcile_current_state(reason="test snapshot")
+
+    assert await registry.get_action(ACTION_UUID) is not None
+    assert events[-1].registered == ["python::test.stub.action"]
+
+    await state.delete(presence_key)
+    await registry._reconcile_current_state(reason="test snapshot")
+
+    assert await registry.get_action(ACTION_UUID) is None
+    assert events[-1].unregistered == ["python::test.stub.action"]
+
+
+@pytest.mark.asyncio
+async def test_action_registry_loads_builtin_actions_without_plugin_catalogs():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-    await controller.start(ctx)
 
-    request_actions_sent = any(
-        isinstance(m, DeckrMessage)
-        and m.message_type == REQUEST_ACTIONS
-        and m.recipient == plugin_hosts_broadcast()
-        and m.sender == CONTROLLER_ADDR
-        for m in sent_messages
-    )
-    assert not request_actions_sent
+    await registry.start(RunContext(tg=mock_tg, stopping=stopping))
 
-
-@pytest.mark.asyncio
-async def test_host_handles_request_actions_and_emits():
-    """When host receives requestActions, it sends actionsRegistered on the bus."""
-
-    emit_called = []
-    HOST_MSG_TYPES = frozenset(
-        {
-            "requestActions",
-            "getAction",
-            "willAppear",
-            "willDisappear",
-            "keyUp",
-            "keyDown",
-            "dialRotate",
-            "touchTap",
-            "touchSwipe",
-        }
-    )
-
-    class RequestActionsHost:
-        name = "request_test"
-        _event_bus = None
-
-        def __init__(self, event_bus):
-            self._event_bus = event_bus
-
-        async def start(self, ctx):
-            ctx.tg.start_soon(self._subscription_loop)
-
-        async def _subscription_loop(self):
-            if self._event_bus is None:
-                return
-            async with self._event_bus.subscribe() as stream:
-                async for event in stream:
-                    if not isinstance(event, DeckrMessage) or not plugin_message_for_host(
-                        event, self.name
-                    ):
-                        continue
-                    if event.message_type not in HOST_MSG_TYPES:
-                        continue
-                    if event.message_type == "requestActions":
-                        emit_called.append(True)
-                        await self._event_bus.send(
-                            _actions_registered_message(host_id=self.name)
-                        )
-
-        async def stop(self):
-            pass
-
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-    ctx = RunContext(tg=mock_tg, stopping=stopping)
-    await registry.start(ctx)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(registry._subscription_loop)
-        await anyio.sleep(0.01)
-
-        host_ctx = RunContext(tg=tg, stopping=stopping)
-        host = RequestActionsHost(bus)
-        await host.start(host_ctx)
-        await anyio.sleep(0.02)
-
-        # Exercise the legacy host response path directly; controller startup no
-        # longer emits requestActions during the Sprint 1 NATS proof.
-        await bus.send(_request_actions_message())
-        await anyio.sleep(0.05)
-
-        assert len(emit_called) == 1, "Host should have sent actionsRegistered"
-        meta = await registry.get_action(StubAction.uuid)
-        assert meta is not None
-        assert meta.host_id == "request_test"
-
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_controller_empty_hosts_starts_ok():
-    """ControllerService starts without plugin hosts (hosts are loaded by service_runner)."""
-    from deckr.controller._controller_service import ControllerService
-    from deckr.controller.config import FileBackedDeviceConfigService
-    from deckr.controller.settings import InMemorySettingsService
-
-    bus = _plugin_bus()
-    registry = ActionRegistry(endpoint=bus.endpoint(CONTROLLER_ADDR), controller_id=CONTROLLER_ID)
-    config_service = FileBackedDeviceConfigService()
-    settings_service = InMemorySettingsService()
-    hardware = _hardware_bus()
-    controller = ControllerService(
-        hardware_endpoint=hardware.endpoint(CONTROLLER_ADDR),
-        state=hardware.deckr.state(),
-        config_service=config_service,
-        settings_service=settings_service,
-        controller_id=CONTROLLER_ID,
-        action_registry=registry,
-        plugin_endpoint=bus.endpoint(CONTROLLER_ADDR),
-    )
-    stopping = anyio.Event()
-
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=stopping)
-        await registry.start(ctx)
-        await controller.start(ctx)
-        await anyio.sleep(0.05)
-
-        # Builtin actions still work
-        goto_page = await registry.get_action("deckr.plugin.builtin.gotopage")
-        assert goto_page is not None
-
-        stopping.set()
-        await controller.stop()
-        tg.cancel_scope.cancel()
+    goto_page = await registry.get_action("deckr.plugin.builtin.gotopage")
+    assert goto_page is not None
+    assert goto_page.host_id == BUILTIN_ACTION_PROVIDER_ID

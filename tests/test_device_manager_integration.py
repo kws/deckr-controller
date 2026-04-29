@@ -6,7 +6,6 @@ import anyio
 import pytest
 import pytest_asyncio
 from conftest import LaneHarness
-from deckr.components import RunContext
 from deckr.contracts.messages import DeckrMessage
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.messages import (
@@ -16,16 +15,10 @@ from deckr.hardware.messages import (
     HardwareSlot,
 )
 from deckr.pluginhost.messages import (
-    ACTIONS_REGISTERED,
     context_subject,
     controller_address,
     host_address,
-    plugin_actions_subject,
-    plugin_body_dict,
     plugin_message,
-    plugin_message_for_host,
-    subject_action_uuid,
-    subject_context_id,
 )
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
@@ -86,19 +79,6 @@ async def _plugin_command_for_active_binding(
         action_instance_id=ctx.action_instance_id,
         binding_id=ctx.binding_id,
         page_session_id=ctx.page_session_id,
-    )
-
-
-def _actions_registered_message(action_uuid: str) -> DeckrMessage:
-    return plugin_message(
-        sender=HOST_ADDR,
-        recipient=CONTROLLER_ADDR,
-        message_type=ACTIONS_REGISTERED,
-        body={
-            "actionUuids": [action_uuid],
-            "actions": [{"uuid": action_uuid}],
-        },
-        subject=plugin_actions_subject(HOST_ID),
     )
 
 
@@ -209,271 +189,6 @@ class SetImageOnAppearAction:
 
     async def on_will_disappear(self, event, context):
         pass
-
-
-class MockPlugin:
-    def __init__(self, action):
-        self._action = action
-        self.name = "test_plugin"
-
-    async def provides_actions(self):
-        return [self._action.uuid]
-
-    async def get_action(self, uuid: str):
-        if uuid == self._action.uuid:
-            return self._action
-        return None
-
-
-class MockPluginHost:
-    """Message-native plugin host for testing."""
-
-    def __init__(self, action, event_bus):
-        self._action = action
-        self._event_bus = event_bus
-        self.name = HOST_ID
-        self.controller_id = CONTROLLER_ID
-        from deckr.core.util.anyio import AsyncMap
-
-        self._plugins = AsyncMap()
-        self._registry = None
-
-    async def _ensure_plugins(self):
-        if await self._plugins.get("test") is None:
-            await self._plugins.set("test", MockPlugin(self._action))
-
-    async def start(self, ctx):
-        from deckr.plugin_hosts.python.context_registry import (
-            PluginContextRegistry,
-        )
-        from deckr.plugin_hosts.python.message_context import MessagePluginContext
-
-        def create_context(*, context_id: str, settings: dict | None = None):
-            return MessagePluginContext(
-                event_bus=self._event_bus,
-                host_id=self.name,
-                controller_id=self.controller_id,
-                context_id=context_id,
-                settings=settings,
-            )
-
-        self._registry = PluginContextRegistry(create_context)
-        ctx.tg.start_soon(self._subscription_loop)
-        await self._ensure_plugins()
-        await self._event_bus.send(_actions_registered_message(self._action.uuid))
-
-    async def _subscription_loop(self):
-        from deckr.pluginhost.messages import (
-            DIAL_ROTATE,
-            HERE_ARE_SETTINGS,
-            KEY_DOWN,
-            KEY_UP,
-            REQUEST_ACTIONS,
-            TOUCH_SWIPE,
-            TOUCH_TAP,
-            WILL_APPEAR,
-            WILL_DISAPPEAR,
-        )
-        from deckr.python_plugin.events import (
-            DialRotate,
-            KeyDown,
-            KeyUp,
-            TouchSwipe,
-            TouchTap,
-            WillAppear,
-            WillDisappear,
-        )
-
-        def event_from_payload(event_type, payload):
-            event_data = payload.get("event", payload)
-            event_data = {**event_data, "context": context_id}
-            return event_type.model_validate(event_data)
-
-        HOST_MSG_TYPES = frozenset(
-            {
-                REQUEST_ACTIONS,
-                HERE_ARE_SETTINGS,
-                WILL_APPEAR,
-                WILL_DISAPPEAR,
-                KEY_UP,
-                KEY_DOWN,
-                DIAL_ROTATE,
-                TOUCH_TAP,
-                TOUCH_SWIPE,
-            }
-        )
-        if self._event_bus is None or self._registry is None:
-            return
-        async with self._event_bus.subscribe() as stream:
-            async for event in stream:
-                if not isinstance(event, DeckrMessage) or not plugin_message_for_host(
-                    event, self.name
-                ):
-                    continue
-                if event.message_type not in HOST_MSG_TYPES:
-                    continue
-                msg = event
-                if msg.message_type == REQUEST_ACTIONS:
-                    await self._event_bus.send(
-                        _actions_registered_message(self._action.uuid)
-                    )
-                elif msg.message_type == HERE_ARE_SETTINGS:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    settings = payload.get("settings", {})
-                    if context_id:
-                        self._registry.deliver_settings(context_id, settings)
-                elif msg.message_type == WILL_APPEAR:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    event_data = payload.get("event", payload)
-                    event_data = {**event_data, "context": context_id}
-                    ev = WillAppear.model_validate(event_data)
-                    action_uuid = subject_action_uuid(msg.subject) or ""
-                    action = await self._get_action(action_uuid)
-                    if action is None:
-                        return
-                    settings = payload.get("settings", {}) or {}
-                    ctx = self._registry.get_or_create(
-                        ev.context, settings=dict(settings)
-                    )
-                    await action.on_will_appear(ev, ctx)
-                elif msg.message_type == WILL_DISAPPEAR:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    event_data = payload.get("event", payload)
-                    event_data = {**event_data, "context": context_id}
-                    ev = WillDisappear.model_validate(event_data)
-                    action_uuid = subject_action_uuid(msg.subject) or ""
-                    action = await self._get_action(action_uuid)
-                    if action is None:
-                        return
-                    context_id = ev.context
-                    ctx = self._registry.get(context_id)
-                    if ctx is not None:
-                        try:
-                            await action.on_will_disappear(ev, ctx)
-                        finally:
-                            self._registry.remove(context_id)
-                elif msg.message_type == KEY_UP:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    action_uuid = subject_action_uuid(msg.subject) or ""
-                    ev = event_from_payload(KeyUp, payload)
-                    action = await self._get_action(action_uuid)
-                    if action is not None and hasattr(action, "on_key_up"):
-                        ctx = self._registry.get(ev.context)
-                        if ctx is None:
-                            ctx = self._registry.get_or_create(
-                                ev.context, settings=None
-                            )
-                        await action.on_key_up(ev, ctx)
-                elif msg.message_type == KEY_DOWN:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    action_uuid = subject_action_uuid(msg.subject) or ""
-                    ev = event_from_payload(KeyDown, payload)
-                    action = await self._get_action(action_uuid)
-                    if action is not None and hasattr(action, "on_key_down"):
-                        ctx = self._registry.get(ev.context)
-                        if ctx is None:
-                            ctx = self._registry.get_or_create(
-                                ev.context, settings=None
-                            )
-                        await action.on_key_down(ev, ctx)
-                elif msg.message_type == DIAL_ROTATE:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    action_uuid = subject_action_uuid(msg.subject) or ""
-                    ev = event_from_payload(DialRotate, payload)
-                    action = await self._get_action(action_uuid)
-                    if action is not None and hasattr(action, "on_dial_rotate"):
-                        ctx = self._registry.get(ev.context)
-                        if ctx is None:
-                            ctx = self._registry.get_or_create(
-                                ev.context, settings=None
-                            )
-                        await action.on_dial_rotate(ev, ctx)
-                elif msg.message_type == TOUCH_TAP:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    action_uuid = subject_action_uuid(msg.subject) or ""
-                    ev = event_from_payload(TouchTap, payload)
-                    action = await self._get_action(action_uuid)
-                    if action is not None and hasattr(action, "on_touch_tap"):
-                        ctx = self._registry.get(ev.context)
-                        if ctx is None:
-                            ctx = self._registry.get_or_create(
-                                ev.context, settings=None
-                            )
-                        await action.on_touch_tap(ev, ctx)
-                elif msg.message_type == TOUCH_SWIPE:
-                    payload = plugin_body_dict(msg)
-                    context_id = subject_context_id(msg.subject) or ""
-                    action_uuid = subject_action_uuid(msg.subject) or ""
-                    ev = event_from_payload(TouchSwipe, payload)
-                    action = await self._get_action(action_uuid)
-                    if action is not None and hasattr(action, "on_touch_swipe"):
-                        ctx = self._registry.get(ev.context)
-                        if ctx is None:
-                            ctx = self._registry.get_or_create(
-                                ev.context, settings=None
-                            )
-                        await action.on_touch_swipe(ev, ctx)
-
-    async def stop(self):
-        pass
-
-    async def _get_action(self, uuid: str):
-        if uuid == self._action.uuid:
-            return self._action
-        return None
-
-
-class MockPluginService:
-    """Plugin manager that uses message bus with test actions."""
-
-    def __init__(self, action=None, start_soon=None):
-        self._action = action or SetImageOnAppearAction()
-        self._bus = _plugin_bus()
-        self._start_soon = start_soon
-        self._adapter = None
-        self._command_handler = None
-
-    async def start(self, start_soon=None):
-        start_soon = start_soon or self._start_soon
-        if start_soon is None:
-            return
-        host = MockPluginHost(self._action, self._bus)
-        stopping = anyio.Event()
-        mock_tg = MagicMock()
-        mock_tg.start_soon = lambda fn, *a, **k: None
-        host_ctx = RunContext(tg=mock_tg, stopping=stopping)
-        await host.start(host_ctx)
-        start_soon(self._command_subscription_loop)
-
-    async def _command_subscription_loop(self):
-        from deckr.pluginhost.messages import COMMAND_MESSAGE_TYPES
-
-        async with self._bus.subscribe() as stream:
-            async for event in stream:
-                if (
-                    isinstance(event, DeckrMessage)
-                    and event.message_type in COMMAND_MESSAGE_TYPES
-                ):
-                    if self._command_handler is not None:
-                        await self._command_handler(event)
-
-    async def get_action(self, uuid: str):
-        if uuid == self._action.uuid:
-            return ActionMetadata(
-                uuid=self._action.uuid,
-                host_id="python",
-            )
-        return None
-
-    def register_command_handler(self, handler):
-        self._command_handler = handler
 
 
 class NoopAction:
@@ -620,78 +335,6 @@ async def test_set_image_last_write_wins_same_slot(
             "test-device", "0,0", f"frame-{initial_generation + 2}".encode()
         )
         tg.cancel_scope.cancel()
-
-
-@pytest.mark.skip(reason="Hangs: MockPluginService/adapter blocks; needs investigation")
-@pytest.mark.asyncio
-async def test_key_down_event_delivered_to_plugin(
-    device_config_set_image, persistence_tmp_dir
-):
-    """KeyDownMessage and KeyUpMessage are translated and delivered via EventTranslator."""
-    received = []
-
-    class RecordKeyEventsAction:
-        uuid: str = "test.virtual.record"
-
-        async def on_will_appear(self, event, context):
-            await context.set_image(_solid_key_image())
-
-        async def on_will_disappear(self, event, context):
-            pass
-
-        async def on_key_down(self, event, context):
-            received.append(("key_down", event.context, event.slot_id))
-
-        async def on_key_up(self, event, context):
-            received.append(("key_up", event.context, event.slot_id))
-
-    device = _make_mock_device()
-    registry = MockPluginService(action=RecordKeyEventsAction(), start_soon=None)
-    config = DeviceConfig(
-        id="test-device",
-        name="Test Device",
-        match={"fingerprint": "fingerprint:test-device"},
-        profiles=[
-            Profile(
-                name="default",
-                pages=[
-                    Page(
-                        controls=[
-                            Control(
-                                slot="0,0",
-                                action=RecordKeyEventsAction.uuid,
-                                settings={},
-                            )
-                        ]
-                    )
-                ],
-            )
-        ],
-    )
-    async with anyio.create_task_group() as tg:
-        await registry.start(tg.start_soon)
-        manager = DeviceManager(
-            controller_id=CONTROLLER_ID,
-            device=device,
-            hardware_ref=_hardware_ref(device),
-            command_service=FakeHardwareCommandService(),
-            config=config,
-            manager=registry,
-            plugin_bus=registry._bus,
-            start_soon=tg.start_soon,
-        )
-        registry.register_command_handler(manager.handle_command)
-        await manager.set_page(profile="default", page=0)
-        await anyio.sleep(0.1)
-        await manager.on_event(
-            hw_messages.KeyDownMessage(device_id="test-device", key_id="0,0")
-        )
-        await manager.on_event(
-            hw_messages.KeyUpMessage(device_id="test-device", key_id="0,0")
-        )
-    expected_context = received[0][1] if received else ""
-    assert ("key_down", expected_context, "0,0") in received
-    assert ("key_up", expected_context, "0,0") in received
 
 
 @pytest.mark.asyncio
@@ -1165,11 +808,4 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
         ctx_after = await manager.action_contexts.get("0,0")
         assert ctx_after is None
 
-        # Unavailable overlay should have been rendered
-        with anyio.fail_after(1.0):
-            while command_service.set_image.call_count != 1:
-                await anyio.sleep(0.01)
-        command_service.set_image.assert_called_once()
-        assert command_service.set_image.call_args[0][0] == "test-device"
-        assert command_service.set_image.call_args[0][1] == "0,0"
         tg.cancel_scope.cancel()

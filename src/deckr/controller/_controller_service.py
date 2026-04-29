@@ -9,6 +9,7 @@ from deckr.components import BaseComponent, RunContext
 from deckr.contracts.messages import (
     DeckrMessage,
     controller_address,
+    hardware_manager_address,
 )
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
@@ -25,6 +26,7 @@ from deckr.state import (
     StateConflict,
     StateEntry,
     StateStore,
+    StateUnavailable,
     device_claim_key,
     parse_device_claim_key,
     parse_hardware_inventory_key,
@@ -172,21 +174,40 @@ class ControllerService(BaseComponent):
                     await ctrl_ctx.on_event(message)
 
     async def _inventory_loop(self) -> None:
-        async with self._state.watch("inventory.hardware.") as stream:
-            async for change in stream:
-                manager_id = parse_hardware_inventory_key(change.key)
-                if manager_id is None:
-                    continue
-                if change.entry is None:
-                    self._inventory_by_manager.pop(manager_id, None)
-                    await self._handle_manager_unreachable(manager_id)
-                    continue
-                try:
-                    inventory = HardwareInventory.model_validate(change.entry.value)
-                except ValueError:
-                    logger.warning("Ignoring invalid hardware inventory %s", change.key)
-                    continue
-                await self._handle_inventory(inventory)
+        while True:
+            try:
+                async with self._state.watch("inventory.hardware.") as stream:
+                    async for change in stream:
+                        manager_id = parse_hardware_inventory_key(change.key)
+                        if manager_id is None:
+                            continue
+                        if change.entry is None:
+                            self._inventory_by_manager.pop(manager_id, None)
+                            await self._handle_manager_unreachable(manager_id)
+                            continue
+                        try:
+                            inventory = HardwareInventory.model_validate(
+                                change.entry.value
+                            )
+                        except ValueError:
+                            logger.warning(
+                                "Ignoring invalid hardware inventory %s", change.key
+                            )
+                            continue
+                        if (
+                            inventory.manager_id != manager_id
+                            or inventory.manager_endpoint
+                            != hardware_manager_address(manager_id)
+                        ):
+                            logger.warning(
+                                "Ignoring hardware inventory %s with mismatched payload",
+                                change.key,
+                            )
+                            continue
+                        await self._handle_inventory(inventory)
+            except StateUnavailable:
+                logger.warning("Hardware inventory state unavailable; retrying")
+                await anyio.sleep(1.0)
 
     async def _handle_inventory(self, inventory: HardwareInventory) -> None:
         manager_id = inventory.manager_id
@@ -234,7 +255,11 @@ class ControllerService(BaseComponent):
             )
             return
         claim_key = device_claim_key(manager_id=ref.manager_id, device_id=ref.device_id)
-        current_claim = await self._state.get(claim_key)
+        try:
+            current_claim = await self._state.get(claim_key)
+        except StateUnavailable:
+            logger.warning("Could not inspect claim %s; retrying later", claim_key)
+            return
         if current_claim is not None:
             self._remember_blocked_claim(claim_key, current_claim)
             return
@@ -242,9 +267,16 @@ class ControllerService(BaseComponent):
         try:
             entry = await self._state.create(claim_key, claim, ttl=PRESENCE_TTL_SECONDS)
         except StateConflict:
-            current_claim = await self._state.get(claim_key)
+            try:
+                current_claim = await self._state.get(claim_key)
+            except StateUnavailable:
+                logger.warning("Could not inspect conflicting claim %s", claim_key)
+                return
             if current_claim is not None:
                 self._remember_blocked_claim(claim_key, current_claim)
+            return
+        except StateUnavailable:
+            logger.warning("Could not create claim %s; retrying later", claim_key)
             return
         self._blocked_claim_revisions.pop(claim_key, None)
         self._owned_claims[claim_key] = OwnedDeviceClaim(
@@ -299,8 +331,8 @@ class ControllerService(BaseComponent):
         stopping: anyio.Event,
     ) -> None:
         key = presence_endpoint_key(lane=endpoint.lane.name, endpoint=endpoint.endpoint)
-        try:
-            while not stopping.is_set():
+        while not stopping.is_set():
+            try:
                 entry = await self._state.put(
                     key,
                     EndpointPresence(
@@ -315,8 +347,13 @@ class ControllerService(BaseComponent):
                 )
                 self._owned_presence_revisions[key] = entry.revision
                 await anyio.sleep(PRESENCE_HEARTBEAT_SECONDS)
-        finally:
-            await self._withdraw_presence_key(key, endpoint.endpoint)
+            except StateUnavailable:
+                logger.warning(
+                    "Could not refresh controller endpoint presence %s; retrying",
+                    key,
+                )
+                await anyio.sleep(PRESENCE_HEARTBEAT_SECONDS)
+        await self._withdraw_presence_key(key, endpoint.endpoint)
 
     async def _withdraw_presence_key(self, key: str, endpoint) -> None:
         revision = self._owned_presence_revisions.pop(key, None)
@@ -338,70 +375,98 @@ class ControllerService(BaseComponent):
                 )
 
     async def _manager_presence_loop(self) -> None:
-        async with self._state.watch("presence.endpoint.") as stream:
-            async for change in stream:
-                parsed = parse_presence_endpoint_key(change.key)
-                if parsed is None:
-                    continue
-                lane, endpoint = parsed
-                if (
-                    lane != "hardware_messages"
-                    or endpoint.family != "hardware_manager"
-                ):
-                    continue
-                manager_id = endpoint.endpoint_id
-                if change.entry is None:
-                    self._manager_presence_sessions.pop(manager_id, None)
-                    await self._handle_manager_unreachable(
-                        manager_id,
-                        drop_inventory=False,
-                    )
-                    continue
-                try:
-                    presence = EndpointPresence.model_validate(change.entry.value)
-                except ValueError:
-                    self._manager_presence_sessions.pop(manager_id, None)
-                    await self._handle_manager_unreachable(
-                        manager_id,
-                        drop_inventory=False,
-                    )
-                    continue
-                previous = self._manager_presence_sessions.get(manager_id)
-                if previous is not None and previous != presence.session_id:
-                    await self._handle_manager_unreachable(
-                        manager_id,
-                        drop_inventory=False,
-                    )
-                self._manager_presence_sessions[manager_id] = presence.session_id
-                inventory = self._inventory_by_manager.get(manager_id)
-                if inventory is not None and inventory.session_id == presence.session_id:
-                    await self._handle_inventory(inventory)
+        while True:
+            try:
+                async with self._state.watch("presence.endpoint.") as stream:
+                    async for change in stream:
+                        parsed = parse_presence_endpoint_key(change.key)
+                        if parsed is None:
+                            continue
+                        lane, endpoint = parsed
+                        if (
+                            lane != "hardware_messages"
+                            or endpoint.family != "hardware_manager"
+                        ):
+                            continue
+                        manager_id = endpoint.endpoint_id
+                        if change.entry is None:
+                            self._manager_presence_sessions.pop(manager_id, None)
+                            await self._handle_manager_unreachable(
+                                manager_id,
+                                drop_inventory=False,
+                            )
+                            continue
+                        try:
+                            presence = EndpointPresence.model_validate(
+                                change.entry.value
+                            )
+                        except ValueError:
+                            self._manager_presence_sessions.pop(manager_id, None)
+                            await self._handle_manager_unreachable(
+                                manager_id,
+                                drop_inventory=False,
+                            )
+                            continue
+                        if presence.endpoint != endpoint or presence.lane != lane:
+                            logger.warning(
+                                "Ignoring manager presence %s with mismatched payload",
+                                change.key,
+                            )
+                            self._manager_presence_sessions.pop(manager_id, None)
+                            await self._handle_manager_unreachable(
+                                manager_id,
+                                drop_inventory=False,
+                            )
+                            continue
+                        previous = self._manager_presence_sessions.get(manager_id)
+                        if previous is not None and previous != presence.session_id:
+                            await self._handle_manager_unreachable(
+                                manager_id,
+                                drop_inventory=False,
+                            )
+                        self._manager_presence_sessions[manager_id] = presence.session_id
+                        inventory = self._inventory_by_manager.get(manager_id)
+                        if (
+                            inventory is not None
+                            and inventory.session_id == presence.session_id
+                        ):
+                            await self._handle_inventory(inventory)
+            except StateUnavailable:
+                logger.warning("Manager presence state unavailable; retrying")
+                await anyio.sleep(1.0)
 
     async def _claim_watch_loop(self) -> None:
-        async with self._state.watch("claim.device.") as stream:
-            async for change in stream:
-                parsed = parse_device_claim_key(change.key)
-                if parsed is None:
-                    continue
-                manager_id, device_id = parsed
-                owned = self._owned_claims.get(change.key)
-                if owned is None:
-                    if change.entry is None:
-                        self._blocked_claim_revisions.pop(change.key, None)
-                        await self._try_claim_after_claim_loss(manager_id, device_id)
-                    else:
-                        self._blocked_claim_revisions[change.key] = (
-                            change.entry.revision
-                        )
-                    continue
-                if change.entry is None:
-                    self._blocked_claim_revisions.pop(change.key, None)
-                    live = self._device_registry.get_by_ref(owned.ref)
-                    if live is not None:
-                        await self._disconnect_live(live, release_claim=False)
-                    self._owned_claims.pop(change.key, None)
-                    continue
-                await self._handle_owned_claim_update(change.key, change.entry)
+        while True:
+            try:
+                async with self._state.watch("claim.device.") as stream:
+                    async for change in stream:
+                        parsed = parse_device_claim_key(change.key)
+                        if parsed is None:
+                            continue
+                        manager_id, device_id = parsed
+                        owned = self._owned_claims.get(change.key)
+                        if owned is None:
+                            if change.entry is None:
+                                self._blocked_claim_revisions.pop(change.key, None)
+                                await self._try_claim_after_claim_loss(
+                                    manager_id, device_id
+                                )
+                            else:
+                                self._blocked_claim_revisions[change.key] = (
+                                    change.entry.revision
+                                )
+                            continue
+                        if change.entry is None:
+                            self._blocked_claim_revisions.pop(change.key, None)
+                            live = self._device_registry.get_by_ref(owned.ref)
+                            if live is not None:
+                                await self._disconnect_live(live, release_claim=False)
+                            self._owned_claims.pop(change.key, None)
+                            continue
+                        await self._handle_owned_claim_update(change.key, change.entry)
+            except StateUnavailable:
+                logger.warning("Device claim state unavailable; retrying")
+                await anyio.sleep(1.0)
 
     async def _try_claim_after_claim_loss(
         self,
@@ -471,6 +536,12 @@ class ControllerService(BaseComponent):
                         await self._disconnect_live(live, release_claim=False)
                     self._owned_claims.pop(owned.key, None)
                     continue
+                except StateUnavailable:
+                    logger.warning(
+                        "Could not refresh claim %s; waiting for broker state",
+                        owned.key,
+                    )
+                    continue
                 self._owned_claims[owned.key] = OwnedDeviceClaim(
                     key=owned.key,
                     config_id=owned.config_id,
@@ -508,6 +579,8 @@ class ControllerService(BaseComponent):
                     await self._state.delete(claim_key, revision=owned.revision)
                 except StateConflict:
                     logger.info("Claim %s changed before release", claim_key)
+                except StateUnavailable:
+                    logger.warning("Could not release claim %s", claim_key)
         await self.on_device_disconnected(live.config_id)
 
     async def start(self, ctx: RunContext):
@@ -546,6 +619,8 @@ class ControllerService(BaseComponent):
                     await self._state.delete(owned.key, revision=owned.revision)
                 except StateConflict:
                     logger.info("Claim %s changed before release", owned.key)
+                except StateUnavailable:
+                    logger.warning("Could not release claim %s", owned.key)
             self._owned_claims.pop(owned.key, None)
 
     async def _device_lifecycle(
