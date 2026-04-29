@@ -1,6 +1,6 @@
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -28,6 +28,7 @@ from deckr.state import (
     StateStore,
     StateUnavailable,
     device_claim_key,
+    encode_key_token,
     parse_device_claim_key,
     parse_hardware_inventory_key,
     parse_presence_endpoint_key,
@@ -53,6 +54,19 @@ logger = logging.getLogger(__name__)
 
 PRESENCE_HEARTBEAT_SECONDS = 5.0
 PRESENCE_TTL_SECONDS = 15
+_STATE_RECONCILE_SECONDS = 1.0
+_WATCH_RETRY_SECONDS = 1.0
+_HARDWARE_INVENTORY_PREFIX = "inventory.hardware."
+_DEVICE_CLAIM_PREFIX = "claim.device."
+_HARDWARE_MANAGER_PRESENCE_PREFIX = ".".join(
+    (
+        "presence",
+        "endpoint",
+        encode_key_token("hardware_messages"),
+        encode_key_token("hardware_manager"),
+        "",
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +113,7 @@ class ControllerService(BaseComponent):
         self._inventory_by_manager: dict[str, HardwareInventory] = {}
         self._manager_presence_sessions: dict[str, str] = {}
         self._owned_presence_revisions: dict[str, int] = {}
+        self._hardware_reconcile_lock = anyio.Lock()
         self._stopping: anyio.Event | None = None
 
     async def _handle_plugin_command(self, msg: DeckrMessage) -> None:
@@ -176,58 +191,17 @@ class ControllerService(BaseComponent):
     async def _inventory_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch("inventory.hardware.") as stream:
+                async with self._state.watch(_HARDWARE_INVENTORY_PREFIX) as stream:
                     async for change in stream:
                         manager_id = parse_hardware_inventory_key(change.key)
                         if manager_id is None:
                             continue
-                        if change.entry is None:
-                            self._inventory_by_manager.pop(manager_id, None)
-                            await self._handle_manager_unreachable(manager_id)
-                            continue
-                        try:
-                            inventory = HardwareInventory.model_validate(
-                                change.entry.value
-                            )
-                        except ValueError:
-                            logger.warning(
-                                "Ignoring invalid hardware inventory %s", change.key
-                            )
-                            continue
-                        if (
-                            inventory.manager_id != manager_id
-                            or inventory.manager_endpoint
-                            != hardware_manager_address(manager_id)
-                        ):
-                            logger.warning(
-                                "Ignoring hardware inventory %s with mismatched payload",
-                                change.key,
-                            )
-                            continue
-                        await self._handle_inventory(inventory)
+                        await self._reconcile_hardware_current_state(
+                            reason="hardware inventory watch"
+                        )
             except StateUnavailable:
                 logger.warning("Hardware inventory state unavailable; retrying")
-                await anyio.sleep(1.0)
-
-    async def _handle_inventory(self, inventory: HardwareInventory) -> None:
-        manager_id = inventory.manager_id
-        self._inventory_by_manager[manager_id] = inventory
-        if self._manager_presence_sessions.get(manager_id) != inventory.session_id:
-            return
-        seen_refs: set[hw_messages.HardwareDeviceRef] = set()
-        for device_id, item in inventory.devices.items():
-            ref = hw_messages.HardwareDeviceRef(
-                manager_id=manager_id,
-                device_id=item.device_id or device_id,
-            )
-            seen_refs.add(ref)
-            if self._device_registry.get_by_ref(ref) is not None:
-                continue
-            await self._try_claim_inventory_device(ref, item)
-
-        for live in self._device_registry.for_manager(manager_id):
-            if live.ref not in seen_refs:
-                await self._disconnect_live(live, release_claim=True)
+                await anyio.sleep(_WATCH_RETRY_SECONDS)
 
     async def _try_claim_inventory_device(
         self,
@@ -377,7 +351,7 @@ class ControllerService(BaseComponent):
     async def _manager_presence_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch("presence.endpoint.") as stream:
+                async with self._state.watch(_HARDWARE_MANAGER_PRESENCE_PREFIX) as stream:
                     async for change in stream:
                         parsed = parse_presence_endpoint_key(change.key)
                         if parsed is None:
@@ -388,134 +362,194 @@ class ControllerService(BaseComponent):
                             or endpoint.family != "hardware_manager"
                         ):
                             continue
-                        manager_id = endpoint.endpoint_id
-                        if change.entry is None:
-                            self._manager_presence_sessions.pop(manager_id, None)
-                            await self._handle_manager_unreachable(
-                                manager_id,
-                                drop_inventory=False,
-                            )
-                            continue
-                        try:
-                            presence = EndpointPresence.model_validate(
-                                change.entry.value
-                            )
-                        except ValueError:
-                            self._manager_presence_sessions.pop(manager_id, None)
-                            await self._handle_manager_unreachable(
-                                manager_id,
-                                drop_inventory=False,
-                            )
-                            continue
-                        if presence.endpoint != endpoint or presence.lane != lane:
-                            logger.warning(
-                                "Ignoring manager presence %s with mismatched payload",
-                                change.key,
-                            )
-                            self._manager_presence_sessions.pop(manager_id, None)
-                            await self._handle_manager_unreachable(
-                                manager_id,
-                                drop_inventory=False,
-                            )
-                            continue
-                        previous = self._manager_presence_sessions.get(manager_id)
-                        if previous is not None and previous != presence.session_id:
-                            await self._handle_manager_unreachable(
-                                manager_id,
-                                drop_inventory=False,
-                            )
-                        self._manager_presence_sessions[manager_id] = presence.session_id
-                        inventory = self._inventory_by_manager.get(manager_id)
-                        if (
-                            inventory is not None
-                            and inventory.session_id == presence.session_id
-                        ):
-                            await self._handle_inventory(inventory)
+                        await self._reconcile_hardware_current_state(
+                            reason="manager presence watch"
+                        )
             except StateUnavailable:
                 logger.warning("Manager presence state unavailable; retrying")
-                await anyio.sleep(1.0)
+                await anyio.sleep(_WATCH_RETRY_SECONDS)
 
     async def _claim_watch_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch("claim.device.") as stream:
+                async with self._state.watch(_DEVICE_CLAIM_PREFIX) as stream:
                     async for change in stream:
                         parsed = parse_device_claim_key(change.key)
                         if parsed is None:
                             continue
-                        manager_id, device_id = parsed
-                        owned = self._owned_claims.get(change.key)
-                        if owned is None:
-                            if change.entry is None:
-                                self._blocked_claim_revisions.pop(change.key, None)
-                                await self._try_claim_after_claim_loss(
-                                    manager_id, device_id
-                                )
-                            else:
-                                self._blocked_claim_revisions[change.key] = (
-                                    change.entry.revision
-                                )
-                            continue
-                        if change.entry is None:
-                            self._blocked_claim_revisions.pop(change.key, None)
-                            live = self._device_registry.get_by_ref(owned.ref)
-                            if live is not None:
-                                await self._disconnect_live(live, release_claim=False)
-                            self._owned_claims.pop(change.key, None)
-                            continue
-                        await self._handle_owned_claim_update(change.key, change.entry)
+                        await self._reconcile_hardware_current_state(
+                            reason="device claim watch"
+                        )
             except StateUnavailable:
                 logger.warning("Device claim state unavailable; retrying")
-                await anyio.sleep(1.0)
+                await anyio.sleep(_WATCH_RETRY_SECONDS)
 
-    async def _try_claim_after_claim_loss(
+    async def _hardware_reconciliation_loop(self) -> None:
+        while True:
+            try:
+                await self._reconcile_hardware_current_state(reason="broker snapshot")
+            except StateUnavailable:
+                logger.warning(
+                    "Hardware current state unavailable; reconciliation will retry",
+                    exc_info=True,
+                )
+            await anyio.sleep(_STATE_RECONCILE_SECONDS)
+
+    async def _reconcile_hardware_current_state(self, *, reason: str) -> None:
+        async with self._hardware_reconcile_lock:
+            await self._reconcile_hardware_current_state_locked(reason=reason)
+
+    async def _reconcile_hardware_current_state_locked(self, *, reason: str) -> None:
+        presence_entries = await self._state.items(_HARDWARE_MANAGER_PRESENCE_PREFIX)
+        inventory_entries = await self._state.items(_HARDWARE_INVENTORY_PREFIX)
+        claim_entries = await self._state.items(_DEVICE_CLAIM_PREFIX)
+
+        next_presence_sessions: dict[str, str] = {}
+        next_inventory: dict[str, HardwareInventory] = {}
+        current_claims: dict[str, StateEntry] = {}
+
+        for entry in presence_entries:
+            parsed = parse_presence_endpoint_key(entry.key)
+            if parsed is None:
+                continue
+            lane, endpoint = parsed
+            if lane != "hardware_messages" or endpoint.family != "hardware_manager":
+                continue
+            presence = _valid_endpoint_presence(entry)
+            if presence is not None:
+                next_presence_sessions[endpoint.endpoint_id] = presence.session_id
+
+        for entry in inventory_entries:
+            manager_id = parse_hardware_inventory_key(entry.key)
+            if manager_id is None:
+                continue
+            inventory = _valid_hardware_inventory(entry, manager_id=manager_id)
+            if inventory is not None:
+                next_inventory[manager_id] = inventory
+
+        for entry in claim_entries:
+            parsed = parse_device_claim_key(entry.key)
+            if parsed is None:
+                continue
+            current_claims[entry.key] = entry
+
+        logger.debug("Reconciling hardware current state via %s", reason)
+        self._manager_presence_sessions = next_presence_sessions
+        self._inventory_by_manager = next_inventory
+        for key in tuple(self._blocked_claim_revisions):
+            if key not in current_claims:
+                self._blocked_claim_revisions.pop(key, None)
+
+        await self._reconcile_owned_claims(current_claims)
+        await self._reconcile_live_hardware(current_claims)
+        await self._reconcile_available_inventory(current_claims)
+
+    async def _reconcile_owned_claims(
         self,
-        manager_id: str,
-        device_id: str,
+        current_claims: Mapping[str, StateEntry],
     ) -> None:
-        inventory = self._inventory_by_manager.get(manager_id)
-        if inventory is None:
-            return
-        if self._manager_presence_sessions.get(manager_id) != inventory.session_id:
-            return
-        item = inventory.devices.get(device_id)
-        if item is None:
-            return
-        ref = hw_messages.HardwareDeviceRef(
-            manager_id=manager_id,
-            device_id=item.device_id or device_id,
-        )
-        if self._device_registry.get_by_ref(ref) is not None:
-            return
-        await self._try_claim_inventory_device(ref, item)
+        for owned in tuple(self._owned_claims.values()):
+            entry = current_claims.get(owned.key)
+            if entry is None:
+                await self._revoke_owned_claim(owned, release_claim=False)
+                continue
 
-    async def _handle_owned_claim_update(self, key: str, entry: StateEntry) -> None:
-        owned = self._owned_claims.get(key)
-        if owned is None:
-            return
-        try:
-            claim = DeviceClaim.model_validate(entry.value)
-        except ValueError:
-            live = self._device_registry.get_by_ref(owned.ref)
-            if live is not None:
+            claim = _valid_device_claim(entry)
+            if claim is None or not self._claim_belongs_to_this_session(claim):
+                await self._revoke_owned_claim(owned, release_claim=False)
+                continue
+
+            self._owned_claims[owned.key] = OwnedDeviceClaim(
+                key=owned.key,
+                config_id=owned.config_id,
+                ref=owned.ref,
+                revision=entry.revision,
+            )
+            if not self._ref_is_available(owned.ref):
+                await self._revoke_owned_claim(
+                    self._owned_claims[owned.key],
+                    release_claim=True,
+                )
+
+    async def _reconcile_live_hardware(
+        self,
+        current_claims: Mapping[str, StateEntry],
+    ) -> None:
+        for live in tuple(self._device_registry.all()):
+            if not self._ref_is_available(live.ref):
+                await self._disconnect_live(live, release_claim=True)
+                continue
+            claim_key = device_claim_key(
+                manager_id=live.ref.manager_id,
+                device_id=live.ref.device_id,
+            )
+            entry = current_claims.get(claim_key)
+            claim = _valid_device_claim(entry) if entry is not None else None
+            if (
+                claim_key not in self._owned_claims
+                or claim is None
+                or not self._claim_belongs_to_this_session(claim)
+            ):
                 await self._disconnect_live(live, release_claim=False)
-            self._owned_claims.pop(key, None)
-            return
-        if (
-            claim.claimed_by_endpoint != controller_address(self._controller_id)
-            or claim.claimed_by_session_id != self._session_id
-        ):
-            live = self._device_registry.get_by_ref(owned.ref)
-            if live is not None:
-                await self._disconnect_live(live, release_claim=False)
-            self._owned_claims.pop(key, None)
-            return
-        self._owned_claims[key] = OwnedDeviceClaim(
-            key=owned.key,
-            config_id=owned.config_id,
-            ref=owned.ref,
-            revision=entry.revision,
+
+    async def _reconcile_available_inventory(
+        self,
+        current_claims: Mapping[str, StateEntry],
+    ) -> None:
+        for inventory in self._inventory_by_manager.values():
+            if not self._inventory_is_usable(inventory):
+                continue
+            for device_id, item in inventory.devices.items():
+                ref = hw_messages.HardwareDeviceRef(
+                    manager_id=inventory.manager_id,
+                    device_id=item.device_id or device_id,
+                )
+                if self._device_registry.get_by_ref(ref) is not None:
+                    continue
+                claim_key = device_claim_key(
+                    manager_id=ref.manager_id,
+                    device_id=ref.device_id,
+                )
+                claim_entry = current_claims.get(claim_key)
+                if claim_entry is not None:
+                    claim = _valid_device_claim(claim_entry)
+                    if claim is None or not self._claim_belongs_to_this_session(claim):
+                        self._blocked_claim_revisions[claim_key] = claim_entry.revision
+                    continue
+                self._blocked_claim_revisions.pop(claim_key, None)
+                await self._try_claim_inventory_device(ref, item)
+
+    def _inventory_is_usable(self, inventory: HardwareInventory) -> bool:
+        return (
+            self._manager_presence_sessions.get(inventory.manager_id)
+            == inventory.session_id
         )
+
+    def _ref_is_available(self, ref: hw_messages.HardwareDeviceRef) -> bool:
+        inventory = self._inventory_by_manager.get(ref.manager_id)
+        if inventory is None or not self._inventory_is_usable(inventory):
+            return False
+        return ref in _hardware_inventory_refs(inventory)
+
+    def _claim_belongs_to_this_session(self, claim: DeviceClaim) -> bool:
+        return (
+            claim.claimed_by_endpoint == controller_address(self._controller_id)
+            and claim.claimed_by_session_id == self._session_id
+        )
+
+    async def _revoke_owned_claim(
+        self,
+        owned: OwnedDeviceClaim,
+        *,
+        release_claim: bool,
+    ) -> None:
+        live = self._device_registry.get_by_ref(owned.ref)
+        if live is not None:
+            await self._disconnect_live(live, release_claim=release_claim)
+            return
+        self._owned_claims.pop(owned.key, None)
+        if release_claim:
+            await self._delete_owned_claim(owned)
 
     async def _claim_refresh_loop(self) -> None:
         while True:
@@ -549,17 +583,6 @@ class ControllerService(BaseComponent):
                     revision=entry.revision,
                 )
 
-    async def _handle_manager_unreachable(
-        self,
-        manager_id: str,
-        *,
-        drop_inventory: bool = True,
-    ) -> None:
-        if drop_inventory:
-            self._inventory_by_manager.pop(manager_id, None)
-        for live in self._device_registry.for_manager(manager_id):
-            await self._disconnect_live(live, release_claim=True)
-
     async def _disconnect_live(
         self,
         live: LiveHardwareDevice,
@@ -574,13 +597,7 @@ class ControllerService(BaseComponent):
         )
         owned = self._owned_claims.pop(claim_key, None)
         if release_claim and owned is not None:
-            with anyio.CancelScope(shield=True):
-                try:
-                    await self._state.delete(claim_key, revision=owned.revision)
-                except StateConflict:
-                    logger.info("Claim %s changed before release", claim_key)
-                except StateUnavailable:
-                    logger.warning("Could not release claim %s", claim_key)
+            await self._delete_owned_claim(owned)
         await self.on_device_disconnected(live.config_id)
 
     async def start(self, ctx: RunContext):
@@ -596,6 +613,7 @@ class ControllerService(BaseComponent):
         ctx.tg.start_soon(self._inventory_loop)
         ctx.tg.start_soon(self._manager_presence_loop)
         ctx.tg.start_soon(self._claim_watch_loop)
+        ctx.tg.start_soon(self._hardware_reconciliation_loop)
         ctx.tg.start_soon(self._claim_refresh_loop)
 
     async def stop(self):
@@ -614,14 +632,17 @@ class ControllerService(BaseComponent):
 
     async def _release_owned_claims(self) -> None:
         for owned in tuple(self._owned_claims.values()):
-            with anyio.CancelScope(shield=True):
-                try:
-                    await self._state.delete(owned.key, revision=owned.revision)
-                except StateConflict:
-                    logger.info("Claim %s changed before release", owned.key)
-                except StateUnavailable:
-                    logger.warning("Could not release claim %s", owned.key)
+            await self._delete_owned_claim(owned)
             self._owned_claims.pop(owned.key, None)
+
+    async def _delete_owned_claim(self, owned: OwnedDeviceClaim) -> None:
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._state.delete(owned.key, revision=owned.revision)
+            except StateConflict:
+                logger.info("Claim %s changed before release", owned.key)
+            except StateUnavailable:
+                logger.warning("Could not release claim %s", owned.key)
 
     async def _device_lifecycle(
         self,
@@ -714,3 +735,66 @@ class ControllerService(BaseComponent):
                 await ctrl_ctx.clear_page(clear_outputs=False)
         finally:
             logger.info("Stopped controller service for config %s", config_id)
+
+
+def _valid_endpoint_presence(entry: StateEntry) -> EndpointPresence | None:
+    parsed = parse_presence_endpoint_key(entry.key)
+    if parsed is None:
+        return None
+    lane, endpoint = parsed
+    try:
+        presence = EndpointPresence.model_validate(entry.value)
+    except ValueError:
+        logger.warning("Ignoring invalid endpoint presence %s", entry.key)
+        return None
+    if presence.endpoint != endpoint or presence.lane != lane:
+        logger.warning(
+            "Ignoring endpoint presence %s with mismatched payload endpoint=%s lane=%s",
+            entry.key,
+            presence.endpoint,
+            presence.lane,
+        )
+        return None
+    return presence
+
+
+def _valid_hardware_inventory(
+    entry: StateEntry,
+    *,
+    manager_id: str,
+) -> HardwareInventory | None:
+    try:
+        inventory = HardwareInventory.model_validate(entry.value)
+    except ValueError:
+        logger.warning("Ignoring invalid hardware inventory %s", entry.key)
+        return None
+    if (
+        inventory.manager_id != manager_id
+        or inventory.manager_endpoint != hardware_manager_address(manager_id)
+    ):
+        logger.warning(
+            "Ignoring hardware inventory %s with mismatched payload",
+            entry.key,
+        )
+        return None
+    return inventory
+
+
+def _valid_device_claim(entry: StateEntry) -> DeviceClaim | None:
+    try:
+        return DeviceClaim.model_validate(entry.value)
+    except ValueError:
+        logger.warning("Ignoring invalid device claim %s", entry.key)
+        return None
+
+
+def _hardware_inventory_refs(
+    inventory: HardwareInventory,
+) -> set[hw_messages.HardwareDeviceRef]:
+    return {
+        hw_messages.HardwareDeviceRef(
+            manager_id=inventory.manager_id,
+            device_id=item.device_id or device_id,
+        )
+        for device_id, item in inventory.devices.items()
+    }

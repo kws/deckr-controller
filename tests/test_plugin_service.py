@@ -227,6 +227,38 @@ async def test_action_registry_broker_snapshot_removes_actions_after_presence_lo
 
 
 @pytest.mark.asyncio
+async def test_action_registry_broker_snapshot_removes_actions_after_catalog_loss():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    events: list[ActionsChangedEvent] = []
+
+    async def on_changed(event: ActionsChangedEvent) -> None:
+        events.append(event)
+
+    registry._on_actions_changed = on_changed
+    catalog_key = plugin_action_catalog_key("python")
+    await state.put(
+        presence_endpoint_key(
+            lane="plugin_messages",
+            endpoint=host_address("python"),
+        ),
+        _presence("python"),
+    )
+    await state.put(catalog_key, _catalog("python"))
+    await registry._reconcile_current_state(reason="test snapshot")
+
+    assert await registry.get_action(ACTION_UUID) is not None
+    assert events[-1].registered == ["python::test.stub.action"]
+
+    await state.delete(catalog_key)
+    await registry._reconcile_current_state(reason="test snapshot")
+
+    assert await registry.get_action(ACTION_UUID) is None
+    assert events[-1].unregistered == ["python::test.stub.action"]
+
+
+@pytest.mark.asyncio
 async def test_action_registry_loads_builtin_actions_without_plugin_catalogs():
     bus = _state_bus()
     state = bus.deckr.state()

@@ -157,6 +157,26 @@ async def test_manager_presence_loss_cleans_only_configs_for_lost_manager_endpoi
     controller._command_service.register_device(config_id="config-room-b", ref=ref_b)
     await _put_presence(bus, "room-a")
     await _put_presence(bus, "room-b")
+    await _put_inventory(bus, "room-a", fingerprint="serial-a")
+    await _put_inventory(bus, "room-b", fingerprint="serial-b")
+    claim_a = await _put_claim(bus, controller, "room-a", "deck")
+    claim_b = await _put_claim(bus, controller, "room-b", "deck")
+    controller._owned_claims[device_claim_key(manager_id="room-a", device_id="deck")] = (
+        OwnedDeviceClaim(
+            key=device_claim_key(manager_id="room-a", device_id="deck"),
+            config_id="config-room-a",
+            ref=ref_a,
+            revision=claim_a.revision,
+        )
+    )
+    controller._owned_claims[device_claim_key(manager_id="room-b", device_id="deck")] = (
+        OwnedDeviceClaim(
+            key=device_claim_key(manager_id="room-b", device_id="deck"),
+            config_id="config-room-b",
+            ref=ref_b,
+            revision=claim_b.revision,
+        )
+    )
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(controller._manager_presence_loop)
@@ -349,7 +369,6 @@ async def test_claim_loss_retries_cached_matching_inventory():
         controller_id="controller-main",
     )
     controller.on_device_connected = AsyncMock()
-    controller._manager_presence_sessions["room-a"] = "manager-session"
     claim_key = device_claim_key(manager_id="room-a", device_id="deck")
     await bus.deckr.state().create(
         claim_key,
@@ -360,31 +379,19 @@ async def test_claim_loss_retries_cached_matching_inventory():
             ttlSeconds=15,
         ),
     )
-
-    await controller._handle_inventory(
-        HardwareInventory(
-            managerId="room-a",
-            managerEndpoint=hardware_manager_address("room-a"),
-            sessionId="manager-session",
-            timestamp=datetime.now(UTC),
-            ttlSeconds=15,
-            devices={
-                "deck": HardwareInventoryDevice(
-                    deviceId="deck",
-                    hardwareType="test",
-                    fingerprint="serial-a",
-                    descriptor=_device("deck", "serial-a").model_dump(
-                        by_alias=True,
-                        mode="json",
-                    ),
-                )
-            },
-        )
+    await _put_presence(bus, "room-a", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "room-a",
+        fingerprint="serial-a",
+        session_id="manager-session",
     )
+
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
     assert controller._device_registry.get("config-room-a") is None
 
     await bus.deckr.state().delete(claim_key)
-    await controller._try_claim_after_claim_loss("room-a", "deck")
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
 
     claim = await bus.deckr.state().get(claim_key)
     assert claim is not None
@@ -409,7 +416,6 @@ async def test_same_endpoint_old_session_claim_blocks_until_claim_loss():
         controller_id="controller-main",
     )
     controller.on_device_connected = AsyncMock()
-    controller._manager_presence_sessions["room-a"] = "manager-session"
     claim_key = device_claim_key(manager_id="room-a", device_id="deck")
     await bus.deckr.state().create(
         claim_key,
@@ -420,39 +426,162 @@ async def test_same_endpoint_old_session_claim_blocks_until_claim_loss():
             ttlSeconds=15,
         ),
     )
-
-    await controller._handle_inventory(
-        HardwareInventory(
-            managerId="room-a",
-            managerEndpoint=hardware_manager_address("room-a"),
-            sessionId="manager-session",
-            timestamp=datetime.now(UTC),
-            ttlSeconds=15,
-            devices={
-                "deck": HardwareInventoryDevice(
-                    deviceId="deck",
-                    hardwareType="test",
-                    fingerprint="serial-a",
-                    descriptor=_device("deck", "serial-a").model_dump(
-                        by_alias=True,
-                        mode="json",
-                    ),
-                )
-            },
-        )
+    await _put_presence(bus, "room-a", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "room-a",
+        fingerprint="serial-a",
+        session_id="manager-session",
     )
+
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
 
     assert controller._device_registry.get("config-room-a") is None
     assert controller._owned_claims == {}
     assert claim_key in controller._blocked_claim_revisions
 
     await bus.deckr.state().delete(claim_key)
-    await controller._try_claim_after_claim_loss("room-a", "deck")
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
 
     claim = await bus.deckr.state().get(claim_key)
     assert claim is not None
     assert claim.value["claimedByEndpoint"] == "controller:controller-main"
     assert claim.value["claimedBySessionId"] == controller._session_id
+    assert controller._device_registry.get("config-room-a") is not None
+
+
+@pytest.mark.asyncio
+async def test_broker_snapshot_inventory_removal_revokes_live_device():
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        state=bus.deckr.state(),
+        config_service=NullDeviceConfigService(),
+        settings_service=InMemorySettingsService(),
+        controller_id="controller-main",
+    )
+    controller.on_device_disconnected = AsyncMock()
+    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    controller._device_registry.connect(
+        config_id="config-room-a",
+        ref=ref,
+        device=_device("deck", "serial-a"),
+    )
+    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    claim_key = device_claim_key(manager_id="room-a", device_id="deck")
+    claim_entry = await _put_claim(bus, controller, "room-a", "deck")
+    controller._owned_claims[claim_key] = OwnedDeviceClaim(
+        key=claim_key,
+        config_id="config-room-a",
+        ref=ref,
+        revision=claim_entry.revision,
+    )
+    await _put_presence(bus, "room-a", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "room-a",
+        fingerprint="serial-a",
+        session_id="manager-session",
+    )
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+    await bus.deckr.state().put(
+        "inventory.hardware.room-a",
+        HardwareInventory(
+            managerId="room-a",
+            managerEndpoint=hardware_manager_address("room-a"),
+            sessionId="manager-session",
+            timestamp=datetime.now(UTC),
+            ttlSeconds=15,
+            devices={},
+        ),
+    )
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+    controller.on_device_disconnected.assert_awaited_once_with("config-room-a")
+    assert controller._device_registry.get("config-room-a") is None
+    assert await bus.deckr.state().get(claim_key) is None
+
+
+@pytest.mark.asyncio
+async def test_broker_snapshot_claim_takeover_revokes_owned_device():
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        state=bus.deckr.state(),
+        config_service=NullDeviceConfigService(),
+        settings_service=InMemorySettingsService(),
+        controller_id="controller-main",
+    )
+    controller.on_device_disconnected = AsyncMock()
+    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    controller._device_registry.connect(
+        config_id="config-room-a",
+        ref=ref,
+        device=_device("deck", "serial-a"),
+    )
+    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    claim_key = device_claim_key(manager_id="room-a", device_id="deck")
+    claim_entry = await _put_claim(bus, controller, "room-a", "deck")
+    controller._owned_claims[claim_key] = OwnedDeviceClaim(
+        key=claim_key,
+        config_id="config-room-a",
+        ref=ref,
+        revision=claim_entry.revision,
+    )
+    await _put_presence(bus, "room-a", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "room-a",
+        fingerprint="serial-a",
+        session_id="manager-session",
+    )
+    await bus.deckr.state().put(
+        claim_key,
+        DeviceClaim(
+            claimedByEndpoint=controller_address("other"),
+            claimedBySessionId="other-session",
+            timestamp=datetime.now(UTC),
+            ttlSeconds=15,
+        ),
+    )
+
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+    controller.on_device_disconnected.assert_awaited_once_with("config-room-a")
+    assert controller._device_registry.get("config-room-a") is None
+    assert claim_key not in controller._owned_claims
+    claim = await bus.deckr.state().get(claim_key)
+    assert claim is not None
+    assert claim.value["claimedByEndpoint"] == "controller:other"
+
+
+@pytest.mark.asyncio
+async def test_hardware_snapshot_unavailable_keeps_live_device(monkeypatch):
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        state=bus.deckr.state(),
+        config_service=NullDeviceConfigService(),
+        settings_service=InMemorySettingsService(),
+        controller_id="controller-main",
+    )
+    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    controller._device_registry.connect(
+        config_id="config-room-a",
+        ref=ref,
+        device=_device("deck", "serial-a"),
+    )
+
+    async def unavailable_items(*args, **kwargs):
+        del args, kwargs
+        raise StateUnavailable("nats down")
+
+    monkeypatch.setattr(controller._state, "items", unavailable_items)
+
+    with pytest.raises(StateUnavailable):
+        await controller._reconcile_hardware_current_state(reason="test outage")
+
     assert controller._device_registry.get("config-room-a") is not None
 
 
@@ -557,6 +686,53 @@ async def _put_presence(
             timestamp=datetime.now(UTC),
             ttlSeconds=15,
             metadata={},
+        ),
+    )
+
+
+async def _put_inventory(
+    bus: LaneHarness,
+    manager_id: str,
+    *,
+    fingerprint: str,
+    session_id: str | None = None,
+) -> None:
+    await bus.deckr.state().put(
+        f"inventory.hardware.{manager_id}",
+        HardwareInventory(
+            managerId=manager_id,
+            managerEndpoint=hardware_manager_address(manager_id),
+            sessionId=session_id or f"session-{manager_id}",
+            timestamp=datetime.now(UTC),
+            ttlSeconds=15,
+            devices={
+                "deck": HardwareInventoryDevice(
+                    deviceId="deck",
+                    hardwareType="test",
+                    fingerprint=fingerprint,
+                    descriptor=_device("deck", fingerprint).model_dump(
+                        by_alias=True,
+                        mode="json",
+                    ),
+                )
+            },
+        ),
+    )
+
+
+async def _put_claim(
+    bus: LaneHarness,
+    controller: ControllerService,
+    manager_id: str,
+    device_id: str,
+):
+    return await bus.deckr.state().create(
+        device_claim_key(manager_id=manager_id, device_id=device_id),
+        DeviceClaim(
+            claimedByEndpoint=controller_address("controller-main"),
+            claimedBySessionId=controller._session_id,
+            timestamp=datetime.now(UTC),
+            ttlSeconds=15,
         ),
     )
 

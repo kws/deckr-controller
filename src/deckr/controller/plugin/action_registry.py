@@ -60,6 +60,7 @@ class ActionRegistry(BaseComponent):
         self._action_registry: dict[str, tuple[str, ActionDescriptor]] = {}
         self._catalogs: dict[str, PluginActionCatalog] = {}
         self._host_presence_sessions: dict[str, str] = {}
+        self._reconcile_lock = anyio.Lock()
 
     async def get_action(self, address: str) -> ActionMetadata | None:
         if "::" in address:
@@ -124,26 +125,9 @@ class ActionRegistry(BaseComponent):
                         host_id = endpoint.endpoint_id
                         if not _is_allowed_host_id(host_id):
                             continue
-                        if change.entry is None:
-                            self._host_presence_sessions.pop(host_id, None)
-                            await self._reconcile_host(host_id, reason="host presence lost")
-                            continue
-                        presence = _valid_host_presence(change.entry, host_id=host_id)
-                        if presence is None:
-                            self._host_presence_sessions.pop(host_id, None)
-                            await self._reconcile_host(
-                                host_id,
-                                reason="invalid host presence",
-                            )
-                            continue
-                        previous = self._host_presence_sessions.get(host_id)
-                        self._host_presence_sessions[host_id] = presence.session_id
-                        reason = (
-                            "host presence changed"
-                            if previous and previous != presence.session_id
-                            else "host presence observed"
+                        await self._reconcile_current_state(
+                            reason="host presence watch"
                         )
-                        await self._reconcile_host(host_id, reason=reason)
             except StateUnavailable:
                 logger.warning(
                     "Plugin host presence state unavailable; retrying",
@@ -159,17 +143,9 @@ class ActionRegistry(BaseComponent):
                         host_id = parse_plugin_action_catalog_key(change.key)
                         if host_id is None or not _is_allowed_host_id(host_id):
                             continue
-                        if change.entry is None:
-                            self._catalogs.pop(host_id, None)
-                            await self._reconcile_host(host_id, reason="catalog lost")
-                            continue
-                        catalog = _valid_catalog(change.entry, host_id=host_id)
-                        if catalog is None:
-                            self._catalogs.pop(host_id, None)
-                            await self._reconcile_host(host_id, reason="invalid catalog")
-                            continue
-                        self._catalogs[host_id] = catalog
-                        await self._reconcile_host(host_id, reason="catalog observed")
+                        await self._reconcile_current_state(
+                            reason="catalog watch"
+                        )
             except StateUnavailable:
                 logger.warning(
                     "Plugin action catalog state unavailable; retrying",
@@ -189,6 +165,10 @@ class ActionRegistry(BaseComponent):
             await anyio.sleep(_STATE_RECONCILE_SECONDS)
 
     async def _reconcile_current_state(self, *, reason: str) -> None:
+        async with self._reconcile_lock:
+            await self._reconcile_current_state_locked(reason=reason)
+
+    async def _reconcile_current_state_locked(self, *, reason: str) -> None:
         presence_entries = await self._state.items(_PLUGIN_HOST_PRESENCE_PREFIX)
         catalog_entries = await self._state.items(_PLUGIN_CATALOG_PREFIX)
 
