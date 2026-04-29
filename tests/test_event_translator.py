@@ -12,15 +12,37 @@ from deckr.controller._event_translator import (
 CONTROLLER_ID = "controller-main"
 
 
+def _event(
+    *,
+    control_id: str,
+    capability_id: str,
+    event_type: str,
+    value: object | None = None,
+) -> hw_messages.ControlInputMessage:
+    message = hw_messages.control_input_message(
+        manager_id="manager-main",
+        device_id="d1",
+        control_id=control_id,
+        capability_id=capability_id,
+        event_type=event_type,
+        value=value,
+    )
+    return hw_messages.hardware_body_from_message(message)
+
+
 class TestEventTranslator:
-    """Translate each HW event type and verify payload + method name."""
+    """Translate each hardware input type and verify payload + method name."""
 
     @pytest.fixture
     def translator(self):
         return EventTranslator(CONTROLLER_ID)
 
     def test_key_down_event(self, translator):
-        event = hw_messages.KeyDownMessage(key_id="1,2")
+        event = _event(
+            control_id="1,2",
+            capability_id="button.momentary",
+            event_type="down",
+        )
         out = translator.translate(event, "d1")
         assert out is not None
         assert isinstance(out, TranslatedEvent)
@@ -32,7 +54,11 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "1,2"
 
     def test_key_up_event(self, translator):
-        event = hw_messages.KeyUpMessage(key_id="0,0")
+        event = _event(
+            control_id="0,0",
+            capability_id="button.momentary",
+            event_type="up",
+        )
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "0,0"
@@ -43,7 +69,12 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "0,0"
 
     def test_dial_rotate_event(self, translator):
-        event = hw_messages.DialRotateMessage(dial_id="dial1", direction="clockwise")
+        event = _event(
+            control_id="dial1",
+            capability_id="encoder.relative",
+            event_type="rotate",
+            value={"direction": "clockwise"},
+        )
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "dial1"
@@ -54,15 +85,22 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "dial1"
         assert out.plugin_event.direction == "clockwise"
 
-        event_cc = hw_messages.DialRotateMessage(
-            dial_id="d2", direction="counterclockwise"
+        event_cc = _event(
+            control_id="d2",
+            capability_id="encoder.relative",
+            event_type="rotate",
+            value={"direction": "counterclockwise"},
         )
         out_cc = translator.translate(event_cc, "d1")
         assert out_cc is not None
         assert out_cc.plugin_event.direction == "counterclockwise"
 
     def test_touch_tap_event(self, translator):
-        event = hw_messages.TouchTapMessage(touch_id="TouchStrip")
+        event = _event(
+            control_id="TouchStrip",
+            capability_id="touch.gesture",
+            event_type="tap",
+        )
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "TouchStrip"
@@ -73,7 +111,12 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "TouchStrip"
 
     def test_touch_swipe_event(self, translator):
-        event = hw_messages.TouchSwipeMessage(touch_id="strip", direction="left")
+        event = _event(
+            control_id="strip",
+            capability_id="touch.gesture",
+            event_type="swipe",
+            value={"direction": "left"},
+        )
         out = translator.translate(event, "d1")
         assert out is not None
         assert out.slot_id == "strip"
@@ -84,13 +127,20 @@ class TestEventTranslator:
         assert out.plugin_event.slot_id == "strip"
         assert out.plugin_event.direction == "left"
 
-        event_r = hw_messages.TouchSwipeMessage(touch_id="strip", direction="right")
+        event_r = _event(
+            control_id="strip",
+            capability_id="touch.gesture",
+            event_type="swipe",
+            value={"direction": "right"},
+        )
         out_r = translator.translate(event_r, "d1")
         assert out_r is not None
         assert out_r.plugin_event.direction == "right"
 
     def test_non_interaction_events_return_none(self, translator):
-        event = hw_messages.DeviceDisconnectedMessage()
+        event = hw_messages.DeviceUnavailableMessage(
+            deviceRef={"managerId": "manager-main", "deviceId": "d1"}
+        )
         assert translator.translate(event, "d1") is None
 
     def test_gesture_unsupported_returns_none(self):
@@ -101,7 +151,11 @@ class TestEventTranslator:
             CONTROLLER_ID,
             is_gesture_supported=no_gestures,
         )
-        event = hw_messages.KeyUpMessage(key_id="0,0")
+        event = _event(
+            control_id="0,0",
+            capability_id="button.momentary",
+            event_type="up",
+        )
         assert translator.translate(event, "d1") is None
 
     def test_gesture_supported_filter(self):
@@ -114,13 +168,23 @@ class TestEventTranslator:
         )
         assert (
             translator.translate(
-                hw_messages.KeyUpMessage(key_id="0,0"), "d1"
+                _event(
+                    control_id="0,0",
+                    capability_id="button.momentary",
+                    event_type="up",
+                ),
+                "d1",
             )
             is not None
         )
         assert (
             translator.translate(
-                hw_messages.KeyDownMessage(key_id="0,0"), "d1"
+                _event(
+                    control_id="0,0",
+                    capability_id="button.momentary",
+                    event_type="down",
+                ),
+                "d1",
             )
             is None
         )

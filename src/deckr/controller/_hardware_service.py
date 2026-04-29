@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import base64
 import logging
 from dataclasses import dataclass
 
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import CapabilityRef, DeviceDescriptor, DeviceRef
 from deckr.lanes import EndpointLane
 
 logger = logging.getLogger(__name__)
 
 
+def _ref_key(ref: DeviceRef) -> tuple[str, str]:
+    return ref.manager_id, ref.device_id
+
+
 @dataclass(frozen=True, slots=True)
 class LiveHardwareDevice:
     config_id: str
-    ref: hw_messages.HardwareDeviceRef
-    device: hw_messages.HardwareDevice
+    ref: DeviceRef
+    device: DeviceDescriptor
 
 
 class HardwareDeviceRegistry:
@@ -21,29 +27,29 @@ class HardwareDeviceRegistry:
 
     def __init__(self) -> None:
         self._devices_by_config: dict[str, LiveHardwareDevice] = {}
-        self._config_by_ref: dict[hw_messages.HardwareDeviceRef, str] = {}
+        self._config_by_ref: dict[tuple[str, str], str] = {}
 
     def connect(
         self,
         *,
         config_id: str,
-        ref: hw_messages.HardwareDeviceRef,
-        device: hw_messages.HardwareDevice,
+        ref: DeviceRef,
+        device: DeviceDescriptor,
     ) -> LiveHardwareDevice:
         self.disconnect_config(config_id)
         live = LiveHardwareDevice(config_id=config_id, ref=ref, device=device)
         self._devices_by_config[config_id] = live
-        self._config_by_ref[ref] = config_id
+        self._config_by_ref[_ref_key(ref)] = config_id
         return live
 
     def disconnect_config(self, config_id: str) -> LiveHardwareDevice | None:
         live = self._devices_by_config.pop(config_id, None)
         if live is not None:
-            self._config_by_ref.pop(live.ref, None)
+            self._config_by_ref.pop(_ref_key(live.ref), None)
         return live
 
-    def disconnect_ref(self, ref: hw_messages.HardwareDeviceRef) -> LiveHardwareDevice | None:
-        config_id = self._config_by_ref.pop(ref, None)
+    def disconnect_ref(self, ref: DeviceRef) -> LiveHardwareDevice | None:
+        config_id = self._config_by_ref.pop(_ref_key(ref), None)
         if config_id is None:
             return None
         return self._devices_by_config.pop(config_id, None)
@@ -51,8 +57,8 @@ class HardwareDeviceRegistry:
     def get(self, config_id: str) -> LiveHardwareDevice | None:
         return self._devices_by_config.get(config_id)
 
-    def get_by_ref(self, ref: hw_messages.HardwareDeviceRef) -> LiveHardwareDevice | None:
-        config_id = self._config_by_ref.get(ref)
+    def get_by_ref(self, ref: DeviceRef) -> LiveHardwareDevice | None:
+        config_id = self._config_by_ref.get(_ref_key(ref))
         if config_id is None:
             return None
         return self._devices_by_config.get(config_id)
@@ -74,15 +80,15 @@ class HardwareCommandService:
     def __init__(self, endpoint: EndpointLane, *, controller_id: str) -> None:
         self._endpoint = endpoint
         self._controller_id = controller_id
-        self._ref_by_config_id: dict[str, hw_messages.HardwareDeviceRef] = {}
+        self._ref_by_config_id: dict[str, DeviceRef] = {}
 
-    def register_device(self, *, config_id: str, ref: hw_messages.HardwareDeviceRef) -> None:
+    def register_device(self, *, config_id: str, ref: DeviceRef) -> None:
         self._ref_by_config_id[config_id] = ref
 
     def unregister_config(self, config_id: str) -> None:
         self._ref_by_config_id.pop(config_id, None)
 
-    async def _ref_for(self, config_id: str) -> hw_messages.HardwareDeviceRef | None:
+    async def _ref_for(self, config_id: str) -> DeviceRef | None:
         ref = self._ref_by_config_id.get(config_id)
         if ref is None:
             logger.info(
@@ -96,16 +102,19 @@ class HardwareCommandService:
         if ref is None:
             return
         await self._endpoint.publish(
-            hw_messages.hardware_command_for_control(
+            hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
-                ref=hw_messages.HardwareControlRef(
-                    manager_id=ref.manager_id,
-                    device_id=ref.device_id,
-                    control_id=slot_id,
-                    control_kind="slot",
+                ref=CapabilityRef(
+                    deviceRef=ref,
+                    controlId=slot_id,
+                    capabilityId="raster.bitmap",
                 ),
-                message_type=hw_messages.SET_IMAGE,
-                body=hw_messages.SetImageMessage(slot_id=slot_id, image=image),
+                command_type="set_frame",
+                params={
+                    "commandType": "set_frame",
+                    "image": base64.b64encode(image).decode("ascii"),
+                    "encoding": "jpeg",
+                },
             )
         )
 
@@ -114,41 +123,36 @@ class HardwareCommandService:
         if ref is None:
             return
         await self._endpoint.publish(
-            hw_messages.hardware_command_for_control(
+            hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
-                ref=hw_messages.HardwareControlRef(
-                    manager_id=ref.manager_id,
-                    device_id=ref.device_id,
-                    control_id=slot_id,
-                    control_kind="slot",
+                ref=CapabilityRef(
+                    deviceRef=ref,
+                    controlId=slot_id,
+                    capabilityId="raster.bitmap",
                 ),
-                message_type=hw_messages.CLEAR_SLOT,
-                body=hw_messages.ClearSlotMessage(slot_id=slot_id),
+                command_type="clear",
+                params={"commandType": "clear"},
             )
         )
 
     async def sleep_screen(self, config_id: str) -> None:
-        ref = await self._ref_for(config_id)
-        if ref is None:
-            return
-        await self._endpoint.publish(
-            hw_messages.hardware_command_for_device(
-                controller_id=self._controller_id,
-                ref=ref,
-                message_type=hw_messages.SLEEP_SCREEN,
-                body=hw_messages.SleepScreenMessage(),
-            )
-        )
+        await self._send_power_command(config_id, command_type="sleep")
 
     async def wake_screen(self, config_id: str) -> None:
+        await self._send_power_command(config_id, command_type="wake")
+
+    async def _send_power_command(self, config_id: str, *, command_type: str) -> None:
         ref = await self._ref_for(config_id)
         if ref is None:
             return
         await self._endpoint.publish(
-            hw_messages.hardware_command_for_device(
+            hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
-                ref=ref,
-                message_type=hw_messages.WAKE_SCREEN,
-                body=hw_messages.WakeScreenMessage(),
+                ref=CapabilityRef(
+                    deviceRef=ref,
+                    capabilityId="device.power",
+                ),
+                command_type=command_type,
+                params={"commandType": command_type},
             )
         )

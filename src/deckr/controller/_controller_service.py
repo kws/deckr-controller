@@ -13,6 +13,7 @@ from deckr.contracts.messages import (
 )
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.lanes import EndpointLane
 from deckr.pluginhost.messages import (
     COMMAND_MESSAGE_TYPES,
@@ -73,7 +74,7 @@ _HARDWARE_MANAGER_PRESENCE_PREFIX = ".".join(
 class OwnedDeviceClaim:
     key: str
     config_id: str
-    ref: hw_messages.HardwareDeviceRef
+    ref: DeviceRef
     revision: int
 
 
@@ -170,13 +171,7 @@ class ControllerService(BaseComponent):
         async with self._hardware_endpoint.subscribe() as subscribe:
             async for message in subscribe:
                 event = hw_messages.hardware_body_from_message(message)
-                if not isinstance(event, hw_messages.HARDWARE_INPUT_MESSAGE_TYPES):
-                    continue
-                if isinstance(
-                    event,
-                    hw_messages.DeviceConnectedMessage
-                    | hw_messages.DeviceDisconnectedMessage,
-                ):
+                if not isinstance(event, hw_messages.ControlInputMessage):
                     continue
                 ref = hw_messages.hardware_device_ref_from_message(message)
                 if ref is None:
@@ -205,7 +200,7 @@ class ControllerService(BaseComponent):
 
     async def _try_claim_inventory_device(
         self,
-        ref: hw_messages.HardwareDeviceRef,
+        ref: DeviceRef,
         item,
     ) -> None:
         device = self._device_from_inventory(ref, item)
@@ -269,19 +264,10 @@ class ControllerService(BaseComponent):
 
     def _device_from_inventory(
         self,
-        ref: hw_messages.HardwareDeviceRef,
+        ref: DeviceRef,
         item,
-    ) -> hw_messages.HardwareDevice:
-        descriptor = dict(item.descriptor or {})
-        if descriptor:
-            return hw_messages.HardwareDevice.model_validate(descriptor)
-        return hw_messages.HardwareDevice(
-            id=ref.device_id,
-            fingerprint=item.fingerprint,
-            hid=item.fingerprint,
-            slots=(),
-            name=item.hardware_type,
-        )
+    ) -> DeviceDescriptor:
+        return item.descriptor
 
     def _new_claim(self) -> DeviceClaim:
         return DeviceClaim(
@@ -500,10 +486,9 @@ class ControllerService(BaseComponent):
             if not self._inventory_is_usable(inventory):
                 continue
             for device_id, item in inventory.devices.items():
-                ref = hw_messages.HardwareDeviceRef(
-                    manager_id=inventory.manager_id,
-                    device_id=item.device_id or device_id,
-                )
+                ref = item.device_ref
+                if ref.device_id != device_id:
+                    continue
                 if self._device_registry.get_by_ref(ref) is not None:
                     continue
                 claim_key = device_claim_key(
@@ -525,11 +510,11 @@ class ControllerService(BaseComponent):
             == inventory.session_id
         )
 
-    def _ref_is_available(self, ref: hw_messages.HardwareDeviceRef) -> bool:
+    def _ref_is_available(self, ref: DeviceRef) -> bool:
         inventory = self._inventory_by_manager.get(ref.manager_id)
         if inventory is None or not self._inventory_is_usable(inventory):
             return False
-        return ref in _hardware_inventory_refs(inventory)
+        return (ref.manager_id, ref.device_id) in _hardware_inventory_ref_keys(inventory)
 
     def _claim_belongs_to_this_session(self, claim: DeviceClaim) -> bool:
         return (
@@ -788,13 +773,11 @@ def _valid_device_claim(entry: StateEntry) -> DeviceClaim | None:
         return None
 
 
-def _hardware_inventory_refs(
+def _hardware_inventory_ref_keys(
     inventory: HardwareInventory,
-) -> set[hw_messages.HardwareDeviceRef]:
+) -> set[tuple[str, str]]:
     return {
-        hw_messages.HardwareDeviceRef(
-            manager_id=inventory.manager_id,
-            device_id=item.device_id or device_id,
-        )
+        (item.device_ref.manager_id, item.device_ref.device_id)
         for device_id, item in inventory.devices.items()
+        if item.device_ref.device_id == device_id
     }

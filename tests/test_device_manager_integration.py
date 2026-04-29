@@ -7,12 +7,16 @@ import pytest
 import pytest_asyncio
 from conftest import LaneHarness
 from deckr.contracts.messages import DeckrMessage
-from deckr.hardware import messages as hw_messages
-from deckr.hardware.messages import (
-    HardwareCoordinates,
-    HardwareDevice,
-    HardwareImageFormat,
-    HardwareSlot,
+from deckr.hardware.descriptors import (
+    DECKR_INPUT_BUTTON,
+    DECKR_INPUT_ENCODER,
+    DECKR_INPUT_TOUCH,
+    DECKR_OUTPUT_RASTER,
+    CapabilityDescriptor,
+    ControlDescriptor,
+    ControlGeometry,
+    DeviceDescriptor,
+    DeviceRef,
 )
 from deckr.pluginhost.messages import (
     context_subject,
@@ -89,37 +93,116 @@ def _make_slot(
     slot_type: str = "key",
     gestures: list[str] | None = None,
     has_display: bool = True,
-) -> HardwareSlot:
+) -> ControlDescriptor:
     if gestures is None:
         gestures = ["key_down", "key_up"]
-    return HardwareSlot(
-        id=slot_id,
-        coordinates=HardwareCoordinates(column=col, row=row),
-        image_format=HardwareImageFormat(width=72, height=72) if has_display else None,
-        slot_type=slot_type,
-        gestures=gestures,
+    input_capabilities = []
+    if "key_down" in gestures or "key_up" in gestures:
+        input_capabilities.append(
+            CapabilityDescriptor(
+                capabilityId="button.momentary",
+                family=DECKR_INPUT_BUTTON,
+                type="momentary",
+                direction="input",
+                access=("emits",),
+                eventTypes=("down", "up"),
+            )
+        )
+    if "press" in gestures or "key_down" in gestures or "key_up" in gestures:
+        input_capabilities.append(
+            CapabilityDescriptor.model_validate(
+                {
+                    "capabilityId": "button.press",
+                    "family": DECKR_INPUT_BUTTON,
+                    "type": "activation",
+                    "direction": "input",
+                    "access": ["emits"],
+                    "eventTypes": ["press"],
+                }
+            )
+        )
+    if "encoder_rotate" in gestures:
+        input_capabilities.append(
+            CapabilityDescriptor(
+                capabilityId="encoder.relative",
+                family=DECKR_INPUT_ENCODER,
+                type="relative",
+                direction="input",
+                access=("emits",),
+                eventTypes=("rotate",),
+            )
+        )
+    if "touch_tap" in gestures or "touch_swipe" in gestures:
+        event_types = []
+        if "touch_tap" in gestures:
+            event_types.append("tap")
+        if "touch_swipe" in gestures:
+            event_types.append("swipe")
+        input_capabilities.append(
+            CapabilityDescriptor(
+                capabilityId="touch.gesture",
+                family=DECKR_INPUT_TOUCH,
+                type="gesture",
+                direction="input",
+                access=("emits",),
+                eventTypes=tuple(event_types),
+            )
+        )
+    output_capabilities = []
+    if has_display:
+        output_capabilities.append(
+            CapabilityDescriptor.model_validate(
+                {
+                    "capabilityId": "raster.bitmap",
+                    "family": DECKR_OUTPUT_RASTER,
+                    "type": "bitmap",
+                    "direction": "output",
+                    "access": ["settable"],
+                    "commandTypes": ["set_frame", "clear"],
+                    "constraints": [
+                        {
+                            "type": "fixed",
+                            "subject": "width",
+                            "value": 72,
+                            "unit": "pixel",
+                        },
+                        {
+                            "type": "fixed",
+                            "subject": "height",
+                            "value": 72,
+                            "unit": "pixel",
+                        },
+                    ],
+                }
+            )
+        )
+    return ControlDescriptor(
+        controlId=slot_id,
+        kind=slot_type,
+        geometry=ControlGeometry(x=col, y=row, width=1, height=1, unit="grid"),
+        inputCapabilities=tuple(input_capabilities),
+        outputCapabilities=tuple(output_capabilities),
     )
 
 
 def _make_mock_device(
-    device_id: str = "test-device", slots: list[HardwareSlot] | None = None
-) -> HardwareDevice:
+    device_id: str = "test-device", slots: list[ControlDescriptor] | None = None
+) -> DeviceDescriptor:
     """Create device metadata for controller tests."""
     if slots is None:
         slots = [_make_slot("0,0"), _make_slot("1,0")]
-    return HardwareDevice(
-        id=device_id,
-        name="Test Device",
-        hid=f"mock:{device_id}",
+    return DeviceDescriptor(
+        deviceId=device_id,
+        displayName="Test Device",
         fingerprint=f"fingerprint:{device_id}",
-        slots=slots,
+        controls=tuple(slots),
     )
 
 
-def _hardware_ref(device: HardwareDevice) -> hw_messages.HardwareDeviceRef:
-    return hw_messages.HardwareDeviceRef(
-        manager_id="manager-main",
-        device_id=device.id,
+def _hardware_ref(device: DeviceDescriptor) -> DeviceRef:
+    return DeviceRef(
+        managerId="manager-main",
+        deviceId=device.device_id,
     )
 
 

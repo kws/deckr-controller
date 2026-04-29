@@ -19,8 +19,7 @@ from deckr.controller._state_store import (
 from deckr.controller.settings import SettingsService, SettingsTarget
 
 if TYPE_CHECKING:
-    from deckr.hardware.messages import HardwareImageFormat
-
+    from deckr.controller._device_layout import RasterImageFormat
     from deckr.controller._hardware_service import HardwareCommandService
 
 logger = logging.getLogger(__name__)
@@ -62,7 +61,7 @@ class CommandRouter:
         render_service: RenderService,
         render_dispatcher: RenderDispatcher,
         output: DeviceOutput,
-        image_format: "HardwareImageFormat | None",
+        image_format: "RasterImageFormat | None",
         start_soon: Callable,
         *,
         settings_service: SettingsService | None = None,

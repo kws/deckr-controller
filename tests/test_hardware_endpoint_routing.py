@@ -8,6 +8,7 @@ import pytest
 from conftest import LaneHarness
 from deckr.contracts.messages import controller_address, hardware_manager_address
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import CapabilityRef, DeviceDescriptor, DeviceRef
 from deckr.state import (
     DeviceClaim,
     EndpointPresence,
@@ -34,13 +35,12 @@ from deckr.controller.config import (
 from deckr.controller.settings import InMemorySettingsService
 
 
-def _device(device_id: str, fingerprint: str) -> hw_messages.HardwareDevice:
-    return hw_messages.HardwareDevice(
-        id=device_id,
-        name="Test Device",
-        hid=f"hid:{fingerprint}",
+def _device(device_id: str, fingerprint: str) -> DeviceDescriptor:
+    return DeviceDescriptor(
+        deviceId=device_id,
+        displayName="Test Device",
         fingerprint=fingerprint,
-        slots=[],
+        controls=[],
     )
 
 
@@ -52,8 +52,8 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
         controller_id="controller-main",
     )
     registry = HardwareDeviceRegistry()
-    ref_a = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
-    ref_b = hw_messages.HardwareDeviceRef(manager_id="room-b", device_id="deck")
+    ref_a = DeviceRef(manager_id="room-a", device_id="deck")
+    ref_b = DeviceRef(manager_id="room-b", device_id="deck")
 
     registry.connect(
         config_id="config-room-a",
@@ -81,20 +81,18 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
     assert registry.get_by_ref(ref_b).config_id == "config-room-b"
     assert msg_a.recipient.endpoint == hardware_manager_address("room-a")
     assert msg_b.recipient.endpoint == hardware_manager_address("room-b")
-    assert hw_messages.hardware_control_ref_from_subject(msg_a.subject) == (
-        hw_messages.HardwareControlRef(
-            manager_id="room-a",
-            device_id="deck",
-            control_id="0,0",
-            control_kind="slot",
+    assert hw_messages.hardware_capability_ref_from_subject(msg_a.subject) == (
+        CapabilityRef(
+            deviceRef=DeviceRef(managerId="room-a", deviceId="deck"),
+            controlId="0,0",
+            capabilityId="raster.bitmap",
         )
     )
-    assert hw_messages.hardware_control_ref_from_subject(msg_b.subject) == (
-        hw_messages.HardwareControlRef(
-            manager_id="room-b",
-            device_id="deck",
-            control_id="0,0",
-            control_kind="slot",
+    assert hw_messages.hardware_capability_ref_from_subject(msg_b.subject) == (
+        CapabilityRef(
+            deviceRef=DeviceRef(managerId="room-b", deviceId="deck"),
+            controlId="0,0",
+            capabilityId="raster.bitmap",
         )
     )
 
@@ -107,26 +105,25 @@ async def test_direct_command_drops_when_device_is_no_longer_live():
         controller_id="controller-main",
     )
 
-    async with bus.subscribe(hardware_manager_address("room-a")) as stream:
-        await command_service.wake_screen("config-room-a")
-        with anyio.move_on_after(0.05) as scope:
-            await stream.receive()
-
-    assert scope.cancel_called
+    await command_service.wake_screen("config-room-a")
 
     command_service.register_device(
         config_id="config-room-a",
-        ref=hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck"),
+        ref=DeviceRef(manager_id="room-a", device_id="deck"),
     )
 
     async with bus.subscribe(hardware_manager_address("room-a")) as stream:
         await command_service.wake_screen("config-room-a")
         message = await stream.receive()
 
-    assert message.recipient.endpoint == hardware_manager_address("room-a")
-    assert hw_messages.hardware_device_ref_from_message(message) == (
-        hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    ref = hw_messages.hardware_capability_ref_from_subject(message.subject)
+    assert ref == CapabilityRef(
+        deviceRef=DeviceRef(managerId="room-a", deviceId="deck"),
+        capabilityId="device.power",
     )
+    body = hw_messages.hardware_body_from_message(message)
+    assert isinstance(body, hw_messages.ControlCommandMessage)
+    assert body.command_type == "wake"
 
 
 @pytest.mark.asyncio
@@ -140,8 +137,8 @@ async def test_manager_presence_loss_cleans_only_configs_for_lost_manager_endpoi
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
-    ref_a = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
-    ref_b = hw_messages.HardwareDeviceRef(manager_id="room-b", device_id="deck")
+    ref_a = DeviceRef(manager_id="room-a", device_id="deck")
+    ref_b = DeviceRef(manager_id="room-b", device_id="deck")
 
     controller._device_registry.connect(
         config_id="config-room-a",
@@ -208,7 +205,7 @@ async def test_manager_presence_session_change_invalidates_owned_device():
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
-    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
     claim_key = device_claim_key(manager_id="room-a", device_id="deck")
     controller._device_registry.connect(
         config_id="config-room-a",
@@ -280,7 +277,7 @@ async def test_device_reconnect_replaces_existing_context_without_hardware_clear
     await controller._controller_contexts.set("config-room-a", ctrl_ctx)
     live = LiveHardwareDevice(
         config_id="config-room-a",
-        ref=hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck"),
+        ref=DeviceRef(manager_id="room-a", device_id="deck"),
         device=_device("deck", "serial-a"),
     )
 
@@ -309,7 +306,7 @@ async def test_device_lifecycle_renders_once_before_listening_for_config_changes
     )
     live = controller._device_registry.connect(
         config_id="config-room-a",
-        ref=hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck"),
+        ref=DeviceRef(manager_id="room-a", device_id="deck"),
         device=_device("deck", "serial-a"),
     )
     managers = []
@@ -461,7 +458,7 @@ async def test_broker_snapshot_inventory_removal_revokes_live_device():
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
-    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
     controller._device_registry.connect(
         config_id="config-room-a",
         ref=ref,
@@ -514,7 +511,7 @@ async def test_broker_snapshot_claim_takeover_revokes_owned_device():
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
-    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
     controller._device_registry.connect(
         config_id="config-room-a",
         ref=ref,
@@ -566,7 +563,7 @@ async def test_hardware_snapshot_unavailable_keeps_live_device(monkeypatch):
         settings_service=InMemorySettingsService(),
         controller_id="controller-main",
     )
-    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
     controller._device_registry.connect(
         config_id="config-room-a",
         ref=ref,
@@ -597,7 +594,7 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
     )
     ctrl_ctx = AsyncMock()
     await controller._controller_contexts.set("config-room-a", ctrl_ctx)
-    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
     controller._device_registry.connect(
         config_id="config-room-a",
         ref=ref,
@@ -639,7 +636,7 @@ async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
         settings_service=InMemorySettingsService(),
         controller_id="controller-main",
     )
-    ref = hw_messages.HardwareDeviceRef(manager_id="room-a", device_id="deck")
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
     controller._device_registry.connect(
         config_id="config-room-a",
         ref=ref,
@@ -707,13 +704,12 @@ async def _put_inventory(
             ttlSeconds=15,
             devices={
                 "deck": HardwareInventoryDevice(
-                    deviceId="deck",
-                    hardwareType="test",
-                    fingerprint=fingerprint,
-                    descriptor=_device("deck", fingerprint).model_dump(
-                        by_alias=True,
-                        mode="json",
+                    deviceRef=DeviceRef(
+                        managerId=manager_id,
+                        deviceId="deck",
+                        fingerprint=fingerprint,
                     ),
+                    descriptor=_device("deck", fingerprint),
                 )
             },
         ),

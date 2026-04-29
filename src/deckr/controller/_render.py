@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from deckr.hardware.messages import HardwareImageFormat
 from invariant import (
     Node,
     SubGraphNode,
@@ -18,6 +17,7 @@ from invariant import (
     ref,
 )
 
+from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._state_store import ControlStateStore, RenderContent, TitleOptions
 from deckr.controller._title_defaults import (
     DEFAULT_FONT_FAMILY,
@@ -187,7 +187,7 @@ def _parse_font_size(
 
 
 def _title_options_to_params(
-    opts: TitleOptions | None, image_format: HardwareImageFormat
+    opts: TitleOptions | None, image_format: RasterImageFormat
 ) -> dict:
     """Convert TitleOptions to kwargs for title_card."""
     if opts is None:
@@ -250,7 +250,7 @@ def _wire_to_node(wire: dict[str, Any]) -> SubGraphNode:
     return _graph_output_to_node(graph_dict, output)
 
 
-def _to_render_image_format(image_format: HardwareImageFormat) -> RenderImageFormat:
+def _to_render_image_format(image_format: RasterImageFormat) -> RenderImageFormat:
     return RenderImageFormat(
         width=image_format.width,
         height=image_format.height,
@@ -258,8 +258,8 @@ def _to_render_image_format(image_format: HardwareImageFormat) -> RenderImageFor
     )
 
 
-def _to_hw_image_format(image_format: RenderImageFormat) -> HardwareImageFormat:
-    return HardwareImageFormat(
+def _to_hw_image_format(image_format: RenderImageFormat) -> RasterImageFormat:
+    return RasterImageFormat(
         width=image_format.width,
         height=image_format.height,
         rotation=image_format.rotation,
@@ -267,7 +267,7 @@ def _to_hw_image_format(image_format: RenderImageFormat) -> HardwareImageFormat:
 
 
 def _model_to_graph(
-    model: RenderModel, image_format: HardwareImageFormat
+    model: RenderModel, image_format: RasterImageFormat
 ) -> Node | SubGraphNode | None:
     """Resolve a RenderModel to the graph that should be executed."""
 
@@ -292,7 +292,7 @@ def _model_to_graph(
 
 def build_render_request(
     model: RenderModel,
-    image_format: HardwareImageFormat,
+    image_format: RasterImageFormat,
     *,
     context_id: str = "",
     binding_id: str | None = None,
@@ -316,7 +316,7 @@ def build_render_request(
 
 
 def _graph_to_jpeg_bytes(
-    node: Node | SubGraphNode, image_format: HardwareImageFormat
+    node: Node | SubGraphNode, image_format: RasterImageFormat
 ) -> bytes:
     """Run invariant-gfx graph with canvas context; apply rotation; return JPEG bytes."""
 
@@ -358,7 +358,7 @@ class RenderService:
     def build_request(
         self,
         model: RenderModel,
-        image_format: HardwareImageFormat,
+        image_format: RasterImageFormat,
         *,
         context_id: str = "",
         binding_id: str | None = None,

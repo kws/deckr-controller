@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deckr.hardware.messages import HardwareDevice, HardwareSlot
+    from deckr.hardware.descriptors import ControlDescriptor, DeviceDescriptor
     from deckr.pluginhost.messages import ControlBindingDescriptor
     from deckr.python_plugin.interface import PluginAction
 
@@ -76,16 +76,19 @@ class ValidationResult:
         )
 
 
-def _slot_by_id(device: HardwareDevice, slot_id: str) -> HardwareSlot | None:
-    for slot in device.slots:
-        if slot.id == slot_id:
-            return slot
+def _control_by_id(
+    device: DeviceDescriptor,
+    control_id: str,
+) -> ControlDescriptor | None:
+    for control in device.controls:
+        if control.control_id == control_id:
+            return control
     return None
 
 
 async def validate_page_bindings(
     bindings: list[ControlBindingDescriptor],
-    device: HardwareDevice,
+    device: DeviceDescriptor,
     get_action: Callable[[str], Awaitable[PluginAction | None]],
     profile_id: str | None = None,
     page_id: str | None = None,
@@ -94,11 +97,11 @@ async def validate_page_bindings(
     result = ValidationResult(valid=True)
     for binding in bindings:
         control_id = binding.control_id
-        slot = _slot_by_id(device, control_id)
-        if slot is None:
+        control = _control_by_id(device, control_id)
+        if control is None:
             result.add_error(
                 code="slot_not_found",
-                message=f"slot '{control_id}' not found on device",
+                message=f"control '{control_id}' not found on device",
                 slot_id=control_id,
                 action_uuid=binding.action_uuid,
                 profile_id=profile_id,

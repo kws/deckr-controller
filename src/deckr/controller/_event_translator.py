@@ -1,6 +1,6 @@
-"""Translate hardware events to plugin events and dispatch metadata."""
+"""Translate hardware input events to plugin events and dispatch metadata."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,7 +26,7 @@ class TranslatedEvent:
 
 class EventTranslator:
     """
-    Maps hw_messages.* to plugin.events.* and dispatch method names.
+    Maps capability-targeted control input to current plugin dispatch methods.
     Returns None for non-interaction events.
     """
 
@@ -37,8 +37,8 @@ class EventTranslator:
         is_gesture_supported: Callable[[str, str], bool] | None = None,
     ):
         """
-        Optional is_gesture_supported(slot_id, gesture) -> bool.
-        If None, all gestures are considered supported (permissive fallback).
+        Optional is_gesture_supported(control_id, gesture) -> bool.
+        If None, all gestures are considered supported.
         """
         self._controller_id = controller_id
         self._is_gesture_supported = is_gesture_supported or (lambda _s, _g: True)
@@ -49,90 +49,105 @@ class EventTranslator:
         """
         Translate a hardware event to plugin dispatch metadata.
         Returns None if event is not an interaction type.
-        Caller is responsible for resolving action context by slot_id.
+        Caller is responsible for resolving action context by control id.
         """
-        if isinstance(event, hw_messages.KeyDownMessage):
-            return self._translate_key_down(event, config_id)
-        if isinstance(event, hw_messages.KeyUpMessage):
-            return self._translate_key_up(event, config_id)
-        if isinstance(event, hw_messages.DialRotateMessage):
-            return self._translate_dial_rotate(event, config_id)
-        if isinstance(event, hw_messages.TouchTapMessage):
-            return self._translate_touch_tap(event, config_id)
-        if isinstance(event, hw_messages.TouchSwipeMessage):
-            return self._translate_touch_swipe(event, config_id)
-
+        del config_id
+        if not isinstance(event, hw_messages.ControlInputMessage):
+            return None
+        if event.event_type == "down":
+            return self._translate_key_down(event)
+        if event.event_type == "up":
+            return self._translate_key_up(event)
+        if event.event_type == "rotate":
+            return self._translate_dial_rotate(event)
+        if event.event_type == "tap":
+            return self._translate_touch_tap(event)
+        if event.event_type == "swipe":
+            return self._translate_touch_swipe(event)
         return None
 
     def _translate_key_down(
-        self, event: hw_messages.KeyDownMessage, config_id: str
+        self, event: hw_messages.ControlInputMessage
     ) -> TranslatedEvent | None:
-        slot_id = event.key_id
-        if not self._is_gesture_supported(slot_id, "key_down"):
+        control_id = event.control_id
+        if not self._is_gesture_supported(control_id, "key_down"):
             return None
         return TranslatedEvent(
-            slot_id=slot_id,
+            slot_id=control_id,
             method_name="on_key_down",
-            plugin_event=KeyDown(context="", slot_id=slot_id),
+            plugin_event=KeyDown(context="", slot_id=control_id),
             gesture="key_down",
         )
 
     def _translate_key_up(
-        self, event: hw_messages.KeyUpMessage, config_id: str
+        self, event: hw_messages.ControlInputMessage
     ) -> TranslatedEvent | None:
-        slot_id = event.key_id
-        if not self._is_gesture_supported(slot_id, "key_up"):
+        control_id = event.control_id
+        if not self._is_gesture_supported(control_id, "key_up"):
             return None
         return TranslatedEvent(
-            slot_id=slot_id,
+            slot_id=control_id,
             method_name="on_key_up",
-            plugin_event=KeyUp(context="", slot_id=slot_id),
+            plugin_event=KeyUp(context="", slot_id=control_id),
             gesture="key_up",
         )
 
     def _translate_dial_rotate(
-        self, event: hw_messages.DialRotateMessage, config_id: str
+        self, event: hw_messages.ControlInputMessage
     ) -> TranslatedEvent | None:
-        slot_id = event.dial_id
-        if not self._is_gesture_supported(slot_id, "encoder_rotate"):
+        control_id = event.control_id
+        if not self._is_gesture_supported(control_id, "encoder_rotate"):
             return None
+        value = event.value if isinstance(event.value, Mapping) else {}
+        direction = value.get("direction")
+        if direction not in {"clockwise", "counterclockwise"}:
+            delta = value.get("delta")
+            direction = (
+                "clockwise"
+                if isinstance(delta, int | float) and delta >= 0
+                else "counterclockwise"
+            )
         return TranslatedEvent(
-            slot_id=slot_id,
+            slot_id=control_id,
             method_name="on_dial_rotate",
             plugin_event=DialRotate(
                 context="",
-                slot_id=slot_id,
-                direction=event.direction,
+                slot_id=control_id,
+                direction=direction,
             ),
             gesture="encoder_rotate",
         )
 
     def _translate_touch_tap(
-        self, event: hw_messages.TouchTapMessage, config_id: str
+        self, event: hw_messages.ControlInputMessage
     ) -> TranslatedEvent | None:
-        slot_id = event.touch_id
-        if not self._is_gesture_supported(slot_id, "touch_tap"):
+        control_id = event.control_id
+        if not self._is_gesture_supported(control_id, "touch_tap"):
             return None
         return TranslatedEvent(
-            slot_id=slot_id,
+            slot_id=control_id,
             method_name="on_touch_tap",
-            plugin_event=TouchTap(context="", slot_id=slot_id),
+            plugin_event=TouchTap(context="", slot_id=control_id),
             gesture="touch_tap",
         )
 
     def _translate_touch_swipe(
-        self, event: hw_messages.TouchSwipeMessage, config_id: str
+        self, event: hw_messages.ControlInputMessage
     ) -> TranslatedEvent | None:
-        slot_id = event.touch_id
-        if not self._is_gesture_supported(slot_id, "touch_swipe"):
+        control_id = event.control_id
+        if not self._is_gesture_supported(control_id, "touch_swipe"):
+            return None
+        value = event.value if isinstance(event.value, Mapping) else {}
+        direction = value.get("direction")
+        if direction not in {"left", "right"}:
             return None
         return TranslatedEvent(
-            slot_id=slot_id,
+            slot_id=control_id,
             method_name="on_touch_swipe",
             plugin_event=TouchSwipe(
                 context="",
-                slot_id=slot_id,
-                direction=event.direction,
+                slot_id=control_id,
+                direction=direction,
             ),
             gesture="touch_swipe",
         )

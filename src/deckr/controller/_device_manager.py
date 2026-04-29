@@ -13,6 +13,7 @@ from deckr.contracts.messages import (
 )
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.pluginhost.messages import (
     CLOSE_PAGE,
     HERE_ARE_SETTINGS,
@@ -58,7 +59,11 @@ from deckr.controller._binding_validator import (
     validate_page_bindings,
 )
 from deckr.controller._command_router import DeviceOutput
-from deckr.controller._device_layout import build_device_layout
+from deckr.controller._device_layout import (
+    ControlSurface,
+    build_device_layout,
+    control_surface_by_id,
+)
 from deckr.controller._event_translator import EventTranslator
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._navigation_service import (
@@ -107,13 +112,8 @@ def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
         return None
 
 
-def _find_slot(
-    device: hw_messages.HardwareDevice, slot_id: str
-) -> hw_messages.HardwareSlot | None:
-    for slot in device.slots:
-        if slot.id == slot_id:
-            return slot
-    return None
+def _find_slot(device: DeviceDescriptor, slot_id: str) -> ControlSurface | None:
+    return control_surface_by_id(device, slot_id)
 
 
 _ACTION_INSTANCE_NAMESPACE = uuid.UUID("dcd72f2a-65cb-4d9f-b0e8-4e0ef3d334f1")
@@ -160,7 +160,7 @@ class BindingLease:
     action_uuid: str
     host_id: str
     control_id: str
-    slot: hw_messages.HardwareSlot
+    slot: ControlSurface
     profile_id: str
     page_id: str
     settings_target: SettingsTarget | None
@@ -181,8 +181,8 @@ class DeviceManager:
         self,
         *,
         controller_id: str,
-        device: hw_messages.HardwareDevice,
-        hardware_ref: hw_messages.HardwareDeviceRef,
+        device: DeviceDescriptor,
+        hardware_ref: DeviceRef,
         command_service: HardwareCommandService,
         config: DeviceConfig,
         manager: PluginManager,
@@ -225,7 +225,7 @@ class DeviceManager:
         self._nav_lock = anyio.Lock()
         self._start_soon(self._page_timeout_loop)
 
-    async def _render_unavailable_to_slot(self, slot: hw_messages.HardwareSlot) -> None:
+    async def _render_unavailable_to_slot(self, slot: ControlSurface) -> None:
         """Render 'not available' overlay to a slot (e.g. when action is missing)."""
         if slot.image_format is None:
             return
@@ -325,7 +325,7 @@ class DeviceManager:
     async def _try_resolve_binding(
         self,
         binding: ControlBindingDescriptor,
-        slot: hw_messages.HardwareSlot,
+        slot: ControlSurface,
         *,
         profile_id: str,
         page_id: str,

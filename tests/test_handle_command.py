@@ -7,12 +7,14 @@ import pytest
 from conftest import LaneHarness
 from deckr.contracts.messages import DeckrMessage
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.messages import (
-    HardwareCoordinates,
-    HardwareDevice,
-    HardwareDeviceRef,
-    HardwareImageFormat,
-    HardwareSlot,
+from deckr.hardware.descriptors import (
+    DECKR_INPUT_BUTTON,
+    DECKR_OUTPUT_RASTER,
+    CapabilityDescriptor,
+    ControlDescriptor,
+    ControlGeometry,
+    DeviceDescriptor,
+    DeviceRef,
 )
 from deckr.pluginhost.messages import (
     CLOSE_PAGE,
@@ -82,35 +84,69 @@ def _command_message(
     )
 
 
-def _make_slot(
-    slot_id: str,
+def _make_control(
+    control_id: str,
     has_display: bool = True,
-    slot_type: str = "key",
-) -> HardwareSlot:
-    return HardwareSlot(
-        id=slot_id,
-        coordinates=HardwareCoordinates(column=0, row=0),
-        image_format=HardwareImageFormat(width=72, height=72) if has_display else None,
-        slot_type=slot_type,
-        gestures=["key_down", "key_up"],
+    kind: str = "key",
+) -> ControlDescriptor:
+    output_capabilities = ()
+    if has_display:
+        output_capabilities = (
+            CapabilityDescriptor.model_validate(
+                {
+                    "capabilityId": "raster.bitmap",
+                    "family": DECKR_OUTPUT_RASTER,
+                    "type": "bitmap",
+                    "direction": "output",
+                    "access": ["settable"],
+                    "commandTypes": ["set_frame", "clear"],
+                    "constraints": [
+                        {"type": "fixed", "subject": "width", "value": 72},
+                        {"type": "fixed", "subject": "height", "value": 72},
+                    ],
+                }
+            ),
+        )
+    return ControlDescriptor(
+        controlId=control_id,
+        kind=kind,
+        geometry=ControlGeometry(x=0, y=0, width=1, height=1, unit="grid"),
+        inputCapabilities=(
+            CapabilityDescriptor(
+                capabilityId="button.momentary",
+                family=DECKR_INPUT_BUTTON,
+                type="momentary",
+                direction="input",
+                access=("emits",),
+                eventTypes=("down", "up"),
+            ),
+            CapabilityDescriptor(
+                capabilityId="button.press",
+                family=DECKR_INPUT_BUTTON,
+                type="activation",
+                direction="input",
+                access=("emits",),
+                eventTypes=("press",),
+            ),
+        ),
+        outputCapabilities=output_capabilities,
     )
 
 
 def _make_mock_device(device_id: str = "test-device", with_buttons: bool = False):
-    slots = [_make_slot("0,0"), _make_slot("1,0")]
+    controls = [_make_control("0,0"), _make_control("1,0")]
     if with_buttons:
-        slots.append(_make_slot("B2", has_display=False, slot_type="button"))
-    return HardwareDevice(
-        id=device_id,
-        name="Test Device",
-        hid=f"mock:{device_id}",
+        controls.append(_make_control("B2", has_display=False, kind="button"))
+    return DeviceDescriptor(
+        deviceId=device_id,
+        displayName="Test Device",
         fingerprint=f"fingerprint:{device_id}",
-        slots=slots,
+        controls=controls,
     )
 
 
-def _hardware_ref(device: HardwareDevice):
-    return HardwareDeviceRef(manager_id="manager-main", device_id=device.id)
+def _hardware_ref(device: DeviceDescriptor):
+    return DeviceRef(managerId="manager-main", deviceId=device.device_id)
 
 
 class FakeHardwareCommandService:
@@ -176,7 +212,7 @@ def _make_manager(
     plugin_bus: LaneHarness | None = None,
     registry: MagicMock | None = None,
     config: DeviceConfig | None = None,
-    device: HardwareDevice | None = None,
+    device: DeviceDescriptor | None = None,
 ) -> DeviceManager:
     device = device or _make_mock_device()
     return DeviceManager(
@@ -184,7 +220,7 @@ def _make_manager(
         device=device,
         hardware_ref=_hardware_ref(device),
         command_service=command_service or FakeHardwareCommandService(),
-        config=config or _minimal_config(device.id),
+        config=config or _minimal_config(device.device_id),
         manager=registry or _registry_for_action(),
         plugin_bus=plugin_bus or _plugin_bus(),
         start_soon=lambda fn, *a, **k: None,
@@ -417,10 +453,13 @@ async def test_dynamic_child_binding_can_reuse_opener_control_and_close_page(
 
     child_ctx.on_key_up = AsyncMock()
     await manager.on_event(
-        hw_messages.hardware_input_message(
+        hw_messages.control_input_message(
             manager_id="manager-main",
-            device_id=device.id,
-            body=hw_messages.KeyUpMessage(key_id="0,0"),
+            device_id=device.device_id,
+            control_id="0,0",
+            capability_id="button.momentary",
+            event_type="up",
+            value={"eventType": "up"},
         )
     )
     child_ctx.on_key_up.assert_awaited_once()

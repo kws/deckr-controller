@@ -3,7 +3,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from deckr.contracts.models import thaw_json
-from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import DeviceDescriptor
 from deckr.pluginhost.messages import (
     DIAL_ROTATE,
     KEY_DOWN,
@@ -31,6 +31,7 @@ from deckr.python_plugin.events import (
 from deckr.python_plugin.interface import ControlContext as ControlContextProtocol
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
+from deckr.controller._device_layout import ControlSurface
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
@@ -60,12 +61,12 @@ class ControlContext(ControlContextProtocol):
     def __init__(
         self,
         controller_id: str,
-        device: hw_messages.HardwareDevice,
+        device: DeviceDescriptor,
         config_id: str,
         command_service: HardwareCommandService,
         host_id: str,
         action_uuid: str,
-        slot: hw_messages.HardwareSlot,
+        slot: ControlSurface,
         settings: dict,
         manager: "DeviceManager",
         plugin_bus: Any,
