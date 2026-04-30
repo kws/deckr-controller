@@ -14,7 +14,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from deckr.pluginhost.messages import ControlBindingDescriptor
+from deckr.pluginhost.messages import PageChildBindingDescriptor
 
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._binding_validator import (
@@ -116,12 +116,7 @@ def _make_control(
 
 
 def _make_key_action():
-    """Action that only has key + will_appear (so required_gestures = key_down, key_up; requires_image = True)."""
-    action = MagicMock(spec=["on_key_down", "on_key_up", "on_will_appear"])
-    action.on_key_down = MagicMock()
-    action.on_key_up = MagicMock()
-    action.on_will_appear = AsyncMock()
-    return action
+    return ActionMetadata(uuid="action.a", host_id="host-a")
 
 
 @pytest.mark.asyncio
@@ -133,10 +128,12 @@ async def test_validate_page_bindings_all_valid():
         return action
 
     bindings = [
-        ControlBindingDescriptor(control_id="0,0", action_uuid="action.a", settings={}),
-        ControlBindingDescriptor(control_id="0,1", action_uuid="action.b", settings={}),
+        PageChildBindingDescriptor(controlId="0,0", settings={}),
+        PageChildBindingDescriptor(controlId="0,1", settings={}),
     ]
-    result = await validate_exact_control_bindings(bindings, device, get_action)
+    result = await validate_exact_control_bindings(
+        bindings, device, get_action, action_uuid="action.a"
+    )
     assert result.valid is True
     assert len(result.errors) == 0
 
@@ -144,20 +141,17 @@ async def test_validate_page_bindings_all_valid():
 @pytest.mark.asyncio
 async def test_validate_page_bindings_missing_control():
     device = _make_device(controls=[_make_control("0,0")])
-    action = MagicMock()
-    action.on_key_down = MagicMock()
-    action.on_key_up = MagicMock()
-    action.on_will_appear = MagicMock()
+    action = ActionMetadata(uuid="action.a", host_id="host-a")
 
     async def get_action(uuid: str):
         return action
 
     bindings = [
-        ControlBindingDescriptor(
-            control_id="99,99", action_uuid="action.a", settings={}
-        )
+        PageChildBindingDescriptor(controlId="99,99", settings={})
     ]
-    result = await validate_exact_control_bindings(bindings, device, get_action)
+    result = await validate_exact_control_bindings(
+        bindings, device, get_action, action_uuid="action.a"
+    )
     assert result.valid is False
     assert len(result.errors) == 1
     assert result.errors[0].code == "control_not_found"
@@ -173,11 +167,11 @@ async def test_validate_page_bindings_missing_action():
         return None
 
     bindings = [
-        ControlBindingDescriptor(
-            control_id="0,0", action_uuid="nonexistent", settings={}
-        )
+        PageChildBindingDescriptor(controlId="0,0", settings={})
     ]
-    result = await validate_exact_control_bindings(bindings, device, get_action)
+    result = await validate_exact_control_bindings(
+        bindings, device, get_action, action_uuid="nonexistent"
+    )
     assert result.valid is True  # Page can load (partial activation)
     assert result.has_blocking_errors is False
     assert result.has_non_blocking_errors is True

@@ -134,7 +134,7 @@ def test_control_surface_reports_descriptor_kind_and_input_events():
 
     assert surface.id == "D1"
     assert surface.kind == "encoder"
-    assert surface.input_events == ("encoder_rotate",)
+    assert surface.input_events == ("rotate",)
     assert surface.image_format is None
     assert surface.raster_capability_id is None
 
@@ -146,6 +146,6 @@ def test_control_surface_reports_raster_capability_metadata():
     assert surface.kind == "key"
     assert surface.coordinates.row == 0
     assert surface.coordinates.column == 0
-    assert surface.input_events == ("key_down", "key_up", "press")
+    assert surface.input_events == ("down", "press", "up")
     assert surface.image_format == RasterImageFormat(width=72, height=72)
     assert surface.raster_capability_id == "raster.bitmap"

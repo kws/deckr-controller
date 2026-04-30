@@ -19,7 +19,7 @@ class RenderContent:
 
 @dataclass
 class TransientOverlay:
-    """Temporary overlay (showAlert / showOk); cleared on expiry."""
+    """Temporary success/failure overlay; cleared on expiry."""
 
     type: Literal["alert", "ok"]
     expires_at: float  # time.monotonic() deadline

@@ -121,16 +121,16 @@ def _input_events_for_control(control: ControlDescriptor) -> list[str]:
     for capability in control.input_capabilities:
         if capability.family == DECKR_INPUT_BUTTON:
             if capability.capability_type == "momentary":
-                input_events.extend(("key_down", "key_up"))
+                input_events.extend(("down", "up"))
             elif capability.capability_type == "activation":
                 input_events.append("press")
         elif capability.family == DECKR_INPUT_ENCODER:
-            input_events.append("encoder_rotate")
+            input_events.append("rotate")
         elif capability.family == DECKR_INPUT_TOUCH:
             if "tap" in capability.event_types:
-                input_events.append("touch_tap")
+                input_events.append("tap")
             if "swipe" in capability.event_types:
-                input_events.append("touch_swipe")
+                input_events.append("swipe")
     return sorted(set(input_events))
 
 

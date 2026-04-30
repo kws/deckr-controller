@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deckr.hardware.descriptors import DeviceDescriptor
-    from deckr.python_plugin.interface import PluginAction
+
+    from deckr.controller.plugin.provider import ActionMetadata
 
 from deckr.controller._binding_resolution import (
     ConfiguredControlBinding,
@@ -92,7 +93,7 @@ class ValidationResult:
 async def validate_page_bindings(
     bindings: list[ConfiguredControlBinding],
     device: DeviceDescriptor,
-    get_action: Callable[[str], Awaitable[PluginAction | None]],
+    get_action: Callable[[str], Awaitable[ActionMetadata | None]],
     profile_id: str | None = None,
     page_id: str | None = None,
 ) -> ValidationResult:
@@ -132,7 +133,9 @@ async def validate_page_bindings(
 async def validate_exact_control_bindings(
     bindings: list,
     device: DeviceDescriptor,
-    get_action: Callable[[str], Awaitable[PluginAction | None]],
+    get_action: Callable[[str], Awaitable[ActionMetadata | None]],
+    *,
+    action_uuid: str,
     profile_id: str | None = None,
     page_id: str | None = None,
 ) -> ValidationResult:
@@ -142,7 +145,7 @@ async def validate_exact_control_bindings(
         [
             exact_control_binding(
                 control_id=binding.control_id,
-                action_uuid=binding.action_uuid,
+                action_uuid=action_uuid,
                 settings=binding.settings,
                 title_options=binding.title_options,
             )

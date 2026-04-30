@@ -314,8 +314,8 @@ def device_config_set_image():
 async def test_key_press_renders_to_device(
     device_config_set_image, persistence_tmp_dir
 ):
-    """Graph-backed setImage returns promptly and the frame is written asynchronously."""
-    from deckr.pluginhost.messages import SET_IMAGE
+    """Capability bindingOutput writes the selected raster capability."""
+    from deckr.pluginhost.messages import BINDING_OUTPUT
 
     device = _make_mock_device()
     registry = MagicMock()
@@ -341,8 +341,30 @@ async def test_key_press_renders_to_device(
         )
         await manager.set_page(profile="default", page=0)
         baseline_calls = command_service.set_raster_frame.call_count
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+        binding = ctx.metadata.model_copy(update={"output_generation": 1})
         msg = await _plugin_command_for_active_binding(
-            manager, SET_IMAGE, {"image": _solid_key_image()}
+            manager,
+            BINDING_OUTPUT,
+            {
+                "binding": binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": "test-device",
+                    },
+                    "controlId": "0,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "set_frame",
+                "params": {"image": "ZnJhbWU=", "encoding": "jpeg"},
+                "generation": 1,
+            },
         )
         with anyio.fail_after(0.2):
             await manager.handle_command(msg)
@@ -357,15 +379,15 @@ async def test_key_press_renders_to_device(
     assert call_args[0][0] == "test-device"
     assert call_args[0][1] == "0,0"
     assert call_args[0][2] == "raster.bitmap"
-    assert len(call_args[0][3]) > 0
+    assert call_args[0][3] == b"frame"
 
 
 @pytest.mark.asyncio
 async def test_set_image_last_write_wins_same_slot(
     device_config_set_image, persistence_tmp_dir
 ):
-    """Rapid successive graph-backed setImage commands only apply the newest frame."""
-    from deckr.pluginhost.messages import SET_IMAGE
+    """bindingOutput rejects stale or mismatched output generations."""
+    from deckr.pluginhost.messages import BINDING_OUTPUT
 
     device = _make_mock_device()
     plugin_bus = _plugin_bus()
@@ -376,7 +398,6 @@ async def test_set_image_last_write_wins_same_slot(
             host_id="python",
         )
     )
-    backend = ControlledFrameBackend()
     command_service = FakeHardwareCommandService()
 
     async with anyio.create_task_group() as tg:
@@ -389,38 +410,37 @@ async def test_set_image_last_write_wins_same_slot(
             manager=registry,
             plugin_bus=plugin_bus,
             start_soon=tg.start_soon,
-            render_backend=backend,
         )
         await manager.set_page(profile="default", page=0)
-        initial_generation = manager._render_dispatcher._slots["0,0"].generation
-
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+        binding = ctx.metadata.model_copy(update={"output_generation": 1})
         msg = await _plugin_command_for_active_binding(
-            manager, SET_IMAGE, {"image": _solid_key_image()}
+            manager,
+            BINDING_OUTPUT,
+            {
+                "binding": binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": "test-device",
+                    },
+                    "controlId": "0,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "set_frame",
+                "params": {"image": "ZnJhbWU=", "encoding": "jpeg"},
+                "generation": 2,
+            },
         )
 
         await manager.handle_command(msg)
-        await manager.handle_command(msg)
 
-        with anyio.fail_after(1.0):
-            while backend.calls != [initial_generation + 1]:
-                await anyio.sleep(0.01)
-
-        backend.release(initial_generation + 1)
-        with anyio.fail_after(1.0):
-            while backend.calls != [initial_generation + 1, initial_generation + 2]:
-                await anyio.sleep(0.01)
-
-        backend.release(initial_generation + 2)
-        with anyio.fail_after(1.0):
-            while command_service.set_raster_frame.call_count != 1:
-                await anyio.sleep(0.01)
-
-        command_service.set_raster_frame.assert_awaited_once_with(
-            "test-device",
-            "0,0",
-            "raster.bitmap",
-            f"frame-{initial_generation + 2}".encode(),
-        )
+        command_service.set_raster_frame.assert_not_awaited()
         tg.cancel_scope.cancel()
 
 

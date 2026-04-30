@@ -8,7 +8,7 @@ from typing import Protocol
 
 @dataclass
 class ActionMetadata:
-    """Metadata for an action, from host registry or hereIsAction. Replaces PluginAction for message-based dispatch."""
+    """Metadata for an action from host registry current state."""
 
     uuid: str
     host_id: str

@@ -1,7 +1,9 @@
+import base64
+import binascii
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,27 +15,38 @@ from deckr.contracts.messages import (
 )
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.descriptors import DECKR_OUTPUT_RASTER, DeviceDescriptor, DeviceRef
+from deckr.hardware.descriptors import (
+    DECKR_OUTPUT_RASTER,
+    CapabilityRef,
+    ControlRef,
+    DeviceDescriptor,
+    DeviceRef,
+)
 from deckr.pluginhost.messages import (
+    ACTION_INSTANCE_CREATED,
+    ACTION_INSTANCE_DESTROYED,
+    BINDING_OUTPUT,
     CLOSE_PAGE,
     HERE_ARE_SETTINGS,
     OPEN_PAGE,
-    PAGE_APPEAR,
-    PAGE_DISAPPEAR,
+    PAGE_SESSION_CLOSED,
+    PAGE_SESSION_OPENED,
     REPLACE_PAGE,
     REQUEST_SETTINGS,
-    SET_IMAGE,
     SET_PAGE,
     SET_SETTINGS,
-    SET_TITLE,
-    SHOW_ALERT,
-    SHOW_OK,
     SLEEP_SCREEN,
     UPDATE_PAGE,
     WAKE_SCREEN,
-    DynamicPageDescriptor,
+    ActionInstanceLifecycleBody,
+    ActionInstanceMetadata,
+    BindingMetadata,
+    BindingOutputBody,
+    DynamicPageCommand,
+    MatchedCapability,
+    PageSessionLifecycleBody,
+    PageSessionMetadata,
     SettingsBody,
-    TitleOptions,
     context_subject,
     controller_address,
     host_address,
@@ -49,7 +62,6 @@ from deckr.pluginhost.messages import (
     subject_context_id,
     subject_page_session_id,
 )
-from deckr.python_plugin.events import PageAppear, PageDisappear
 from pydantic import ValidationError
 
 from deckr.controller._binding_resolution import ResolvedControlBinding
@@ -93,13 +105,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_WIDGET_TIMEOUT_MS = 60_000
 
 
-def _title_options_from_payload(payload: object) -> TitleOptions | None:
-    if payload is None:
-        return None
-    return TitleOptions.model_validate(payload)
-
-
-def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
+def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
     """Validate a dynamic page descriptor from a bus payload."""
     if not data:
         return None
@@ -107,7 +113,7 @@ def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
     if not bindings_data:
         return None
     try:
-        return DynamicPageDescriptor.model_validate(data)
+        return DynamicPageCommand.model_validate(data)
     except ValidationError:
         logger.warning("Ignoring invalid dynamic page descriptor payload", exc_info=True)
         return None
@@ -161,6 +167,7 @@ class DynamicPageSession:
     page_session_id: str
     context_id: str
     action_instance_id: str
+    template_id: str | None
     owner_context_id: str
     owner_binding_id: str
     owner_control_id: str
@@ -189,6 +196,9 @@ class BindingLease:
     settings_target: SettingsTarget | None
     context: ControlContext
     page_session_id: str | None = None
+    role_id: str | None = None
+    item_key: str | None = None
+    handler: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -243,6 +253,8 @@ class DeviceManager:
         self._binding_leases: dict[str, BindingLease] = {}
         self._binding_by_context: dict[str, str] = {}
         self._active_binding_by_control: dict[str, str] = {}
+        self._action_instances: dict[str, ActionInstanceMetadata] = {}
+        self._action_instance_hosts: dict[str, str] = {}
         self._clock = clock or time.monotonic
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
@@ -295,7 +307,7 @@ class DeviceManager:
         if active_binding == binding_id:
             self._active_binding_by_control.pop(lease.control_id, None)
             await self.action_contexts.delete(lease.control_id)
-        await lease.context.on_will_disappear()
+        await lease.context.on_binding_detached("detach")
         output = (
             DeviceOutput(
                 self._command_service,
@@ -347,6 +359,108 @@ class DeviceManager:
             plugin_uuid=plugin_uuid,
         )
 
+    def _matched_capabilities(
+        self,
+        binding: ResolvedControlBinding,
+    ) -> tuple[MatchedCapability, ...]:
+        selected = {
+            "input": binding.input_capability_ids,
+            "output": binding.output_capability_ids,
+            "state": binding.state_capability_ids,
+            "config": binding.config_capability_ids,
+            "diagnostic": binding.diagnostic_capability_ids,
+        }
+        matches: list[MatchedCapability] = []
+        for direction, capability_ids in selected.items():
+            for capability in binding.control.capabilities:
+                if capability.capability_id not in capability_ids:
+                    continue
+                if direction != "diagnostic" and capability.direction != direction:
+                    continue
+                matches.append(
+                    MatchedCapability(
+                        requirementName=direction,
+                        capability=CapabilityRef(
+                            deviceRef=self.hardware_ref,
+                            controlId=binding.control_id,
+                            capabilityId=capability.capability_id,
+                        ),
+                        family=capability.family,
+                        type=capability.capability_type,
+                        direction=capability.direction,
+                        eventTypes=capability.event_types,
+                        commandTypes=capability.command_types,
+                        provenance="native",
+                    )
+                )
+        return tuple(matches)
+
+    async def _ensure_action_instance(
+        self,
+        *,
+        action_meta: Any,
+        action_instance_id: str,
+        context_id: str,
+        settings: Mapping[str, Any],
+    ) -> None:
+        if action_instance_id in self._action_instances:
+            return
+        metadata = ActionInstanceMetadata(
+            pluginId=action_meta.plugin_uuid,
+            actionId=action_meta.uuid,
+            actionInstanceId=action_instance_id,
+            configId=self.config_id,
+            contextId=context_id,
+        )
+        self._action_instances[action_instance_id] = metadata
+        self._action_instance_hosts[action_instance_id] = action_meta.host_id
+        if action_meta.host_id == BUILTIN_ACTION_PROVIDER_ID:
+            return
+        msg = plugin_message(
+            sender=controller_address(self._controller_id),
+            recipient=host_address(action_meta.host_id),
+            message_type=ACTION_INSTANCE_CREATED,
+            body=ActionInstanceLifecycleBody(
+                metadata=metadata,
+                settings=dict(settings),
+            ),
+            subject=context_subject(
+                context_id,
+                config_id=self.config_id,
+                action_instance_id=action_instance_id,
+                action_uuid=action_meta.uuid,
+            ),
+        )
+        await self._plugin_bus.publish(msg)
+
+    async def _destroy_action_instance(
+        self,
+        action_instance_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        metadata = self._action_instances.pop(action_instance_id, None)
+        host_id = self._action_instance_hosts.pop(action_instance_id, None)
+        if metadata is None or host_id is None or host_id == BUILTIN_ACTION_PROVIDER_ID:
+            return
+        msg = plugin_message(
+            sender=controller_address(self._controller_id),
+            recipient=host_address(host_id),
+            message_type=ACTION_INSTANCE_DESTROYED,
+            body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
+            subject=context_subject(
+                metadata.context_id or "",
+                config_id=self.config_id,
+                action_instance_id=metadata.action_instance_id,
+                action_uuid=metadata.action_id,
+            ),
+        )
+        await self._plugin_bus.publish(msg)
+
+    async def _destroy_all_action_instances(self, *, reason: str) -> None:
+        for action_instance_id in list(self._action_instances):
+            await self._destroy_action_instance(action_instance_id, reason=reason)
+
     async def _try_resolve_binding(
         self,
         binding: ResolvedControlBinding,
@@ -356,8 +470,11 @@ class DeviceManager:
         action_instance_id: str,
         page_session_id: str | None = None,
         persist_settings: bool = True,
+        role_id: str | None = None,
+        item_key: str | None = None,
+        handler: str | None = None,
     ) -> bool:
-        """Resolve a binding: create ControlContext and call on_will_appear if action available.
+        """Resolve a binding: create ControlContext and announce the binding lease.
         Returns True if context was created, False if action not found (caller should render unavailable).
         """
         raster_capability_id = _selected_raster_capability_id(binding)
@@ -399,6 +516,30 @@ class DeviceManager:
             builtin_action = self.manager.get_builtin_action(action_meta.uuid)
         binding_id = make_binding_id()
         context_id = make_context_id()
+        await self._ensure_action_instance(
+            action_meta=action_meta,
+            action_instance_id=action_instance_id,
+            context_id=context_id,
+            settings=binding.settings,
+        )
+        binding_metadata = BindingMetadata(
+            pluginId=action_meta.plugin_uuid,
+            actionId=action_meta.uuid,
+            actionInstanceId=action_instance_id,
+            configId=self.config_id,
+            contextId=context_id,
+            bindingId=binding_id,
+            pageSessionId=page_session_id,
+            deviceRef=self.hardware_ref,
+            controlRef=ControlRef(
+                deviceRef=self.hardware_ref,
+                controlId=control.id,
+            ),
+            roleId=role_id,
+            itemKey=item_key,
+            handler=handler,
+            matchedCapabilities=self._matched_capabilities(binding),
+        )
         ctx = ControlContext(
             controller_id=self._controller_id,
             device=self.device,
@@ -418,10 +559,7 @@ class DeviceManager:
             page_id=page_id,
             title_options=binding.title_options,
             builtin_action=builtin_action,
-            action_instance_id=action_instance_id,
-            binding_id=binding_id,
-            context_id=context_id,
-            page_session_id=page_session_id,
+            metadata=binding_metadata,
         )
         lease = BindingLease(
             binding_id=binding_id,
@@ -438,12 +576,15 @@ class DeviceManager:
             settings_target=settings_target,
             context=ctx,
             page_session_id=page_session_id,
+            role_id=role_id,
+            item_key=item_key,
+            handler=handler,
         )
         self._binding_leases[binding_id] = lease
         self._binding_by_context[context_id] = binding_id
         self._active_binding_by_control[control.id] = binding_id
         await self.action_contexts.set(control.id, ctx)
-        await ctx.on_will_appear()
+        await ctx.on_binding_attached()
         logger.info(
             "Binding resolved on profile=%s page=%s control=%s action=%s host=%s binding=%s",
             profile_id,
@@ -485,7 +626,27 @@ class DeviceManager:
                     context_id=session.context_id, reason="timeout"
                 )
 
-    async def _emit_page_appear(
+    def _page_session_metadata(
+        self,
+        session: DynamicPageSession,
+    ) -> PageSessionMetadata:
+        bindings = tuple(
+            lease.context.metadata
+            for lease in self._binding_leases.values()
+            if lease.page_session_id == session.page_session_id
+        )
+        return PageSessionMetadata(
+            actionInstanceId=session.action_instance_id,
+            configId=self.config_id,
+            pageId=session.page_id,
+            pageSessionId=session.page_session_id,
+            contextId=session.context_id,
+            templateId=session.template_id,
+            ownerBindingId=session.owner_binding_id,
+            bindings=bindings,
+        )
+
+    async def _emit_page_opened(
         self,
         session: DynamicPageSession,
         *,
@@ -493,27 +654,13 @@ class DeviceManager:
     ) -> None:
         if session.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        settings = (
-            await self._settings_service.get(session.settings_target)
-            if session.settings_target is not None
-            else {}
-        )
-        event = PageAppear(
-            context=session.context_id,
-            page_id=session.page_id,
-            timeout_ms=session.timeout_ms,
-        )
         msg = plugin_message(
             sender=controller_address(self._controller_id),
             recipient=host_address(session.owner_host_id),
-            message_type=PAGE_APPEAR,
-            body={
-                "settings": settings,
-                "event": event.model_dump(
-                    by_alias=True,
-                    exclude={"context"},
-                ),
-            },
+            message_type=PAGE_SESSION_OPENED,
+            body=PageSessionLifecycleBody(
+                pageSession=self._page_session_metadata(session)
+            ),
             subject=context_subject(
                 session.context_id,
                 config_id=self.config_id,
@@ -525,7 +672,7 @@ class DeviceManager:
         )
         await self._plugin_bus.publish(msg)
 
-    async def _emit_page_disappear(
+    async def _emit_page_closed(
         self,
         session: DynamicPageSession,
         reason: str,
@@ -534,21 +681,14 @@ class DeviceManager:
     ) -> None:
         if session.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        event = PageDisappear(
-            context=session.context_id,
-            page_id=session.page_id,
-            reason=reason,
-        )
         msg = plugin_message(
             sender=controller_address(self._controller_id),
             recipient=host_address(session.owner_host_id),
-            message_type=PAGE_DISAPPEAR,
-            body={
-                "event": event.model_dump(
-                    by_alias=True,
-                    exclude={"context"},
-                ),
-            },
+            message_type=PAGE_SESSION_CLOSED,
+            body=PageSessionLifecycleBody(
+                pageSession=self._page_session_metadata(session),
+                reason=reason,
+            ),
             subject=context_subject(
                 session.context_id,
                 config_id=self.config_id,
@@ -569,7 +709,7 @@ class DeviceManager:
         session = self._dynamic_page_session
         if session is None:
             return
-        await self._emit_page_disappear(
+        await self._emit_page_closed(
             session,
             reason,
             causation_id=causation_id,
@@ -618,11 +758,15 @@ class DeviceManager:
                         err.control_ref,
                         err.action_uuid,
                     )
-        elif isinstance(arriving, DynamicPageDescriptor):
+        elif isinstance(arriving, DynamicPageCommand):
+            if page_session is None:
+                logger.error("Dynamic page validation missing page session")
+                return False
             result = await validate_exact_control_bindings(
                 list(arriving.bindings),
                 self.device,
                 self.manager.get_action,
+                action_uuid=page_session.owner_action_uuid,
                 profile_id="_dynamic",
                 page_id=arriving.page_id,
             )
@@ -681,11 +825,11 @@ class DeviceManager:
                     )
                     if control is not None:
                         await self._render_unavailable_to_control(control)
-        elif isinstance(arriving, DynamicPageDescriptor):
+        elif isinstance(arriving, DynamicPageCommand):
             if page_session is None:
                 logger.error("Dynamic page transition missing page session")
                 return False
-            for binding in result.bindings:
+            for child, binding in zip(arriving.bindings, result.bindings, strict=True):
                 if not await self._try_resolve_binding(
                     binding,
                     profile_id="_dynamic",
@@ -693,6 +837,9 @@ class DeviceManager:
                     action_instance_id=page_session.action_instance_id,
                     page_session_id=page_session.page_session_id,
                     persist_settings=False,
+                    role_id=child.role_id,
+                    item_key=child.item_key,
+                    handler=child.handler,
                 ):
                     control = _find_control_surface(
                         self.device,
@@ -708,7 +855,7 @@ class DeviceManager:
         *,
         profile: str | None = None,
         page: int | None = None,
-        descriptor: DynamicPageDescriptor | None = None,
+        descriptor: DynamicPageCommand | None = None,
         page_session: DynamicPageSession | None = None,
         close_dynamic: bool = True,
         close_reason: str = "navigate",
@@ -741,7 +888,7 @@ class DeviceManager:
         *,
         profile: str | None = None,
         page: int | None = None,
-        descriptor: DynamicPageDescriptor | None = None,
+        descriptor: DynamicPageCommand | None = None,
         causation_id: str | None = None,
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor)."""
@@ -758,7 +905,7 @@ class DeviceManager:
     async def open_page(
         self,
         *,
-        descriptor: DynamicPageDescriptor,
+        descriptor: DynamicPageCommand,
         context_id: str,
         causation_id: str | None = None,
     ) -> None:
@@ -791,8 +938,9 @@ class DeviceManager:
                 owner_lease.profile_id, owner_page
             )
             page_id = descriptor.page_id or make_dynamic_page_id()
-            descriptor = DynamicPageDescriptor(
-                page_id=page_id,
+            descriptor = DynamicPageCommand(
+                pageId=page_id,
+                templateId=descriptor.template_id,
                 bindings=descriptor.bindings,
             )
 
@@ -801,6 +949,7 @@ class DeviceManager:
                 page_session_id=make_page_session_id(),
                 context_id=make_context_id(),
                 action_instance_id=owner_lease.action_instance_id,
+                template_id=descriptor.template_id,
                 owner_context_id=context_id,
                 owner_binding_id=owner_lease.binding_id,
                 owner_control_id=owner_lease.control_id,
@@ -820,7 +969,7 @@ class DeviceManager:
             )
             if ok:
                 self._dynamic_page_session = session
-                await self._emit_page_appear(session, causation_id=causation_id)
+                await self._emit_page_opened(session, causation_id=causation_id)
 
     def _page_control_session(self, context_id: str) -> DynamicPageSession | None:
         session = self._dynamic_page_session
@@ -843,7 +992,7 @@ class DeviceManager:
     async def update_page(
         self,
         *,
-        descriptor: DynamicPageDescriptor,
+        descriptor: DynamicPageCommand,
         context_id: str,
         causation_id: str | None = None,
     ) -> None:
@@ -873,7 +1022,7 @@ class DeviceManager:
     async def replace_page(
         self,
         *,
-        descriptor: DynamicPageDescriptor,
+        descriptor: DynamicPageCommand,
         context_id: str,
         causation_id: str | None = None,
     ) -> None:
@@ -886,8 +1035,9 @@ class DeviceManager:
                 logger.warning("replace_page ignored: no active page for %s", context_id)
                 return
             page_id = descriptor.page_id or make_dynamic_page_id()
-            replacement = DynamicPageDescriptor(
-                page_id=page_id,
+            replacement = DynamicPageCommand(
+                pageId=page_id,
+                templateId=descriptor.template_id,
                 bindings=descriptor.bindings,
             )
             next_session = DynamicPageSession(
@@ -895,6 +1045,7 @@ class DeviceManager:
                 page_session_id=make_page_session_id(),
                 context_id=make_context_id(),
                 action_instance_id=current.action_instance_id,
+                template_id=descriptor.template_id,
                 owner_context_id=current.owner_context_id,
                 owner_binding_id=current.owner_binding_id,
                 owner_control_id=current.owner_control_id,
@@ -912,13 +1063,13 @@ class DeviceManager:
                 close_dynamic=False,
             )
             if ok:
-                await self._emit_page_disappear(
+                await self._emit_page_closed(
                     current,
                     reason="replaced",
                     causation_id=causation_id,
                 )
                 self._dynamic_page_session = next_session
-                await self._emit_page_appear(next_session, causation_id=causation_id)
+                await self._emit_page_opened(next_session, causation_id=causation_id)
 
     async def close_page(
         self,
@@ -939,7 +1090,7 @@ class DeviceManager:
                 page=session.owner_page,
                 close_dynamic=False,
             )
-            await self._emit_page_disappear(
+            await self._emit_page_closed(
                 session,
                 reason=reason,
                 causation_id=causation_id,
@@ -949,6 +1100,7 @@ class DeviceManager:
         async with self._nav_lock:
             await self._finalize_dynamic_page(reason="clear")
             await self._revoke_active_bindings(clear_outputs=clear_outputs)
+            await self._destroy_all_action_instances(reason="clear")
             if clear_outputs:
                 await self._clear_all_image_slots()
 
@@ -1028,9 +1180,17 @@ class DeviceManager:
                 to_reappear.append(ctx)
         for lease in to_remove:
             await self._revoke_binding(lease.binding_id)
+            if not any(
+                other.action_instance_id == lease.action_instance_id
+                for other in self._binding_leases.values()
+            ):
+                await self._destroy_action_instance(
+                    lease.action_instance_id,
+                    reason="action_unregistered",
+                )
             await self._render_unavailable_to_control(lease.control)
         for ctx in to_reappear:
-            await ctx.on_will_appear()
+            await ctx.on_binding_attached()
 
         # Handle registered: try to resolve bindings that were previously unavailable
         current_page = self._nav.current_page
@@ -1051,18 +1211,19 @@ class DeviceManager:
             action_instance_id = None
             persist_settings = True
         else:
+            session = self._dynamic_page_session
+            if session is None:
+                return
             result = await validate_exact_control_bindings(
                 list(current_page.bindings),
                 self.device,
                 self.manager.get_action,
+                action_uuid=session.owner_action_uuid,
                 profile_id="_dynamic",
                 page_id=current_page.page_id,
             )
             profile_id = "_dynamic"
             page_id = current_page.page_id
-            session = self._dynamic_page_session
-            if session is None:
-                return
             page_session_id = session.page_session_id
             action_instance_id = session.action_instance_id
             persist_settings = False
@@ -1082,7 +1243,12 @@ class DeviceManager:
             unregistered,
         )
 
-        for binding in result.bindings:
+        child_bindings = (
+            current_page.bindings
+            if isinstance(current_page, DynamicPageCommand)
+            else (None,) * len(result.bindings)
+        )
+        for child, binding in zip(child_bindings, result.bindings, strict=True):
             if await self.action_contexts.has_key(binding.control_id):
                 continue  # Already has context
             resolved_action_instance_id = action_instance_id or _action_instance_id(
@@ -1100,6 +1266,9 @@ class DeviceManager:
                 action_instance_id=resolved_action_instance_id,
                 page_session_id=page_session_id,
                 persist_settings=persist_settings,
+                role_id=child.role_id if child is not None else None,
+                item_key=child.item_key if child is not None else None,
+                handler=child.handler if child is not None else None,
             )
 
     async def _config_listener(self) -> None:
@@ -1128,6 +1297,7 @@ class DeviceManager:
             self.config = config
             if self._dynamic_page_session is not None:
                 await self._finalize_dynamic_page(reason="config_change")
+            await self._destroy_all_action_instances(reason="config_change")
             transition = self._nav.update_config(config)
             await self._execute_transition(transition)
 
@@ -1257,7 +1427,7 @@ class DeviceManager:
         return None
 
     async def handle_command(self, msg: DeckrMessage) -> None:
-        """Handle a command message from a plugin host (setTitle, setImage, etc.)."""
+        """Handle a canonical command message from a plugin host."""
         payload = plugin_body_dict(msg)
         context_id = subject_context_id(msg.subject) or ""
         if not context_id:
@@ -1322,6 +1492,12 @@ class DeviceManager:
             )
             return
 
+        if msg_type == BINDING_OUTPUT:
+            if authorization.binding is not None:
+                body = BindingOutputBody.model_validate(payload)
+                await self._handle_binding_output(authorization.binding, body)
+            return
+
         page_session = authorization.page_session
         if page_session is not None:
             if msg_type == SET_SETTINGS:
@@ -1350,18 +1526,7 @@ class DeviceManager:
 
         router = lease.context._router
 
-        if msg_type == SET_TITLE:
-            await router.set_title(
-                payload.get("text", ""),
-                title_options=_title_options_from_payload(payload.get("titleOptions")),
-            )
-        elif msg_type == SET_IMAGE:
-            await router.set_image(payload.get("image", ""))
-        elif msg_type == SHOW_ALERT:
-            await router.show_alert()
-        elif msg_type == SHOW_OK:
-            await router.show_ok()
-        elif msg_type == SET_SETTINGS:
+        if msg_type == SET_SETTINGS:
             await router.set_settings(payload.get("settings", {}))
             settings = await router.get_settings()
             await send_settings_response(vars(settings))
@@ -1382,6 +1547,77 @@ class DeviceManager:
         elif msg_type == WAKE_SCREEN:
             await self._command_service.wake_screen(self.config_id)
 
+    async def _handle_binding_output(
+        self,
+        lease: BindingLease,
+        body: BindingOutputBody,
+    ) -> None:
+        if (
+            body.binding.context_id != lease.context_id
+            or body.binding.binding_id != lease.binding_id
+            or body.binding.action_instance_id != lease.action_instance_id
+        ):
+            logger.warning(
+                "Ignoring binding output with mismatched mirrored lease identity"
+            )
+            return
+        if body.binding.output_generation != body.generation:
+            logger.warning(
+                "Ignoring binding output with mismatched generation for binding %s",
+                lease.binding_id,
+            )
+            return
+        if body.capability.control_id != lease.control_id:
+            logger.warning(
+                "Ignoring binding output for wrong control %s on binding %s",
+                body.capability.control_id,
+                lease.binding_id,
+            )
+            return
+        if body.capability.capability_id != lease.raster_capability_id:
+            logger.warning(
+                "Ignoring unsupported binding output capability %s on binding %s",
+                body.capability.capability_id,
+                lease.binding_id,
+            )
+            return
+        if body.command_type == "clear":
+            await self._command_service.clear_raster(
+                self.config_id,
+                lease.control_id,
+                body.capability.capability_id,
+            )
+            return
+        if body.command_type != "set_frame":
+            logger.warning(
+                "Ignoring unsupported binding output command %s on binding %s",
+                body.command_type,
+                lease.binding_id,
+            )
+            return
+        image = body.params.get("image")
+        encoding = body.params.get("encoding")
+        if not isinstance(image, str) or encoding != "jpeg":
+            logger.warning(
+                "Ignoring raster output without jpeg image payload on binding %s",
+                lease.binding_id,
+            )
+            return
+        try:
+            frame = base64.b64decode(image, validate=True)
+        except (ValueError, binascii.Error):
+            logger.warning(
+                "Ignoring raster output with invalid base64 image on binding %s",
+                lease.binding_id,
+            )
+            return
+        await self._command_service.set_raster_frame(
+            self.config_id,
+            lease.control_id,
+            body.capability.capability_id,
+            frame,
+        )
+
     async def on_event(self, message: DeckrMessage):
         event = hw_messages.hardware_body_from_message(message)
         translated = self._translator.translate(event, self.config_id)
@@ -1390,7 +1626,7 @@ class DeviceManager:
         if self._dynamic_page_session is not None:
             self._record_page_activity()
 
-        control_id = translated.slot_id
+        control_id = translated.control_id
         binding_id = self._active_binding_by_control.get(control_id)
         lease = self._binding_leases.get(binding_id) if binding_id is not None else None
         if lease is None:
@@ -1398,28 +1634,23 @@ class DeviceManager:
                 "Ignoring input from unbound control config=%s control=%s capability=%s",
                 self.config_id,
                 control_id,
-                event.capability_id,
+                translated.capability_id,
             )
             return
-        if event.capability_id not in lease.input_capability_ids:
+        if translated.capability_id not in lease.input_capability_ids:
             logger.info(
                 "Ignoring input for unselected capability config=%s control=%s capability=%s",
                 self.config_id,
                 control_id,
-                event.capability_id,
+                translated.capability_id,
             )
             return
 
-        method_name = translated.method_name
-        plugin_event = translated.plugin_event.model_copy(
-            update={"context": lease.context_id}
-        )
         try:
-            await getattr(lease.context, method_name)(plugin_event)
+            await lease.context.on_input(translated.plugin_event)
         except Exception as e:
             logger.error(
-                "Error calling %s on action %s: %s",
-                method_name,
+                "Error delivering input to action %s: %s",
                 lease.action_uuid,
                 e,
                 exc_info=True,

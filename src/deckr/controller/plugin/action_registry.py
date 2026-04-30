@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING
 
 import anyio
 from deckr.components import BaseComponent, RunContext
@@ -21,13 +20,11 @@ from deckr.state import (
 
 from deckr.controller.plugin.builtin import (
     BUILTIN_ACTION_PROVIDER_ID,
+    BuiltinAction,
     BuiltinRegistry,
 )
 from deckr.controller.plugin.events import ActionsChangedEvent
 from deckr.controller.plugin.provider import ActionMetadata
-
-if TYPE_CHECKING:
-    from deckr.python_plugin.interface import PluginAction
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +84,7 @@ class ActionRegistry(BaseComponent):
             return None
         return _metadata(BUILTIN_ACTION_PROVIDER_ID, descriptor)
 
-    def get_builtin_action(self, uuid: str) -> PluginAction | None:
+    def get_builtin_action(self, uuid: str) -> BuiltinAction | None:
         return self._builtin_registry.get_action(uuid)
 
     async def start(self, ctx: RunContext) -> None:

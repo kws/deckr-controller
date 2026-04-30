@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deckr.pluginhost.messages import (
-    DynamicPageDescriptor,
+    DynamicPageCommand,
     TitleOptions,
 )
 
@@ -39,7 +39,7 @@ class StaticPageRef:
     page_index: int
 
 
-PageStackEntry = StaticPageRef | DynamicPageDescriptor
+PageStackEntry = StaticPageRef | DynamicPageCommand
 
 
 @dataclass

@@ -3,8 +3,7 @@
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from deckr.pluginhost.messages import DynamicPageDescriptor, TitleOptions
-from deckr.python_plugin.interface import PluginContext as PluginContextProtocol
+from deckr.pluginhost.messages import BindingMetadata, DynamicPageCommand, TitleOptions
 
 from deckr.controller._command_router import CommandRouter
 from deckr.controller.settings import SettingsService
@@ -14,7 +13,7 @@ if TYPE_CHECKING:
     from deckr.controller._hardware_service import HardwareCommandService
 
 
-class BuiltInPluginContext(PluginContextProtocol):
+class BuiltInPluginContext:
     """Thin facade for builtin actions: delegates to router, hardware commands, and manager."""
 
     def __init__(
@@ -24,6 +23,7 @@ class BuiltInPluginContext(PluginContextProtocol):
         config_id: str,
         manager: "DeviceManager",
         context_id: str,
+        binding_metadata: BindingMetadata,
         settings_service: SettingsService | None = None,
     ):
         self._router = router
@@ -31,6 +31,7 @@ class BuiltInPluginContext(PluginContextProtocol):
         self._config_id = config_id
         self._manager = manager
         self._context_id = context_id
+        self.binding_metadata = binding_metadata
         self._settings_service = settings_service
 
     async def set_title(
@@ -70,17 +71,17 @@ class BuiltInPluginContext(PluginContextProtocol):
     ) -> None:
         await self._manager.set_page(profile=profile, page=page)
 
-    async def open_page(self, descriptor: DynamicPageDescriptor) -> None:
+    async def open_page(self, descriptor: DynamicPageCommand) -> None:
         await self._manager.open_page(
             descriptor=descriptor, context_id=self._context_id
         )
 
-    async def update_page(self, descriptor: DynamicPageDescriptor) -> None:
+    async def update_page(self, descriptor: DynamicPageCommand) -> None:
         await self._manager.update_page(
             descriptor=descriptor, context_id=self._context_id
         )
 
-    async def replace_page(self, descriptor: DynamicPageDescriptor) -> None:
+    async def replace_page(self, descriptor: DynamicPageCommand) -> None:
         await self._manager.replace_page(
             descriptor=descriptor, context_id=self._context_id
         )

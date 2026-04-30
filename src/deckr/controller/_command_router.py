@@ -109,7 +109,7 @@ class CommandRouter:
         )
 
     async def render(self) -> None:
-        """Trigger resolve → encode → write (e.g. after willAppear)."""
+        """Trigger resolve, encode, and write after state changes."""
         await self._render()
 
     async def set_title(
