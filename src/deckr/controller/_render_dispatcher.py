@@ -97,10 +97,7 @@ class ProcessPoolRenderBackend:
 
     async def render(self, request: RenderRequest) -> RenderResult:
         try:
-            loop = asyncio.get_running_loop()
-            frame = await loop.run_in_executor(
-                self._executor, render_request_to_jpeg, request
-            )
+            frame = await _run_in_process_pool(self._executor, request)
             return RenderResult(
                 context_id=request.context_id,
                 binding_id=request.binding_id,
@@ -126,6 +123,20 @@ class ProcessPoolRenderBackend:
 
     async def aclose(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def _run_in_process_pool(
+    executor: ProcessPoolExecutor,
+    request: RenderRequest,
+) -> bytes:
+    """Bridge to ProcessPoolExecutor while preserving worker initialization.
+
+    AnyIO's process helper does not expose per-worker initializers, and the render
+    backend needs `_init_render_worker()` so child processes ignore Ctrl-C.
+    """
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, render_request_to_jpeg, request)
 
 
 @dataclass(slots=True)
