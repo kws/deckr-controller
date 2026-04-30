@@ -130,6 +130,12 @@ def _plugin_target(plugin_id: str = "plugin.clock") -> SettingsTargetRef:
     )
 
 
+def _target_with(**updates: Any) -> SettingsTargetRef:
+    data = _stable_action_target().to_dict()
+    data.update(updates)
+    return SettingsTargetRef.model_validate(data)
+
+
 async def _next_with_timeout(stream: AsyncIterator[Any]) -> Any:
     with anyio.fail_after(1):
         return await anext(stream)
@@ -226,6 +232,48 @@ async def test_schema_validation_rejects_invalid_settings(tmp_path: Path) -> Non
     reloaded = await config_service.get_config(CONFIG_ID)
     assert reloaded is not None
     assert reloaded.profiles[0].pages[0].controls[0].settings == {"mode": "time"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_updates",
+    [
+        {"actionId": "action.other"},
+        {"stableId": "clock-secondary"},
+        {"pluginId": "plugin.other"},
+        {"stableId": None},
+    ],
+)
+async def test_action_target_metadata_mismatch_is_unknown(
+    tmp_path: Path,
+    target_updates: dict[str, Any],
+) -> None:
+    service, config_service = await _service(tmp_path)
+    bad_target = _target_with(**target_updates)
+
+    with pytest.raises(KeyError):
+        await service.get(bad_target)
+    with pytest.raises(KeyError):
+        await service.patch(bad_target, {"mode": "date"})
+    with pytest.raises(KeyError):
+        await service.replace(bad_target, {"mode": "date"})
+
+    reloaded = await config_service.get_config(CONFIG_ID)
+    assert reloaded is not None
+    assert reloaded.profiles[0].pages[0].controls[0].settings == {"mode": "time"}
+
+
+@pytest.mark.asyncio
+async def test_rejected_subscription_does_not_register_subscriber(tmp_path: Path) -> None:
+    service, _ = await _service(tmp_path)
+    bad_target = _target_with(actionId="action.other")
+
+    stream = service.subscribe(bad_target)
+    with pytest.raises(KeyError):
+        await _next_with_timeout(stream)
+    await stream.aclose()
+
+    assert service._subscribers == {}
 
 
 @pytest.mark.asyncio
