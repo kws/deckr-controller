@@ -16,13 +16,16 @@ from deckr.hardware.descriptors import (
 )
 from deckr.pluginhost.messages import ControlBindingDescriptor
 
+from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._binding_validator import (
     ValidationError,
     ValidationResult,
     format_validation_summary,
+    validate_exact_control_bindings,
     validate_page_bindings,
 )
 from deckr.controller._render import RenderResult
+from deckr.controller.config import CapabilitySelector, ControlSelector
 from deckr.controller.plugin.provider import ActionMetadata
 
 CONTROLLER_ID = "controller-main"
@@ -30,8 +33,8 @@ CONTROLLER_ID = "controller-main"
 
 class FakeHardwareCommandService:
     def __init__(self):
-        self.set_image = AsyncMock()
-        self.clear_slot = AsyncMock()
+        self.set_raster_frame = AsyncMock()
+        self.clear_raster = AsyncMock()
         self.sleep_screen = AsyncMock()
         self.wake_screen = AsyncMock()
 
@@ -133,13 +136,13 @@ async def test_validate_page_bindings_all_valid():
         ControlBindingDescriptor(control_id="0,0", action_uuid="action.a", settings={}),
         ControlBindingDescriptor(control_id="0,1", action_uuid="action.b", settings={}),
     ]
-    result = await validate_page_bindings(bindings, device, get_action)
+    result = await validate_exact_control_bindings(bindings, device, get_action)
     assert result.valid is True
     assert len(result.errors) == 0
 
 
 @pytest.mark.asyncio
-async def test_validate_page_bindings_missing_slot():
+async def test_validate_page_bindings_missing_control():
     device = _make_device(controls=[_make_control("0,0")])
     action = MagicMock()
     action.on_key_down = MagicMock()
@@ -154,10 +157,10 @@ async def test_validate_page_bindings_missing_slot():
             control_id="99,99", action_uuid="action.a", settings={}
         )
     ]
-    result = await validate_page_bindings(bindings, device, get_action)
+    result = await validate_exact_control_bindings(bindings, device, get_action)
     assert result.valid is False
     assert len(result.errors) == 1
-    assert result.errors[0].code == "slot_not_found"
+    assert result.errors[0].code == "control_not_found"
     assert "99,99" in result.errors[0].message
 
 
@@ -174,12 +177,76 @@ async def test_validate_page_bindings_missing_action():
             control_id="0,0", action_uuid="nonexistent", settings={}
         )
     ]
-    result = await validate_page_bindings(bindings, device, get_action)
+    result = await validate_exact_control_bindings(bindings, device, get_action)
     assert result.valid is True  # Page can load (partial activation)
     assert result.has_blocking_errors is False
     assert result.has_non_blocking_errors is True
     assert len(result.errors) == 1
     assert result.errors[0].code == "action_not_found"
+
+
+@pytest.mark.asyncio
+async def test_validate_page_bindings_rejects_ambiguous_selector():
+    device = _make_device(controls=[_make_control("0,0"), _make_control("1,0")])
+    action = _make_key_action()
+
+    async def get_action(uuid: str):
+        return action
+
+    result = await validate_page_bindings(
+        [
+            ConfiguredControlBinding(
+                selector=ControlSelector(
+                    kind="key",
+                    output=(
+                        CapabilitySelector(
+                            family=DECKR_OUTPUT_RASTER,
+                            type="bitmap",
+                        ),
+                    ),
+                ),
+                action_uuid="action.a",
+                settings={},
+            )
+        ],
+        device,
+        get_action,
+    )
+
+    assert result.valid is False
+    assert result.errors[0].code == "control_selector_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_activation_requirement_does_not_match_momentary_only_control():
+    device = _make_device(controls=[_make_control("0,0")])
+    action = _make_key_action()
+
+    async def get_action(uuid: str):
+        return action
+
+    result = await validate_page_bindings(
+        [
+            ConfiguredControlBinding(
+                selector=ControlSelector(
+                    control_id="0,0",
+                    input=(
+                        CapabilitySelector(
+                            family=DECKR_INPUT_BUTTON,
+                            type="activation",
+                        ),
+                    ),
+                ),
+                action_uuid="action.a",
+                settings={},
+            )
+        ],
+        device,
+        get_action,
+    )
+
+    assert result.valid is False
+    assert result.errors[0].code == "capability_not_found"
 
 
 # --- format_validation_summary ---
@@ -192,19 +259,19 @@ def test_format_validation_summary_passed():
 
 def test_format_validation_summary_errors():
     result = ValidationResult(valid=False)
-    result.add_error("slot_not_found", "slot 'x' not found", "x", "action.a")
+    result.add_error("control_not_found", "control 'x' not found", "x", "action.a")
     result.add_error(
         "capability_mismatch", "mismatch", "y", "action.b", details=["need image"]
     )
     s = format_validation_summary(result)
     assert "2 error(s)" in s
-    assert "slot_not_found" in s or "x" in s
+    assert "control_not_found" in s or "x" in s
     assert "capability_mismatch" in s or "y" in s
 
 
 def test_format_validation_summary_list_of_errors():
     errors = [
-        ValidationError("slot_not_found", "msg", "0,0", "a", details=[]),
+        ValidationError("control_not_found", "msg", "0,0", "a", details=[]),
     ]
     s = format_validation_summary(errors)
     assert "1 error(s)" in s
@@ -233,7 +300,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
                     Page(
                         controls=[
                             Control(
-                                slot="99,99",
+                                selector={"control_id": "99,99"},
                                 action="deckr.plugin.builtin.gotopage",
                                 settings={},
                             ),
@@ -294,12 +361,12 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action="deckr.plugin.builtin.gotopage",
                                 settings={},
                             ),
                             Control(
-                                slot="0,1",
+                                selector={"control_id": "0,1"},
                                 action="com.example.nonexistent",
                                 settings={},
                             ),
@@ -344,7 +411,8 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
 
         with anyio.fail_after(1.0):
             while not any(
-                c[0][1] == "0,1" for c in command_service.set_image.call_args_list
+                c[0][1] == "0,1"
+                for c in command_service.set_raster_frame.call_args_list
             ):
                 await anyio.sleep(0.01)
 

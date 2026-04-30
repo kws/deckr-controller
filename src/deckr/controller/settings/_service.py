@@ -10,7 +10,7 @@ from deckr.contracts.models import thaw_json
 
 logger = logging.getLogger(__name__)
 
-SettingsScope = Literal["context"]
+SettingsScope = Literal["action_instance"]
 
 
 def _store_key(target: SettingsTarget) -> str:
@@ -29,35 +29,26 @@ class SettingsTarget:
     scope: SettingsScope
     controller_id: str
     config_id: str | None = None
-    profile_id: str | None = None
-    page_id: str | None = None
-    slot_id: str | None = None
+    action_instance_id: str | None = None
     action_uuid: str | None = None
-    dynamic_page_uuid: str | None = None
     plugin_uuid: str | None = None
 
     @classmethod
-    def for_context(
+    def for_action_instance(
         cls,
         *,
         controller_id: str,
         config_id: str,
-        profile_id: str,
-        page_id: str,
-        slot_id: str,
+        action_instance_id: str,
         action_uuid: str,
-        dynamic_page_uuid: str | None = None,
         plugin_uuid: str | None = None,
     ) -> SettingsTarget:
         return cls(
-            scope="context",
+            scope="action_instance",
             controller_id=controller_id,
             config_id=config_id,
-            profile_id=profile_id,
-            page_id=page_id,
-            slot_id=slot_id,
+            action_instance_id=action_instance_id,
             action_uuid=action_uuid,
-            dynamic_page_uuid=dynamic_page_uuid,
             plugin_uuid=plugin_uuid,
         )
 
@@ -66,9 +57,7 @@ class SettingsTarget:
 
         required = {
             "config_id": self.config_id,
-            "profile_id": self.profile_id,
-            "page_id": self.page_id,
-            "slot_id": self.slot_id,
+            "action_instance_id": self.action_instance_id,
             "action_uuid": self.action_uuid,
         }
         missing = [name for name, value in required.items() if not value]
@@ -77,13 +66,9 @@ class SettingsTarget:
 
         parts = [
             f"config={self.config_id}",
-            f"profile={self.profile_id}",
-            f"page={self.page_id}",
-            f"slot={self.slot_id}",
+            f"action_instance={self.action_instance_id}",
             f"action={self.action_uuid}",
         ]
-        if self.dynamic_page_uuid is not None:
-            parts.append(f"dynamic_page={self.dynamic_page_uuid}")
         return "|".join(parts)
 
 
@@ -140,7 +125,7 @@ class InMemorySettingsService:
             to_remove = [
                 key
                 for key, target in self._targets_by_key.items()
-                if target.scope == "context"
+                if target.scope == "action_instance"
                 and target.controller_id == controller_id
                 and target.config_id == config_id
             ]

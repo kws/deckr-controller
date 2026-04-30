@@ -37,7 +37,7 @@ def _make_config(
                 pages=[
                     Page(
                         controls=[
-                            Control(slot="0,0", action="action.a", settings={}),
+                            Control(selector={"control_id": "0,0"}, action="action.a", settings={}),
                         ]
                     ),
                 ],
@@ -47,7 +47,10 @@ def _make_config(
 
 
 def _config_to_yaml(cfg: DeviceConfig) -> str:
-    return yaml.dump(cfg.model_dump(), default_flow_style=False)
+    return yaml.safe_dump(
+        cfg.model_dump(by_alias=True, mode="json"),
+        default_flow_style=False,
+    )
 
 
 @pytest.mark.asyncio

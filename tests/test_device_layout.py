@@ -1,4 +1,4 @@
-"""Tests for DeviceLayout builder and ImageGrid."""
+"""Tests for descriptor-derived control surface helpers."""
 
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
@@ -11,17 +11,16 @@ from deckr.hardware.descriptors import (
 )
 
 from deckr.controller._device_layout import (
-    ImageGrid,
     RasterImageFormat,
-    SlotInfo,
-    build_device_layout,
+    control_surface,
+    raster_controls,
 )
 
 
-def _raster_capability() -> CapabilityDescriptor:
+def _raster_capability(capability_id: str = "raster.bitmap") -> CapabilityDescriptor:
     return CapabilityDescriptor.model_validate(
         {
-            "capabilityId": "raster.bitmap",
+            "capabilityId": capability_id,
             "family": DECKR_OUTPUT_RASTER,
             "type": "bitmap",
             "direction": "output",
@@ -56,6 +55,19 @@ def _button_caps() -> tuple[CapabilityDescriptor, ...]:
     )
 
 
+def _encoder_caps() -> tuple[CapabilityDescriptor, ...]:
+    return (
+        CapabilityDescriptor(
+            capabilityId="encoder.relative",
+            family=DECKR_INPUT_ENCODER,
+            type="relative",
+            direction="input",
+            access=("emits",),
+            eventTypes=("rotate",),
+        ),
+    )
+
+
 def _make_control(
     control_id: str,
     row: int,
@@ -69,7 +81,9 @@ def _make_control(
         controlId=control_id,
         kind=kind,
         geometry=ControlGeometry(x=col, y=row, width=1, height=1, unit="grid"),
-        inputCapabilities=input_capabilities if input_capabilities is not None else _button_caps(),
+        inputCapabilities=(
+            input_capabilities if input_capabilities is not None else _button_caps()
+        ),
         outputCapabilities=(_raster_capability(),) if has_display else (),
     )
 
@@ -83,84 +97,55 @@ def _device(*controls: ControlDescriptor, device_id: str = "dev1") -> DeviceDesc
     )
 
 
-def test_build_device_layout_empty_device():
-    layout = build_device_layout(_device())
-    assert layout.device_id == "dev1"
-    assert layout.image_grid.rows == 0
-    assert layout.image_grid.cols == 0
-    assert layout.image_grid.total_keys() == 0
-    assert len(layout.buttons) == 0
-    assert len(layout.encoders) == 0
+def test_raster_controls_empty_device():
+    assert raster_controls(_device()) == ()
 
 
-def test_build_device_layout_image_grid_only():
+def test_raster_controls_order_by_geometry_without_kind_classification():
     device = _device(
-        _make_control("0,0", 0, 0),
-        _make_control("1,0", 1, 0),
-        _make_control("0,1", 0, 1),
-    )
-    layout = build_device_layout(device)
-    assert layout.device_id == "dev1"
-    assert layout.image_grid.total_keys() == 3
-    assert layout.image_grid.rows == 2
-    assert layout.image_grid.cols == 2
-    slot_ids = [s.slot_id for s in layout.image_grid.slots]
-    assert "0,0" in slot_ids
-    assert "1,0" in slot_ids
-    assert "0,1" in slot_ids
-    assert layout.image_grid.slot_id(0, 0) is not None
-    assert (
-        layout.image_grid.slot_id(1, 1) is None
-        or layout.image_grid.slot_id(1, 1) in slot_ids
+        _make_control("plain-button-with-display", 1, 0, kind="button"),
+        _make_control("top-key", 0, 0, kind="key"),
+        _make_control("encoder-display", 0, 1, kind="encoder"),
+        _make_control("button-no-display", 2, 0, kind="button", has_display=False),
     )
 
+    controls = raster_controls(device)
 
-def test_build_device_layout_classifies_buttons_and_encoders():
-    encoder_caps = (
-        CapabilityDescriptor(
-            capabilityId="encoder.relative",
-            family=DECKR_INPUT_ENCODER,
-            type="relative",
-            direction="input",
-            access=("emits",),
-            eventTypes=("rotate",),
-        ),
-    )
-    device = _device(
-        _make_control("0,0", 0, 0),
-        _make_control("B1", 2, 0, kind="button", has_display=False),
+    assert [control.control_id for control in controls] == [
+        "top-key",
+        "encoder-display",
+        "plain-button-with-display",
+    ]
+    assert all(control.image_format == RasterImageFormat(width=72, height=72) for control in controls)
+    assert {control.capability_id for control in controls} == {"raster.bitmap"}
+
+
+def test_control_surface_reports_descriptor_kind_and_input_events():
+    surface = control_surface(
         _make_control(
             "D1",
             2,
             1,
             kind="encoder",
             has_display=False,
-            input_capabilities=encoder_caps,
-        ),
+            input_capabilities=_encoder_caps(),
+        )
     )
-    layout = build_device_layout(device)
-    assert layout.image_grid.total_keys() == 1
-    assert len(layout.buttons) == 1
-    assert layout.buttons[0].slot_id == "B1"
-    assert len(layout.encoders) == 1
-    assert layout.encoders[0].slot_id == "D1"
-    assert layout.encoders[0].image_format is None
+
+    assert surface.id == "D1"
+    assert surface.kind == "encoder"
+    assert surface.input_events == ("encoder_rotate",)
+    assert surface.image_format is None
+    assert surface.raster_capability_id is None
 
 
-def test_image_grid_slot_id_row_col():
-    grid = ImageGrid(
-        rows=2,
-        cols=2,
-        slots=(
-            SlotInfo("0,0", 0, 0, RasterImageFormat(width=72, height=72), "raster.bitmap"),
-            SlotInfo("0,1", 0, 1, RasterImageFormat(width=72, height=72), "raster.bitmap"),
-            SlotInfo("1,0", 1, 0, RasterImageFormat(width=72, height=72), "raster.bitmap"),
-            SlotInfo("1,1", 1, 1, RasterImageFormat(width=72, height=72), "raster.bitmap"),
-        ),
-    )
-    assert grid.slot_id(0, 0) == "0,0"
-    assert grid.slot_id(1, 0) == "1,0"
-    assert grid.slot_id(0, 1) == "0,1"
-    assert grid.slot_id(1, 1) == "1,1"
-    assert grid.slot_id(2, 0) is None
-    assert grid.total_keys() == 4
+def test_control_surface_reports_raster_capability_metadata():
+    surface = control_surface(_make_control("0,0", 0, 0))
+
+    assert surface.id == "0,0"
+    assert surface.kind == "key"
+    assert surface.coordinates.row == 0
+    assert surface.coordinates.column == 0
+    assert surface.input_events == ("key_down", "key_up", "press")
+    assert surface.image_format == RasterImageFormat(width=72, height=72)
+    assert surface.raster_capability_id == "raster.bitmap"

@@ -1,9 +1,9 @@
 """Tests for render pipeline: resolve, _title_options_to_params, title_options flow."""
 
 import pytest
-from deckr.controller._device_layout import RasterImageFormat
 from deckr.pluginhost.messages import TitleOptions
 
+from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import (
     _font_style_to_weight_and_style,
     _hex_to_rgba,

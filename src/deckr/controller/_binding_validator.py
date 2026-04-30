@@ -1,4 +1,4 @@
-"""Pure binding validation: slot existence and action lookup."""
+"""Pure binding validation: selector resolution and action lookup."""
 
 from __future__ import annotations
 
@@ -8,9 +8,15 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deckr.hardware.descriptors import ControlDescriptor, DeviceDescriptor
-    from deckr.pluginhost.messages import ControlBindingDescriptor
+    from deckr.hardware.descriptors import DeviceDescriptor
     from deckr.python_plugin.interface import PluginAction
+
+from deckr.controller._binding_resolution import (
+    ConfiguredControlBinding,
+    ResolvedControlBinding,
+    exact_control_binding,
+    resolve_binding,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +27,7 @@ class ValidationError:
 
     code: str
     message: str
-    slot_id: str
+    control_ref: str
     action_uuid: str
     profile_id: str | None = None
     page_id: str | None = None
@@ -29,7 +35,13 @@ class ValidationError:
 
 
 # Error codes that block page load (page cannot activate).
-BLOCKING_ERROR_CODES = frozenset({"slot_not_found"})
+BLOCKING_ERROR_CODES = frozenset(
+    {
+        "capability_not_found",
+        "control_not_found",
+        "control_selector_ambiguous",
+    }
+)
 
 # Error codes that allow partial load (slot gets "unavailable" display).
 NON_BLOCKING_ERROR_CODES = frozenset({"action_not_found"})
@@ -41,10 +53,11 @@ class ValidationResult:
 
     valid: bool
     errors: list[ValidationError] = field(default_factory=list)
+    bindings: list[ResolvedControlBinding] = field(default_factory=list)
 
     @property
     def has_blocking_errors(self) -> bool:
-        """True if any error blocks page activation (e.g. slot_not_found)."""
+        """True if any error blocks page activation."""
         return any(e.code in BLOCKING_ERROR_CODES for e in self.errors)
 
     @property
@@ -56,7 +69,7 @@ class ValidationResult:
         self,
         code: str,
         message: str,
-        slot_id: str,
+        control_ref: str,
         action_uuid: str,
         profile_id: str | None = None,
         page_id: str | None = None,
@@ -67,7 +80,7 @@ class ValidationResult:
             ValidationError(
                 code=code,
                 message=message,
-                slot_id=slot_id,
+                control_ref=control_ref,
                 action_uuid=action_uuid,
                 profile_id=profile_id,
                 page_id=page_id,
@@ -76,53 +89,70 @@ class ValidationResult:
         )
 
 
-def _control_by_id(
-    device: DeviceDescriptor,
-    control_id: str,
-) -> ControlDescriptor | None:
-    for control in device.controls:
-        if control.control_id == control_id:
-            return control
-    return None
-
-
 async def validate_page_bindings(
-    bindings: list[ControlBindingDescriptor],
+    bindings: list[ConfiguredControlBinding],
     device: DeviceDescriptor,
     get_action: Callable[[str], Awaitable[PluginAction | None]],
     profile_id: str | None = None,
     page_id: str | None = None,
 ) -> ValidationResult:
-    """Validate all bindings for a page: slot existence and action lookup."""
+    """Validate and resolve all bindings for a page."""
     result = ValidationResult(valid=True)
     for binding in bindings:
-        control_id = binding.control_id
-        control = _control_by_id(device, control_id)
-        if control is None:
+        resolution = resolve_binding(binding, device.controls)
+        if not resolution.ok:
             result.add_error(
-                code="slot_not_found",
-                message=f"control '{control_id}' not found on device",
-                slot_id=control_id,
+                code=resolution.code or "control_not_found",
+                message=resolution.message or "control selector did not resolve",
+                control_ref=", ".join(resolution.details) or "<selector>",
                 action_uuid=binding.action_uuid,
                 profile_id=profile_id,
                 page_id=page_id,
+                details=list(resolution.details),
             )
             continue
+        result.bindings.append(resolution.binding)
         action = await get_action(binding.action_uuid)
         if action is None:
-            # Non-blocking: page loads; this slot shows "unavailable"
+            # Non-blocking: page loads; this control shows "unavailable"
             result.add_error(
                 code="action_not_found",
                 message=f"action '{binding.action_uuid}' not found",
-                slot_id=control_id,
+                control_ref=resolution.binding.control_id,
                 action_uuid=binding.action_uuid,
                 profile_id=profile_id,
                 page_id=page_id,
             )
             continue
-    # Page can load if no blocking errors (slot_not_found). action_not_found is non-blocking.
+    # Page can load if no selector/capability errors. action_not_found is non-blocking.
     result.valid = not result.has_blocking_errors
     return result
+
+
+async def validate_exact_control_bindings(
+    bindings: list,
+    device: DeviceDescriptor,
+    get_action: Callable[[str], Awaitable[PluginAction | None]],
+    profile_id: str | None = None,
+    page_id: str | None = None,
+) -> ValidationResult:
+    """Validate plugin-provided exact control bindings."""
+
+    return await validate_page_bindings(
+        [
+            exact_control_binding(
+                control_id=binding.control_id,
+                action_uuid=binding.action_uuid,
+                settings=binding.settings,
+                title_options=binding.title_options,
+            )
+            for binding in bindings
+        ],
+        device,
+        get_action,
+        profile_id=profile_id,
+        page_id=page_id,
+    )
 
 
 def format_validation_summary(result: ValidationResult | list[ValidationError]) -> str:
@@ -132,7 +162,7 @@ def format_validation_summary(result: ValidationResult | list[ValidationError]) 
         return "validation passed"
     parts = [f"{len(errors)} error(s):"]
     for e in errors[:3]:
-        parts.append(f" [{e.code}] {e.slot_id!r} / {e.action_uuid!r}")
+        parts.append(f" [{e.code}] {e.control_ref!r} / {e.action_uuid!r}")
     if len(errors) > 3:
         parts.append(f" ... and {len(errors) - 3} more")
     return "; ".join(parts)

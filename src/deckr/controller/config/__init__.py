@@ -1,4 +1,13 @@
-from ._data import Control, DeviceConfig, DeviceConfigMatch, Page, Profile
+from ._data import (
+    CapabilitySelector,
+    Control,
+    ControlSelector,
+    DeviceConfig,
+    DeviceConfigMatch,
+    GeometrySelector,
+    Page,
+    Profile,
+)
 from ._service import (
     DeviceConfigService,
     FileBackedDeviceConfigService,
@@ -7,10 +16,13 @@ from ._service import (
 
 __all__ = [
     "Control",
+    "CapabilitySelector",
+    "ControlSelector",
     "DeviceConfig",
     "DeviceConfigMatch",
     "DeviceConfigService",
     "FileBackedDeviceConfigService",
+    "GeometrySelector",
     "NullDeviceConfigService",
     "Page",
     "Profile",

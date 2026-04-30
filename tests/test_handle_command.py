@@ -151,8 +151,8 @@ def _hardware_ref(device: DeviceDescriptor):
 
 class FakeHardwareCommandService:
     def __init__(self):
-        self.set_image = AsyncMock()
-        self.clear_slot = AsyncMock()
+        self.set_raster_frame = AsyncMock()
+        self.clear_raster = AsyncMock()
         self.sleep_screen = AsyncMock()
         self.wake_screen = AsyncMock()
 
@@ -179,7 +179,7 @@ def _minimal_config(device_id: str = "test-device") -> DeviceConfig:
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
                                 settings={},
                             )
@@ -404,7 +404,7 @@ async def test_dynamic_child_binding_can_reuse_opener_control_and_close_page(
                 pages=[
                     Page(
                         controls=[
-                            Control(slot="0,0", action=owner_action, settings={})
+                            Control(selector={"control_id": "0,0"}, action=owner_action, settings={})
                         ]
                     )
                 ],
@@ -541,7 +541,7 @@ async def test_open_page_replacement_events_set_causation(persistence_tmp_dir):
     plugin_bus = _plugin_bus()
     config = _minimal_config()
     config.profiles[0].pages.append(
-        Page(controls=[Control(slot="0,0", action=NoopAction.uuid, settings={})])
+        Page(controls=[Control(selector={"control_id": "0,0"}, action=NoopAction.uuid, settings={})])
     )
     registry = MagicMock()
     registry.get_action = AsyncMock(
@@ -631,7 +631,7 @@ async def test_widget_page_timeout_returns_to_owner(persistence_tmp_dir):
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
                                 settings={},
                             )
@@ -691,7 +691,7 @@ async def test_handle_command_set_page(persistence_tmp_dir):
     plugin_bus = _plugin_bus()
     config = _minimal_config()
     config.profiles[0].pages.append(
-        Page(controls=[Control(slot="0,0", action=NoopAction.uuid, settings={})])
+        Page(controls=[Control(selector={"control_id": "0,0"}, action=NoopAction.uuid, settings={})])
     )
     registry = MagicMock()
     registry.get_action = AsyncMock(
@@ -822,7 +822,7 @@ async def test_handle_command_rejects_different_host_for_page_commands(
 ):
     config = _minimal_config()
     config.profiles[0].pages.append(
-        Page(controls=[Control(slot="0,0", action=NoopAction.uuid, settings={})])
+        Page(controls=[Control(selector={"control_id": "0,0"}, action=NoopAction.uuid, settings={})])
     )
     manager = _make_manager(config=config)
     await manager.set_page(profile="default", page=0)

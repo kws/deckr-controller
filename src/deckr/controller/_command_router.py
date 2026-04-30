@@ -26,29 +26,40 @@ logger = logging.getLogger(__name__)
 
 
 class DeviceOutput:
-    """Thin wrapper: writes bytes to device; records last frame per slot."""
+    """Thin wrapper: writes raster frames to a selected control capability."""
 
     def __init__(
         self,
         command_service: "HardwareCommandService",
         config_id: str,
-        slot_id: str,
+        control_id: str,
+        capability_id: str,
     ):
         self._command_service = command_service
         self._config_id = config_id
-        self._slot_id = slot_id
+        self._control_id = control_id
+        self._capability_id = capability_id
         self.last_frame: bytes | None = None
 
     @property
-    def slot_id(self) -> str:
-        return self._slot_id
+    def control_id(self) -> str:
+        return self._control_id
 
     async def write(self, frame: bytes) -> None:
-        await self._command_service.set_image(self._config_id, self._slot_id, frame)
+        await self._command_service.set_raster_frame(
+            self._config_id,
+            self._control_id,
+            self._capability_id,
+            frame,
+        )
         self.last_frame = frame
 
     async def clear(self) -> None:
-        await self._command_service.clear_slot(self._config_id, self._slot_id)
+        await self._command_service.clear_raster(
+            self._config_id,
+            self._control_id,
+            self._capability_id,
+        )
         self.last_frame = None
 
 
@@ -60,7 +71,7 @@ class CommandRouter:
         store: ControlStateStore,
         render_service: RenderService,
         render_dispatcher: RenderDispatcher,
-        output: DeviceOutput,
+        output: DeviceOutput | None,
         image_format: "RasterImageFormat | None",
         start_soon: Callable,
         *,
@@ -79,7 +90,7 @@ class CommandRouter:
         self._settings_hydrated = False
 
     async def _render(self) -> None:
-        if self._image_format is None:
+        if self._image_format is None or self._output is None:
             return
         model = resolve(self._store)
         request = self._render_service.build_request(
@@ -87,10 +98,10 @@ class CommandRouter:
             self._image_format,
             context_id=self._store.context_id,
             binding_id=self._store.binding_id,
-            slot_id=self._output.slot_id,
+            slot_id=self._output.control_id,
         )
         await self._render_dispatcher.submit_request(
-            slot_id=self._output.slot_id,
+            slot_id=self._output.control_id,
             context_id=self._store.context_id,
             binding_id=self._store.binding_id,
             request=request,

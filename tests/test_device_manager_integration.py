@@ -208,8 +208,8 @@ def _hardware_ref(device: DeviceDescriptor) -> DeviceRef:
 
 class FakeHardwareCommandService:
     def __init__(self):
-        self.set_image = AsyncMock()
-        self.clear_slot = AsyncMock()
+        self.set_raster_frame = AsyncMock()
+        self.clear_raster = AsyncMock()
         self.sleep_screen = AsyncMock()
         self.wake_screen = AsyncMock()
 
@@ -298,7 +298,7 @@ def device_config_set_image():
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=SetImageOnAppearAction.uuid,
                                 settings={},
                             )
@@ -340,7 +340,7 @@ async def test_key_press_renders_to_device(
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
-        baseline_calls = command_service.set_image.call_count
+        baseline_calls = command_service.set_raster_frame.call_count
         msg = await _plugin_command_for_active_binding(
             manager, SET_IMAGE, {"image": _solid_key_image()}
         )
@@ -348,15 +348,16 @@ async def test_key_press_renders_to_device(
             await manager.handle_command(msg)
 
         with anyio.fail_after(5.0):
-            while command_service.set_image.call_count <= baseline_calls:
+            while command_service.set_raster_frame.call_count <= baseline_calls:
                 await anyio.sleep(0.01)
         tg.cancel_scope.cancel()
 
-    assert command_service.set_image.call_count > baseline_calls
-    call_args = command_service.set_image.call_args
+    assert command_service.set_raster_frame.call_count > baseline_calls
+    call_args = command_service.set_raster_frame.call_args
     assert call_args[0][0] == "test-device"
     assert call_args[0][1] == "0,0"
-    assert len(call_args[0][2]) > 0
+    assert call_args[0][2] == "raster.bitmap"
+    assert len(call_args[0][3]) > 0
 
 
 @pytest.mark.asyncio
@@ -411,11 +412,14 @@ async def test_set_image_last_write_wins_same_slot(
 
         backend.release(initial_generation + 2)
         with anyio.fail_after(1.0):
-            while command_service.set_image.call_count != 1:
+            while command_service.set_raster_frame.call_count != 1:
                 await anyio.sleep(0.01)
 
-        command_service.set_image.assert_awaited_once_with(
-            "test-device", "0,0", f"frame-{initial_generation + 2}".encode()
+        command_service.set_raster_frame.assert_awaited_once_with(
+            "test-device",
+            "0,0",
+            "raster.bitmap",
+            f"frame-{initial_generation + 2}".encode(),
         )
         tg.cancel_scope.cancel()
 
@@ -444,7 +448,7 @@ async def test_settings_isolated_by_page_same_slot(persistence_tmp_dir):
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
                                 settings={},
                             )
@@ -453,7 +457,7 @@ async def test_settings_isolated_by_page_same_slot(persistence_tmp_dir):
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
                                 settings={},
                             )
@@ -523,12 +527,12 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
                                 settings={},
                             ),
                             Control(
-                                slot="1,0",
+                                selector={"control_id": "1,0"},
                                 action=NoopAction.uuid,
                                 settings={},
                             ),
@@ -592,7 +596,7 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
                                 settings={
                                     "label": "from-config",
@@ -616,7 +620,7 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
                                 settings={"label": "from-reload"},
                             )
@@ -688,7 +692,7 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
                         Page(
                             controls=[
                                 Control(
-                                    slot="0,0",
+                                    selector={"control_id": "0,0"},
                                     action=NoopAction.uuid,
                                     settings={},
                                 )
@@ -705,12 +709,12 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
 
     await manager.set_page(profile="default", page=0)
     assert await manager.action_contexts.get("0,0") is not None
-    command_service.clear_slot.reset_mock()
-    command_service.clear_slot.side_effect = LookupError("No live hardware route")
+    command_service.clear_raster.reset_mock()
+    command_service.clear_raster.side_effect = LookupError("No live hardware route")
 
     await manager.clear_page(clear_outputs=False)
 
-    command_service.clear_slot.assert_not_awaited()
+    command_service.clear_raster.assert_not_awaited()
     assert await manager.action_contexts.get("0,0") is None
 
 
@@ -769,7 +773,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_slot(
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=ACTION_X_UUID,
                                 settings={},
                             )
@@ -845,7 +849,7 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action=ACTION_X_UUID,
                                 settings={},
                             )
@@ -876,7 +880,7 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
         assert ctx_before is not None
 
         # Clear mock to isolate on_actions_changed effects
-        command_service.set_image.reset_mock()
+        command_service.set_raster_frame.reset_mock()
 
         # Remove action from registry to simulate unregister (otherwise the
         # "registered" handling would re-resolve and recreate the context)

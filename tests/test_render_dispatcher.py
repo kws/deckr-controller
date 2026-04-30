@@ -12,13 +12,13 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
-from deckr.controller._device_layout import RasterImageFormat
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
 from invariant_gfx.artifacts import BlobArtifact
 from PIL import Image
 
 from deckr.controller._command_router import DeviceOutput
+from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import (
     RenderImageFormat,
     RenderModel,
@@ -36,8 +36,8 @@ from deckr.controller.invariant.executor import ProcessSafeDiskStore
 
 class FakeHardwareCommandService:
     def __init__(self):
-        self.set_image = AsyncMock()
-        self.clear_slot = AsyncMock()
+        self.set_raster_frame = AsyncMock()
+        self.clear_raster = AsyncMock()
         self.sleep_screen = AsyncMock()
         self.wake_screen = AsyncMock()
 
@@ -117,7 +117,7 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
     command_service = FakeHardwareCommandService()
 
     backend = ControlledBackend()
-    output = DeviceOutput(command_service, "dev", "0,0")
+    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
 
     async with anyio.create_task_group() as tg:
         dispatcher = RenderDispatcher(
@@ -158,11 +158,16 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
 
         backend.release(3)
         with anyio.fail_after(1.0):
-            while command_service.set_image.call_count != 1:
+            while command_service.set_raster_frame.call_count != 1:
                 await anyio.sleep(0.01)
 
         assert output.last_frame == b"frame-3"
-        command_service.set_image.assert_awaited_once_with("dev", "0,0", b"frame-3")
+        command_service.set_raster_frame.assert_awaited_once_with(
+            "dev",
+            "0,0",
+            "raster.bitmap",
+            b"frame-3",
+        )
         tg.cancel_scope.cancel()
 
 
@@ -171,7 +176,7 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
     command_service = FakeHardwareCommandService()
 
     backend = ControlledBackend()
-    output = DeviceOutput(command_service, "dev", "0,0")
+    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
 
     async with anyio.create_task_group() as tg:
         dispatcher = RenderDispatcher(
@@ -194,8 +199,12 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
         backend.release(1)
         await anyio.sleep(0.05)
 
-        command_service.clear_slot.assert_awaited_once_with("dev", "0,0")
-        command_service.set_image.assert_not_awaited()
+        command_service.clear_raster.assert_awaited_once_with(
+            "dev",
+            "0,0",
+            "raster.bitmap",
+        )
+        command_service.set_raster_frame.assert_not_awaited()
         assert output.last_frame is None
         tg.cancel_scope.cancel()
 
@@ -205,7 +214,7 @@ async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
     command_service = FakeHardwareCommandService()
 
     backend = ControlledBackend()
-    output = DeviceOutput(command_service, "dev", "0,0")
+    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
 
     async with anyio.create_task_group() as tg:
         dispatcher = RenderDispatcher(
@@ -233,8 +242,8 @@ async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
         backend.release(1)
         await anyio.sleep(0.05)
 
-        command_service.clear_slot.assert_not_awaited()
-        command_service.set_image.assert_not_awaited()
+        command_service.clear_raster.assert_not_awaited()
+        command_service.set_raster_frame.assert_not_awaited()
         tg.cancel_scope.cancel()
 
 

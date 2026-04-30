@@ -223,8 +223,6 @@ class RenderDispatcher:
             async with io_lock:
                 if target_output is not None:
                     await target_output.clear()
-                else:
-                    await self._command_service.clear_slot(self._config_id, slot_id)
         return generation
 
     async def _run_slot(self, slot_id: str, request: RenderRequest) -> None:
@@ -269,9 +267,3 @@ class RenderDispatcher:
                 return
             if target_output is not None:
                 await target_output.write(result.frame)
-            else:
-                await self._command_service.set_image(
-                    self._config_id,
-                    result.slot_id,
-                    result.frame,
-                )

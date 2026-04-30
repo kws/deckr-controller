@@ -171,17 +171,52 @@ class ControllerService(BaseComponent):
         async with self._hardware_endpoint.subscribe() as subscribe:
             async for message in subscribe:
                 event = hw_messages.hardware_body_from_message(message)
-                if not isinstance(event, hw_messages.ControlInputMessage):
-                    continue
                 ref = hw_messages.hardware_device_ref_from_message(message)
                 if ref is None:
                     continue
                 live = self._device_registry.get_by_ref(ref)
+                if isinstance(event, hw_messages.DeviceAvailableMessage):
+                    await self._reconcile_hardware_current_state(
+                        reason="deviceAvailable message"
+                    )
+                    continue
+                if isinstance(event, hw_messages.DeviceDescriptorChangedMessage):
+                    if live is not None:
+                        updated = self._device_registry.update_descriptor(
+                            ref=ref,
+                            device=event.descriptor,
+                        )
+                        if updated is not None:
+                            self._command_service.register_device(
+                                config_id=updated.config_id,
+                                ref=updated.ref,
+                                device=updated.device,
+                            )
+                            ctrl_ctx = await self._controller_contexts.get(
+                                updated.config_id
+                            )
+                            if ctrl_ctx is not None:
+                                await ctrl_ctx.on_descriptor_changed(updated.device)
+                    else:
+                        await self._reconcile_hardware_current_state(
+                            reason="deviceDescriptorChanged message"
+                        )
+                    continue
+                if isinstance(event, hw_messages.DeviceUnavailableMessage):
+                    if live is not None:
+                        await self._disconnect_live(live, release_claim=True)
+                    continue
                 if live is None:
                     continue
                 ctrl_ctx = await self._controller_contexts.get(live.config_id)
-                if ctrl_ctx is not None:
+                if ctrl_ctx is None:
+                    continue
+                if isinstance(event, hw_messages.ControlInputMessage):
                     await ctrl_ctx.on_event(message)
+                elif isinstance(event, hw_messages.CapabilityStateChangedMessage):
+                    await ctrl_ctx.on_capability_state_changed(event)
+                elif isinstance(event, hw_messages.CommandRejectedMessage):
+                    await ctrl_ctx.on_command_rejected(event)
 
     async def _inventory_loop(self) -> None:
         while True:
@@ -259,7 +294,11 @@ class ControllerService(BaseComponent):
             ref=ref,
             device=device,
         )
-        self._command_service.register_device(config_id=config.id, ref=ref)
+        self._command_service.register_device(
+            config_id=config.id,
+            ref=ref,
+            device=device,
+        )
         await self.on_device_connected(live, initial_config=config)
 
     def _device_from_inventory(
@@ -477,6 +516,8 @@ class ControllerService(BaseComponent):
                 or not self._claim_belongs_to_this_session(claim)
             ):
                 await self._disconnect_live(live, release_claim=False)
+                continue
+            await self._refresh_live_descriptor(live)
 
     async def _reconcile_available_inventory(
         self,
@@ -515,6 +556,31 @@ class ControllerService(BaseComponent):
         if inventory is None or not self._inventory_is_usable(inventory):
             return False
         return (ref.manager_id, ref.device_id) in _hardware_inventory_ref_keys(inventory)
+
+    async def _refresh_live_descriptor(self, live: LiveHardwareDevice) -> None:
+        inventory = self._inventory_by_manager.get(live.ref.manager_id)
+        if inventory is None or not self._inventory_is_usable(inventory):
+            return
+        item = inventory.devices.get(live.ref.device_id)
+        if item is None:
+            return
+        descriptor = self._device_from_inventory(live.ref, item)
+        if descriptor == live.device:
+            return
+        updated = self._device_registry.update_descriptor(
+            ref=live.ref,
+            device=descriptor,
+        )
+        if updated is None:
+            return
+        self._command_service.register_device(
+            config_id=updated.config_id,
+            ref=updated.ref,
+            device=updated.device,
+        )
+        ctrl_ctx = await self._controller_contexts.get(updated.config_id)
+        if ctrl_ctx is not None:
+            await ctrl_ctx.on_descriptor_changed(updated.device)
 
     def _claim_belongs_to_this_session(self, claim: DeviceClaim) -> bool:
         return (

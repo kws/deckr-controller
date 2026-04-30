@@ -13,7 +13,7 @@ from deckr.contracts.messages import (
 )
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
+from deckr.hardware.descriptors import DECKR_OUTPUT_RASTER, DeviceDescriptor, DeviceRef
 from deckr.pluginhost.messages import (
     CLOSE_PAGE,
     HERE_ARE_SETTINGS,
@@ -31,7 +31,6 @@ from deckr.pluginhost.messages import (
     SLEEP_SCREEN,
     UPDATE_PAGE,
     WAKE_SCREEN,
-    ControlBindingDescriptor,
     DynamicPageDescriptor,
     SettingsBody,
     TitleOptions,
@@ -53,16 +52,18 @@ from deckr.pluginhost.messages import (
 from deckr.python_plugin.events import PageAppear, PageDisappear
 from pydantic import ValidationError
 
+from deckr.controller._binding_resolution import ResolvedControlBinding
 from deckr.controller._binding_validator import (
     BLOCKING_ERROR_CODES,
     format_validation_summary,
+    validate_exact_control_bindings,
     validate_page_bindings,
 )
 from deckr.controller._command_router import DeviceOutput
 from deckr.controller._device_layout import (
     ControlSurface,
-    build_device_layout,
-    control_surface_by_id,
+    control_surface_for_raster_capability,
+    raster_controls,
 )
 from deckr.controller._event_translator import EventTranslator
 from deckr.controller._hardware_service import HardwareCommandService
@@ -112,8 +113,28 @@ def _descriptor_from_payload(data: dict) -> DynamicPageDescriptor | None:
         return None
 
 
-def _find_slot(device: DeviceDescriptor, slot_id: str) -> ControlSurface | None:
-    return control_surface_by_id(device, slot_id)
+def _find_control_surface(
+    device: DeviceDescriptor,
+    control_id: str,
+    *,
+    raster_capability_id: str | None = None,
+) -> ControlSurface | None:
+    for control in device.controls:
+        if control.control_id == control_id:
+            return control_surface_for_raster_capability(control, raster_capability_id)
+    return None
+
+
+def _selected_raster_capability_id(binding: ResolvedControlBinding) -> str | None:
+    for capability in binding.control.output_capabilities:
+        if capability.capability_id not in binding.output_capability_ids:
+            continue
+        if (
+            capability.family == DECKR_OUTPUT_RASTER
+            and capability.capability_type == "bitmap"
+        ):
+            return capability.capability_id
+    return None
 
 
 _ACTION_INSTANCE_NAMESPACE = uuid.UUID("dcd72f2a-65cb-4d9f-b0e8-4e0ef3d334f1")
@@ -160,7 +181,9 @@ class BindingLease:
     action_uuid: str
     host_id: str
     control_id: str
-    slot: ControlSurface
+    control: ControlSurface
+    input_capability_ids: frozenset[str]
+    raster_capability_id: str | None
     profile_id: str
     page_id: str
     settings_target: SettingsTarget | None
@@ -225,22 +248,27 @@ class DeviceManager:
         self._nav_lock = anyio.Lock()
         self._start_soon(self._page_timeout_loop)
 
-    async def _render_unavailable_to_slot(self, slot: ControlSurface) -> None:
-        """Render 'not available' overlay to a slot (e.g. when action is missing)."""
-        if slot.image_format is None:
+    async def _render_unavailable_to_control(self, control: ControlSurface) -> None:
+        """Render a not-available overlay to an output-capable control."""
+        if control.image_format is None or control.raster_capability_id is None:
             return
         model = RenderModel(overlay_type="unavailable")
         render_service = RenderService()
-        output = DeviceOutput(self._command_service, self.config_id, slot.id)
+        output = DeviceOutput(
+            self._command_service,
+            self.config_id,
+            control.id,
+            control.raster_capability_id,
+        )
         context_id = make_context_id()
         request = render_service.build_request(
             model,
-            slot.image_format,
+            control.image_format,
             context_id=context_id,
-            slot_id=slot.id,
+            slot_id=control.id,
         )
         await self._render_dispatcher.submit_request(
-            slot_id=slot.id,
+            slot_id=control.id,
             context_id=context_id,
             request=request,
             output=output,
@@ -268,11 +296,21 @@ class DeviceManager:
             self._active_binding_by_control.pop(lease.control_id, None)
             await self.action_contexts.delete(lease.control_id)
         await lease.context.on_will_disappear()
+        output = (
+            DeviceOutput(
+                self._command_service,
+                self.config_id,
+                lease.control_id,
+                lease.raster_capability_id,
+            )
+            if lease.raster_capability_id is not None
+            else None
+        )
         await self._render_dispatcher.clear_slot(
             lease.control_id,
             context_id=lease.context_id,
             binding_id=lease.binding_id,
-            output=DeviceOutput(self._command_service, self.config_id, lease.control_id),
+            output=output,
             clear_output=clear_output,
         )
         return lease
@@ -282,50 +320,36 @@ class DeviceManager:
             await self._revoke_binding(binding_id, clear_output=clear_outputs)
 
     async def _clear_all_image_slots(self) -> None:
-        """Clear all image-capable slots before rendering new page. Prevents stale content."""
-        layout = build_device_layout(self.device)
-        for slot_info in layout.image_grid.slots:
+        """Clear raster-capable controls before rendering a new page."""
+        for control in raster_controls(self.device):
             await self._render_dispatcher.clear_slot(
-                slot_info.slot_id,
+                control.control_id,
                 output=DeviceOutput(
                     self._command_service,
                     self.config_id,
-                    slot_info.slot_id,
+                    control.control_id,
+                    control.capability_id,
                 ),
             )
-        for enc in layout.encoders:
-            if enc.image_format is not None:
-                await self._render_dispatcher.clear_slot(
-                    enc.slot_id,
-                    output=DeviceOutput(
-                        self._command_service,
-                        self.config_id,
-                        enc.slot_id,
-                    ),
-                )
 
     def _build_context_settings_target_for_binding(
         self,
         *,
-        profile_id: str,
-        page_id: str,
-        binding: ControlBindingDescriptor,
+        action_instance_id: str,
+        binding: ResolvedControlBinding,
         plugin_uuid: str | None = None,
     ) -> SettingsTarget:
-        return SettingsTarget.for_context(
+        return SettingsTarget.for_action_instance(
             controller_id=self._controller_id,
             config_id=self.config_id,
-            profile_id=profile_id,
-            page_id=page_id,
-            slot_id=binding.control_id,
+            action_instance_id=action_instance_id,
             action_uuid=binding.action_uuid,
             plugin_uuid=plugin_uuid,
         )
 
     async def _try_resolve_binding(
         self,
-        binding: ControlBindingDescriptor,
-        slot: ControlSurface,
+        binding: ResolvedControlBinding,
         *,
         profile_id: str,
         page_id: str,
@@ -336,6 +360,19 @@ class DeviceManager:
         """Resolve a binding: create ControlContext and call on_will_appear if action available.
         Returns True if context was created, False if action not found (caller should render unavailable).
         """
+        raster_capability_id = _selected_raster_capability_id(binding)
+        control = _find_control_surface(
+            self.device,
+            binding.control_id,
+            raster_capability_id=raster_capability_id,
+        )
+        if control is None:
+            logger.warning(
+                "Resolved binding control disappeared before bind: config=%s control=%s",
+                self.config_id,
+                binding.control_id,
+            )
+            return False
         action_meta = await self.manager.get_action(binding.action_uuid)
         if action_meta is None:
             logger.info(
@@ -348,8 +385,7 @@ class DeviceManager:
             return False
         settings_target = (
             self._build_context_settings_target_for_binding(
-                profile_id=profile_id,
-                page_id=page_id,
+                action_instance_id=action_instance_id,
                 binding=binding,
                 plugin_uuid=action_meta.plugin_uuid,
             )
@@ -370,7 +406,7 @@ class DeviceManager:
             command_service=self._command_service,
             host_id=action_meta.host_id,
             action_uuid=action_meta.uuid,
-            slot=slot,
+            slot=control,
             settings=binding.settings,
             manager=self,
             plugin_bus=self._plugin_bus,
@@ -393,8 +429,10 @@ class DeviceManager:
             action_instance_id=action_instance_id,
             action_uuid=action_meta.uuid,
             host_id=action_meta.host_id,
-            control_id=slot.id,
-            slot=slot,
+            control_id=control.id,
+            control=control,
+            input_capability_ids=binding.input_capability_ids,
+            raster_capability_id=raster_capability_id,
             profile_id=profile_id,
             page_id=page_id,
             settings_target=settings_target,
@@ -403,8 +441,8 @@ class DeviceManager:
         )
         self._binding_leases[binding_id] = lease
         self._binding_by_context[context_id] = binding_id
-        self._active_binding_by_control[slot.id] = binding_id
-        await self.action_contexts.set(slot.id, ctx)
+        self._active_binding_by_control[control.id] = binding_id
+        await self.action_contexts.set(control.id, ctx)
         await ctx.on_will_appear()
         logger.info(
             "Binding resolved on profile=%s page=%s control=%s action=%s host=%s binding=%s",
@@ -547,9 +585,8 @@ class DeviceManager:
         arriving = transition.arriving
 
         if isinstance(arriving, StaticPageRef):
-            bindings = self._nav.resolve_static_bindings(arriving)
             result = await validate_page_bindings(
-                bindings,
+                self._nav.resolve_static_bindings(arriving),
                 self.device,
                 self.manager.get_action,
                 profile_id=arriving.profile_name,
@@ -563,10 +600,10 @@ class DeviceManager:
                 for err in result.errors:
                     if err.code in BLOCKING_ERROR_CODES:
                         logger.error(
-                            "Binding validation failed [%s]: %s (slot=%s action=%s) %s",
+                            "Binding validation failed [%s]: %s (control=%s action=%s) %s",
                             err.code,
                             err.message,
-                            err.slot_id,
+                            err.control_ref,
                             err.action_uuid,
                             err.details,
                         )
@@ -576,13 +613,13 @@ class DeviceManager:
             for err in result.errors:
                 if err.code not in BLOCKING_ERROR_CODES:
                     logger.warning(
-                        "Action unavailable (slot will show 'not available'): %s (slot=%s action=%s)",
+                        "Action unavailable (control will show 'not available'): %s (control=%s action=%s)",
                         err.message,
-                        err.slot_id,
+                        err.control_ref,
                         err.action_uuid,
                     )
         elif isinstance(arriving, DynamicPageDescriptor):
-            result = await validate_page_bindings(
+            result = await validate_exact_control_bindings(
                 list(arriving.bindings),
                 self.device,
                 self.manager.get_action,
@@ -597,10 +634,10 @@ class DeviceManager:
                 for err in result.errors:
                     if err.code in BLOCKING_ERROR_CODES:
                         logger.error(
-                            "Dynamic page binding validation failed [%s]: %s (slot=%s action=%s) %s",
+                            "Dynamic page binding validation failed [%s]: %s (control=%s action=%s) %s",
                             err.code,
                             err.message,
-                            err.slot_id,
+                            err.control_ref,
                             err.action_uuid,
                             err.details,
                         )
@@ -610,9 +647,9 @@ class DeviceManager:
             for err in result.errors:
                 if err.code not in BLOCKING_ERROR_CODES:
                     logger.warning(
-                        "Action unavailable (slot will show 'not available'): %s (slot=%s action=%s)",
+                        "Action unavailable (control will show 'not available'): %s (control=%s action=%s)",
                         err.message,
-                        err.slot_id,
+                        err.control_ref,
                         err.action_uuid,
                     )
 
@@ -622,11 +659,7 @@ class DeviceManager:
         await self._clear_all_image_slots()
 
         if isinstance(arriving, StaticPageRef):
-            bindings = self._nav.resolve_static_bindings(arriving)
-            for binding in bindings:
-                slot = _find_slot(self.device, binding.control_id)
-                if slot is None:
-                    continue
+            for binding in result.bindings:
                 action_instance_id = _action_instance_id(
                     controller_id=self._controller_id,
                     config_id=self.config_id,
@@ -637,35 +670,37 @@ class DeviceManager:
                 )
                 if not await self._try_resolve_binding(
                     binding,
-                    slot,
                     profile_id=arriving.profile_name,
                     page_id=str(arriving.page_index),
                     action_instance_id=action_instance_id,
                 ):
-                    await self._render_unavailable_to_slot(slot)
+                    control = _find_control_surface(
+                        self.device,
+                        binding.control_id,
+                        raster_capability_id=_selected_raster_capability_id(binding),
+                    )
+                    if control is not None:
+                        await self._render_unavailable_to_control(control)
         elif isinstance(arriving, DynamicPageDescriptor):
             if page_session is None:
                 logger.error("Dynamic page transition missing page session")
                 return False
-            for binding in arriving.bindings:
-                slot = _find_slot(self.device, binding.control_id)
-                if slot is None:
-                    logger.error(
-                        "Control %s not found on device %s",
-                        binding.control_id,
-                        self.config_id,
-                    )
-                    continue
+            for binding in result.bindings:
                 if not await self._try_resolve_binding(
                     binding,
-                    slot,
                     profile_id="_dynamic",
                     page_id=arriving.page_id,
                     action_instance_id=page_session.action_instance_id,
                     page_session_id=page_session.page_session_id,
                     persist_settings=False,
                 ):
-                    await self._render_unavailable_to_slot(slot)
+                    control = _find_control_surface(
+                        self.device,
+                        binding.control_id,
+                        raster_capability_id=_selected_raster_capability_id(binding),
+                    )
+                    if control is not None:
+                        await self._render_unavailable_to_control(control)
         return True
 
     async def _set_page_locked(
@@ -917,6 +952,48 @@ class DeviceManager:
             if clear_outputs:
                 await self._clear_all_image_slots()
 
+    async def on_descriptor_changed(self, descriptor: DeviceDescriptor) -> None:
+        """Re-resolve the active page against a changed device descriptor."""
+
+        async with self._nav_lock:
+            self.device = descriptor
+            current_page = self._nav.current_page
+            if current_page is None:
+                return
+            ok = await self._execute_transition(
+                PageTransition(departing=current_page, arriving=current_page),
+                page_session=self._dynamic_page_session,
+            )
+            if not ok:
+                await self._finalize_dynamic_page(reason="device_descriptor_changed")
+                await self._revoke_active_bindings(clear_outputs=False)
+
+    async def on_capability_state_changed(
+        self,
+        event: hw_messages.CapabilityStateChangedMessage,
+    ) -> None:
+        logger.info(
+            "Observed capability state change config=%s control=%s capability=%s state=%s",
+            self.config_id,
+            event.control_id,
+            event.capability_id,
+            event.state_type,
+        )
+
+    async def on_command_rejected(
+        self,
+        event: hw_messages.CommandRejectedMessage,
+    ) -> None:
+        logger.warning(
+            "Hardware command rejected config=%s control=%s capability=%s command=%s reason=%s message=%s",
+            self.config_id,
+            event.control_id,
+            event.capability_id,
+            event.command_type,
+            event.reason,
+            event.message,
+        )
+
     async def on_actions_changed(
         self, registered: list[str], unregistered: list[str]
     ) -> None:
@@ -951,7 +1028,7 @@ class DeviceManager:
                 to_reappear.append(ctx)
         for lease in to_remove:
             await self._revoke_binding(lease.binding_id)
-            await self._render_unavailable_to_slot(lease.slot)
+            await self._render_unavailable_to_control(lease.control)
         for ctx in to_reappear:
             await ctx.on_will_appear()
 
@@ -961,14 +1038,26 @@ class DeviceManager:
             return
 
         if isinstance(current_page, StaticPageRef):
-            bindings = self._nav.resolve_static_bindings(current_page)
+            result = await validate_page_bindings(
+                self._nav.resolve_static_bindings(current_page),
+                self.device,
+                self.manager.get_action,
+                profile_id=current_page.profile_name,
+                page_id=str(current_page.page_index),
+            )
             profile_id = current_page.profile_name
             page_id = str(current_page.page_index)
             page_session_id = None
             action_instance_id = None
             persist_settings = True
         else:
-            bindings = current_page.bindings
+            result = await validate_exact_control_bindings(
+                list(current_page.bindings),
+                self.device,
+                self.manager.get_action,
+                profile_id="_dynamic",
+                page_id=current_page.page_id,
+            )
             profile_id = "_dynamic"
             page_id = current_page.page_id
             session = self._dynamic_page_session
@@ -978,6 +1067,13 @@ class DeviceManager:
             action_instance_id = session.action_instance_id
             persist_settings = False
 
+        if result.has_blocking_errors:
+            logger.warning(
+                "Skipping action-change rebind for invalid page bindings: %s",
+                format_validation_summary(result),
+            )
+            return
+
         logger.info(
             "Re-evaluating page bindings for config=%s page=%s after actions change +%s -%s",
             self.config_id,
@@ -986,12 +1082,9 @@ class DeviceManager:
             unregistered,
         )
 
-        for binding in bindings:
+        for binding in result.bindings:
             if await self.action_contexts.has_key(binding.control_id):
                 continue  # Already has context
-            slot = _find_slot(self.device, binding.control_id)
-            if slot is None:
-                continue
             resolved_action_instance_id = action_instance_id or _action_instance_id(
                 controller_id=self._controller_id,
                 config_id=self.config_id,
@@ -1002,7 +1095,6 @@ class DeviceManager:
             )
             await self._try_resolve_binding(
                 binding,
-                slot,
                 profile_id=profile_id,
                 page_id=page_id,
                 action_instance_id=resolved_action_instance_id,
@@ -1302,6 +1394,20 @@ class DeviceManager:
         binding_id = self._active_binding_by_control.get(control_id)
         lease = self._binding_leases.get(binding_id) if binding_id is not None else None
         if lease is None:
+            logger.info(
+                "Ignoring input from unbound control config=%s control=%s capability=%s",
+                self.config_id,
+                control_id,
+                event.capability_id,
+            )
+            return
+        if event.capability_id not in lease.input_capability_ids:
+            logger.info(
+                "Ignoring input for unselected capability config=%s control=%s capability=%s",
+                self.config_id,
+                control_id,
+                event.capability_id,
+            )
             return
 
         method_name = translated.method_name

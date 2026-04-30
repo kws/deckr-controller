@@ -8,7 +8,13 @@ import pytest
 from conftest import LaneHarness
 from deckr.contracts.messages import controller_address, hardware_manager_address
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.descriptors import CapabilityRef, DeviceDescriptor, DeviceRef
+from deckr.hardware.descriptors import (
+    CapabilityDescriptor,
+    CapabilityRef,
+    ControlDescriptor,
+    DeviceDescriptor,
+    DeviceRef,
+)
 from deckr.state import (
     DeviceClaim,
     EndpointPresence,
@@ -40,7 +46,32 @@ def _device(device_id: str, fingerprint: str) -> DeviceDescriptor:
         deviceId=device_id,
         displayName="Test Device",
         fingerprint=fingerprint,
-        controls=[],
+        controls=(
+            ControlDescriptor(
+                controlId="0,0",
+                kind="key",
+                outputCapabilities=(
+                    CapabilityDescriptor(
+                        capabilityId="raster.bitmap",
+                        family="deckr.output.raster",
+                        type="bitmap",
+                        direction="output",
+                        access=("settable",),
+                        commandTypes=("set_frame", "clear"),
+                    ),
+                ),
+            ),
+        ),
+        capabilities=(
+            CapabilityDescriptor(
+                capabilityId="device.power",
+                family="deckr.device.power",
+                type="screen",
+                direction="command",
+                access=("invokable",),
+                commandTypes=("sleep", "wake"),
+            ),
+        ),
     )
 
 
@@ -65,15 +96,32 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
         ref=ref_b,
         device=_device("deck", "serial-b"),
     )
-    command_service.register_device(config_id="config-room-a", ref=ref_a)
-    command_service.register_device(config_id="config-room-b", ref=ref_b)
+    command_service.register_device(
+        config_id="config-room-a",
+        ref=ref_a,
+        device=_device("deck", "serial-a"),
+    )
+    command_service.register_device(
+        config_id="config-room-b",
+        ref=ref_b,
+        device=_device("deck", "serial-b"),
+    )
 
     async with (
         bus.subscribe(hardware_manager_address("room-a")) as stream_a,
         bus.subscribe(hardware_manager_address("room-b")) as stream_b,
     ):
-        await command_service.set_image("config-room-a", "0,0", b"a")
-        await command_service.clear_slot("config-room-b", "0,0")
+        await command_service.set_raster_frame(
+            "config-room-a",
+            "0,0",
+            "raster.bitmap",
+            b"a",
+        )
+        await command_service.clear_raster(
+            "config-room-b",
+            "0,0",
+            "raster.bitmap",
+        )
         msg_a = await stream_a.receive()
         msg_b = await stream_b.receive()
 
@@ -110,6 +158,7 @@ async def test_direct_command_drops_when_device_is_no_longer_live():
     command_service.register_device(
         config_id="config-room-a",
         ref=DeviceRef(manager_id="room-a", device_id="deck"),
+        device=_device("deck", "serial-a"),
     )
 
     async with bus.subscribe(hardware_manager_address("room-a")) as stream:
@@ -150,8 +199,8 @@ async def test_manager_presence_loss_cleans_only_configs_for_lost_manager_endpoi
         ref=ref_b,
         device=_device("deck", "serial-b"),
     )
-    controller._command_service.register_device(config_id="config-room-a", ref=ref_a)
-    controller._command_service.register_device(config_id="config-room-b", ref=ref_b)
+    controller._command_service.register_device(config_id="config-room-a", ref=ref_a, device=_device("deck", "serial-a"))
+    controller._command_service.register_device(config_id="config-room-b", ref=ref_b, device=_device("deck", "serial-b"))
     await _put_presence(bus, "room-a")
     await _put_presence(bus, "room-b")
     await _put_inventory(bus, "room-a", fingerprint="serial-a")
@@ -212,7 +261,7 @@ async def test_manager_presence_session_change_invalidates_owned_device():
         ref=ref,
         device=_device("deck", "serial-a"),
     )
-    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    controller._command_service.register_device(config_id="config-room-a", ref=ref, device=_device("deck", "serial-a"))
     claim_entry = await bus.deckr.state().create(
         claim_key,
         DeviceClaim(
@@ -464,7 +513,7 @@ async def test_broker_snapshot_inventory_removal_revokes_live_device():
         ref=ref,
         device=_device("deck", "serial-a"),
     )
-    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    controller._command_service.register_device(config_id="config-room-a", ref=ref, device=_device("deck", "serial-a"))
     claim_key = device_claim_key(manager_id="room-a", device_id="deck")
     claim_entry = await _put_claim(bus, controller, "room-a", "deck")
     controller._owned_claims[claim_key] = OwnedDeviceClaim(
@@ -517,7 +566,7 @@ async def test_broker_snapshot_claim_takeover_revokes_owned_device():
         ref=ref,
         device=_device("deck", "serial-a"),
     )
-    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    controller._command_service.register_device(config_id="config-room-a", ref=ref, device=_device("deck", "serial-a"))
     claim_key = device_claim_key(manager_id="room-a", device_id="deck")
     claim_entry = await _put_claim(bus, controller, "room-a", "deck")
     controller._owned_claims[claim_key] = OwnedDeviceClaim(
@@ -600,7 +649,7 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
         ref=ref,
         device=_device("deck", "serial-a"),
     )
-    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    controller._command_service.register_device(config_id="config-room-a", ref=ref, device=_device("deck", "serial-a"))
     claim_key = device_claim_key(manager_id="room-a", device_id="deck")
     entry = await bus.deckr.state().create(
         claim_key,
@@ -623,7 +672,7 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
     assert await bus.deckr.state().get(claim_key) is None
     ctrl_ctx.clear_page.assert_awaited_once_with(clear_outputs=False)
     assert controller._device_registry.get("config-room-a") is None
-    assert controller._command_service._ref_by_config_id == {}
+    assert controller._command_service._devices_by_config_id == {}
 
 
 @pytest.mark.asyncio
@@ -642,7 +691,7 @@ async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
         ref=ref,
         device=_device("deck", "serial-a"),
     )
-    controller._command_service.register_device(config_id="config-room-a", ref=ref)
+    controller._command_service.register_device(config_id="config-room-a", ref=ref, device=_device("deck", "serial-a"))
     claim_key = device_claim_key(manager_id="room-a", device_id="deck")
     controller._owned_claims[claim_key] = OwnedDeviceClaim(
         key=claim_key,
@@ -663,7 +712,7 @@ async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
     await controller._claim_refresh_loop()
 
     assert controller._device_registry.get("config-room-a") is not None
-    assert controller._command_service._ref_by_config_id["config-room-a"] == ref
+    assert controller._command_service._devices_by_config_id["config-room-a"].ref == ref
     assert claim_key in controller._owned_claims
 
 

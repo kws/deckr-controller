@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deckr.pluginhost.messages import (
-    ControlBindingDescriptor,
     DynamicPageDescriptor,
     TitleOptions,
 )
 
+from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller.config._data import (
     DeviceConfig,
 )
@@ -88,13 +88,13 @@ class NavigationService:
                 return p
         return self._config.profiles[0]
 
-    def resolve_static_bindings(self, ref: StaticPageRef) -> list[ControlBindingDescriptor]:
-        """Return slot bindings for a static page from config."""
+    def resolve_static_bindings(self, ref: StaticPageRef) -> list[ConfiguredControlBinding]:
+        """Return unresolved descriptor selector bindings for a static page."""
         profile = self._find_profile(ref.profile_name)
         page = profile.pages[ref.page_index]
         return [
-            ControlBindingDescriptor(
-                control_id=c.slot,
+            ConfiguredControlBinding(
+                selector=c.selector,
                 action_uuid=c.action,
                 settings=dict(c.settings),
                 title_options=_config_title_options_to_store(c.title_options),

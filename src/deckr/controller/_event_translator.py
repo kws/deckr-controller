@@ -58,6 +58,8 @@ class EventTranslator:
             return self._translate_key_down(event)
         if event.event_type == "up":
             return self._translate_key_up(event)
+        if event.event_type == "press":
+            return self._translate_button_press(event)
         if event.event_type == "rotate":
             return self._translate_dial_rotate(event)
         if event.event_type == "tap":
@@ -90,6 +92,19 @@ class EventTranslator:
             method_name="on_key_up",
             plugin_event=KeyUp(context="", slot_id=control_id),
             gesture="key_up",
+        )
+
+    def _translate_button_press(
+        self, event: hw_messages.ControlInputMessage
+    ) -> TranslatedEvent | None:
+        control_id = event.control_id
+        if not self._is_gesture_supported(control_id, "press"):
+            return None
+        return TranslatedEvent(
+            slot_id=control_id,
+            method_name="on_key_up",
+            plugin_event=KeyUp(context="", slot_id=control_id),
+            gesture="press",
         )
 
     def _translate_dial_rotate(

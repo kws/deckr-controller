@@ -4,10 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from deckr.controller._device_layout import RasterImageFormat
 from deckr.pluginhost.messages import TitleOptions
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
+from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import (
@@ -19,22 +19,24 @@ from deckr.controller.settings import SettingsTarget
 
 class FakeHardwareCommandService:
     def __init__(self):
-        self.set_image = AsyncMock()
-        self.clear_slot = AsyncMock()
+        self.set_raster_frame = AsyncMock()
+        self.clear_raster = AsyncMock()
         self.sleep_screen = AsyncMock()
         self.wake_screen = AsyncMock()
 
 
 def _make_output(
-    slot_id: str = "0,0",
+    control_id: str = "0,0",
     *,
+    capability_id: str = "raster.bitmap",
     config_id: str = "config-dev",
     command_service: FakeHardwareCommandService | None = None,
 ) -> DeviceOutput:
     return DeviceOutput(
         command_service or FakeHardwareCommandService(),
         config_id,
-        slot_id,
+        control_id,
+        capability_id,
     )
 
 
@@ -51,14 +53,23 @@ async def test_device_output_records_last_frame():
 
     await output.write(b"frame1")
     assert output.last_frame == b"frame1"
-    command_service.set_image.assert_called_once_with("config-dev", "0,0", b"frame1")
+    command_service.set_raster_frame.assert_called_once_with(
+        "config-dev",
+        "0,0",
+        "raster.bitmap",
+        b"frame1",
+    )
 
     await output.write(b"frame2")
     assert output.last_frame == b"frame2"
 
     await output.clear()
     assert output.last_frame is None
-    command_service.clear_slot.assert_called_once_with("config-dev", "0,0")
+    command_service.clear_raster.assert_called_once_with(
+        "config-dev",
+        "0,0",
+        "raster.bitmap",
+    )
 
 
 # --- CommandRouter content updates ---
@@ -114,7 +125,7 @@ async def test_render_no_op_when_image_format_none():
     )
     await router.set_title("Back")
     assert output.last_frame is None
-    command_service.set_image.assert_not_called()
+    command_service.set_raster_frame.assert_not_called()
     render_dispatcher.submit_request.assert_not_called()
 
 
@@ -217,12 +228,10 @@ async def test_get_settings_hydrates_from_runtime_overlay():
             return {"runtime": 42, **dict(patch)}
 
     settings_service = FakeSettingsService()
-    target = SettingsTarget.for_context(
+    target = SettingsTarget.for_action_instance(
         controller_id="controller-main",
         config_id="config-dev",
-        profile_id="default",
-        page_id="0",
-        slot_id="0,0",
+        action_instance_id="instance-a",
         action_uuid="action",
     )
 
@@ -270,12 +279,10 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
         async def merge(self, target, patch):
             raise OSError("disk full")
 
-    target = SettingsTarget.for_context(
+    target = SettingsTarget.for_action_instance(
         controller_id="controller-main",
         config_id="config-dev",
-        profile_id="default",
-        page_id="0",
-        slot_id="0,0",
+        action_instance_id="instance-a",
         action_uuid="action",
     )
     router = CommandRouter(

@@ -109,7 +109,16 @@ class ControlContext(ControlContextProtocol):
         self._store.settings = dict(thaw_json(settings))
         self._store.default_title_options = title_options
 
-        output = DeviceOutput(command_service, config_id, slot.id)
+        output = (
+            DeviceOutput(
+                command_service,
+                config_id,
+                slot.id,
+                slot.raster_capability_id,
+            )
+            if slot.raster_capability_id is not None
+            else None
+        )
         render_service = RenderService()
         self._router = CommandRouter(
             store=self._store,
@@ -146,12 +155,12 @@ class ControlContext(ControlContextProtocol):
         return SlotInfo.model_validate(
             {
                 "slotId": self.slot.id,
-                "slotType": self.slot.slot_type,
+                "slotType": self.slot.kind,
                 "coordinates": {
                     "column": self.slot.coordinates.column,
                     "row": self.slot.coordinates.row,
                 },
-                "gestures": sorted(self.slot.gestures),
+                "gestures": sorted(self.slot.input_events),
                 "imageFormat": image_format,
             }
         )

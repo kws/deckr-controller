@@ -27,13 +27,13 @@ def device_config():
                 pages=[
                     Page(
                         controls=[
-                            Control(slot="0,0", action="action.a", settings={"x": 1}),
-                            Control(slot="0,1", action="action.b", settings={}),
+                            Control(selector={"control_id": "0,0"}, action="action.a", settings={"x": 1}),
+                            Control(selector={"control_id": "0,1"}, action="action.b", settings={}),
                         ]
                     ),
                     Page(
                         controls=[
-                            Control(slot="1,0", action="action.c", settings={}),
+                            Control(selector={"control_id": "1,0"}, action="action.c", settings={}),
                         ]
                     ),
                 ],
@@ -87,7 +87,7 @@ def test_resolve_static_bindings_includes_title_options():
                     Page(
                         controls=[
                             Control(
-                                slot="0,0",
+                                selector={"control_id": "0,0"},
                                 action="action.a",
                                 settings={},
                                 title_options=TitleOptions(
