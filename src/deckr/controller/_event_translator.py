@@ -31,7 +31,7 @@ class EventTranslator:
         self._is_gesture_supported = is_gesture_supported or (lambda _s, _g: True)
 
     def translate(
-        self, event: hw_messages.HardwareTransportMessage, config_id: str
+        self, event: hw_messages.HardwareMessageBody, config_id: str
     ) -> TranslatedEvent | None:
         del config_id
         if not isinstance(event, hw_messages.ControlInputMessage):
