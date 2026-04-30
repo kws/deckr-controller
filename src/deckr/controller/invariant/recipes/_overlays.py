@@ -164,7 +164,7 @@ def ok_overlay() -> SubGraphNode:
 
 
 def solid_card(color: tuple[int, int, int, int] = BLACK) -> SubGraphNode:
-    """SubGraphNode: solid color fill (canvas size). Use for blank/empty slots."""
+    """SubGraphNode: solid color fill (canvas size). Use for blank/empty controls."""
     inner = {
         "output": Node(
             op_name="gfx:create_solid",

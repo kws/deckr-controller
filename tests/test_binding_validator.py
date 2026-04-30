@@ -35,8 +35,8 @@ class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
-        self.sleep_screen = AsyncMock()
-        self.wake_screen = AsyncMock()
+        self.sleep_device = AsyncMock()
+        self.wake_device = AsyncMock()
 
 
 def _make_device(
@@ -60,7 +60,7 @@ class _ImmediateRenderBackend:
         return RenderResult(
             context_id=request.context_id,
             binding_id=request.binding_id,
-            slot_id=request.slot_id,
+            control_id=request.control_id,
             generation=request.generation,
             frame=b"frame",
         )
@@ -160,7 +160,7 @@ async def test_validate_page_bindings_missing_control():
 
 @pytest.mark.asyncio
 async def test_validate_page_bindings_missing_action():
-    """Missing action is non-blocking; page loads with slot showing 'unavailable'."""
+    """Missing action is non-blocking; page loads with control showing 'unavailable'."""
     device = _make_device(controls=[_make_control("0,0")])
 
     async def get_action(uuid: str):
@@ -276,7 +276,7 @@ def test_format_validation_summary_list_of_errors():
 
 @pytest.mark.asyncio
 async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
-    """When static page has invalid bindings (e.g. missing slot), DeviceManager rejects transition and reverts stack."""
+    """When static page has invalid bindings (e.g. missing control), DeviceManager rejects transition and reverts stack."""
     from deckr.controller._device_manager import DeviceManager
     from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 
@@ -329,7 +329,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     )
     await manager.set_page(profile="default", page=0)
 
-    # Validation rejected the page: no contexts were created (invalid slot 99,99 not on device).
+    # Validation rejected the page: no contexts were created (invalid control 99,99 not on device).
     # Current page remains unchanged when validation fails on the first page.
     contexts = await manager.action_contexts.values()
     assert len(contexts) == 0
@@ -337,7 +337,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
 
 @pytest.mark.asyncio
 async def test_device_manager_loads_page_with_missing_action_shows_unavailable():
-    """When static page has missing action, page loads; slot shows 'unavailable' overlay."""
+    """When static page has missing action, page loads; control shows 'unavailable' overlay."""
     from deckr.controller._device_manager import DeviceManager
     from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 

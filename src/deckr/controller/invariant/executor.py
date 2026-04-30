@@ -19,14 +19,6 @@ L2_SIZE_LIMIT_BYTES = 512 * 1024 * 1024
 L2_EVICTION_POLICY = "least-frequently-used"
 
 
-class ProcessSafeDiskStore(DiskStore):
-    """Compatibility alias for tests and older imports.
-
-    The underlying DiskStore is now backed by diskcache, which already handles
-    concurrent access across threads and processes.
-    """
-
-
 def build_executor(*, cache_dir: Path | str | None = None) -> Executor:
     """Build an Executor with gfx core ops and a bounded LFU cache chain."""
 
@@ -38,7 +30,7 @@ def build_executor(*, cache_dir: Path | str | None = None) -> Executor:
 
     store = ChainStore(
         l1=MemoryStore(cache="lfu", max_size=L1_MAX_ARTIFACTS),
-        l2=ProcessSafeDiskStore(
+        l2=DiskStore(
             cache_dir=cache_dir,
             size_limit_bytes=L2_SIZE_LIMIT_BYTES,
             eviction_policy=L2_EVICTION_POLICY,
@@ -57,7 +49,3 @@ def get_executor() -> Executor:
     if _EXECUTOR is None:
         _EXECUTOR = build_executor()
     return _EXECUTOR
-
-
-# Backwards-compatible module attribute for existing imports.
-executor = get_executor()

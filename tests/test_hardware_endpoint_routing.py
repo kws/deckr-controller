@@ -28,9 +28,9 @@ from deckr.state import (
 import deckr.controller._controller_service as controller_module
 from deckr.controller._controller_service import ControllerService, OwnedDeviceClaim
 from deckr.controller._hardware_service import (
+    DeviceRouteRegistry,
     HardwareCommandService,
-    HardwareDeviceRegistry,
-    LiveHardwareDevice,
+    LiveDeviceRoute,
 )
 from deckr.controller.config import (
     DeviceConfig,
@@ -82,7 +82,7 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
         bus.endpoint("controller:controller-main"),
         controller_id="controller-main",
     )
-    registry = HardwareDeviceRegistry()
+    registry = DeviceRouteRegistry()
     ref_a = DeviceRef(manager_id="room-a", device_id="deck")
     ref_b = DeviceRef(manager_id="room-b", device_id="deck")
 
@@ -153,7 +153,7 @@ async def test_direct_command_drops_when_device_is_no_longer_live():
         controller_id="controller-main",
     )
 
-    await command_service.wake_screen("config-room-a")
+    await command_service.wake_device("config-room-a")
 
     command_service.register_device(
         config_id="config-room-a",
@@ -162,7 +162,7 @@ async def test_direct_command_drops_when_device_is_no_longer_live():
     )
 
     async with bus.subscribe(hardware_manager_address("room-a")) as stream:
-        await command_service.wake_screen("config-room-a")
+        await command_service.wake_device("config-room-a")
         message = await stream.receive()
 
     ref = hw_messages.hardware_capability_ref_from_subject(message.subject)
@@ -324,7 +324,7 @@ async def test_device_reconnect_replaces_existing_context_without_hardware_clear
     controller._start_soon = lambda fn, *args: None
     ctrl_ctx = AsyncMock()
     await controller._controller_contexts.set("config-room-a", ctrl_ctx)
-    live = LiveHardwareDevice(
+    live = LiveDeviceRoute(
         config_id="config-room-a",
         ref=DeviceRef(manager_id="room-a", device_id="deck"),
         device=_device("deck", "serial-a"),

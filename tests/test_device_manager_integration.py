@@ -72,9 +72,9 @@ async def _plugin_command_for_active_binding(
     message_type: str,
     payload: dict | None = None,
     *,
-    slot_id: str = "0,0",
+    control_id: str = "0,0",
 ) -> DeckrMessage:
-    ctx = await manager.action_contexts.get(slot_id)
+    ctx = await manager.action_contexts.get(control_id)
     assert ctx is not None
     return _plugin_command(
         message_type,
@@ -86,18 +86,18 @@ async def _plugin_command_for_active_binding(
     )
 
 
-def _make_slot(
-    slot_id: str,
+def _make_control(
+    control_id: str,
     row: int = 0,
     col: int = 0,
-    slot_type: str = "key",
-    gestures: list[str] | None = None,
+    kind: str = "key",
+    events: list[str] | None = None,
     has_display: bool = True,
 ) -> ControlDescriptor:
-    if gestures is None:
-        gestures = ["key_down", "key_up"]
+    if events is None:
+        events = ["momentary", "press"]
     input_capabilities = []
-    if "key_down" in gestures or "key_up" in gestures:
+    if "momentary" in events:
         input_capabilities.append(
             CapabilityDescriptor(
                 capabilityId="button.momentary",
@@ -108,7 +108,7 @@ def _make_slot(
                 eventTypes=("down", "up"),
             )
         )
-    if "press" in gestures or "key_down" in gestures or "key_up" in gestures:
+    if "press" in events:
         input_capabilities.append(
             CapabilityDescriptor.model_validate(
                 {
@@ -121,7 +121,7 @@ def _make_slot(
                 }
             )
         )
-    if "encoder_rotate" in gestures:
+    if "rotate" in events:
         input_capabilities.append(
             CapabilityDescriptor(
                 capabilityId="encoder.relative",
@@ -132,11 +132,11 @@ def _make_slot(
                 eventTypes=("rotate",),
             )
         )
-    if "touch_tap" in gestures or "touch_swipe" in gestures:
+    if "tap" in events or "swipe" in events:
         event_types = []
-        if "touch_tap" in gestures:
+        if "tap" in events:
             event_types.append("tap")
-        if "touch_swipe" in gestures:
+        if "swipe" in events:
             event_types.append("swipe")
         input_capabilities.append(
             CapabilityDescriptor(
@@ -177,8 +177,8 @@ def _make_slot(
             )
         )
     return ControlDescriptor(
-        controlId=slot_id,
-        kind=slot_type,
+        controlId=control_id,
+        kind=kind,
         geometry=ControlGeometry(x=col, y=row, width=1, height=1, unit="grid"),
         inputCapabilities=tuple(input_capabilities),
         outputCapabilities=tuple(output_capabilities),
@@ -186,16 +186,17 @@ def _make_slot(
 
 
 def _make_mock_device(
-    device_id: str = "test-device", slots: list[ControlDescriptor] | None = None
+    device_id: str = "test-device",
+    controls: list[ControlDescriptor] | None = None,
 ) -> DeviceDescriptor:
     """Create device metadata for controller tests."""
-    if slots is None:
-        slots = [_make_slot("0,0"), _make_slot("1,0")]
+    if controls is None:
+        controls = [_make_control("0,0"), _make_control("1,0")]
     return DeviceDescriptor(
         deviceId=device_id,
         displayName="Test Device",
         fingerprint=f"fingerprint:{device_id}",
-        controls=tuple(slots),
+        controls=tuple(controls),
     )
 
 
@@ -210,8 +211,8 @@ class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
-        self.sleep_screen = AsyncMock()
-        self.wake_screen = AsyncMock()
+        self.sleep_device = AsyncMock()
+        self.wake_device = AsyncMock()
 
 
 def _solid_key_graph() -> SubGraphNode:
@@ -250,7 +251,7 @@ class ControlledFrameBackend:
         return RenderResult(
             context_id=request.context_id,
             binding_id=request.binding_id,
-            slot_id=request.slot_id,
+            control_id=request.control_id,
             generation=request.generation,
             frame=f"frame-{request.generation}".encode(),
         )
@@ -262,13 +263,13 @@ class ControlledFrameBackend:
         return
 
 
-class SetImageOnAppearAction:
-    """Minimal action that sets a graph-backed image on will_appear."""
+class SetRasterImageOnAppearAction:
+    """Minimal action that sets a graph-backed raster image on will_appear."""
 
     uuid: str = "test.virtual.setops"
 
     async def on_will_appear(self, event, context):
-        await context.set_image(_solid_key_image())
+        await context.set_raster_image(_solid_key_image())
 
     async def on_will_disappear(self, event, context):
         pass
@@ -285,8 +286,8 @@ class NoopAction:
 
 
 @pytest_asyncio.fixture
-def device_config_set_image():
-    """Config: one profile, one page, one control on slot 0,0 with SetImageOnAppearAction."""
+def device_config_set_raster_image():
+    """Config: one profile, one page, one control with SetRasterImageOnAppearAction."""
     return DeviceConfig(
         id="test-device",
         name="Test Device",
@@ -299,7 +300,7 @@ def device_config_set_image():
                         controls=[
                             Control(
                                 selector={"control_id": "0,0"},
-                                action=SetImageOnAppearAction.uuid,
+                                action=SetRasterImageOnAppearAction.uuid,
                                 settings={},
                             )
                         ]
@@ -312,7 +313,7 @@ def device_config_set_image():
 
 @pytest.mark.asyncio
 async def test_key_press_renders_to_device(
-    device_config_set_image, persistence_tmp_dir
+    device_config_set_raster_image, persistence_tmp_dir
 ):
     """Capability bindingOutput writes the selected raster capability."""
     from deckr.pluginhost.messages import BINDING_OUTPUT
@@ -321,7 +322,7 @@ async def test_key_press_renders_to_device(
     registry = MagicMock()
     registry.get_action = AsyncMock(
         return_value=ActionMetadata(
-            uuid=SetImageOnAppearAction.uuid,
+            uuid=SetRasterImageOnAppearAction.uuid,
             host_id="python",
         )
     )
@@ -334,7 +335,7 @@ async def test_key_press_renders_to_device(
             device=device,
             hardware_ref=_hardware_ref(device),
             command_service=command_service,
-            config=device_config_set_image,
+            config=device_config_set_raster_image,
             manager=registry,
             plugin_bus=plugin_bus,
             start_soon=tg.start_soon,
@@ -383,8 +384,8 @@ async def test_key_press_renders_to_device(
 
 
 @pytest.mark.asyncio
-async def test_set_image_last_write_wins_same_slot(
-    device_config_set_image, persistence_tmp_dir
+async def test_set_raster_image_last_write_wins_same_control(
+    device_config_set_raster_image, persistence_tmp_dir
 ):
     """bindingOutput rejects stale or mismatched output generations."""
     from deckr.pluginhost.messages import BINDING_OUTPUT
@@ -394,7 +395,7 @@ async def test_set_image_last_write_wins_same_slot(
     registry = MagicMock()
     registry.get_action = AsyncMock(
         return_value=ActionMetadata(
-            uuid=SetImageOnAppearAction.uuid,
+            uuid=SetRasterImageOnAppearAction.uuid,
             host_id="python",
         )
     )
@@ -406,7 +407,7 @@ async def test_set_image_last_write_wins_same_slot(
             device=device,
             hardware_ref=_hardware_ref(device),
             command_service=command_service,
-            config=device_config_set_image,
+            config=device_config_set_raster_image,
             manager=registry,
             plugin_bus=plugin_bus,
             start_soon=tg.start_soon,
@@ -445,8 +446,8 @@ async def test_set_image_last_write_wins_same_slot(
 
 
 @pytest.mark.asyncio
-async def test_settings_isolated_by_page_same_slot(persistence_tmp_dir):
-    """Same slot on different pages keeps separate settings."""
+async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
+    """Same control on different pages keeps separate settings."""
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
@@ -525,7 +526,7 @@ async def test_settings_isolated_by_page_same_slot(persistence_tmp_dir):
 
 @pytest.mark.asyncio
 async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
-    """Same action on different slots keeps separate settings."""
+    """Same action on different controls keeps separate settings."""
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
@@ -777,11 +778,11 @@ ACTION_X_UUID = "test.action.x"
 async def test_on_actions_changed_registered_resolves_unavailable_slot(
     persistence_tmp_dir,
 ):
-    """When action becomes available, on_actions_changed creates context for previously unavailable slot."""
+    """When action becomes available, on_actions_changed creates context for unavailable control."""
     device = _make_mock_device()
     plugin_bus = _plugin_bus()
     registry = ConfigurableActionRegistry()
-    # Initially no action - slot will show unavailable
+        # Initially no action - control will show unavailable
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
@@ -822,7 +823,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_slot(
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
 
-        # Slot should be unavailable (no context)
+        # Control should be unavailable (no context)
         ctx_before = await manager.action_contexts.get("0,0")
         assert ctx_before is None
 
@@ -839,7 +840,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_slot(
             unregistered=[],
         )
 
-        # Slot should now have context
+        # Control should now have context
         ctx_after = await manager.action_contexts.get("0,0")
         assert ctx_after is not None
         assert ctx_after.action_uuid == ACTION_X_UUID
@@ -895,7 +896,7 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
 
-        # Slot should have context
+        # Control should have context
         ctx_before = await manager.action_contexts.get("0,0")
         assert ctx_before is not None
 
@@ -911,7 +912,7 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
             registered=[], unregistered=[f"test_host::{ACTION_X_UUID}"]
         )
 
-        # Slot should no longer have context
+        # Control should no longer have context
         ctx_after = await manager.action_contexts.get("0,0")
         assert ctx_after is None
 

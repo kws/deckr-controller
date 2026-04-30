@@ -44,7 +44,7 @@ BLOCKING_ERROR_CODES = frozenset(
     }
 )
 
-# Error codes that allow partial load (slot gets "unavailable" display).
+# Error codes that allow partial load (control gets "unavailable" display).
 NON_BLOCKING_ERROR_CODES = frozenset({"action_not_found"})
 
 

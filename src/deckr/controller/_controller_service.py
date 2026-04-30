@@ -38,9 +38,9 @@ from deckr.state import (
 
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
+    DeviceRouteRegistry,
     HardwareCommandService,
-    HardwareDeviceRegistry,
-    LiveHardwareDevice,
+    LiveDeviceRoute,
 )
 from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
@@ -94,7 +94,7 @@ class ControllerService(BaseComponent):
         super().__init__()
         self._hardware_endpoint = hardware_endpoint
         self._state = state
-        self._device_registry = HardwareDeviceRegistry()
+        self._device_registry = DeviceRouteRegistry()
         self._config_service = config_service
         self._settings_service = settings_service
         self._controller_id = controller_id
@@ -557,7 +557,7 @@ class ControllerService(BaseComponent):
             return False
         return (ref.manager_id, ref.device_id) in _hardware_inventory_ref_keys(inventory)
 
-    async def _refresh_live_descriptor(self, live: LiveHardwareDevice) -> None:
+    async def _refresh_live_descriptor(self, live: LiveDeviceRoute) -> None:
         inventory = self._inventory_by_manager.get(live.ref.manager_id)
         if inventory is None or not self._inventory_is_usable(inventory):
             return
@@ -636,7 +636,7 @@ class ControllerService(BaseComponent):
 
     async def _disconnect_live(
         self,
-        live: LiveHardwareDevice,
+        live: LiveDeviceRoute,
         *,
         release_claim: bool,
     ) -> None:
@@ -697,7 +697,7 @@ class ControllerService(BaseComponent):
 
     async def _device_lifecycle(
         self,
-        live: LiveHardwareDevice,
+        live: LiveDeviceRoute,
         initial_config,
     ) -> None:
         """Run device setup, config listener, and wait for disconnect."""
@@ -762,7 +762,7 @@ class ControllerService(BaseComponent):
 
     async def on_device_connected(
         self,
-        live: LiveHardwareDevice,
+        live: LiveDeviceRoute,
         *,
         initial_config,
     ):

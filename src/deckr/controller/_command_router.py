@@ -98,10 +98,10 @@ class CommandRouter:
             self._image_format,
             context_id=self._store.context_id,
             binding_id=self._store.binding_id,
-            slot_id=self._output.control_id,
+            control_id=self._output.control_id,
         )
         await self._render_dispatcher.submit_request(
-            slot_id=self._output.control_id,
+            control_id=self._output.control_id,
             context_id=self._store.context_id,
             binding_id=self._store.binding_id,
             request=request,
@@ -123,7 +123,7 @@ class CommandRouter:
         self._store.content.title_options = title_options
         await self._render()
 
-    async def set_image(self, image: str) -> None:
+    async def set_raster_image(self, image: str) -> None:
         self._store.content.image = image
         self._store.content.title = None
         await self._render()

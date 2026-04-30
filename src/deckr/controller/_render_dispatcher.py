@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from deckr.controller._hardware_service import HardwareCommandService
 
 
-class SlotOutput(Protocol):
+class ControlOutput(Protocol):
     async def write(self, frame: bytes) -> None: ...
 
     async def clear(self) -> None: ...
@@ -62,7 +62,7 @@ class ThreadRenderBackend:
             return RenderResult(
                 context_id=request.context_id,
                 binding_id=request.binding_id,
-                slot_id=request.slot_id,
+                control_id=request.control_id,
                 generation=request.generation,
                 frame=frame,
             )
@@ -70,13 +70,13 @@ class ThreadRenderBackend:
             logger.exception(
                 "Thread render failed for %s:%s gen=%s",
                 request.context_id,
-                request.slot_id,
+                request.control_id,
                 request.generation,
             )
             return RenderResult(
                 context_id=request.context_id,
                 binding_id=request.binding_id,
-                slot_id=request.slot_id,
+                control_id=request.control_id,
                 generation=request.generation,
                 frame=None,
                 error=str(exc),
@@ -104,7 +104,7 @@ class ProcessPoolRenderBackend:
             return RenderResult(
                 context_id=request.context_id,
                 binding_id=request.binding_id,
-                slot_id=request.slot_id,
+                control_id=request.control_id,
                 generation=request.generation,
                 frame=frame,
             )
@@ -112,13 +112,13 @@ class ProcessPoolRenderBackend:
             logger.exception(
                 "Process render failed for %s:%s gen=%s",
                 request.context_id,
-                request.slot_id,
+                request.control_id,
                 request.generation,
             )
             return RenderResult(
                 context_id=request.context_id,
                 binding_id=request.binding_id,
-                slot_id=request.slot_id,
+                control_id=request.control_id,
                 generation=request.generation,
                 frame=None,
                 error=str(exc),
@@ -129,18 +129,18 @@ class ProcessPoolRenderBackend:
 
 
 @dataclass(slots=True)
-class _SlotRenderState:
+class _ControlRenderState:
     generation: int = 0
     context_id: str | None = None
     binding_id: str | None = None
-    output: SlotOutput | None = None
+    output: ControlOutput | None = None
     running: bool = False
     pending_request: RenderRequest | None = None
     io_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
 class RenderDispatcher:
-    """Per-device dispatcher that enforces last-write-wins by slot generation."""
+    """Per-device dispatcher that enforces last-write-wins by control generation."""
 
     def __init__(
         self,
@@ -155,21 +155,21 @@ class RenderDispatcher:
         self._backend = backend
         self._start_soon = start_soon
         self._lock = anyio.Lock()
-        self._slots: dict[str, _SlotRenderState] = {}
+        self._controls: dict[str, _ControlRenderState] = {}
 
     async def submit_request(
         self,
         *,
-        slot_id: str,
+        control_id: str,
         context_id: str,
         binding_id: str | None = None,
         request: RenderRequest | None,
-        output: SlotOutput | None = None,
+        output: ControlOutput | None = None,
     ) -> int:
-        """Submit a request for a slot, replacing any older pending work."""
+        """Submit a request for a control, replacing any older pending work."""
 
         async with self._lock:
-            state = self._slots.setdefault(slot_id, _SlotRenderState())
+            state = self._controls.setdefault(control_id, _ControlRenderState())
             state.generation += 1
             generation = state.generation
             state.context_id = context_id
@@ -185,29 +185,29 @@ class RenderDispatcher:
                 request,
                 context_id=context_id,
                 binding_id=binding_id,
-                slot_id=slot_id,
+                control_id=control_id,
                 generation=generation,
             )
             if state.running:
                 state.pending_request = request
             else:
                 state.running = True
-                self._start_soon(self._run_slot, slot_id, request)
+                self._start_soon(self._run_control, control_id, request)
             return generation
 
-    async def clear_slot(
+    async def clear_control(
         self,
-        slot_id: str,
+        control_id: str,
         *,
         context_id: str | None = None,
         binding_id: str | None = None,
-        output: SlotOutput | None = None,
+        output: ControlOutput | None = None,
         clear_output: bool = True,
     ) -> int:
-        """Invalidate queued/running renders for a slot and clear the device slot."""
+        """Invalidate queued/running renders for a control and clear its output."""
 
         async with self._lock:
-            state = self._slots.setdefault(slot_id, _SlotRenderState())
+            state = self._controls.setdefault(control_id, _ControlRenderState())
             state.generation += 1
             generation = state.generation
             if context_id is not None:
@@ -225,14 +225,14 @@ class RenderDispatcher:
                     await target_output.clear()
         return generation
 
-    async def _run_slot(self, slot_id: str, request: RenderRequest) -> None:
+    async def _run_control(self, control_id: str, request: RenderRequest) -> None:
         current = request
         while True:
             result = await self._backend.render(current)
             await self._apply_result(result)
 
             async with self._lock:
-                state = self._slots.get(slot_id)
+                state = self._controls.get(control_id)
                 if state is None:
                     return
                 next_request = state.pending_request
@@ -244,7 +244,7 @@ class RenderDispatcher:
 
     async def _apply_result(self, result: RenderResult) -> None:
         async with self._lock:
-            state = self._slots.get(result.slot_id)
+            state = self._controls.get(result.control_id)
             if state is None:
                 return
             io_lock = state.io_lock
@@ -252,7 +252,7 @@ class RenderDispatcher:
 
         async with io_lock:
             async with self._lock:
-                state = self._slots.get(result.slot_id)
+                state = self._controls.get(result.control_id)
                 if state is None:
                     return
                 if state.generation != result.generation:

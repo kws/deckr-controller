@@ -21,8 +21,8 @@ class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
-        self.sleep_screen = AsyncMock()
-        self.wake_screen = AsyncMock()
+        self.sleep_device = AsyncMock()
+        self.wake_device = AsyncMock()
 
 
 def _make_output(
@@ -159,11 +159,11 @@ async def test_set_title_without_title_options_clears_explicit_options(router_wi
 
 
 @pytest.mark.asyncio
-async def test_set_image_replaces_title_content(router_with_mocks):
-    """set_image replaces title content with an explicit image."""
+async def test_set_raster_image_replaces_title_content(router_with_mocks):
+    """set_raster_image replaces title content with an explicit raster image."""
     router = router_with_mocks
     await router.set_title("Styled", title_options=TitleOptions(font_family="Inter"))
-    await router.set_image("https://example.com/img.png")
+    await router.set_raster_image("https://example.com/img.png")
     assert router._store.content.image == "https://example.com/img.png"
     assert router._store.content.title is None
 

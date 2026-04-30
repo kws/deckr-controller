@@ -14,6 +14,7 @@ import anyio
 import pytest
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
+from invariant.store.disk import DiskStore
 from invariant_gfx.artifacts import BlobArtifact
 from PIL import Image
 
@@ -31,15 +32,14 @@ from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderDispatcher,
 )
-from deckr.controller.invariant.executor import ProcessSafeDiskStore
 
 
 class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
-        self.sleep_screen = AsyncMock()
-        self.wake_screen = AsyncMock()
+        self.sleep_device = AsyncMock()
+        self.wake_device = AsyncMock()
 
 
 def _png_data_uri() -> str:
@@ -66,7 +66,7 @@ class ControlledBackend:
         return RenderResult(
             context_id=request.context_id,
             binding_id=request.binding_id,
-            slot_id=request.slot_id,
+            control_id=request.control_id,
             generation=request.generation,
             frame=f"frame-{request.generation}".encode(),
         )
@@ -81,7 +81,7 @@ class ControlledBackend:
 def _solid_request() -> RenderRequest:
     return RenderRequest(
         context_id="ctx",
-        slot_id="0,0",
+        control_id="0,0",
         generation=0,
         image_format=RenderImageFormat(width=72, height=72),
         graph={"graph": {}, "output": "output"},
@@ -129,19 +129,19 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
         request = _solid_request()
 
         await dispatcher.submit_request(
-            slot_id="0,0",
+            control_id="0,0",
             context_id="ctx",
             request=request,
             output=output,
         )
         await dispatcher.submit_request(
-            slot_id="0,0",
+            control_id="0,0",
             context_id="ctx",
             request=request,
             output=output,
         )
         await dispatcher.submit_request(
-            slot_id="0,0",
+            control_id="0,0",
             context_id="ctx",
             request=request,
             output=output,
@@ -172,7 +172,7 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
 
 
 @pytest.mark.asyncio
-async def test_render_dispatcher_clear_slot_blocks_stale_completion():
+async def test_render_dispatcher_clear_control_blocks_stale_completion():
     command_service = FakeHardwareCommandService()
 
     backend = ControlledBackend()
@@ -186,7 +186,7 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
             start_soon=tg.start_soon,
         )
         await dispatcher.submit_request(
-            slot_id="0,0",
+            control_id="0,0",
             context_id="ctx",
             request=_solid_request(),
             output=output,
@@ -195,7 +195,7 @@ async def test_render_dispatcher_clear_slot_blocks_stale_completion():
             while backend.calls != [1]:
                 await anyio.sleep(0.01)
 
-        await dispatcher.clear_slot("0,0", context_id="ctx", output=output)
+        await dispatcher.clear_control("0,0", context_id="ctx", output=output)
         backend.release(1)
         await anyio.sleep(0.05)
 
@@ -224,7 +224,7 @@ async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
             start_soon=tg.start_soon,
         )
         await dispatcher.submit_request(
-            slot_id="0,0",
+            control_id="0,0",
             context_id="ctx",
             request=_solid_request(),
             output=output,
@@ -233,7 +233,7 @@ async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
             while backend.calls != [1]:
                 await anyio.sleep(0.01)
 
-        await dispatcher.clear_slot(
+        await dispatcher.clear_control(
             "0,0",
             context_id="ctx",
             output=output,
@@ -265,7 +265,7 @@ def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
         model,
         fmt,
         context_id=f"ctx:{case_id}",
-        slot_id="0,0",
+        control_id="0,0",
     )
     assert request is not None
 
@@ -339,13 +339,13 @@ def test_process_pool_executor_parallelism():
 
 
 def _write_blob_to_store(cache_dir: str, payload: bytes) -> bytes:
-    store = ProcessSafeDiskStore(cache_dir=cache_dir)
+    store = DiskStore(cache_dir=cache_dir)
     blob = BlobArtifact(data=payload, content_type="application/octet-stream")
     store.put("test:blob", "a" * 64, blob)
     return store.get("test:blob", "a" * 64).data
 
 
-def test_process_safe_disk_store_survives_concurrent_writers(tmp_path: Path):
+def test_disk_store_survives_concurrent_writers(tmp_path: Path):
     payload_a = b"a" * 1024
     payload_b = b"b" * 1024
 
@@ -355,7 +355,7 @@ def test_process_safe_disk_store_survives_concurrent_writers(tmp_path: Path):
         result_a = fut_a.result(timeout=30)
         result_b = fut_b.result(timeout=30)
 
-    store = ProcessSafeDiskStore(cache_dir=tmp_path)
+    store = DiskStore(cache_dir=tmp_path)
     final = store.get("test:blob", "a" * 64).data
 
     assert result_a in {payload_a, payload_b}

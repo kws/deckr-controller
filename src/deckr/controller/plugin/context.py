@@ -47,7 +47,7 @@ class ControlContext:
         command_service: HardwareCommandService,
         host_id: str,
         action_uuid: str,
-        slot: ControlSurface,
+        control: ControlSurface,
         settings: Mapping[str, Any],
         manager: "DeviceManager",
         plugin_bus: Any,
@@ -74,7 +74,7 @@ class ControlContext:
         self.page_session_id = metadata.page_session_id
         self._builtin_action = builtin_action
         self.metadata = metadata
-        self.slot = slot
+        self.control = control
         self.manager = manager
         self._plugin_bus = plugin_bus
         self.profile_id = profile_id
@@ -92,10 +92,10 @@ class ControlContext:
             DeviceOutput(
                 command_service,
                 config_id,
-                slot.id,
-                slot.raster_capability_id,
+                control.id,
+                control.raster_capability_id,
             )
-            if slot.raster_capability_id is not None
+            if control.raster_capability_id is not None
             else None
         )
         self._router = CommandRouter(
@@ -103,15 +103,13 @@ class ControlContext:
             render_service=RenderService(),
             render_dispatcher=render_dispatcher,
             output=output,
-            image_format=slot.image_format,
+            image_format=control.image_format,
             start_soon=start_soon,
             settings_service=settings_service,
             settings_target=context_settings_target,
         )
         self.plugin_context = BuiltInPluginContext(
             router=self._router,
-            command_service=command_service,
-            config_id=config_id,
             manager=manager,
             context_id=self.id,
             binding_metadata=metadata,

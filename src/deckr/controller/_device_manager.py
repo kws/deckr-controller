@@ -35,9 +35,7 @@ from deckr.pluginhost.messages import (
     REQUEST_SETTINGS,
     SET_PAGE,
     SET_SETTINGS,
-    SLEEP_SCREEN,
     UPDATE_PAGE,
-    WAKE_SCREEN,
     ActionInstanceLifecycleBody,
     ActionInstanceMetadata,
     BindingMetadata,
@@ -277,10 +275,10 @@ class DeviceManager:
             model,
             control.image_format,
             context_id=context_id,
-            slot_id=control.id,
+            control_id=control.id,
         )
         await self._render_dispatcher.submit_request(
-            slot_id=control.id,
+            control_id=control.id,
             context_id=context_id,
             request=request,
             output=output,
@@ -318,7 +316,7 @@ class DeviceManager:
             if lease.raster_capability_id is not None
             else None
         )
-        await self._render_dispatcher.clear_slot(
+        await self._render_dispatcher.clear_control(
             lease.control_id,
             context_id=lease.context_id,
             binding_id=lease.binding_id,
@@ -331,10 +329,10 @@ class DeviceManager:
         for binding_id in list(self._binding_leases):
             await self._revoke_binding(binding_id, clear_output=clear_outputs)
 
-    async def _clear_all_image_slots(self) -> None:
+    async def _clear_all_raster_controls(self) -> None:
         """Clear raster-capable controls before rendering a new page."""
         for control in raster_controls(self.device):
-            await self._render_dispatcher.clear_slot(
+            await self._render_dispatcher.clear_control(
                 control.control_id,
                 output=DeviceOutput(
                     self._command_service,
@@ -547,7 +545,7 @@ class DeviceManager:
             command_service=self._command_service,
             host_id=action_meta.host_id,
             action_uuid=action_meta.uuid,
-            slot=control,
+            control=control,
             settings=binding.settings,
             manager=self,
             plugin_bus=self._plugin_bus,
@@ -800,7 +798,7 @@ class DeviceManager:
         if transition.departing is not None:
             await self._revoke_active_bindings()
 
-        await self._clear_all_image_slots()
+        await self._clear_all_raster_controls()
 
         if isinstance(arriving, StaticPageRef):
             for binding in result.bindings:
@@ -1102,7 +1100,7 @@ class DeviceManager:
             await self._revoke_active_bindings(clear_outputs=clear_outputs)
             await self._destroy_all_action_instances(reason="clear")
             if clear_outputs:
-                await self._clear_all_image_slots()
+                await self._clear_all_raster_controls()
 
     async def on_descriptor_changed(self, descriptor: DeviceDescriptor) -> None:
         """Re-resolve the active page against a changed device descriptor."""
@@ -1542,10 +1540,6 @@ class DeviceManager:
                 page=payload.get("page", 0),
                 causation_id=msg.message_id,
             )
-        elif msg_type == SLEEP_SCREEN:
-            await self._command_service.sleep_screen(self.config_id)
-        elif msg_type == WAKE_SCREEN:
-            await self._command_service.wake_screen(self.config_id)
 
     async def _handle_binding_output(
         self,

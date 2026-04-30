@@ -21,17 +21,17 @@ def _ref_key(ref: DeviceRef) -> tuple[str, str]:
 
 
 @dataclass(frozen=True, slots=True)
-class LiveHardwareDevice:
+class LiveDeviceRoute:
     config_id: str
     ref: DeviceRef
     device: DeviceDescriptor
 
 
-class HardwareDeviceRegistry:
-    """Controller-local cache of live hardware metadata by config id and live ref."""
+class DeviceRouteRegistry:
+    """Controller-local cache of live device routes by config id and device ref."""
 
     def __init__(self) -> None:
-        self._devices_by_config: dict[str, LiveHardwareDevice] = {}
+        self._devices_by_config: dict[str, LiveDeviceRoute] = {}
         self._config_by_ref: dict[tuple[str, str], str] = {}
 
     def connect(
@@ -40,9 +40,9 @@ class HardwareDeviceRegistry:
         config_id: str,
         ref: DeviceRef,
         device: DeviceDescriptor,
-    ) -> LiveHardwareDevice:
+    ) -> LiveDeviceRoute:
         self.disconnect_config(config_id)
-        live = LiveHardwareDevice(config_id=config_id, ref=ref, device=device)
+        live = LiveDeviceRoute(config_id=config_id, ref=ref, device=device)
         self._devices_by_config[config_id] = live
         self._config_by_ref[_ref_key(ref)] = config_id
         return live
@@ -52,43 +52,43 @@ class HardwareDeviceRegistry:
         *,
         ref: DeviceRef,
         device: DeviceDescriptor,
-    ) -> LiveHardwareDevice | None:
+    ) -> LiveDeviceRoute | None:
         config_id = self._config_by_ref.get(_ref_key(ref))
         if config_id is None:
             return None
-        live = LiveHardwareDevice(config_id=config_id, ref=ref, device=device)
+        live = LiveDeviceRoute(config_id=config_id, ref=ref, device=device)
         self._devices_by_config[config_id] = live
         return live
 
-    def disconnect_config(self, config_id: str) -> LiveHardwareDevice | None:
+    def disconnect_config(self, config_id: str) -> LiveDeviceRoute | None:
         live = self._devices_by_config.pop(config_id, None)
         if live is not None:
             self._config_by_ref.pop(_ref_key(live.ref), None)
         return live
 
-    def disconnect_ref(self, ref: DeviceRef) -> LiveHardwareDevice | None:
+    def disconnect_ref(self, ref: DeviceRef) -> LiveDeviceRoute | None:
         config_id = self._config_by_ref.pop(_ref_key(ref), None)
         if config_id is None:
             return None
         return self._devices_by_config.pop(config_id, None)
 
-    def get(self, config_id: str) -> LiveHardwareDevice | None:
+    def get(self, config_id: str) -> LiveDeviceRoute | None:
         return self._devices_by_config.get(config_id)
 
-    def get_by_ref(self, ref: DeviceRef) -> LiveHardwareDevice | None:
+    def get_by_ref(self, ref: DeviceRef) -> LiveDeviceRoute | None:
         config_id = self._config_by_ref.get(_ref_key(ref))
         if config_id is None:
             return None
         return self._devices_by_config.get(config_id)
 
-    def for_manager(self, manager_id: str) -> tuple[LiveHardwareDevice, ...]:
+    def for_manager(self, manager_id: str) -> tuple[LiveDeviceRoute, ...]:
         return tuple(
             live
             for live in self._devices_by_config.values()
             if live.ref.manager_id == manager_id
         )
 
-    def all(self) -> tuple[LiveHardwareDevice, ...]:
+    def all(self) -> tuple[LiveDeviceRoute, ...]:
         return tuple(self._devices_by_config.values())
 
 
@@ -98,7 +98,7 @@ class HardwareCommandService:
     def __init__(self, endpoint: EndpointLane, *, controller_id: str) -> None:
         self._endpoint = endpoint
         self._controller_id = controller_id
-        self._devices_by_config_id: dict[str, LiveHardwareDevice] = {}
+        self._devices_by_config_id: dict[str, LiveDeviceRoute] = {}
 
     def register_device(
         self,
@@ -107,7 +107,7 @@ class HardwareCommandService:
         ref: DeviceRef,
         device: DeviceDescriptor,
     ) -> None:
-        self._devices_by_config_id[config_id] = LiveHardwareDevice(
+        self._devices_by_config_id[config_id] = LiveDeviceRoute(
             config_id=config_id,
             ref=ref,
             device=device,
@@ -116,7 +116,7 @@ class HardwareCommandService:
     def unregister_config(self, config_id: str) -> None:
         self._devices_by_config_id.pop(config_id, None)
 
-    async def _live_for(self, config_id: str) -> LiveHardwareDevice | None:
+    async def _live_for(self, config_id: str) -> LiveDeviceRoute | None:
         live = self._devices_by_config_id.get(config_id)
         if live is None:
             logger.info(
@@ -174,10 +174,10 @@ class HardwareCommandService:
             )
         )
 
-    async def sleep_screen(self, config_id: str) -> None:
+    async def sleep_device(self, config_id: str) -> None:
         await self._send_power_command(config_id, command_type="sleep")
 
-    async def wake_screen(self, config_id: str) -> None:
+    async def wake_device(self, config_id: str) -> None:
         await self._send_power_command(config_id, command_type="wake")
 
     async def _send_power_command(self, config_id: str, *, command_type: str) -> None:

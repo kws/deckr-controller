@@ -62,7 +62,7 @@ class RenderRequest:
     """Serialized render payload suitable for thread/process backends."""
 
     context_id: str
-    slot_id: str
+    control_id: str
     generation: int
     image_format: RenderImageFormat
     graph: dict[str, Any]
@@ -72,10 +72,10 @@ class RenderRequest:
 
 @dataclass(frozen=True, slots=True)
 class RenderResult:
-    """Rendered JPEG bytes for a specific slot generation."""
+    """Rendered JPEG bytes for a specific control generation."""
 
     context_id: str
-    slot_id: str
+    control_id: str
     generation: int
     frame: bytes | None
     binding_id: str | None = None
@@ -296,7 +296,7 @@ def build_render_request(
     *,
     context_id: str = "",
     binding_id: str | None = None,
-    slot_id: str = "",
+    control_id: str = "",
     generation: int = 0,
 ) -> RenderRequest | None:
     """Convert a RenderModel to a serialized render request."""
@@ -308,7 +308,7 @@ def build_render_request(
     return RenderRequest(
         context_id=context_id,
         binding_id=binding_id,
-        slot_id=slot_id,
+        control_id=control_id,
         generation=generation,
         image_format=_to_render_image_format(image_format),
         graph=_node_to_wire(graph),
@@ -362,7 +362,7 @@ class RenderService:
         *,
         context_id: str = "",
         binding_id: str | None = None,
-        slot_id: str = "",
+        control_id: str = "",
         generation: int = 0,
     ) -> RenderRequest | None:
         return build_render_request(
@@ -370,6 +370,6 @@ class RenderService:
             image_format,
             context_id=context_id,
             binding_id=binding_id,
-            slot_id=slot_id,
+            control_id=control_id,
             generation=generation,
         )

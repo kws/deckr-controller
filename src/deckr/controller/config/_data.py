@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _ConfigModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
 
 class TitleOptions(_ConfigModel):
