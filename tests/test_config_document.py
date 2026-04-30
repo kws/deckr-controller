@@ -70,9 +70,9 @@ port = 1884
     assert plugin_host["instances"]["main"]["runtime"]["descriptor_roots"] == (
         "plugins/runtime",
     )
-    driver = document.namespace("deckr.drivers.mqtt")
-    assert driver is not None
-    assert driver["broker"]["hostname"] == "mqtt.local"
+    manager_config = document.namespace("deckr.drivers.mqtt")
+    assert manager_config is not None
+    assert manager_config["broker"]["hostname"] == "mqtt.local"
 
 
 def test_explicit_config_allows_missing_controller_table(tmp_path: Path) -> None:

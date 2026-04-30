@@ -772,7 +772,7 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
 
 
 @pytest.mark.asyncio
-async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
+async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
     """Same action on different controls keeps separate settings."""
     device = _make_mock_device()
     registry = MagicMock()
@@ -834,18 +834,18 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
         )
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
-        slot_a = await manager.action_contexts.get("0,0")
-        slot_b = await manager.action_contexts.get("1,0")
-        await slot_a.plugin_context.set_settings({"slot_marker": "A"})
-        await slot_b.plugin_context.set_settings({"slot_marker": "B"})
+        control_a = await manager.action_contexts.get("0,0")
+        control_b = await manager.action_contexts.get("1,0")
+        await control_a.plugin_context.set_settings({"control_marker": "A"})
+        await control_b.plugin_context.set_settings({"control_marker": "B"})
 
         await manager.set_page(profile="default", page=0)
-        slot_a_reload = await manager.action_contexts.get("0,0")
-        slot_b_reload = await manager.action_contexts.get("1,0")
-        settings_a = await slot_a_reload.plugin_context.get_settings()
-        settings_b = await slot_b_reload.plugin_context.get_settings()
-        assert settings_a.slot_marker == "A"
-        assert settings_b.slot_marker == "B"
+        control_a_reload = await manager.action_contexts.get("0,0")
+        control_b_reload = await manager.action_contexts.get("1,0")
+        settings_a = await control_a_reload.plugin_context.get_settings()
+        settings_b = await control_b_reload.plugin_context.get_settings()
+        assert settings_a.control_marker == "A"
+        assert settings_b.control_marker == "B"
 
 
 @pytest.mark.asyncio
@@ -1028,14 +1028,14 @@ ACTION_X_UUID = "test.action.x"
 
 
 @pytest.mark.asyncio
-async def test_on_actions_changed_registered_resolves_unavailable_slot(
+async def test_on_actions_changed_registered_resolves_unavailable_control(
     persistence_tmp_dir,
 ):
     """When action becomes available, on_actions_changed creates context for unavailable control."""
     device = _make_mock_device()
     plugin_bus = _plugin_bus()
     registry = ConfigurableActionRegistry()
-        # Initially no action - control will show unavailable
+    # Initially no action - control will show unavailable
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
