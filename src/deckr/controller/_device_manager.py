@@ -104,6 +104,13 @@ from deckr.controller.settings import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_WIDGET_TIMEOUT_MS = 60_000
+_SETTINGS_COMMAND_TYPES = frozenset(
+    {
+        SETTINGS_REQUEST,
+        SETTINGS_PATCH,
+        SETTINGS_REPLACE,
+    }
+)
 
 
 def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
@@ -1410,10 +1417,90 @@ class DeviceManager:
         )
         return None
 
+    def _settings_target_from_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        msg_type: str,
+        sender: object,
+    ) -> SettingsTargetRef | None:
+        target_data = payload.get("target")
+        if not isinstance(target_data, Mapping):
+            logger.warning(
+                "Ignoring invalid settings command %s from %s without target object",
+                msg_type,
+                sender,
+            )
+            return None
+        try:
+            return SettingsTargetRef.model_validate(target_data)
+        except (ValidationError, ValueError):
+            logger.warning(
+                "Ignoring invalid settings target for %s from %s",
+                msg_type,
+                sender,
+                exc_info=True,
+            )
+            return None
+
+    def _plugin_settings_authorized(
+        self,
+        *,
+        sender_host_id: str,
+        target: SettingsTargetRef,
+    ) -> bool:
+        plugin_id = target.plugin_id or ""
+        if not self.manager.host_provides_plugin(sender_host_id, plugin_id):
+            logger.warning(
+                "Ignoring plugin settings command from host %s for plugin %s",
+                sender_host_id,
+                plugin_id or "<missing>",
+            )
+            return False
+        return True
+
+    async def _settings_snapshot_for_command(
+        self,
+        *,
+        msg_type: str,
+        target: SettingsTargetRef,
+        payload: Mapping[str, Any],
+    ) -> SettingsSnapshotBody | None:
+        if self._settings_service is None:
+            return None
+        try:
+            if msg_type == SETTINGS_REQUEST:
+                snapshot = await self._settings_service.get(target)
+            elif msg_type == SETTINGS_PATCH:
+                body = SettingsPatchBody.model_validate(payload)
+                snapshot = await self._settings_service.patch(target, body.settings)
+            else:
+                body = SettingsReplaceBody.model_validate(payload)
+                snapshot = await self._settings_service.replace(target, body.settings)
+        except (KeyError, ValidationError, ValueError):
+            logger.warning(
+                "Ignoring invalid settings command %s for target %s",
+                msg_type,
+                target.key(),
+                exc_info=True,
+            )
+            return None
+        return SettingsSnapshotBody.from_snapshot(snapshot)
+
     async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from a plugin host."""
-        payload = plugin_body_dict(msg)
+        try:
+            payload = plugin_body_dict(msg)
+        except (ValidationError, ValueError):
+            logger.warning(
+                "Ignoring invalid plugin command body %s from %s",
+                msg.message_type,
+                msg.sender,
+                exc_info=True,
+            )
+            return
         msg_type = msg.message_type
+        settings_target: SettingsTargetRef | None = None
 
         async def send_settings_response(snapshot_body: SettingsSnapshotBody) -> None:
             await self._plugin_bus.reply_to(
@@ -1423,34 +1510,39 @@ class DeviceManager:
                 subject=msg.subject,
             )
 
-        if msg_type in {SETTINGS_REQUEST, SETTINGS_PATCH, SETTINGS_REPLACE}:
+        if msg_type in _SETTINGS_COMMAND_TYPES:
             sender_host_id = self._command_sender_host_id(msg)
             if sender_host_id is None:
                 return
-            target_data = payload.get("target")
-            if not isinstance(target_data, dict):
+            settings_target = self._settings_target_from_payload(
+                payload,
+                msg_type=msg_type,
+                sender=msg.sender,
+            )
+            if settings_target is None:
                 return
-            target = SettingsTargetRef.model_validate(target_data)
-            if target.config_id != self.config_id:
+            if settings_target.config_id != self.config_id:
+                logger.warning(
+                    "Ignoring settings command %s from %s for config %s on manager config %s",
+                    msg_type,
+                    msg.sender,
+                    settings_target.config_id,
+                    self.config_id,
+                )
                 return
-            if target.scope == "plugin":
-                if self._settings_service is None:
+            if settings_target.scope == "plugin":
+                if not self._plugin_settings_authorized(
+                    sender_host_id=sender_host_id,
+                    target=settings_target,
+                ):
                     return
-                if msg_type == SETTINGS_REQUEST:
-                    snapshot = await self._settings_service.get(target)
-                elif msg_type == SETTINGS_PATCH:
-                    body = SettingsPatchBody.model_validate(payload)
-                    snapshot = await self._settings_service.patch(
-                        target,
-                        body.settings,
-                    )
-                else:
-                    body = SettingsReplaceBody.model_validate(payload)
-                    snapshot = await self._settings_service.replace(
-                        target,
-                        body.settings,
-                    )
-                await send_settings_response(SettingsSnapshotBody.from_snapshot(snapshot))
+                snapshot_body = await self._settings_snapshot_for_command(
+                    msg_type=msg_type,
+                    target=settings_target,
+                    payload=payload,
+                )
+                if snapshot_body is not None:
+                    await send_settings_response(snapshot_body)
                 return
 
         context_id = subject_context_id(msg.subject) or ""
@@ -1515,51 +1607,46 @@ class DeviceManager:
 
         page_session = authorization.page_session
         if page_session is not None:
-            if msg_type in {SETTINGS_REQUEST, SETTINGS_PATCH, SETTINGS_REPLACE}:
+            if msg_type in _SETTINGS_COMMAND_TYPES:
                 if self._settings_service is None or page_session.settings_target is None:
                     return
-                target = SettingsTargetRef.model_validate(payload.get("target"))
+                target = settings_target
+                if target is None:
+                    return
                 if target.key() != page_session.settings_target.key():
                     logger.warning("Ignoring settings command for mismatched page target")
                     return
-                if msg_type == SETTINGS_REQUEST:
-                    snapshot = await self._settings_service.get(target)
-                elif msg_type == SETTINGS_PATCH:
-                    body = SettingsPatchBody.model_validate(payload)
-                    snapshot = await self._settings_service.patch(
-                        target,
-                        body.settings,
-                    )
-                else:
-                    body = SettingsReplaceBody.model_validate(payload)
-                    snapshot = await self._settings_service.replace(
-                        target,
-                        body.settings,
-                    )
-                await send_settings_response(SettingsSnapshotBody.from_snapshot(snapshot))
+                snapshot_body = await self._settings_snapshot_for_command(
+                    msg_type=msg_type,
+                    target=target,
+                    payload=payload,
+                )
+                if snapshot_body is not None:
+                    await send_settings_response(snapshot_body)
             return
 
         lease = authorization.binding
         if lease is None:
             return
 
-        if msg_type in {SETTINGS_REQUEST, SETTINGS_PATCH, SETTINGS_REPLACE}:
+        if msg_type in _SETTINGS_COMMAND_TYPES:
             if self._settings_service is None or lease.settings_target is None:
                 return
-            target = SettingsTargetRef.model_validate(payload.get("target"))
+            target = settings_target
+            if target is None:
+                return
             if target.key() != lease.settings_target.key():
                 logger.warning("Ignoring settings command for mismatched binding target")
                 return
-            if msg_type == SETTINGS_REQUEST:
-                snapshot = await self._settings_service.get(target)
-            elif msg_type == SETTINGS_PATCH:
-                body = SettingsPatchBody.model_validate(payload)
-                snapshot = await self._settings_service.patch(target, body.settings)
-            else:
-                body = SettingsReplaceBody.model_validate(payload)
-                snapshot = await self._settings_service.replace(target, body.settings)
-            lease.context._store.settings = dict(thaw_json(snapshot.settings))
-            await send_settings_response(SettingsSnapshotBody.from_snapshot(snapshot))
+            snapshot_body = await self._settings_snapshot_for_command(
+                msg_type=msg_type,
+                target=target,
+                payload=payload,
+            )
+            if snapshot_body is None:
+                return
+            lease.context._store.settings = dict(thaw_json(snapshot_body.settings))
+            await send_settings_response(snapshot_body)
         elif msg_type == SET_PAGE:
             if lease.page_session_id is not None:
                 logger.warning("Ignoring setPage from dynamic child binding")

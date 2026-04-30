@@ -43,6 +43,7 @@ def _catalog(
     *,
     session_id: str = "session-1",
     action_uuid: str = ACTION_UUID,
+    plugin_uuid: str | None = "test.plugin",
 ) -> PluginActionCatalog:
     return PluginActionCatalog(
         hostId=host_id,
@@ -54,7 +55,7 @@ def _catalog(
             action_uuid: ActionDescriptor(
                 uuid=action_uuid,
                 name=f"Action {action_uuid}",
-                plugin_uuid="test.plugin",
+                plugin_uuid=plugin_uuid,
             )
         },
     )
@@ -102,6 +103,72 @@ async def test_action_registry_uses_catalog_only_with_matching_host_presence():
         assert meta.host_id == "python"
         assert meta.plugin_uuid == "test.plugin"
         assert events[-1].registered == ["python::test.stub.action"]
+
+    await _run_registry(registry, state, scenario)
+
+
+@pytest.mark.asyncio
+async def test_action_registry_proves_live_host_plugin_ownership():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+
+    async def scenario(events):
+        del events
+        assert not registry.host_provides_plugin("python", "test.plugin")
+        await state.put(
+            presence_endpoint_key(
+                lane="plugin_messages",
+                endpoint=host_address("python"),
+            ),
+            _presence("python"),
+        )
+        await state.put(plugin_action_catalog_key("python"), _catalog("python"))
+        with anyio.fail_after(1):
+            while not registry.host_provides_plugin("python", "test.plugin"):
+                await anyio.sleep(0.01)
+
+        assert registry.host_provides_plugin("python", "test.plugin")
+        assert not registry.host_provides_plugin("other", "test.plugin")
+        assert not registry.host_provides_plugin("python", "other.plugin")
+        assert not registry.host_provides_plugin("python", "")
+        assert not registry.host_provides_plugin(BUILTIN_ACTION_PROVIDER_ID, "test.plugin")
+
+    await _run_registry(registry, state, scenario)
+
+
+@pytest.mark.asyncio
+async def test_action_registry_denies_stale_or_unowned_plugin_settings_authority():
+    bus = _state_bus()
+    state = bus.deckr.state()
+    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+
+    async def scenario(events):
+        del events
+        await state.put(plugin_action_catalog_key("python"), _catalog("python"))
+        await anyio.sleep(0.05)
+        assert not registry.host_provides_plugin("python", "test.plugin")
+
+        await state.put(
+            presence_endpoint_key(
+                lane="plugin_messages",
+                endpoint=host_address("python"),
+            ),
+            _presence("python", session_id="new"),
+        )
+        await state.put(
+            plugin_action_catalog_key("python"),
+            _catalog("python", session_id="old"),
+        )
+        await anyio.sleep(0.05)
+        assert not registry.host_provides_plugin("python", "test.plugin")
+
+        await state.put(
+            plugin_action_catalog_key("python"),
+            _catalog("python", session_id="new", plugin_uuid=None),
+        )
+        await anyio.sleep(0.05)
+        assert not registry.host_provides_plugin("python", "test.plugin")
 
     await _run_registry(registry, state, scenario)
 

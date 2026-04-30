@@ -94,6 +94,20 @@ class ActionRegistry(BaseComponent):
                 return descriptor
         return None
 
+    def host_provides_plugin(self, host_id: str, plugin_id: str) -> bool:
+        host_id = host_id.strip()
+        plugin_id = plugin_id.strip()
+        if not host_id or not plugin_id:
+            return False
+        if host_id in RESERVED_BUILTIN_PROVIDER_IDS:
+            return False
+        if host_id not in self._host_presence_sessions:
+            return False
+        return any(
+            entry_host_id == host_id and descriptor.plugin_uuid == plugin_id
+            for entry_host_id, descriptor in self._action_registry.values()
+        )
+
     def _builtin_action_metadata(self, action_uuid: str) -> ActionMetadata | None:
         descriptor = self._builtin_action_registry.get(action_uuid)
         if descriptor is None:

@@ -20,9 +20,15 @@ from deckr.hardware.descriptors import (
     DeviceRef,
 )
 from deckr.pluginhost.messages import (
+    SETTINGS_PATCH,
+    SETTINGS_REQUEST,
+    SETTINGS_SNAPSHOT,
+    SettingsSnapshotBody,
+    SettingsTargetRef,
     context_subject,
     controller_address,
     host_address,
+    plugin_host_subject,
     plugin_message,
 )
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
@@ -66,6 +72,38 @@ def _plugin_command(
             binding_id=binding_id,
             page_session_id=page_session_id,
         ),
+    )
+
+
+def _plugin_settings_target(
+    plugin_id: str = "plugin.clock",
+    *,
+    config_id: str = "test-device",
+) -> SettingsTargetRef:
+    return SettingsTargetRef(
+        scope="plugin",
+        controllerId=CONTROLLER_ID,
+        configId=config_id,
+        pluginId=plugin_id,
+    )
+
+
+def _plugin_settings_command(
+    message_type: str,
+    target: SettingsTargetRef,
+    *,
+    sender_host_id: str = HOST_ID,
+    settings: dict | None = None,
+) -> DeckrMessage:
+    body: dict = {"target": target.to_dict()}
+    if settings is not None:
+        body["settings"] = settings
+    return plugin_message(
+        sender=host_address(sender_host_id),
+        recipient=CONTROLLER_ADDR,
+        message_type=message_type,
+        body=body,
+        subject=plugin_host_subject(sender_host_id),
     )
 
 
@@ -313,6 +351,179 @@ class MemoryConfigService:
 
     async def _subscribe(self) -> AsyncIterator[DeviceConfig | None]:
         yield self.config
+
+
+def _plugin_settings_config() -> DeviceConfig:
+    return DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        plugin_settings={"plugin.clock": {"timezone": "UTC"}},
+        profiles=[Profile(name="default", pages=[Page(controls=[])])],
+    )
+
+
+def _plugin_settings_device_manager(
+    *,
+    config_service: MemoryConfigService,
+    plugin_bus: LaneHarness,
+    registry: MagicMock,
+) -> DeviceManager:
+    device = _make_mock_device()
+    return DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=config_service.config,
+        manager=registry,
+        plugin_bus=plugin_bus,
+        start_soon=lambda fn, *a, **k: None,
+        settings_service=ConfigBackedSettingsService(
+            controller_id=CONTROLLER_ID,
+            config_service=config_service,
+        ),
+    )
+
+
+async def _next_plugin_message(
+    stream: AsyncIterator[DeckrMessage],
+    *,
+    timeout: float = 1.0,
+) -> DeckrMessage:
+    with anyio.fail_after(timeout):
+        return await anext(stream)
+
+
+async def _assert_no_plugin_message(
+    stream: AsyncIterator[DeckrMessage],
+    *,
+    timeout: float = 0.1,
+) -> None:
+    with anyio.move_on_after(timeout) as scope:
+        await anext(stream)
+    assert scope.cancel_called
+
+
+@pytest.mark.asyncio
+async def test_plugin_settings_patch_from_owning_host_writes_and_replies():
+    config_service = MemoryConfigService(_plugin_settings_config())
+    plugin_bus = _plugin_bus()
+    registry = MagicMock()
+    registry.host_provides_plugin.side_effect = (
+        lambda host_id, plugin_id: host_id == HOST_ID and plugin_id == "plugin.clock"
+    )
+    manager = _plugin_settings_device_manager(
+        config_service=config_service,
+        plugin_bus=plugin_bus,
+        registry=registry,
+    )
+
+    async with plugin_bus.subscribe(HOST_ADDR) as stream:
+        await manager.handle_command(
+            _plugin_settings_command(
+                SETTINGS_PATCH,
+                _plugin_settings_target(),
+                settings={"timezone": "Europe/Amsterdam"},
+            )
+        )
+        reply = await _next_plugin_message(stream)
+
+    assert config_service.config.plugin_settings["plugin.clock"] == {
+        "timezone": "Europe/Amsterdam"
+    }
+    assert reply.message_type == SETTINGS_SNAPSHOT
+    snapshot = SettingsSnapshotBody.model_validate(reply.body)
+    assert snapshot.settings == {"timezone": "Europe/Amsterdam"}
+    assert snapshot.target.key() == _plugin_settings_target().key()
+    registry.host_provides_plugin.assert_called_once_with(HOST_ID, "plugin.clock")
+
+
+@pytest.mark.asyncio
+async def test_plugin_settings_patch_from_non_owning_host_is_ignored():
+    config_service = MemoryConfigService(_plugin_settings_config())
+    plugin_bus = _plugin_bus()
+    registry = MagicMock()
+    registry.host_provides_plugin.return_value = False
+    manager = _plugin_settings_device_manager(
+        config_service=config_service,
+        plugin_bus=plugin_bus,
+        registry=registry,
+    )
+
+    async with plugin_bus.subscribe(host_address("other")) as stream:
+        await manager.handle_command(
+            _plugin_settings_command(
+                SETTINGS_PATCH,
+                _plugin_settings_target(),
+                sender_host_id="other",
+                settings={"timezone": "Europe/Amsterdam"},
+            )
+        )
+        await _assert_no_plugin_message(stream)
+
+    assert config_service.config.plugin_settings["plugin.clock"] == {"timezone": "UTC"}
+    registry.host_provides_plugin.assert_called_once_with("other", "plugin.clock")
+
+
+@pytest.mark.asyncio
+async def test_plugin_settings_request_for_unadvertised_plugin_is_ignored():
+    config_service = MemoryConfigService(_plugin_settings_config())
+    plugin_bus = _plugin_bus()
+    registry = MagicMock()
+    registry.host_provides_plugin.side_effect = (
+        lambda host_id, plugin_id: host_id == HOST_ID and plugin_id == "plugin.clock"
+    )
+    manager = _plugin_settings_device_manager(
+        config_service=config_service,
+        plugin_bus=plugin_bus,
+        registry=registry,
+    )
+
+    async with plugin_bus.subscribe(HOST_ADDR) as stream:
+        await manager.handle_command(
+            _plugin_settings_command(
+                SETTINGS_REQUEST,
+                _plugin_settings_target("plugin.other"),
+            )
+        )
+        await _assert_no_plugin_message(stream)
+
+    assert config_service.config.plugin_settings["plugin.clock"] == {"timezone": "UTC"}
+    registry.host_provides_plugin.assert_called_once_with(HOST_ID, "plugin.other")
+
+
+@pytest.mark.asyncio
+async def test_malformed_settings_commands_are_ignored_without_crashing():
+    config_service = MemoryConfigService(_plugin_settings_config())
+    plugin_bus = _plugin_bus()
+    registry = MagicMock()
+    registry.host_provides_plugin.return_value = True
+    manager = _plugin_settings_device_manager(
+        config_service=config_service,
+        plugin_bus=plugin_bus,
+        registry=registry,
+    )
+
+    target = _plugin_settings_target()
+    valid = _plugin_settings_command(
+        SETTINGS_PATCH,
+        target,
+        settings={"timezone": "Europe/Amsterdam"},
+    )
+    malformed_target = valid.model_copy(
+        update={"body": {"target": "not-a-target", "settings": {}}}
+    )
+    malformed_settings = valid.model_copy(
+        update={"body": {"target": target.to_dict(), "settings": "not-an-object"}}
+    )
+
+    async with plugin_bus.subscribe(HOST_ADDR) as stream:
+        await manager.handle_command(malformed_target)
+        await manager.handle_command(malformed_settings)
+        await _assert_no_plugin_message(stream)
+
+    assert config_service.config.plugin_settings["plugin.clock"] == {"timezone": "UTC"}
 
 
 @pytest_asyncio.fixture
