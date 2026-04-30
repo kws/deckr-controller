@@ -17,6 +17,12 @@ from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.lanes import EndpointLane
 from deckr.pluginhost.messages import (
     COMMAND_MESSAGE_TYPES,
+    SETTINGS_PATCH,
+    SETTINGS_REPLACE,
+    SETTINGS_REQUEST,
+    SettingsPatchBody,
+    SettingsReplaceBody,
+    SettingsRequestBody,
     plugin_message_for_controller,
     subject_config_id,
 )
@@ -122,6 +128,26 @@ class ControllerService(BaseComponent):
         if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
         config_id = subject_config_id(msg.subject)
+        if config_id is None and msg.message_type in {
+            SETTINGS_REQUEST,
+            SETTINGS_PATCH,
+            SETTINGS_REPLACE,
+        }:
+            body_type = {
+                SETTINGS_REQUEST: SettingsRequestBody,
+                SETTINGS_PATCH: SettingsPatchBody,
+                SETTINGS_REPLACE: SettingsReplaceBody,
+            }[msg.message_type]
+            try:
+                config_id = body_type.model_validate(msg.body).target.config_id
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid settings command %s from %s",
+                    msg.message_type,
+                    msg.sender,
+                    exc_info=True,
+                )
+                return
         if config_id is None:
             logger.warning(
                 "Ignoring plugin command %s without config subject from %s",

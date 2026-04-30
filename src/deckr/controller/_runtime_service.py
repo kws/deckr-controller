@@ -60,7 +60,6 @@ class ControllerRuntimeService(BaseComponent):
         config_service = build_config_service(self._runtime.config)
         if isinstance(config_service, Component):
             await self._component_manager.add_component(config_service)
-        settings_service = build_settings_service(self._runtime.config)
 
         controller_service: ControllerService | None = None
 
@@ -74,6 +73,12 @@ class ControllerRuntimeService(BaseComponent):
             on_actions_changed=on_actions_changed,
         )
         await self._component_manager.add_component(action_registry)
+        settings_service = build_settings_service(
+            self._runtime.config,
+            controller_id=self._runtime.controller_id,
+            config_service=config_service,
+            action_descriptor_provider=action_registry.get_action_descriptor,
+        )
 
         controller_service = ControllerService(
             hardware_endpoint=self._hardware_messages.endpoint(

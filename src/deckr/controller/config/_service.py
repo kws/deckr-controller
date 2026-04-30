@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol
@@ -57,6 +58,14 @@ class DeviceConfigService(Protocol):
         manager_id: str,
     ) -> DeviceConfig | None:
         """Return the best controller config for a live hardware device."""
+        ...
+
+    async def get_config(self, config_id: str) -> DeviceConfig | None:
+        """Return config by controller-local id."""
+        ...
+
+    async def write_config(self, config: DeviceConfig) -> DeviceConfig:
+        """Persist a complete config and publish the updated value."""
         ...
 
     def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
@@ -133,6 +142,29 @@ class FileBackedDeviceConfigService(BaseComponent):
             )
         return best[0]
 
+    async def get_config(self, config_id: str) -> DeviceConfig | None:
+        return await self._load_config(config_id)
+
+    async def write_config(self, config: DeviceConfig) -> DeviceConfig:
+        await self._scan_configs()
+        async with self._lock:
+            path = next(
+                (
+                    candidate
+                    for candidate, config_id in self._path_to_config.items()
+                    if config_id == config.id
+                ),
+                self._config_dir / f"{config.id}.yml",
+            )
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        data = config.model_dump(by_alias=True, exclude_none=True, mode="json")
+        tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        os.replace(tmp_path, path)
+        await self._cache_and_notify(path, config)
+        return config
+
     def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
         return self._subscribe_impl(config_id)
 
@@ -170,6 +202,30 @@ class FileBackedDeviceConfigService(BaseComponent):
         await self._scan_configs()
         async with self._lock:
             return self._config_by_id.get(config_id)
+
+    async def _cache_and_notify(self, path: Path, config: DeviceConfig) -> None:
+        async with self._lock:
+            old_config_id = self._path_to_config.get(path)
+            affected_config_ids = {config.id}
+            if old_config_id is not None and old_config_id != config.id:
+                affected_config_ids.add(old_config_id)
+                self._config_by_id.pop(old_config_id, None)
+            self._path_to_config[path] = config.id
+            self._config_by_id[config.id] = config
+            to_send = [
+                (
+                    self._config_by_id.get(config_id),
+                    set(self._subscribers.get(config_id, set())),
+                )
+                for config_id in affected_config_ids
+            ]
+
+        for value, subscribers in to_send:
+            for send in subscribers:
+                try:
+                    await send.send(value)
+                except Exception:
+                    logger.exception("Failed to send config update to subscriber")
 
     async def _scan_configs(self) -> None:
         """Scan config_dir for .yml files and update caches."""
@@ -272,6 +328,14 @@ class NullDeviceConfigService(BaseComponent):
     ) -> DeviceConfig | None:
         del fingerprint, manager_id
         return None
+
+    async def get_config(self, config_id: str) -> DeviceConfig | None:
+        del config_id
+        return None
+
+    async def write_config(self, config: DeviceConfig) -> DeviceConfig:
+        del config
+        raise RuntimeError("No device config service is configured")
 
     def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
         del config_id

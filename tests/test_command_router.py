@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from deckr.pluginhost.messages import TitleOptions
+from deckr.pluginhost.messages import SettingsSnapshot, SettingsTargetRef, TitleOptions
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import RasterImageFormat
@@ -14,7 +14,6 @@ from deckr.controller._state_store import (
     ControlStateStore,
     TransientOverlay,
 )
-from deckr.controller.settings import SettingsTarget
 
 
 class FakeHardwareCommandService:
@@ -217,22 +216,24 @@ async def test_get_settings_hydrates_from_runtime_overlay():
         def __init__(self):
             self.calls = 0
 
-        async def exists(self, target):
-            return True
-
         async def get(self, target):
             self.calls += 1
-            return {"runtime": 42}
+            return SettingsSnapshot(target=target, settings={"runtime": 42})
 
-        async def merge(self, target, patch):
-            return {"runtime": 42, **dict(patch)}
+        async def patch(self, target, patch):
+            return SettingsSnapshot(
+                target=target,
+                settings={"runtime": 42, **dict(patch)},
+            )
 
     settings_service = FakeSettingsService()
-    target = SettingsTarget.for_action_instance(
-        controller_id="controller-main",
-        config_id="config-dev",
-        action_instance_id="instance-a",
-        action_uuid="action",
+    target = SettingsTargetRef(
+        scope="action_instance",
+        controllerId="controller-main",
+        configId="config-dev",
+        pluginId="plugin",
+        actionId="action",
+        actionInstanceId="instance-a",
     )
 
     router = CommandRouter(
@@ -270,20 +271,19 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
     image_format = RasterImageFormat(width=72, height=72)
 
     class FailingSettingsService:
-        async def exists(self, target):
-            return True
-
         async def get(self, target):
-            return {}
+            return SettingsSnapshot(target=target, settings={})
 
-        async def merge(self, target, patch):
+        async def patch(self, target, patch):
             raise OSError("disk full")
 
-    target = SettingsTarget.for_action_instance(
-        controller_id="controller-main",
-        config_id="config-dev",
-        action_instance_id="instance-a",
-        action_uuid="action",
+    target = SettingsTargetRef(
+        scope="action_instance",
+        controllerId="controller-main",
+        configId="config-dev",
+        pluginId="plugin",
+        actionId="action",
+        actionInstanceId="instance-a",
     )
     router = CommandRouter(
         store=store,

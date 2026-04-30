@@ -13,6 +13,7 @@ from deckr.pluginhost.messages import (
     BindingMetadata,
     CapabilityInputBody,
     CapabilityInputEvent,
+    SettingsTargetRef,
     TitleOptions,
     context_subject,
     controller_address,
@@ -27,7 +28,7 @@ from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
 from deckr.controller.plugin.builtin._context import BuiltInPluginContext
-from deckr.controller.settings import SettingsService, SettingsTarget
+from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
     from deckr.controller._device_manager import DeviceManager
@@ -54,7 +55,7 @@ class ControlContext:
         start_soon: Callable[..., None],
         render_dispatcher: RenderDispatcher,
         settings_service: SettingsService | None,
-        context_settings_target: SettingsTarget | None,
+        context_settings_target: SettingsTargetRef | None,
         *,
         profile_id: str,
         page_id: str,

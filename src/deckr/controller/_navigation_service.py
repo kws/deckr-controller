@@ -97,6 +97,8 @@ class NavigationService:
                 selector=c.selector,
                 action_uuid=c.action,
                 settings=dict(c.settings),
+                stable_id=c.id,
+                template_overrides=dict(c.template_overrides),
                 title_options=_config_title_options_to_store(c.title_options),
             )
             for c in page.controls

@@ -1,5 +1,6 @@
 """DeviceManager integration tests. Uses mock devices (no VirtualDevice)."""
 
+from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -31,6 +32,7 @@ from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.plugin.provider import ActionMetadata
+from deckr.controller.settings import ConfigBackedSettingsService
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
@@ -285,6 +287,34 @@ class NoopAction:
         pass
 
 
+class MemoryConfigService:
+    def __init__(self, config: DeviceConfig) -> None:
+        self.config = config
+
+    async def match_device(
+        self,
+        *,
+        fingerprint: str,
+        manager_id: str,
+    ) -> DeviceConfig | None:
+        del manager_id
+        return self.config if self.config.match.fingerprint == fingerprint else None
+
+    async def get_config(self, config_id: str) -> DeviceConfig | None:
+        return self.config if self.config.id == config_id else None
+
+    async def write_config(self, config: DeviceConfig) -> DeviceConfig:
+        self.config = config
+        return config
+
+    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+        del config_id
+        return self._subscribe()
+
+    async def _subscribe(self) -> AsyncIterator[DeviceConfig | None]:
+        yield self.config
+
+
 @pytest_asyncio.fixture
 def device_config_set_raster_image():
     """Config: one profile, one page, one control with SetRasterImageOnAppearAction."""
@@ -488,6 +518,11 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
             )
         ],
     )
+    config_service = MemoryConfigService(config)
+    settings_service = ConfigBackedSettingsService(
+        controller_id=CONTROLLER_ID,
+        config_service=config_service,
+    )
 
     async with anyio.create_task_group():
 
@@ -503,6 +538,7 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
             manager=registry,
             plugin_bus=plugin_bus,
             start_soon=start_soon,
+            settings_service=settings_service,
         )
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
@@ -563,6 +599,11 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
             )
         ],
     )
+    config_service = MemoryConfigService(config)
+    settings_service = ConfigBackedSettingsService(
+        controller_id=CONTROLLER_ID,
+        config_service=config_service,
+    )
 
     async with anyio.create_task_group():
 
@@ -578,6 +619,7 @@ async def test_settings_isolated_by_slot_same_action(persistence_tmp_dir):
             manager=registry,
             plugin_bus=plugin_bus,
             start_soon=start_soon,
+            settings_service=settings_service,
         )
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)

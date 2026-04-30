@@ -1,156 +1,444 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+import secrets
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 import anyio
 from deckr.contracts.models import thaw_json
+from deckr.pluginhost.messages import (
+    ActionDescriptor,
+    SettingsProvenance,
+    SettingsSchemaMetadata,
+    SettingsSnapshot,
+    SettingsTargetDescription,
+    SettingsTargetRef,
+)
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema import validate as validate_json_schema
+
+from deckr.controller.config import DeviceConfigService
+from deckr.controller.config._data import Control, DeviceConfig
+from deckr.controller.settings._identity import derive_action_instance_id
 
 logger = logging.getLogger(__name__)
 
-SettingsScope = Literal["action_instance"]
+ActionDescriptorProvider = Callable[[str], Awaitable[ActionDescriptor | None]]
 
 
-def _store_key(target: SettingsTarget) -> str:
-    return f"controller={target.controller_id}|{target.as_key()}"
-
-
-def _settings_copy(value: dict[str, Any]) -> dict[str, Any]:
-    """Return a mutable JSON-shaped copy of settings-like data."""
-
-    copied = thaw_json(value)
-    return dict(copied) if isinstance(copied, dict) else {}
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class SettingsTarget:
-    scope: SettingsScope
-    controller_id: str
-    config_id: str | None = None
-    action_instance_id: str | None = None
-    action_uuid: str | None = None
-    plugin_uuid: str | None = None
-
-    @classmethod
-    def for_action_instance(
-        cls,
-        *,
-        controller_id: str,
-        config_id: str,
-        action_instance_id: str,
-        action_uuid: str,
-        plugin_uuid: str | None = None,
-    ) -> SettingsTarget:
-        return cls(
-            scope="action_instance",
-            controller_id=controller_id,
-            config_id=config_id,
-            action_instance_id=action_instance_id,
-            action_uuid=action_uuid,
-            plugin_uuid=plugin_uuid,
-        )
-
-    def as_key(self) -> str:
-        """Stable storage key for this target."""
-
-        required = {
-            "config_id": self.config_id,
-            "action_instance_id": self.action_instance_id,
-            "action_uuid": self.action_uuid,
-        }
-        missing = [name for name, value in required.items() if not value]
-        if missing:
-            raise ValueError(f"Missing context settings fields: {', '.join(missing)}")
-
-        parts = [
-            f"config={self.config_id}",
-            f"action_instance={self.action_instance_id}",
-            f"action={self.action_uuid}",
-        ]
-        return "|".join(parts)
+@dataclass(frozen=True, slots=True)
+class _ControlLocation:
+    profile_id: str
+    profile_index: int
+    page_id: str
+    page_index: int
+    control_index: int
+    control: Control
+    action_instance_id: str
 
 
 class SettingsService(Protocol):
-    async def exists(self, target: SettingsTarget) -> bool: ...
-    async def get(self, target: SettingsTarget) -> dict[str, Any]: ...
-    async def merge(
-        self, target: SettingsTarget, patch: dict[str, Any]
-    ) -> dict[str, Any]: ...
-    def subscribe(self, target: SettingsTarget) -> AsyncIterator[dict[str, Any]]: ...
-    async def clear_config_targets(self, *, controller_id: str, config_id: str) -> int:
-        ...
+    async def list_targets(
+        self, *, config_id: str
+    ) -> tuple[SettingsTargetDescription, ...]: ...
+    async def describe_target(
+        self, target: SettingsTargetRef
+    ) -> SettingsTargetDescription: ...
+    async def exists(self, target: SettingsTargetRef) -> bool: ...
+    async def get(self, target: SettingsTargetRef) -> SettingsSnapshot: ...
+    async def patch(
+        self, target: SettingsTargetRef, patch: Mapping[str, Any]
+    ) -> SettingsSnapshot: ...
+    async def replace(
+        self, target: SettingsTargetRef, settings: Mapping[str, Any]
+    ) -> SettingsSnapshot: ...
+    def subscribe(self, target: SettingsTargetRef) -> AsyncIterator[SettingsSnapshot]: ...
+    async def ensure_service_managed_id(
+        self, target: SettingsTargetRef
+    ) -> SettingsTargetRef: ...
 
 
-class InMemorySettingsService:
-    """Test-friendly settings service with subscription support."""
+def _settings_copy(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    copied = thaw_json(value or {})
+    return dict(copied) if isinstance(copied, dict) else {}
 
-    def __init__(self) -> None:
-        self._values: dict[str, dict[str, Any]] = {}
-        self._targets_by_key: dict[str, SettingsTarget] = {}
+
+def _action_settings_from_control(control: Control) -> dict[str, Any]:
+    settings = _settings_copy(control.settings)
+    if control.template_overrides:
+        settings["templateOverrides"] = _settings_copy(control.template_overrides)
+    return settings
+
+
+def _split_action_settings(
+    settings: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    copied = _settings_copy(settings)
+    raw_template_overrides = copied.pop("templateOverrides", {})
+    template_overrides = (
+        _settings_copy(raw_template_overrides)
+        if isinstance(raw_template_overrides, Mapping)
+        else {}
+    )
+    return copied, template_overrides
+
+
+def _schema_metadata(
+    descriptor: ActionDescriptor | None,
+    *,
+    scope: str,
+) -> SettingsSchemaMetadata:
+    schema = None
+    if descriptor is not None:
+        schema = (
+            descriptor.plugin_settings_schema
+            if scope == "plugin"
+            else descriptor.settings_schema
+        )
+    return SettingsSchemaMetadata(
+        schema=schema,
+        stale=schema is None,
+    )
+
+
+def _validate_settings(
+    settings: Mapping[str, Any],
+    metadata: SettingsSchemaMetadata,
+) -> None:
+    if metadata.json_schema is None:
+        return
+    try:
+        validate_json_schema(
+            instance=thaw_json(settings),
+            schema=thaw_json(metadata.json_schema),
+        )
+    except JsonSchemaValidationError as exc:
+        raise ValueError(f"settings failed schema validation: {exc.message}") from exc
+
+
+class ConfigBackedSettingsService:
+    """Settings API backed by controller-owned device config YAML."""
+
+    def __init__(
+        self,
+        *,
+        controller_id: str,
+        config_service: DeviceConfigService,
+        action_descriptor_provider: ActionDescriptorProvider | None = None,
+    ) -> None:
+        self._controller_id = controller_id
+        self._config_service = config_service
+        self._action_descriptor_provider = action_descriptor_provider
         self._subscribers: dict[
-            str, set[anyio.abc.ObjectSendStream[dict[str, Any]]]
+            str, set[anyio.abc.ObjectSendStream[SettingsSnapshot]]
         ] = {}
         self._lock = anyio.Lock()
 
-    async def exists(self, target: SettingsTarget) -> bool:
-        async with self._lock:
-            return _store_key(target) in self._values
+    async def list_targets(
+        self, *, config_id: str
+    ) -> tuple[SettingsTargetDescription, ...]:
+        config = await self._require_config(config_id)
+        descriptions: list[SettingsTargetDescription] = []
+        plugin_ids = {
+            plugin_id
+            for plugin_id in config.plugin_settings
+            if plugin_id.strip()
+        }
+        for location in self._control_locations(config):
+            descriptor = await self._action_descriptor(location.control.action)
+            plugin_id = descriptor.plugin_uuid if descriptor else None
+            if plugin_id:
+                plugin_ids.add(plugin_id)
+            descriptions.append(
+                await self.describe_target(
+                    self.action_target(
+                        config,
+                        location,
+                        plugin_id=plugin_id,
+                    )
+                )
+            )
+        for plugin_id in sorted(plugin_ids):
+            descriptions.append(
+                await self.describe_target(
+                    SettingsTargetRef(
+                        scope="plugin",
+                        controllerId=self._controller_id,
+                        configId=config.id,
+                        pluginId=plugin_id,
+                    )
+                )
+            )
+        return tuple(descriptions)
 
-    async def get(self, target: SettingsTarget) -> dict[str, Any]:
-        async with self._lock:
-            return _settings_copy(self._values.get(_store_key(target), {}))
+    async def describe_target(
+        self, target: SettingsTargetRef
+    ) -> SettingsTargetDescription:
+        config = await self._require_config(target.config_id)
+        descriptor = await self._descriptor_for_target(target)
+        if target.scope == "plugin":
+            return SettingsTargetDescription(
+                target=target,
+                pluginId=target.plugin_id or "",
+                label=target.plugin_id,
+                schemaMetadata=_schema_metadata(descriptor, scope="plugin"),
+                provenance=("config_default",),
+            )
+        location = self._find_control(config, target)
+        return SettingsTargetDescription(
+            target=target,
+            pluginId=target.plugin_id or "",
+            actionId=target.action_id,
+            label=location.control.id or location.control.selector.label or target.action_id,
+            placement={
+                "profile": location.profile_id,
+                "page": location.page_id,
+                "control": location.control.selector.control_id,
+            },
+            schemaMetadata=_schema_metadata(descriptor, scope="action_instance"),
+            provenance=self._action_provenance(location.control),
+        )
 
-    async def merge(
-        self, target: SettingsTarget, patch: dict[str, Any]
-    ) -> dict[str, Any]:
-        async with self._lock:
-            key = _store_key(target)
-            current = _settings_copy(self._values.get(key, {}))
-            current.update(_settings_copy(patch))
-            self._values[key] = current
-            self._targets_by_key[key] = target
-            subscribers = set(self._subscribers.get(key, set()))
-        await self._notify(subscribers, current)
-        return _settings_copy(current)
+    async def exists(self, target: SettingsTargetRef) -> bool:
+        try:
+            await self.get(target)
+        except KeyError:
+            return False
+        return True
 
-    def subscribe(self, target: SettingsTarget) -> AsyncIterator[dict[str, Any]]:
+    async def get(self, target: SettingsTargetRef) -> SettingsSnapshot:
+        config = await self._require_config(target.config_id)
+        descriptor = await self._descriptor_for_target(target)
+        if target.scope == "plugin":
+            settings = _settings_copy(config.plugin_settings.get(target.plugin_id or ""))
+            metadata = _schema_metadata(descriptor, scope="plugin")
+            return SettingsSnapshot(
+                target=target,
+                settings=settings,
+                provenance=("config_default",),
+                schemaMetadata=metadata,
+            )
+        location = self._find_control(config, target)
+        metadata = _schema_metadata(descriptor, scope="action_instance")
+        return SettingsSnapshot(
+            target=target,
+            settings=_action_settings_from_control(location.control),
+            provenance=self._action_provenance(location.control),
+            schemaMetadata=metadata,
+        )
+
+    async def patch(
+        self, target: SettingsTargetRef, patch: Mapping[str, Any]
+    ) -> SettingsSnapshot:
+        current = await self.get(target)
+        merged = _settings_copy(current.settings)
+        merged.update(_settings_copy(patch))
+        return await self.replace(target, merged)
+
+    async def replace(
+        self, target: SettingsTargetRef, settings: Mapping[str, Any]
+    ) -> SettingsSnapshot:
+        config = await self._require_config(target.config_id)
+        descriptor = await self._descriptor_for_target(target)
+        metadata = _schema_metadata(descriptor, scope=target.scope)
+        next_settings = _settings_copy(settings)
+        _validate_settings(next_settings, metadata)
+        if target.scope == "plugin":
+            plugin_settings = dict(config.plugin_settings)
+            plugin_settings[target.plugin_id or ""] = next_settings
+            next_config = config.model_copy(update={"plugin_settings": plugin_settings})
+        else:
+            location = self._find_control(config, target)
+            action_settings, template_overrides = _split_action_settings(next_settings)
+            next_config = self._replace_control(
+                config,
+                location,
+                settings=action_settings,
+                template_overrides=template_overrides,
+            )
+        await self._config_service.write_config(next_config)
+        snapshot = await self.get(target)
+        await self._notify(target, snapshot)
+        return snapshot
+
+    def subscribe(self, target: SettingsTargetRef) -> AsyncIterator[SettingsSnapshot]:
         return self._subscribe_impl(target)
 
-    async def clear_config_targets(self, *, controller_id: str, config_id: str) -> int:
-        """Drop runtime overlays for a config so reloaded config values win."""
+    async def ensure_service_managed_id(
+        self, target: SettingsTargetRef
+    ) -> SettingsTargetRef:
+        if target.scope != "action_instance":
+            return target
+        if target.stable_id:
+            return target
+        config = await self._require_config(target.config_id)
+        location = self._find_control(config, target)
+        managed_id = self._new_managed_id(config)
+        next_config = self._replace_control(
+            config,
+            location,
+            stable_id=managed_id,
+        )
+        await self._config_service.write_config(next_config)
+        next_action_instance_id = derive_action_instance_id(
+            controller_id=self._controller_id,
+            config_id=config.id,
+            action_id=location.control.action,
+            stable_id=managed_id,
+        )
+        return SettingsTargetRef(
+            scope="action_instance",
+            controllerId=self._controller_id,
+            configId=config.id,
+            pluginId=target.plugin_id,
+            actionId=target.action_id,
+            actionInstanceId=next_action_instance_id,
+            stableId=managed_id,
+        )
 
-        async with self._lock:
-            to_remove = [
-                key
-                for key, target in self._targets_by_key.items()
-                if target.scope == "action_instance"
-                and target.controller_id == controller_id
-                and target.config_id == config_id
-            ]
-            for key in to_remove:
-                self._values.pop(key, None)
-                self._targets_by_key.pop(key, None)
-        return len(to_remove)
+    def action_target(
+        self,
+        config: DeviceConfig,
+        location: _ControlLocation,
+        *,
+        plugin_id: str | None,
+    ) -> SettingsTargetRef:
+        return SettingsTargetRef(
+            scope="action_instance",
+            controllerId=self._controller_id,
+            configId=config.id,
+            pluginId=plugin_id or "",
+            actionId=location.control.action,
+            actionInstanceId=location.action_instance_id,
+            stableId=location.control.id,
+        )
+
+    async def _require_config(self, config_id: str) -> DeviceConfig:
+        config = await self._config_service.get_config(config_id)
+        if config is None:
+            raise KeyError(f"Unknown device config {config_id!r}")
+        return config
+
+    async def _action_descriptor(self, action_id: str) -> ActionDescriptor | None:
+        if self._action_descriptor_provider is None:
+            return None
+        return await self._action_descriptor_provider(action_id)
+
+    async def _descriptor_for_target(
+        self, target: SettingsTargetRef
+    ) -> ActionDescriptor | None:
+        if target.action_id:
+            return await self._action_descriptor(target.action_id)
+        if target.scope == "plugin" and target.plugin_id:
+            config = await self._require_config(target.config_id)
+            for location in self._control_locations(config):
+                descriptor = await self._action_descriptor(location.control.action)
+                if descriptor is not None and descriptor.plugin_uuid == target.plugin_id:
+                    return descriptor
+        return None
+
+    def _control_locations(self, config: DeviceConfig) -> tuple[_ControlLocation, ...]:
+        locations: list[_ControlLocation] = []
+        for profile_index, profile in enumerate(config.profiles):
+            for page_index, page in enumerate(profile.pages):
+                page_id = str(page_index)
+                for control_index, control in enumerate(page.controls):
+                    control_id = control.selector.control_id or str(control_index)
+                    locations.append(
+                        _ControlLocation(
+                            profile_id=profile.name,
+                            profile_index=profile_index,
+                            page_id=page_id,
+                            page_index=page_index,
+                            control_index=control_index,
+                            control=control,
+                            action_instance_id=derive_action_instance_id(
+                                controller_id=self._controller_id,
+                                config_id=config.id,
+                                action_id=control.action,
+                                stable_id=control.id,
+                                profile_id=profile.name,
+                                page_id=page_id,
+                                control_id=control_id,
+                            ),
+                        )
+                    )
+        return tuple(locations)
+
+    def _find_control(
+        self,
+        config: DeviceConfig,
+        target: SettingsTargetRef,
+    ) -> _ControlLocation:
+        for location in self._control_locations(config):
+            if location.action_instance_id == target.action_instance_id:
+                return location
+        raise KeyError(f"Unknown action settings target {target.key()!r}")
+
+    def _replace_control(
+        self,
+        config: DeviceConfig,
+        location: _ControlLocation,
+        *,
+        settings: Mapping[str, Any] | None = None,
+        stable_id: str | None = None,
+        template_overrides: Mapping[str, Any] | None = None,
+    ) -> DeviceConfig:
+        profiles = list(config.profiles)
+        profile = profiles[location.profile_index]
+        pages = list(profile.pages)
+        page = pages[location.page_index]
+        controls = list(page.controls)
+        control = controls[location.control_index]
+        update: dict[str, Any] = {}
+        if settings is not None:
+            update["settings"] = _settings_copy(settings)
+        if stable_id is not None:
+            update["id"] = stable_id
+        if template_overrides is not None:
+            update["template_overrides"] = _settings_copy(template_overrides)
+        controls[location.control_index] = control.model_copy(update=update)
+        pages[location.page_index] = page.model_copy(update={"controls": controls})
+        profiles[location.profile_index] = profile.model_copy(update={"pages": pages})
+        return config.model_copy(update={"profiles": profiles})
+
+    def _new_managed_id(self, config: DeviceConfig) -> str:
+        existing = {
+            control.id
+            for profile in config.profiles
+            for page in profile.pages
+            for control in page.controls
+            if control.id is not None
+        }
+        while True:
+            candidate = "managed-" + secrets.token_hex(6)
+            if candidate not in existing:
+                return candidate
+
+    def _action_provenance(
+        self, control: Control
+    ) -> tuple[SettingsProvenance, ...]:
+        provenance: list[SettingsProvenance] = ["config_default"]
+        if control.template_overrides:
+            provenance.append("template_override")
+        return tuple(provenance)
 
     async def _subscribe_impl(
-        self, target: SettingsTarget
-    ) -> AsyncIterator[dict[str, Any]]:
-        send, receive = anyio.create_memory_object_stream[dict[str, Any]](
+        self, target: SettingsTargetRef
+    ) -> AsyncIterator[SettingsSnapshot]:
+        send, receive = anyio.create_memory_object_stream[SettingsSnapshot](
             max_buffer_size=32
         )
-        key = _store_key(target)
+        key = target.key()
         async with self._lock:
-            if key not in self._subscribers:
-                self._subscribers[key] = set()
-            self._subscribers[key].add(send)
-            current = _settings_copy(self._values.get(key, {}))
-        send.send_nowait(current)
+            self._subscribers.setdefault(key, set()).add(send)
+        await send.send(await self.get(target))
 
         try:
             async for value in receive:
-                yield _settings_copy(value)
+                yield value
         finally:
             async with self._lock:
                 subscribers = self._subscribers.get(key)
@@ -160,13 +448,11 @@ class InMemorySettingsService:
                         self._subscribers.pop(key, None)
             await send.aclose()
 
-    async def _notify(
-        self,
-        subscribers: set[anyio.abc.ObjectSendStream[dict[str, Any]]],
-        snapshot: dict[str, Any],
-    ) -> None:
+    async def _notify(self, target: SettingsTargetRef, snapshot: SettingsSnapshot) -> None:
+        async with self._lock:
+            subscribers = set(self._subscribers.get(target.key(), set()))
         for send in subscribers:
             try:
-                await send.send(_settings_copy(snapshot))
+                await send.send(snapshot)
             except Exception:
                 logger.exception("Failed to notify settings subscriber")

@@ -2,7 +2,6 @@ import base64
 import binascii
 import logging
 import time
-import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +12,7 @@ from deckr.contracts.messages import (
     DeckrMessage,
     parse_host_address,
 )
+from deckr.contracts.models import thaw_json
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import (
@@ -27,14 +27,15 @@ from deckr.pluginhost.messages import (
     ACTION_INSTANCE_DESTROYED,
     BINDING_OUTPUT,
     CLOSE_PAGE,
-    HERE_ARE_SETTINGS,
     OPEN_PAGE,
     PAGE_SESSION_CLOSED,
     PAGE_SESSION_OPENED,
     REPLACE_PAGE,
-    REQUEST_SETTINGS,
     SET_PAGE,
-    SET_SETTINGS,
+    SETTINGS_PATCH,
+    SETTINGS_REPLACE,
+    SETTINGS_REQUEST,
+    SETTINGS_SNAPSHOT,
     UPDATE_PAGE,
     ActionInstanceLifecycleBody,
     ActionInstanceMetadata,
@@ -44,7 +45,10 @@ from deckr.pluginhost.messages import (
     MatchedCapability,
     PageSessionLifecycleBody,
     PageSessionMetadata,
-    SettingsBody,
+    SettingsPatchBody,
+    SettingsReplaceBody,
+    SettingsSnapshotBody,
+    SettingsTargetRef,
     context_subject,
     controller_address,
     host_address,
@@ -93,9 +97,8 @@ from deckr.controller.plugin.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.plugin.context import ControlContext
 from deckr.controller.plugin.provider import PluginManager
 from deckr.controller.settings import (
-    InMemorySettingsService,
     SettingsService,
-    SettingsTarget,
+    derive_action_instance_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,24 +144,6 @@ def _selected_raster_capability_id(binding: ResolvedControlBinding) -> str | Non
     return None
 
 
-_ACTION_INSTANCE_NAMESPACE = uuid.UUID("dcd72f2a-65cb-4d9f-b0e8-4e0ef3d334f1")
-
-
-def _action_instance_id(
-    *,
-    controller_id: str,
-    config_id: str,
-    profile_id: str,
-    page_id: str,
-    control_id: str,
-    action_uuid: str,
-) -> str:
-    seed = "\x1f".join(
-        (controller_id, config_id, profile_id, page_id, control_id, action_uuid)
-    )
-    return str(uuid.uuid5(_ACTION_INSTANCE_NAMESPACE, seed))
-
-
 @dataclass(slots=True)
 class DynamicPageSession:
     page_id: str
@@ -175,7 +160,7 @@ class DynamicPageSession:
     owner_page: int
     timeout_ms: int
     last_activity: float
-    settings_target: SettingsTarget | None
+    settings_target: SettingsTargetRef | None
 
 
 @dataclass(slots=True)
@@ -191,7 +176,7 @@ class BindingLease:
     raster_capability_id: str | None
     profile_id: str
     page_id: str
-    settings_target: SettingsTarget | None
+    settings_target: SettingsTargetRef | None
     context: ControlContext
     page_session_id: str | None = None
     role_id: str | None = None
@@ -243,7 +228,7 @@ class DeviceManager:
             backend=self._render_backend,
             start_soon=start_soon,
         )
-        self._settings_service = settings_service or InMemorySettingsService()
+        self._settings_service = settings_service
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
         self._nav = NavigationService(config)
@@ -342,19 +327,21 @@ class DeviceManager:
                 ),
             )
 
-    def _build_context_settings_target_for_binding(
+    def _build_settings_target_for_binding(
         self,
         *,
         action_instance_id: str,
         binding: ResolvedControlBinding,
         plugin_uuid: str | None = None,
-    ) -> SettingsTarget:
-        return SettingsTarget.for_action_instance(
-            controller_id=self._controller_id,
-            config_id=self.config_id,
-            action_instance_id=action_instance_id,
-            action_uuid=binding.action_uuid,
-            plugin_uuid=plugin_uuid,
+    ) -> SettingsTargetRef:
+        return SettingsTargetRef(
+            scope="action_instance",
+            controllerId=self._controller_id,
+            configId=self.config_id,
+            pluginId=plugin_uuid or "",
+            actionId=binding.action_uuid,
+            actionInstanceId=action_instance_id,
+            stableId=binding.stable_id,
         )
 
     def _matched_capabilities(
@@ -499,14 +486,21 @@ class DeviceManager:
             )
             return False
         settings_target = (
-            self._build_context_settings_target_for_binding(
+            self._build_settings_target_for_binding(
                 action_instance_id=action_instance_id,
                 binding=binding,
-                plugin_uuid=action_meta.plugin_uuid,
+                plugin_uuid=action_meta.plugin_uuid or action_meta.host_id,
             )
             if persist_settings
             else None
         )
+        initial_settings = dict(binding.settings)
+        if self._settings_service is not None and settings_target is not None:
+            try:
+                snapshot = await self._settings_service.get(settings_target)
+                initial_settings = dict(thaw_json(snapshot.settings))
+            except KeyError:
+                initial_settings = dict(binding.settings)
         builtin_action = None
         if action_meta.host_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
             self.manager, "get_builtin_action"
@@ -518,7 +512,7 @@ class DeviceManager:
             action_meta=action_meta,
             action_instance_id=action_instance_id,
             context_id=context_id,
-            settings=binding.settings,
+            settings=initial_settings,
         )
         binding_metadata = BindingMetadata(
             pluginId=action_meta.plugin_uuid,
@@ -546,7 +540,7 @@ class DeviceManager:
             host_id=action_meta.host_id,
             action_uuid=action_meta.uuid,
             control=control,
-            settings=binding.settings,
+            settings=initial_settings,
             manager=self,
             plugin_bus=self._plugin_bus,
             start_soon=self._start_soon,
@@ -802,13 +796,14 @@ class DeviceManager:
 
         if isinstance(arriving, StaticPageRef):
             for binding in result.bindings:
-                action_instance_id = _action_instance_id(
+                action_instance_id = derive_action_instance_id(
                     controller_id=self._controller_id,
                     config_id=self.config_id,
+                    action_id=binding.action_uuid,
+                    stable_id=binding.stable_id,
                     profile_id=arriving.profile_name,
                     page_id=str(arriving.page_index),
                     control_id=binding.control_id,
-                    action_uuid=binding.action_uuid,
                 )
                 if not await self._try_resolve_binding(
                     binding,
@@ -1249,13 +1244,14 @@ class DeviceManager:
         for child, binding in zip(child_bindings, result.bindings, strict=True):
             if await self.action_contexts.has_key(binding.control_id):
                 continue  # Already has context
-            resolved_action_instance_id = action_instance_id or _action_instance_id(
+            resolved_action_instance_id = action_instance_id or derive_action_instance_id(
                 controller_id=self._controller_id,
                 config_id=self.config_id,
+                action_id=binding.action_uuid,
+                stable_id=binding.stable_id,
                 profile_id=profile_id,
                 page_id=page_id,
                 control_id=binding.control_id,
-                action_uuid=binding.action_uuid,
             )
             await self._try_resolve_binding(
                 binding,
@@ -1282,16 +1278,6 @@ class DeviceManager:
             await self.clear_page()
             return
         async with self._nav_lock:
-            cleared = await self._settings_service.clear_config_targets(
-                controller_id=self._controller_id,
-                config_id=self.config_id,
-            )
-            if cleared:
-                logger.info(
-                    "Cleared %d runtime settings overlay(s) for %s after config change",
-                    cleared,
-                    self.config_id,
-                )
             self.config = config
             if self._dynamic_page_session is not None:
                 await self._finalize_dynamic_page(reason="config_change")
@@ -1427,27 +1413,58 @@ class DeviceManager:
     async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from a plugin host."""
         payload = plugin_body_dict(msg)
+        msg_type = msg.message_type
+
+        async def send_settings_response(snapshot_body: SettingsSnapshotBody) -> None:
+            await self._plugin_bus.reply_to(
+                msg,
+                message_type=SETTINGS_SNAPSHOT,
+                body=snapshot_body.to_dict(),
+                subject=msg.subject,
+            )
+
+        if msg_type in {SETTINGS_REQUEST, SETTINGS_PATCH, SETTINGS_REPLACE}:
+            sender_host_id = self._command_sender_host_id(msg)
+            if sender_host_id is None:
+                return
+            target_data = payload.get("target")
+            if not isinstance(target_data, dict):
+                return
+            target = SettingsTargetRef.model_validate(target_data)
+            if target.config_id != self.config_id:
+                return
+            if target.scope == "plugin":
+                if self._settings_service is None:
+                    return
+                if msg_type == SETTINGS_REQUEST:
+                    snapshot = await self._settings_service.get(target)
+                elif msg_type == SETTINGS_PATCH:
+                    body = SettingsPatchBody.model_validate(payload)
+                    snapshot = await self._settings_service.patch(
+                        target,
+                        body.settings,
+                    )
+                else:
+                    body = SettingsReplaceBody.model_validate(payload)
+                    snapshot = await self._settings_service.replace(
+                        target,
+                        body.settings,
+                    )
+                await send_settings_response(SettingsSnapshotBody.from_snapshot(snapshot))
+                return
+
         context_id = subject_context_id(msg.subject) or ""
         if not context_id:
             return
         config_id = subject_config_id(msg.subject)
         if config_id != self.config_id:
             return
-        msg_type = msg.message_type
         authorization = await self._authorize_plugin_command(
             msg,
             context_id=context_id,
         )
         if authorization is None:
             return
-
-        async def send_settings_response(settings: dict) -> None:
-            await self._plugin_bus.reply_to(
-                msg,
-                message_type=HERE_ARE_SETTINGS,
-                body=SettingsBody(settings=settings).to_dict(),
-                subject=msg.subject,
-            )
 
         if msg_type == OPEN_PAGE:
             desc_data = payload.get("descriptor")
@@ -1498,39 +1515,51 @@ class DeviceManager:
 
         page_session = authorization.page_session
         if page_session is not None:
-            if msg_type == SET_SETTINGS:
-                target = page_session.settings_target
-                new_settings = (
-                    await self._settings_service.merge(
+            if msg_type in {SETTINGS_REQUEST, SETTINGS_PATCH, SETTINGS_REPLACE}:
+                if self._settings_service is None or page_session.settings_target is None:
+                    return
+                target = SettingsTargetRef.model_validate(payload.get("target"))
+                if target.key() != page_session.settings_target.key():
+                    logger.warning("Ignoring settings command for mismatched page target")
+                    return
+                if msg_type == SETTINGS_REQUEST:
+                    snapshot = await self._settings_service.get(target)
+                elif msg_type == SETTINGS_PATCH:
+                    body = SettingsPatchBody.model_validate(payload)
+                    snapshot = await self._settings_service.patch(
                         target,
-                        dict(payload.get("settings", {})),
+                        body.settings,
                     )
-                    if target is not None
-                    else {}
-                )
-                await send_settings_response(new_settings)
-            elif msg_type == REQUEST_SETTINGS:
-                current_settings = (
-                    await self._settings_service.get(page_session.settings_target)
-                    if page_session.settings_target is not None
-                    else {}
-                )
-                await send_settings_response(current_settings)
+                else:
+                    body = SettingsReplaceBody.model_validate(payload)
+                    snapshot = await self._settings_service.replace(
+                        target,
+                        body.settings,
+                    )
+                await send_settings_response(SettingsSnapshotBody.from_snapshot(snapshot))
             return
 
         lease = authorization.binding
         if lease is None:
             return
 
-        router = lease.context._router
-
-        if msg_type == SET_SETTINGS:
-            await router.set_settings(payload.get("settings", {}))
-            settings = await router.get_settings()
-            await send_settings_response(vars(settings))
-        elif msg_type == REQUEST_SETTINGS:
-            settings = await router.get_settings()
-            await send_settings_response(vars(settings))
+        if msg_type in {SETTINGS_REQUEST, SETTINGS_PATCH, SETTINGS_REPLACE}:
+            if self._settings_service is None or lease.settings_target is None:
+                return
+            target = SettingsTargetRef.model_validate(payload.get("target"))
+            if target.key() != lease.settings_target.key():
+                logger.warning("Ignoring settings command for mismatched binding target")
+                return
+            if msg_type == SETTINGS_REQUEST:
+                snapshot = await self._settings_service.get(target)
+            elif msg_type == SETTINGS_PATCH:
+                body = SettingsPatchBody.model_validate(payload)
+                snapshot = await self._settings_service.patch(target, body.settings)
+            else:
+                body = SettingsReplaceBody.model_validate(payload)
+                snapshot = await self._settings_service.replace(target, body.settings)
+            lease.context._store.settings = dict(thaw_json(snapshot.settings))
+            await send_settings_response(SettingsSnapshotBody.from_snapshot(snapshot))
         elif msg_type == SET_PAGE:
             if lease.page_session_id is not None:
                 logger.warning("Ignoring setPage from dynamic child binding")

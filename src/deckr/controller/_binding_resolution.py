@@ -27,6 +27,8 @@ class ConfiguredControlBinding:
     selector: ControlSelector
     action_uuid: str
     settings: Mapping[str, Any]
+    stable_id: str | None = None
+    template_overrides: Mapping[str, Any] | None = None
     title_options: TitleOptions | None = None
 
     @property
@@ -41,6 +43,8 @@ class ResolvedControlBinding:
     control: ControlDescriptor
     action_uuid: str
     settings: Mapping[str, Any]
+    stable_id: str | None
+    template_overrides: Mapping[str, Any] | None
     title_options: TitleOptions | None
     selector: ControlSelector
     input_capability_ids: frozenset[str]
@@ -114,6 +118,8 @@ def resolve_binding(
             control=control,
             action_uuid=binding.action_uuid,
             settings=binding.settings,
+            stable_id=binding.stable_id,
+            template_overrides=binding.template_overrides,
             title_options=binding.title_options,
             selector=binding.selector,
             input_capability_ids=_selected_capability_ids(
@@ -163,6 +169,8 @@ def exact_control_binding(
         selector=ControlSelector(control_id=control_id),
         action_uuid=action_uuid,
         settings=settings,
+        stable_id=None,
+        template_overrides=None,
         title_options=title_options,
     )
 

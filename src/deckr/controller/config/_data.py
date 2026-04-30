@@ -128,9 +128,11 @@ class ControlSelector(_ConfigModel):
 
 
 class Control(_ConfigModel):
+    id: str | None = None
     selector: ControlSelector
     action: str
     settings: dict[str, Any] = Field(default_factory=dict)
+    template_overrides: dict[str, Any] = Field(default_factory=dict)
     title_options: TitleOptions | None = None
 
 
@@ -155,4 +157,26 @@ class DeviceConfig(_ConfigModel):
     name: str
     match: DeviceConfigMatch
     enabled: bool = True
+    plugin_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     profiles: list[Profile]
+
+    @model_validator(mode="after")
+    def _validate_control_ids(self) -> "DeviceConfig":
+        seen: dict[str, str] = {}
+        duplicates: set[str] = set()
+        for profile in self.profiles:
+            for page_index, page in enumerate(profile.pages):
+                for control in page.controls:
+                    if control.id is None:
+                        continue
+                    location = f"{profile.name}/{page_index}/{control.selector.control_id or '?'}"
+                    if control.id in seen:
+                        duplicates.add(control.id)
+                    else:
+                        seen[control.id] = location
+        if duplicates:
+            raise ValueError(
+                "control ids must be unique within a device config: "
+                + ", ".join(sorted(duplicates))
+            )
+        return self

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import anyio
 from deckr.contracts.models import thaw_json
-from deckr.pluginhost.messages import TitleOptions
+from deckr.pluginhost.messages import SettingsTargetRef, TitleOptions
 
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
@@ -16,7 +16,7 @@ from deckr.controller._state_store import (
     ControlStateStore,
     TransientOverlay,
 )
-from deckr.controller.settings import SettingsService, SettingsTarget
+from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
     from deckr.controller._device_layout import RasterImageFormat
@@ -76,7 +76,7 @@ class CommandRouter:
         start_soon: Callable,
         *,
         settings_service: SettingsService | None = None,
-        settings_target: SettingsTarget | None = None,
+        settings_target: SettingsTargetRef | None = None,
     ):
         self._store = store
         self._render_service = render_service
@@ -165,9 +165,9 @@ class CommandRouter:
             return
 
         if self._settings_service is not None and self._settings_target is not None:
-            overlay = await self._settings_service.get(self._settings_target)
+            snapshot = await self._settings_service.get(self._settings_target)
             merged = dict(thaw_json(self._store.settings))
-            merged.update(overlay)
+            merged.update(snapshot.settings)
             self._store.settings = merged
 
         self._settings_hydrated = True
@@ -183,12 +183,11 @@ class CommandRouter:
         merged = candidate
         if self._settings_service is not None and self._settings_target is not None:
             try:
-                target_exists = await self._settings_service.exists(self._settings_target)
-                patch = settings if target_exists else candidate
-                merged = await self._settings_service.merge(
+                snapshot = await self._settings_service.patch(
                     self._settings_target,
-                    patch,
+                    settings,
                 )
+                merged = dict(thaw_json(snapshot.settings))
             except Exception:
                 logger.exception(
                     "Failed to update runtime settings for context %s",

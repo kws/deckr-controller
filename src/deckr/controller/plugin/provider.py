@@ -14,6 +14,8 @@ class ActionMetadata:
     host_id: str
     name: str | None = None
     plugin_uuid: str | None = None
+    settings_schema: dict | None = None
+    plugin_settings_schema: dict | None = None
 
 
 class PluginManager(Protocol):

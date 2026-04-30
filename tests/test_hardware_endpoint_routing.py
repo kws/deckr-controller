@@ -38,7 +38,6 @@ from deckr.controller.config import (
     NullDeviceConfigService,
     Profile,
 )
-from deckr.controller.settings import InMemorySettingsService
 
 
 def _device(device_id: str, fingerprint: str) -> DeviceDescriptor:
@@ -182,7 +181,7 @@ async def test_manager_presence_loss_cleans_only_configs_for_lost_manager_endpoi
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
@@ -250,7 +249,7 @@ async def test_manager_presence_session_change_invalidates_owned_device():
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
@@ -300,7 +299,7 @@ async def test_device_disconnect_tears_down_without_hardware_clears():
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     ctrl_ctx = AsyncMock()
@@ -318,7 +317,7 @@ async def test_device_reconnect_replaces_existing_context_without_hardware_clear
         hardware_endpoint=object(),
         state=object(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     controller._start_soon = lambda fn, *args: None
@@ -350,7 +349,7 @@ async def test_device_lifecycle_renders_once_before_listening_for_config_changes
         hardware_endpoint=object(),
         state=object(),
         config_service=_MatchingConfigService(config),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     live = controller._device_registry.connect(
@@ -411,7 +410,7 @@ async def test_claim_loss_retries_cached_matching_inventory():
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=_MatchingConfigService(config),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     controller.on_device_connected = AsyncMock()
@@ -458,7 +457,7 @@ async def test_same_endpoint_old_session_claim_blocks_until_claim_loss():
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=_MatchingConfigService(config),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     controller.on_device_connected = AsyncMock()
@@ -503,7 +502,7 @@ async def test_broker_snapshot_inventory_removal_revokes_live_device():
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
@@ -556,7 +555,7 @@ async def test_broker_snapshot_claim_takeover_revokes_owned_device():
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     controller.on_device_disconnected = AsyncMock()
@@ -609,7 +608,7 @@ async def test_hardware_snapshot_unavailable_keeps_live_device(monkeypatch):
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     ref = DeviceRef(manager_id="room-a", device_id="deck")
@@ -638,7 +637,7 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     ctrl_ctx = AsyncMock()
@@ -682,7 +681,7 @@ async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
         hardware_endpoint=bus.endpoint("controller:controller-main"),
         state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
-        settings_service=InMemorySettingsService(),
+        settings_service=None,
         controller_id="controller-main",
     )
     ref = DeviceRef(manager_id="room-a", device_id="deck")

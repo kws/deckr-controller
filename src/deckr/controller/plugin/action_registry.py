@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 import anyio
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.messages import RESERVED_BUILTIN_PROVIDER_IDS, host_address
+from deckr.contracts.models import thaw_json
 from deckr.pluginhost.messages import ActionDescriptor, PluginActionCatalog
 from deckr.state import (
     EndpointPresence,
@@ -76,6 +77,21 @@ class ActionRegistry(BaseComponent):
         for key, (host_id, descriptor) in self._action_registry.items():
             if key.endswith(f"::{address}"):
                 return _metadata(host_id, descriptor)
+        return None
+
+    async def get_action_descriptor(self, address: str) -> ActionDescriptor | None:
+        if "::" in address:
+            provider_id, _, action_uuid = address.partition("::")
+            if provider_id in RESERVED_BUILTIN_PROVIDER_IDS:
+                return self._builtin_action_registry.get(action_uuid)
+            plugin_entry = self._action_registry.get(address)
+            return plugin_entry[1] if plugin_entry is not None else None
+        builtin = self._builtin_action_registry.get(address)
+        if builtin is not None:
+            return builtin
+        for key, (_, descriptor) in self._action_registry.items():
+            if key.endswith(f"::{address}"):
+                return descriptor
         return None
 
     def _builtin_action_metadata(self, action_uuid: str) -> ActionMetadata | None:
@@ -259,6 +275,16 @@ def _metadata(host_id: str, descriptor: ActionDescriptor) -> ActionMetadata:
         host_id=host_id,
         name=descriptor.name,
         plugin_uuid=descriptor.plugin_uuid,
+        settings_schema=(
+            thaw_json(descriptor.settings_schema)
+            if descriptor.settings_schema is not None
+            else None
+        ),
+        plugin_settings_schema=(
+            thaw_json(descriptor.plugin_settings_schema)
+            if descriptor.plugin_settings_schema is not None
+            else None
+        ),
     )
 
 
