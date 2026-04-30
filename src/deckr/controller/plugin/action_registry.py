@@ -104,7 +104,7 @@ class ActionRegistry(BaseComponent):
         if host_id not in self._host_presence_sessions:
             return False
         return any(
-            entry_host_id == host_id and descriptor.plugin_uuid == plugin_id
+            entry_host_id == host_id and descriptor.plugin_id == plugin_id
             for entry_host_id, descriptor in self._action_registry.values()
         )
 
@@ -273,9 +273,9 @@ class ActionRegistry(BaseComponent):
         if self._host_presence_sessions.get(host_id) != catalog.session_id:
             return {}
         return {
-            _qualified_id(host_id, descriptor.uuid): descriptor
+            _qualified_id(host_id, descriptor.action_id): descriptor
             for descriptor in catalog.actions.values()
-            if descriptor.uuid
+            if descriptor.action_id
         }
 
     async def _publish_actions_changed(self, event: ActionsChangedEvent) -> None:
@@ -285,10 +285,10 @@ class ActionRegistry(BaseComponent):
 
 def _metadata(host_id: str, descriptor: ActionDescriptor) -> ActionMetadata:
     return ActionMetadata(
-        uuid=descriptor.uuid,
+        uuid=descriptor.action_id,
         host_id=host_id,
         name=descriptor.name,
-        plugin_uuid=descriptor.plugin_uuid,
+        plugin_uuid=descriptor.plugin_id,
         settings_schema=(
             thaw_json(descriptor.settings_schema)
             if descriptor.settings_schema is not None
@@ -360,14 +360,14 @@ def _valid_catalog_actions(
 ) -> dict[str, ActionDescriptor]:
     valid: dict[str, ActionDescriptor] = {}
     for action_uuid, descriptor in actions.items():
-        if descriptor.uuid != action_uuid:
+        if descriptor.action_id != action_uuid:
             logger.warning(
-                "Ignoring plugin action catalog entry keyed %s with descriptor uuid %s",
+                "Ignoring plugin action catalog entry keyed %s with descriptor actionId %s",
                 action_uuid,
-                descriptor.uuid,
+                descriptor.action_id,
             )
             continue
-        if not descriptor.uuid.strip():
+        if not descriptor.action_id.strip():
             continue
         valid[action_uuid] = descriptor
     return valid

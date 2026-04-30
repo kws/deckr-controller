@@ -53,9 +53,9 @@ def _catalog(
         ttlSeconds=15,
         actions={
             action_uuid: ActionDescriptor(
-                uuid=action_uuid,
+                actionId=action_uuid,
                 name=f"Action {action_uuid}",
-                plugin_uuid=plugin_uuid,
+                pluginId=plugin_uuid,
             )
         },
     )

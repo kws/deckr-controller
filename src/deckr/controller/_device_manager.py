@@ -31,7 +31,6 @@ from deckr.pluginhost.messages import (
     PAGE_SESSION_CLOSED,
     PAGE_SESSION_OPENED,
     REPLACE_PAGE,
-    SET_PAGE,
     SETTINGS_PATCH,
     SETTINGS_REPLACE,
     SETTINGS_REQUEST,
@@ -420,7 +419,6 @@ class DeviceManager:
                 context_id,
                 config_id=self.config_id,
                 action_instance_id=action_instance_id,
-                action_uuid=action_meta.uuid,
             ),
         )
         await self._plugin_bus.publish(msg)
@@ -444,7 +442,6 @@ class DeviceManager:
                 metadata.context_id or "",
                 config_id=self.config_id,
                 action_instance_id=metadata.action_instance_id,
-                action_uuid=metadata.action_id,
             ),
         )
         await self._plugin_bus.publish(msg)
@@ -665,7 +662,6 @@ class DeviceManager:
                 config_id=self.config_id,
                 action_instance_id=session.action_instance_id,
                 page_session_id=session.page_session_id,
-                action_uuid=session.owner_action_uuid,
             ),
             causation_id=causation_id,
         )
@@ -693,7 +689,6 @@ class DeviceManager:
                 config_id=self.config_id,
                 action_instance_id=session.action_instance_id,
                 page_session_id=session.page_session_id,
-                action_uuid=session.owner_action_uuid,
             ),
             causation_id=causation_id,
         )
@@ -1647,16 +1642,6 @@ class DeviceManager:
                 return
             lease.context._store.settings = dict(thaw_json(snapshot_body.settings))
             await send_settings_response(snapshot_body)
-        elif msg_type == SET_PAGE:
-            if lease.page_session_id is not None:
-                logger.warning("Ignoring setPage from dynamic child binding")
-                return
-            await self.set_page(
-                profile=payload.get("profile", "default"),
-                page=payload.get("page", 0),
-                causation_id=msg.message_id,
-            )
-
     async def _handle_binding_output(
         self,
         lease: BindingLease,

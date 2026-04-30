@@ -4,7 +4,6 @@ from typing import Protocol
 
 from deckr.contracts.messages import (
     BUILTIN_ACTION_PROVIDER_ID,
-    LEGACY_BUILTIN_ACTION_PROVIDER_ID,
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
 from deckr.pluginhost.messages import ActionDescriptor, CapabilityInputEvent
@@ -15,7 +14,6 @@ from deckr.controller.plugin.builtin._nav_home import NavHomeAction
 
 __all__ = [
     "BUILTIN_ACTION_PROVIDER_ID",
-    "LEGACY_BUILTIN_ACTION_PROVIDER_ID",
     "RESERVED_BUILTIN_PROVIDER_IDS",
     "BuiltinRegistry",
 ]
@@ -56,7 +54,7 @@ class BuiltinRegistry:
         if action is None:
             return None
         return ActionDescriptor(
-            uuid=action.uuid,
+            actionId=action.uuid,
             name=getattr(action, "name", None),
-            plugin_uuid=getattr(action, "plugin_uuid", None),
+            pluginId=getattr(action, "plugin_uuid", None),
         )

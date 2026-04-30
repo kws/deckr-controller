@@ -65,9 +65,9 @@ def _config() -> DeviceConfig:
 async def _descriptor(action_id: str) -> ActionDescriptor | None:
     if action_id == "action.clock":
         return ActionDescriptor(
-            uuid="action.clock",
+            actionId="action.clock",
             name="Clock",
-            pluginUuid="plugin.clock",
+            pluginId="plugin.clock",
             settingsSchema={
                 "type": "object",
                 "properties": {
@@ -84,9 +84,9 @@ async def _descriptor(action_id: str) -> ActionDescriptor | None:
         )
     if action_id == "action.no_schema":
         return ActionDescriptor(
-            uuid="action.no_schema",
+            actionId="action.no_schema",
             name="No Schema",
-            pluginUuid="plugin.no_schema",
+            pluginId="plugin.no_schema",
         )
     return None
 

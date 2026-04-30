@@ -148,7 +148,7 @@ class ConfigBackedSettingsService:
         }
         for location in self._control_locations(config):
             descriptor = await self._action_descriptor(location.control.action)
-            plugin_id = descriptor.plugin_uuid if descriptor else None
+            plugin_id = descriptor.plugin_id if descriptor else None
             if plugin_id:
                 plugin_ids.add(plugin_id)
             descriptions.append(
@@ -338,7 +338,7 @@ class ConfigBackedSettingsService:
             config = await self._require_config(target.config_id)
             for location in self._control_locations(config):
                 descriptor = await self._action_descriptor(location.control.action)
-                if descriptor is not None and descriptor.plugin_uuid == target.plugin_id:
+                if descriptor is not None and descriptor.plugin_id == target.plugin_id:
                     return descriptor
         return None
 
@@ -391,8 +391,8 @@ class ConfigBackedSettingsService:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
         if target.stable_id != location.control.id:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
-        if descriptor is not None and descriptor.plugin_uuid:
-            if target.plugin_id != descriptor.plugin_uuid:
+        if descriptor is not None and descriptor.plugin_id:
+            if target.plugin_id != descriptor.plugin_id:
                 raise KeyError(f"Unknown action settings target {target.key()!r}")
         return location, descriptor
 

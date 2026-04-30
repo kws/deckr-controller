@@ -137,7 +137,6 @@ class ControlContext:
                 action_instance_id=self.action_instance_id,
                 binding_id=self.binding_id,
                 page_session_id=self.page_session_id,
-                action_uuid=self.action_uuid,
             ),
         )
         await self._plugin_bus.publish(msg)
