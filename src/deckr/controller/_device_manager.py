@@ -46,7 +46,7 @@ from deckr.pluginhost.messages import (
     PageSessionMetadata,
     SettingsPatchBody,
     SettingsReplaceBody,
-    SettingsSnapshotBody,
+    SettingsSnapshot,
     SettingsTargetRef,
     context_subject,
     controller_address,
@@ -1460,7 +1460,7 @@ class DeviceManager:
         msg_type: str,
         target: SettingsTargetRef,
         payload: Mapping[str, Any],
-    ) -> SettingsSnapshotBody | None:
+    ) -> SettingsSnapshot | None:
         if self._settings_service is None:
             return None
         try:
@@ -1480,7 +1480,7 @@ class DeviceManager:
                 exc_info=True,
             )
             return None
-        return SettingsSnapshotBody.from_snapshot(snapshot)
+        return SettingsSnapshot.from_snapshot(snapshot)
 
     async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from a plugin host."""
@@ -1497,7 +1497,7 @@ class DeviceManager:
         msg_type = msg.message_type
         settings_target: SettingsTargetRef | None = None
 
-        async def send_settings_response(snapshot_body: SettingsSnapshotBody) -> None:
+        async def send_settings_response(snapshot_body: SettingsSnapshot) -> None:
             await self._plugin_bus.reply_to(
                 msg,
                 message_type=SETTINGS_SNAPSHOT,

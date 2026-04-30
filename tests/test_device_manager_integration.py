@@ -23,7 +23,7 @@ from deckr.pluginhost.messages import (
     SETTINGS_PATCH,
     SETTINGS_REQUEST,
     SETTINGS_SNAPSHOT,
-    SettingsSnapshotBody,
+    SettingsSnapshot,
     SettingsTargetRef,
     context_subject,
     controller_address,
@@ -433,7 +433,7 @@ async def test_plugin_settings_patch_from_owning_host_writes_and_replies():
         "timezone": "Europe/Amsterdam"
     }
     assert reply.message_type == SETTINGS_SNAPSHOT
-    snapshot = SettingsSnapshotBody.model_validate(reply.body)
+    snapshot = SettingsSnapshot.model_validate(reply.body)
     assert snapshot.settings == {"timezone": "Europe/Amsterdam"}
     assert snapshot.target.key() == _plugin_settings_target().key()
     registry.host_provides_plugin.assert_called_once_with(HOST_ID, "plugin.clock")
