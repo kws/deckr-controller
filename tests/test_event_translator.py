@@ -17,6 +17,7 @@ def _event(
 ) -> hw_messages.ControlInputMessage:
     message = hw_messages.control_input_message(
         manager_id="manager-main",
+        sender_session_id="manager-session",
         device_id="d1",
         control_id=control_id,
         capability_id=capability_id,

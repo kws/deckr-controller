@@ -47,7 +47,7 @@ HOST_ADDR = host_address(HOST_ID)
 
 
 def _plugin_bus() -> LaneHarness:
-    return LaneHarness("plugin_messages", default_endpoint=HOST_ADDR)
+    return LaneHarness("plugin_messages", default_endpoint=CONTROLLER_ADDR)
 
 
 def _plugin_command(
@@ -62,6 +62,7 @@ def _plugin_command(
 ) -> DeckrMessage:
     return plugin_message(
         sender=HOST_ADDR,
+        sender_session_id="host-session",
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
         body=payload or {},
@@ -100,6 +101,7 @@ def _plugin_settings_command(
         body["settings"] = settings
     return plugin_message(
         sender=host_address(sender_host_id),
+        sender_session_id="host-session",
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
         body=body,

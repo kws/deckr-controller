@@ -313,9 +313,10 @@ async def test_device_disconnect_tears_down_without_hardware_clears():
 
 @pytest.mark.asyncio
 async def test_device_reconnect_replaces_existing_context_without_hardware_clears():
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
-        hardware_endpoint=object(),
-        state=object(),
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        state=bus.deckr.state(),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -339,6 +340,7 @@ async def test_device_reconnect_replaces_existing_context_without_hardware_clear
 async def test_device_lifecycle_renders_once_before_listening_for_config_changes(
     monkeypatch,
 ):
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     config = DeviceConfig(
         id="config-room-a",
         name="Room A",
@@ -346,8 +348,8 @@ async def test_device_lifecycle_renders_once_before_listening_for_config_changes
         profiles=[Profile(name="default", pages=[])],
     )
     controller = ControllerService(
-        hardware_endpoint=object(),
-        state=object(),
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        state=bus.deckr.state(),
         config_service=_MatchingConfigService(config),
         settings_service=None,
         controller_id="controller-main",
@@ -705,7 +707,7 @@ async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
         controller._stopping.set()
         raise StateUnavailable("nats down")
 
-    monkeypatch.setattr(controller_module, "PRESENCE_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(controller_module, "CLAIM_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(controller._state, "update", unavailable_update)
 
     await controller._claim_refresh_loop()

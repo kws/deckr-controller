@@ -128,6 +128,7 @@ class ControlContext:
     async def _publish(self, message_type: str, body: Mapping[str, Any] | Any) -> None:
         msg = plugin_message(
             sender=controller_address(self._controller_id),
+            sender_session_id=self._plugin_bus.session_id,
             recipient=host_address(self.host_id),
             message_type=message_type,
             body=body,

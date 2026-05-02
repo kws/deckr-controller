@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
 
+import anyio
 from deckr.components import (
     BaseComponent,
     Component,
@@ -15,7 +17,7 @@ from deckr.components import (
     RunContext,
 )
 from deckr.core.util.runtime_id import require_runtime_id
-from deckr.lanes import Lane
+from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import StateStore
 
 from deckr.controller._config_document import (
@@ -53,50 +55,87 @@ class ControllerRuntimeService(BaseComponent):
         self._plugin_messages = plugin_messages
         self._state = state
         self._component_manager = ComponentManager()
+        self._hardware_endpoint_cm: (
+            AbstractAsyncContextManager[RegisteredEndpointLane] | None
+        ) = None
+        self._plugin_endpoint_cm: (
+            AbstractAsyncContextManager[RegisteredEndpointLane] | None
+        ) = None
+        self._hardware_endpoint: RegisteredEndpointLane | None = None
+        self._plugin_endpoint: RegisteredEndpointLane | None = None
 
     async def start(self, ctx: RunContext) -> None:
-        ctx.tg.start_soon(self._component_manager.run)
+        manager_started = False
+        try:
+            self._hardware_endpoint_cm = self._hardware_messages.register_endpoint(
+                f"controller:{self._runtime.controller_id}",
+                metadata={"runtime": self.name, "role": "controller"},
+            )
+            self._hardware_endpoint = await self._hardware_endpoint_cm.__aenter__()
+            self._plugin_endpoint_cm = self._plugin_messages.register_endpoint(
+                f"controller:{self._runtime.controller_id}",
+                metadata={"runtime": self.name, "role": "controller"},
+            )
+            self._plugin_endpoint = await self._plugin_endpoint_cm.__aenter__()
 
-        config_service = build_config_service(self._runtime.config)
-        if isinstance(config_service, Component):
-            await self._component_manager.add_component(config_service)
+            ctx.tg.start_soon(self._component_manager.run)
+            manager_started = True
 
-        controller_service: ControllerService | None = None
+            config_service = build_config_service(self._runtime.config)
+            if isinstance(config_service, Component):
+                await self._component_manager.add_component(config_service)
 
-        async def on_actions_changed(event) -> None:
-            if controller_service is not None:
-                await controller_service.handle_actions_changed_event(event)
+            controller_service: ControllerService | None = None
 
-        action_registry = ActionRegistry(
-            state=self._state,
-            controller_id=self._runtime.controller_id,
-            on_actions_changed=on_actions_changed,
-        )
-        await self._component_manager.add_component(action_registry)
-        settings_service = build_settings_service(
-            self._runtime.config,
-            controller_id=self._runtime.controller_id,
-            config_service=config_service,
-            action_descriptor_provider=action_registry.get_action_descriptor,
-        )
+            async def on_actions_changed(event) -> None:
+                if controller_service is not None:
+                    await controller_service.handle_actions_changed_event(event)
 
-        controller_service = ControllerService(
-            hardware_endpoint=self._hardware_messages.endpoint(
-                f"controller:{self._runtime.controller_id}"
-            ),
-            state=self._state,
-            config_service=config_service,
-            settings_service=settings_service,
-            controller_id=self._runtime.controller_id,
-            action_registry=action_registry,
-            plugin_endpoint=self._plugin_messages.endpoint(
-                f"controller:{self._runtime.controller_id}"
-            ),
-        )
-        await self._component_manager.add_component(controller_service)
+            action_registry = ActionRegistry(
+                state=self._state,
+                controller_id=self._runtime.controller_id,
+                on_actions_changed=on_actions_changed,
+            )
+            await self._component_manager.add_component(action_registry)
+            settings_service = build_settings_service(
+                self._runtime.config,
+                controller_id=self._runtime.controller_id,
+                config_service=config_service,
+                action_descriptor_provider=action_registry.get_action_descriptor,
+            )
+
+            controller_service = ControllerService(
+                hardware_endpoint=self._hardware_endpoint,
+                state=self._state,
+                config_service=config_service,
+                settings_service=settings_service,
+                controller_id=self._runtime.controller_id,
+                action_registry=action_registry,
+                plugin_endpoint=self._plugin_endpoint,
+            )
+            await self._component_manager.add_component(controller_service)
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                if manager_started:
+                    await self._component_manager.stop()
+                await self._close_endpoint_contexts()
+            raise
 
     async def stop(self) -> None:
         await self._component_manager.stop()
+        await self._close_endpoint_contexts()
+
+    async def _close_endpoint_contexts(self) -> None:
+        plugin_cm = self._plugin_endpoint_cm
+        self._plugin_endpoint_cm = None
+        self._plugin_endpoint = None
+        if plugin_cm is not None:
+            await plugin_cm.__aexit__(None, None, None)
+        hardware_cm = self._hardware_endpoint_cm
+        self._hardware_endpoint_cm = None
+        self._hardware_endpoint = None
+        if hardware_cm is not None:
+            await hardware_cm.__aexit__(None, None, None)
 
 
 def build_controller_runtime(

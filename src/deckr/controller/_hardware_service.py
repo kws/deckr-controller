@@ -11,7 +11,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from deckr.lanes import EndpointLane
+from deckr.lanes import RegisteredEndpointLane
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ class DeviceRouteRegistry:
 class HardwareCommandService:
     """Publishes hardware output commands onto the hardware lane."""
 
-    def __init__(self, endpoint: EndpointLane, *, controller_id: str) -> None:
+    def __init__(self, endpoint: RegisteredEndpointLane, *, controller_id: str) -> None:
         self._endpoint = endpoint
         self._controller_id = controller_id
         self._devices_by_config_id: dict[str, LiveDeviceRoute] = {}
@@ -138,6 +138,7 @@ class HardwareCommandService:
         await self._endpoint.publish(
             hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
+                sender_session_id=self._endpoint.session_id,
                 ref=CapabilityRef(
                     deviceRef=live.ref,
                     controlId=control_id,
@@ -164,6 +165,7 @@ class HardwareCommandService:
         await self._endpoint.publish(
             hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
+                sender_session_id=self._endpoint.session_id,
                 ref=CapabilityRef(
                     deviceRef=live.ref,
                     controlId=control_id,
@@ -195,6 +197,7 @@ class HardwareCommandService:
         await self._endpoint.publish(
             hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
+                sender_session_id=self._endpoint.session_id,
                 ref=CapabilityRef(
                     deviceRef=live.ref,
                     capabilityId=capability_id,

@@ -1,5 +1,4 @@
 import logging
-import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,7 +13,7 @@ from deckr.contracts.messages import (
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
-from deckr.lanes import EndpointLane
+from deckr.lanes import RegisteredEndpointLane
 from deckr.pluginhost.messages import (
     COMMAND_MESSAGE_TYPES,
     SETTINGS_PATCH,
@@ -39,7 +38,6 @@ from deckr.state import (
     parse_device_claim_key,
     parse_hardware_inventory_key,
     parse_presence_endpoint_key,
-    presence_endpoint_key,
 )
 
 from deckr.controller._device_manager import DeviceManager
@@ -59,8 +57,8 @@ from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)
 
-PRESENCE_HEARTBEAT_SECONDS = 5.0
-PRESENCE_TTL_SECONDS = 15
+CLAIM_TTL_SECONDS = 15
+CLAIM_HEARTBEAT_SECONDS = 5.0
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 _HARDWARE_INVENTORY_PREFIX = "inventory.hardware."
@@ -87,14 +85,14 @@ class OwnedDeviceClaim:
 class ControllerService(BaseComponent):
     def __init__(
         self,
-        hardware_endpoint: EndpointLane,
+        hardware_endpoint: RegisteredEndpointLane,
         state: StateStore,
         config_service: DeviceConfigService,
         settings_service: SettingsService,
         *,
         controller_id: str,
         action_registry: ActionRegistry | None = None,
-        plugin_endpoint: EndpointLane | None = None,
+        plugin_endpoint: RegisteredEndpointLane | None = None,
         render_backend: RenderBackend | None = None,
     ):
         super().__init__()
@@ -114,12 +112,11 @@ class ControllerService(BaseComponent):
         self._plugin_endpoint = plugin_endpoint
         self._start_soon: Callable | None = None
         self._render_backend = render_backend
-        self._session_id = str(uuid.uuid4())
+        self._session_id = hardware_endpoint.session_id
         self._owned_claims: dict[str, OwnedDeviceClaim] = {}
         self._blocked_claim_revisions: dict[str, int] = {}
         self._inventory_by_manager: dict[str, HardwareInventory] = {}
         self._manager_presence_sessions: dict[str, str] = {}
-        self._owned_presence_revisions: dict[str, int] = {}
         self._hardware_reconcile_lock = anyio.Lock()
         self._stopping: anyio.Event | None = None
 
@@ -295,7 +292,7 @@ class ControllerService(BaseComponent):
             return
         claim = self._new_claim()
         try:
-            entry = await self._state.create(claim_key, claim, ttl=PRESENCE_TTL_SECONDS)
+            entry = await self._state.create(claim_key, claim, ttl=CLAIM_TTL_SECONDS)
         except StateConflict:
             try:
                 current_claim = await self._state.get(claim_key)
@@ -339,7 +336,7 @@ class ControllerService(BaseComponent):
             claimedByEndpoint=controller_address(self._controller_id),
             claimedBySessionId=self._session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=PRESENCE_TTL_SECONDS,
+            ttlSeconds=CLAIM_TTL_SECONDS,
         )
 
     def _remember_blocked_claim(self, key: str, entry: StateEntry) -> None:
@@ -349,55 +346,6 @@ class ControllerService(BaseComponent):
                 manager_id, device_id = parsed
                 logger.info("Device %s/%s is already claimed", manager_id, device_id)
         self._blocked_claim_revisions[key] = entry.revision
-
-    async def _presence_loop(
-        self,
-        endpoint: EndpointLane,
-        stopping: anyio.Event,
-    ) -> None:
-        key = presence_endpoint_key(lane=endpoint.lane.name, endpoint=endpoint.endpoint)
-        while not stopping.is_set():
-            try:
-                entry = await self._state.put(
-                    key,
-                    EndpointPresence(
-                        endpoint=endpoint.endpoint,
-                        lane=endpoint.lane.name,
-                        sessionId=self._session_id,
-                        timestamp=datetime.now(UTC),
-                        ttlSeconds=PRESENCE_TTL_SECONDS,
-                        metadata={"runtime": "deckr-controller"},
-                    ),
-                    ttl=PRESENCE_TTL_SECONDS,
-                )
-                self._owned_presence_revisions[key] = entry.revision
-                await anyio.sleep(PRESENCE_HEARTBEAT_SECONDS)
-            except StateUnavailable:
-                logger.warning(
-                    "Could not refresh controller endpoint presence %s; retrying",
-                    key,
-                )
-                await anyio.sleep(PRESENCE_HEARTBEAT_SECONDS)
-        await self._withdraw_presence_key(key, endpoint.endpoint)
-
-    async def _withdraw_presence_key(self, key: str, endpoint) -> None:
-        revision = self._owned_presence_revisions.pop(key, None)
-        if revision is None:
-            return
-        with anyio.CancelScope(shield=True):
-            try:
-                await self._state.delete(key, revision=revision)
-            except StateConflict:
-                logger.debug(
-                    "Controller endpoint presence changed before withdrawal for %s",
-                    endpoint,
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to withdraw controller endpoint presence for %s",
-                    endpoint,
-                    exc_info=True,
-                )
 
     async def _manager_presence_loop(self) -> None:
         while True:
@@ -630,7 +578,7 @@ class ControllerService(BaseComponent):
 
     async def _claim_refresh_loop(self) -> None:
         while True:
-            await anyio.sleep(PRESENCE_HEARTBEAT_SECONDS)
+            await anyio.sleep(CLAIM_HEARTBEAT_SECONDS)
             if self._stopping is not None and self._stopping.is_set():
                 return
             for owned in tuple(self._owned_claims.values()):
@@ -639,7 +587,7 @@ class ControllerService(BaseComponent):
                         owned.key,
                         self._new_claim(),
                         revision=owned.revision,
-                        ttl=PRESENCE_TTL_SECONDS,
+                        ttl=CLAIM_TTL_SECONDS,
                     )
                 except StateConflict:
                     live = self._device_registry.get_by_ref(owned.ref)
@@ -682,9 +630,7 @@ class ControllerService(BaseComponent):
         self._start_soon = ctx.tg.start_soon
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
-        ctx.tg.start_soon(self._presence_loop, self._hardware_endpoint, ctx.stopping)
         if self._plugin_endpoint is not None:
-            ctx.tg.start_soon(self._presence_loop, self._plugin_endpoint, ctx.stopping)
             ctx.tg.start_soon(self._plugin_subscription_loop)
         ctx.tg.start_soon(self._hardware_input_loop)
         ctx.tg.start_soon(self._inventory_loop)
@@ -702,8 +648,6 @@ class ControllerService(BaseComponent):
             await ctrl_ctx.clear_page(clear_outputs=False)
         await self._controller_contexts.clear()
         await self._release_owned_claims()
-        for key in tuple(self._owned_presence_revisions):
-            await self._withdraw_presence_key(key, key)
         if self._render_backend is not None:
             await self._render_backend.aclose()
 

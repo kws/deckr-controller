@@ -409,6 +409,7 @@ class DeviceManager:
             return
         msg = plugin_message(
             sender=controller_address(self._controller_id),
+            sender_session_id=self._plugin_bus.session_id,
             recipient=host_address(action_meta.host_id),
             message_type=ACTION_INSTANCE_CREATED,
             body=ActionInstanceLifecycleBody(
@@ -435,6 +436,7 @@ class DeviceManager:
             return
         msg = plugin_message(
             sender=controller_address(self._controller_id),
+            sender_session_id=self._plugin_bus.session_id,
             recipient=host_address(host_id),
             message_type=ACTION_INSTANCE_DESTROYED,
             body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
@@ -652,6 +654,7 @@ class DeviceManager:
             return
         msg = plugin_message(
             sender=controller_address(self._controller_id),
+            sender_session_id=self._plugin_bus.session_id,
             recipient=host_address(session.owner_host_id),
             message_type=PAGE_SESSION_OPENED,
             body=PageSessionLifecycleBody(
@@ -678,6 +681,7 @@ class DeviceManager:
             return
         msg = plugin_message(
             sender=controller_address(self._controller_id),
+            sender_session_id=self._plugin_bus.session_id,
             recipient=host_address(session.owner_host_id),
             message_type=PAGE_SESSION_CLOSED,
             body=PageSessionLifecycleBody(
