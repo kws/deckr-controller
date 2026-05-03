@@ -6,8 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from deckr.actions.messages import TitleOptions
 from deckr.hardware.descriptors import CapabilityDescriptor, ControlDescriptor
-from deckr.pluginhost.messages import TitleOptions
 
 from deckr.controller.config import CapabilitySelector, ControlSelector
 
@@ -26,6 +26,8 @@ class ConfiguredControlBinding:
 
     selector: ControlSelector
     action_uuid: str
+    provider_instance_id: str | None
+    provider_labels: Mapping[str, str]
     settings: Mapping[str, Any]
     stable_id: str | None = None
     template_overrides: Mapping[str, Any] | None = None
@@ -42,6 +44,8 @@ class ResolvedControlBinding:
 
     control: ControlDescriptor
     action_uuid: str
+    provider_instance_id: str | None
+    provider_labels: Mapping[str, str]
     settings: Mapping[str, Any]
     stable_id: str | None
     template_overrides: Mapping[str, Any] | None
@@ -117,6 +121,8 @@ def resolve_binding(
         binding=ResolvedControlBinding(
             control=control,
             action_uuid=binding.action_uuid,
+            provider_instance_id=binding.provider_instance_id,
+            provider_labels=binding.provider_labels,
             settings=binding.settings,
             stable_id=binding.stable_id,
             template_overrides=binding.template_overrides,
@@ -160,6 +166,8 @@ def exact_control_binding(
     *,
     control_id: str,
     action_uuid: str,
+    provider_instance_id: str | None = None,
+    provider_labels: Mapping[str, str] | None = None,
     settings: Mapping[str, Any],
     title_options: TitleOptions | None = None,
 ) -> ConfiguredControlBinding:
@@ -168,6 +176,8 @@ def exact_control_binding(
     return ConfiguredControlBinding(
         selector=ControlSelector(control_id=control_id),
         action_uuid=action_uuid,
+        provider_instance_id=provider_instance_id,
+        provider_labels=dict(provider_labels or {}),
         settings=settings,
         stable_id=None,
         template_overrides=None,

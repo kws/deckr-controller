@@ -27,9 +27,7 @@ from deckr.controller._title_defaults import (
 )
 from deckr.controller.invariant.executor import get_executor
 from deckr.controller.invariant.recipes import (
-    alert_overlay,
     image_card,
-    ok_overlay,
     solid_card,
     title_card,
     unavailable_overlay,
@@ -44,7 +42,7 @@ class RenderModel:
 
     title: str | None = None
     image: str | None = None
-    overlay_type: Literal["alert", "ok", "unavailable", "blank"] | None = None
+    overlay_type: Literal["unavailable", "blank"] | None = None
     title_options: TitleOptions | None = None
 
 
@@ -104,13 +102,8 @@ def resolve(
     store: ControlStateStore,
     now: float | None = None,
 ) -> RenderModel:
-    """Pure function: declarations → RenderModel."""
-    if now is None:
-        now = time.monotonic()
-
-    if store.overlay is not None and now < store.overlay.expires_at:
-        return RenderModel(overlay_type=store.overlay.type)
-
+    """Pure function: declarations -> RenderModel."""
+    del now
     return _content_to_model(store.content, store.default_title_options)
 
 
@@ -271,10 +264,6 @@ def _model_to_graph(
 ) -> Node | SubGraphNode | None:
     """Resolve a RenderModel to the graph that should be executed."""
 
-    if model.overlay_type == "alert":
-        return alert_overlay()
-    if model.overlay_type == "ok":
-        return ok_overlay()
     if model.overlay_type == "unavailable":
         return unavailable_overlay()
     if model.overlay_type == "blank":

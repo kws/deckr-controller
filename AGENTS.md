@@ -15,7 +15,7 @@ Use this repo for:
 - controller services and orchestration
 - config loading and persistence
 - device-manager behavior and remote hardware wiring
-- rendering policy and controller-side plugin runtime
+- rendering policy and controller-side action-provider coordination
 
 Do not move shared contracts here if they are intended to be reused by other
 Deckr components. Those belong in the sibling `deckr` repo.
@@ -30,8 +30,8 @@ Deckr components. Those belong in the sibling `deckr` repo.
   - Invariant-based rendering helpers and recipes.
 - `src/deckr/controller/mqtt`
   - MQTT host integration.
-- `src/deckr/controller/plugin`
-  - Controller-side plugin runtime, providers, and builtins.
+- `src/deckr/controller/action_provider`
+  - Controller-side action-provider lookup protocols and builtins.
 - `tests`
   - Tests for controller behavior only.
 

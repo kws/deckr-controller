@@ -4,6 +4,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import anyio
+from deckr.actions.messages import (
+    COMMAND_MESSAGE_TYPES,
+    SETTINGS_PATCH,
+    SETTINGS_REPLACE,
+    SETTINGS_REQUEST,
+    SettingsPatchBody,
+    SettingsReplaceBody,
+    SettingsRequestBody,
+    action_message_for_controller,
+    subject_config_id,
+)
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.messages import (
     DeckrMessage,
@@ -14,17 +25,6 @@ from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.lanes import RegisteredEndpointLane
-from deckr.pluginhost.messages import (
-    COMMAND_MESSAGE_TYPES,
-    SETTINGS_PATCH,
-    SETTINGS_REPLACE,
-    SETTINGS_REQUEST,
-    SettingsPatchBody,
-    SettingsReplaceBody,
-    SettingsRequestBody,
-    plugin_message_for_controller,
-    subject_config_id,
-)
 from deckr.state import (
     DeviceClaim,
     EndpointPresence,
@@ -50,9 +50,9 @@ from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderBackend,
 )
+from deckr.controller.action_provider.action_registry import ActionRegistry
+from deckr.controller.action_provider.events import ActionsChangedEvent
 from deckr.controller.config import DeviceConfigService
-from deckr.controller.plugin.action_registry import ActionRegistry
-from deckr.controller.plugin.events import ActionsChangedEvent
 from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ class ControllerService(BaseComponent):
         *,
         controller_id: str,
         action_registry: ActionRegistry | None = None,
-        plugin_endpoint: RegisteredEndpointLane | None = None,
+        actions_endpoint: RegisteredEndpointLane | None = None,
         render_backend: RenderBackend | None = None,
     ):
         super().__init__()
@@ -109,7 +109,7 @@ class ControllerService(BaseComponent):
         self._controller_contexts = AsyncMap[str, DeviceManager]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
-        self._plugin_endpoint = plugin_endpoint
+        self._actions_endpoint = actions_endpoint
         self._start_soon: Callable | None = None
         self._render_backend = render_backend
         self._session_id = hardware_endpoint.session_id
@@ -120,7 +120,7 @@ class ControllerService(BaseComponent):
         self._hardware_reconcile_lock = anyio.Lock()
         self._stopping: anyio.Event | None = None
 
-    async def _handle_plugin_command(self, msg: DeckrMessage) -> None:
+    async def _handle_action_command(self, msg: DeckrMessage) -> None:
         """Route command messages to the appropriate DeviceManager."""
         if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
@@ -147,7 +147,7 @@ class ControllerService(BaseComponent):
                 return
         if config_id is None:
             logger.warning(
-                "Ignoring plugin command %s without config subject from %s",
+                "Ignoring action command %s without config subject from %s",
                 msg.message_type,
                 msg.sender,
             )
@@ -167,28 +167,28 @@ class ControllerService(BaseComponent):
         for ctrl_ctx in controller_contexts:
             await ctrl_ctx.on_actions_changed(event.registered, event.unregistered)
 
-    async def _plugin_subscription_loop(self) -> None:
-        """Subscribe to plugin bus and route command messages to DeviceManagers."""
-        if self._plugin_endpoint is None:
+    async def _actions_subscription_loop(self) -> None:
+        """Subscribe to action lane and route command messages to DeviceManagers."""
+        if self._actions_endpoint is None:
             return
-        async with self._plugin_endpoint.subscribe() as stream:
+        async with self._actions_endpoint.subscribe() as stream:
             async for event in stream:
                 try:
                     if not isinstance(event, DeckrMessage):
                         continue
-                    if not plugin_message_for_controller(event, self._controller_id):
+                    if not action_message_for_controller(event, self._controller_id):
                         continue
                     if event.message_type in COMMAND_MESSAGE_TYPES:
-                        await self._handle_plugin_command(event)
+                        await self._handle_action_command(event)
                 except Exception:
                     if isinstance(event, DeckrMessage):
                         logger.exception(
-                            "Error handling plugin message %s from %s",
+                            "Error handling action message %s from %s",
                             event.message_type,
                             event.sender,
                         )
                     else:
-                        logger.exception("Error handling plugin bus event")
+                        logger.exception("Error handling action lane event")
 
     async def _hardware_input_loop(self) -> None:
         async with self._hardware_endpoint.subscribe() as subscribe:
@@ -630,8 +630,8 @@ class ControllerService(BaseComponent):
         self._start_soon = ctx.tg.start_soon
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
-        if self._plugin_endpoint is not None:
-            ctx.tg.start_soon(self._plugin_subscription_loop)
+        if self._actions_endpoint is not None:
+            ctx.tg.start_soon(self._actions_subscription_loop)
         ctx.tg.start_soon(self._hardware_input_loop)
         ctx.tg.start_soon(self._inventory_loop)
         ctx.tg.start_soon(self._manager_presence_loop)
@@ -694,7 +694,7 @@ class ControllerService(BaseComponent):
                 command_service=self._command_service,
                 config=first,
                 manager=self._action_registry,
-                plugin_bus=self._plugin_endpoint,
+                actions_bus=self._actions_endpoint,
                 start_soon=self._start_soon,
                 render_backend=self._render_backend,
                 settings_service=self._settings_service,

@@ -131,6 +131,8 @@ class Control(_ConfigModel):
     id: str | None = None
     selector: ControlSelector
     action: str
+    provider_instance_id: str | None = None
+    provider_labels: dict[str, str] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
     template_overrides: dict[str, Any] = Field(default_factory=dict)
     title_options: TitleOptions | None = None
@@ -157,7 +159,7 @@ class DeviceConfig(_ConfigModel):
     name: str
     match: DeviceConfigMatch
     enabled: bool = True
-    plugin_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    provider_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     profiles: list[Profile]
 
     @model_validator(mode="after")

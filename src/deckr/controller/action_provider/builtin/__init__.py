@@ -2,15 +2,15 @@
 
 from typing import Protocol
 
-from deckr.contracts.messages import (
+from deckr.actions.endpoints import (
     BUILTIN_ACTION_PROVIDER_ID,
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
-from deckr.pluginhost.messages import ActionDescriptor, CapabilityInputEvent
+from deckr.actions.messages import ActionDescriptor, CapabilityInputEvent
 
-from deckr.controller.plugin.builtin._context import BuiltInPluginContext
-from deckr.controller.plugin.builtin._goto import GoToPageAction
-from deckr.controller.plugin.builtin._nav_home import NavHomeAction
+from deckr.controller.action_provider.builtin._context import ControllerActionContext
+from deckr.controller.action_provider.builtin._goto import GoToPageAction
+from deckr.controller.action_provider.builtin._nav_home import NavHomeAction
 
 __all__ = [
     "BUILTIN_ACTION_PROVIDER_ID",
@@ -22,17 +22,17 @@ __all__ = [
 class BuiltinAction(Protocol):
     uuid: str
 
-    async def on_bind(self, context: BuiltInPluginContext) -> None: ...
-    async def on_unbind(self, context: BuiltInPluginContext, reason: str) -> None: ...
+    async def on_bind(self, context: ControllerActionContext) -> None: ...
+    async def on_unbind(self, context: ControllerActionContext, reason: str) -> None: ...
     async def on_input(
         self,
-        context: BuiltInPluginContext,
+        context: ControllerActionContext,
         event: CapabilityInputEvent,
     ) -> None: ...
 
 
 class BuiltinRegistry:
-    """Registry of builtin actions. Resolved by controller before plugin hosts."""
+    """Registry of builtin actions. Resolved by controller before action provider catalogs."""
 
     def __init__(self):
         self._goto_page_action = GoToPageAction()
@@ -56,5 +56,5 @@ class BuiltinRegistry:
         return ActionDescriptor(
             actionId=action.uuid,
             name=getattr(action, "name", None),
-            pluginId=getattr(action, "plugin_uuid", None),
+            providerId=getattr(action, "provider_id", BUILTIN_ACTION_PROVIDER_ID),
         )

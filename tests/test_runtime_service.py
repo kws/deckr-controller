@@ -44,9 +44,9 @@ async def test_controller_component_uses_shared_lanes(
         assert [created.name for created in result.components] == [
             "deckr.controller"
         ]
-        assert set(result.lane_names) == {"hardware_messages", "plugin_messages"}
+        assert set(result.lane_names) == {"hardware_messages", "actions"}
         assert isinstance(result.get_lane("hardware_messages"), Lane)
-        assert isinstance(result.get_lane("plugin_messages"), Lane)
+        assert isinstance(result.get_lane("actions"), Lane)
 
 
 def test_controller_component_can_be_disabled_explicitly() -> None:

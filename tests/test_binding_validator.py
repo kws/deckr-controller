@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 from conftest import LaneHarness
+from deckr.actions.messages import PageChildBindingDescriptor
+from deckr.contracts.messages import controller_address
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_OUTPUT_RASTER,
@@ -14,7 +16,6 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from deckr.pluginhost.messages import PageChildBindingDescriptor
 
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._binding_validator import (
@@ -25,8 +26,8 @@ from deckr.controller._binding_validator import (
     validate_page_bindings,
 )
 from deckr.controller._render import RenderResult
+from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import CapabilitySelector, ControlSelector
-from deckr.controller.plugin.provider import ActionMetadata
 
 CONTROLLER_ID = "controller-main"
 
@@ -116,7 +117,11 @@ def _make_control(
 
 
 def _make_key_action():
-    return ActionMetadata(uuid="action.a", host_id="host-a")
+    return ActionMetadata(
+        uuid="action.a",
+        provider_instance_id="python",
+        provider_id="test",
+    )
 
 
 @pytest.mark.asyncio
@@ -124,7 +129,8 @@ async def test_validate_page_bindings_all_valid():
     device = _make_device(controls=[_make_control("0,0"), _make_control("0,1")])
     action = _make_key_action()
 
-    async def get_action(uuid: str):
+    async def get_action(uuid: str, **kwargs):
+        del kwargs
         return action
 
     bindings = [
@@ -141,9 +147,10 @@ async def test_validate_page_bindings_all_valid():
 @pytest.mark.asyncio
 async def test_validate_page_bindings_missing_control():
     device = _make_device(controls=[_make_control("0,0")])
-    action = ActionMetadata(uuid="action.a", host_id="host-a")
+    action = _make_key_action()
 
-    async def get_action(uuid: str):
+    async def get_action(uuid: str, **kwargs):
+        del kwargs
         return action
 
     bindings = [
@@ -163,7 +170,8 @@ async def test_validate_page_bindings_missing_action():
     """Missing action is non-blocking; page loads with control showing 'unavailable'."""
     device = _make_device(controls=[_make_control("0,0")])
 
-    async def get_action(uuid: str):
+    async def get_action(uuid: str, **kwargs):
+        del kwargs
         return None
 
     bindings = [
@@ -184,7 +192,8 @@ async def test_validate_page_bindings_rejects_ambiguous_selector():
     device = _make_device(controls=[_make_control("0,0"), _make_control("1,0")])
     action = _make_key_action()
 
-    async def get_action(uuid: str):
+    async def get_action(uuid: str, **kwargs):
+        del kwargs
         return action
 
     result = await validate_page_bindings(
@@ -200,6 +209,8 @@ async def test_validate_page_bindings_rejects_ambiguous_selector():
                     ),
                 ),
                 action_uuid="action.a",
+                provider_instance_id=None,
+                provider_labels={},
                 settings={},
             )
         ],
@@ -216,7 +227,8 @@ async def test_activation_requirement_does_not_match_momentary_only_control():
     device = _make_device(controls=[_make_control("0,0")])
     action = _make_key_action()
 
-    async def get_action(uuid: str):
+    async def get_action(uuid: str, **kwargs):
+        del kwargs
         return action
 
     result = await validate_page_bindings(
@@ -232,6 +244,8 @@ async def test_activation_requirement_does_not_match_momentary_only_control():
                     ),
                 ),
                 action_uuid="action.a",
+                provider_instance_id=None,
+                provider_labels={},
                 settings={},
             )
         ],
@@ -295,7 +309,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
                         controls=[
                             Control(
                                 selector={"control_id": "99,99"},
-                                action="deckr.plugin.builtin.gotopage",
+                                action="deckr.controller.builtin.gotopage",
                                 settings={},
                             ),
                         ]
@@ -308,15 +322,21 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     registry = MagicMock()
     registry.get_action = AsyncMock(
         return_value=ActionMetadata(
-            uuid="deckr.plugin.builtin.gotopage",
-            host_id="python",
+            uuid="deckr.controller.builtin.gotopage",
+            provider_instance_id="builtin",
+            provider_id="deckr.builtin",
         )
     )
+    registry.provider_session_id.return_value = "provider-session"
+    registry.provider_instance_provides_provider.return_value = True
 
     def start_soon(*args, **kwargs):
         pass
 
-    plugin_bus = LaneHarness("plugin_messages", default_endpoint="host:python")
+    actions_bus = LaneHarness(
+        "actions",
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
@@ -324,7 +344,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
         command_service=command_service,
         config=config,
         manager=registry,
-        plugin_bus=plugin_bus,
+        actions_bus=actions_bus,
         start_soon=start_soon,
     )
     await manager.set_page(profile="default", page=0)
@@ -356,7 +376,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
                         controls=[
                             Control(
                                 selector={"control_id": "0,0"},
-                                action="deckr.plugin.builtin.gotopage",
+                                action="deckr.controller.builtin.gotopage",
                                 settings={},
                             ),
                             Control(
@@ -373,19 +393,26 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
 
     registry = MagicMock()
     action = _make_key_action()
-    action.uuid = "deckr.plugin.builtin.gotopage"
+    action.uuid = "deckr.controller.builtin.gotopage"
 
-    async def get_action(uuid):
-        if uuid == "deckr.plugin.builtin.gotopage":
+    async def get_action(uuid, **kwargs):
+        del kwargs
+        if uuid == "deckr.controller.builtin.gotopage":
             return ActionMetadata(
                 uuid=action.uuid,
-                host_id="python",
+                provider_instance_id="builtin",
+                provider_id="deckr.builtin",
             )
         return None
 
     registry.get_action = get_action
+    registry.provider_session_id.return_value = "provider-session"
+    registry.provider_instance_provides_provider.return_value = True
 
-    plugin_bus = LaneHarness("plugin_messages", default_endpoint="host:python")
+    actions_bus = LaneHarness(
+        "actions",
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
     async with anyio.create_task_group() as tg:
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
@@ -394,7 +421,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
             command_service=command_service,
             config=config,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=actions_bus,
             start_soon=tg.start_soon,
             render_backend=_ImmediateRenderBackend(),
         )

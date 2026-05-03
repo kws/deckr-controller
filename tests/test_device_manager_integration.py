@@ -7,7 +7,18 @@ import anyio
 import pytest
 import pytest_asyncio
 from conftest import LaneHarness
-from deckr.contracts.messages import DeckrMessage
+from deckr.actions.endpoints import action_provider_address
+from deckr.actions.messages import (
+    SETTINGS_PATCH,
+    SETTINGS_REQUEST,
+    SETTINGS_SNAPSHOT,
+    SettingsSnapshot,
+    SettingsTargetRef,
+    action_message,
+    action_provider_instance_subject,
+    context_subject,
+)
+from deckr.contracts.messages import DeckrMessage, controller_address
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_INPUT_ENCODER,
@@ -19,38 +30,28 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from deckr.pluginhost.messages import (
-    SETTINGS_PATCH,
-    SETTINGS_REQUEST,
-    SETTINGS_SNAPSHOT,
-    SettingsSnapshot,
-    SettingsTargetRef,
-    context_subject,
-    controller_address,
-    host_address,
-    plugin_host_subject,
-    plugin_message,
-)
 from invariant import Node, SubGraphNode, dump_graph_output_data_uri
 from invariant.params import ref
 
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
+from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
-from deckr.controller.plugin.provider import ActionMetadata
 from deckr.controller.settings import ConfigBackedSettingsService
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
-HOST_ID = "python"
-HOST_ADDR = host_address(HOST_ID)
+PROVIDER_INSTANCE_ID = "python"
+PROVIDER_ID = "test.provider"
+PROVIDER_ADDR = action_provider_address(PROVIDER_INSTANCE_ID)
+PROVIDER_SESSION_ID = "action-provider-session"
 
 
-def _plugin_bus() -> LaneHarness:
-    return LaneHarness("plugin_messages", default_endpoint=CONTROLLER_ADDR)
+def _actions_bus() -> LaneHarness:
+    return LaneHarness("actions", default_endpoint=CONTROLLER_ADDR)
 
 
-def _plugin_command(
+def _action_command(
     message_type: str,
     payload: dict | None = None,
     *,
@@ -60,14 +61,16 @@ def _plugin_command(
     binding_id: str,
     page_session_id: str | None = None,
 ) -> DeckrMessage:
-    return plugin_message(
-        sender=HOST_ADDR,
-        sender_session_id="host-session",
+    return action_message(
+        sender=PROVIDER_ADDR,
+        sender_session_id=PROVIDER_SESSION_ID,
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
         body=payload or {},
         subject=context_subject(
             context_id,
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
             config_id=config_id,
             action_instance_id=action_instance_id,
             binding_id=binding_id,
@@ -76,40 +79,59 @@ def _plugin_command(
     )
 
 
-def _plugin_settings_target(
-    plugin_id: str = "plugin.clock",
+def _provider_settings_target(
+    provider_id: str = "clock",
     *,
     config_id: str = "test-device",
 ) -> SettingsTargetRef:
     return SettingsTargetRef(
-        scope="plugin",
+        scope="action_provider_instance",
         controllerId=CONTROLLER_ID,
         configId=config_id,
-        pluginId=plugin_id,
+        providerInstanceId=PROVIDER_INSTANCE_ID,
+        providerId=provider_id,
     )
 
 
-def _plugin_settings_command(
+def _provider_settings_command(
     message_type: str,
     target: SettingsTargetRef,
     *,
-    sender_host_id: str = HOST_ID,
+    sender_provider_instance_id: str = PROVIDER_INSTANCE_ID,
     settings: dict | None = None,
 ) -> DeckrMessage:
     body: dict = {"target": target.to_dict()}
     if settings is not None:
         body["settings"] = settings
-    return plugin_message(
-        sender=host_address(sender_host_id),
-        sender_session_id="host-session",
+    return action_message(
+        sender=action_provider_address(sender_provider_instance_id),
+        sender_session_id=PROVIDER_SESSION_ID,
         recipient=CONTROLLER_ADDR,
         message_type=message_type,
         body=body,
-        subject=plugin_host_subject(sender_host_id),
+        subject=action_provider_instance_subject(
+            sender_provider_instance_id,
+            provider_id=target.provider_id,
+        ),
     )
 
 
-async def _plugin_command_for_active_binding(
+def _metadata(
+    uuid: str,
+    *,
+    provider_instance_id: str = PROVIDER_INSTANCE_ID,
+    provider_id: str = PROVIDER_ID,
+    catalog_session_id: str | None = None,
+) -> ActionMetadata:
+    return ActionMetadata(
+        uuid=uuid,
+        provider_instance_id=provider_instance_id,
+        provider_id=provider_id,
+        catalog_session_id=catalog_session_id,
+    )
+
+
+async def _action_command_for_active_binding(
     manager: DeviceManager,
     message_type: str,
     payload: dict | None = None,
@@ -118,7 +140,7 @@ async def _plugin_command_for_active_binding(
 ) -> DeckrMessage:
     ctx = await manager.action_contexts.get(control_id)
     assert ctx is not None
-    return _plugin_command(
+    return _action_command(
         message_type,
         payload,
         context_id=ctx.id,
@@ -355,20 +377,20 @@ class MemoryConfigService:
         yield self.config
 
 
-def _plugin_settings_config() -> DeviceConfig:
+def _provider_settings_config() -> DeviceConfig:
     return DeviceConfig(
         id="test-device",
         name="Test Device",
         match={"fingerprint": "fingerprint:test-device"},
-        plugin_settings={"plugin.clock": {"timezone": "UTC"}},
+        provider_settings={PROVIDER_INSTANCE_ID: {"timezone": "UTC"}},
         profiles=[Profile(name="default", pages=[Page(controls=[])])],
     )
 
 
-def _plugin_settings_device_manager(
+def _provider_settings_device_manager(
     *,
     config_service: MemoryConfigService,
-    plugin_bus: LaneHarness,
+    actions_bus: LaneHarness,
     registry: MagicMock,
 ) -> DeviceManager:
     device = _make_mock_device()
@@ -379,7 +401,7 @@ def _plugin_settings_device_manager(
         command_service=FakeHardwareCommandService(),
         config=config_service.config,
         manager=registry,
-        plugin_bus=plugin_bus,
+        actions_bus=actions_bus,
         start_soon=lambda fn, *a, **k: None,
         settings_service=ConfigBackedSettingsService(
             controller_id=CONTROLLER_ID,
@@ -388,7 +410,7 @@ def _plugin_settings_device_manager(
     )
 
 
-async def _next_plugin_message(
+async def _next_action_message(
     stream: AsyncIterator[DeckrMessage],
     *,
     timeout: float = 1.0,
@@ -397,7 +419,7 @@ async def _next_plugin_message(
         return await anext(stream)
 
 
-async def _assert_no_plugin_message(
+async def _assert_no_action_message(
     stream: AsyncIterator[DeckrMessage],
     *,
     timeout: float = 0.1,
@@ -408,107 +430,125 @@ async def _assert_no_plugin_message(
 
 
 @pytest.mark.asyncio
-async def test_plugin_settings_patch_from_owning_host_writes_and_replies():
-    config_service = MemoryConfigService(_plugin_settings_config())
-    plugin_bus = _plugin_bus()
+async def test_provider_settings_patch_from_owning_provider_writes_and_replies():
+    config_service = MemoryConfigService(_provider_settings_config())
+    action_bus = _actions_bus()
     registry = MagicMock()
-    registry.host_provides_plugin.side_effect = (
-        lambda host_id, plugin_id: host_id == HOST_ID and plugin_id == "plugin.clock"
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.side_effect = (
+        lambda provider_instance_id, provider_id: provider_instance_id
+        == PROVIDER_INSTANCE_ID
+        and provider_id == "clock"
     )
-    manager = _plugin_settings_device_manager(
+    manager = _provider_settings_device_manager(
         config_service=config_service,
-        plugin_bus=plugin_bus,
+        actions_bus=action_bus,
         registry=registry,
     )
 
-    async with plugin_bus.subscribe(HOST_ADDR) as stream:
+    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(
-            _plugin_settings_command(
+            _provider_settings_command(
                 SETTINGS_PATCH,
-                _plugin_settings_target(),
+                _provider_settings_target(),
                 settings={"timezone": "Europe/Amsterdam"},
             )
         )
-        reply = await _next_plugin_message(stream)
+        reply = await _next_action_message(stream)
 
-    assert config_service.config.plugin_settings["plugin.clock"] == {
+    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
         "timezone": "Europe/Amsterdam"
     }
     assert reply.message_type == SETTINGS_SNAPSHOT
     snapshot = SettingsSnapshot.model_validate(reply.body)
     assert snapshot.settings == {"timezone": "Europe/Amsterdam"}
-    assert snapshot.target.key() == _plugin_settings_target().key()
-    registry.host_provides_plugin.assert_called_once_with(HOST_ID, "plugin.clock")
+    assert snapshot.target.key() == _provider_settings_target().key()
+    registry.provider_instance_provides_provider.assert_called_once_with(
+        PROVIDER_INSTANCE_ID,
+        "clock",
+    )
 
 
 @pytest.mark.asyncio
-async def test_plugin_settings_patch_from_non_owning_host_is_ignored():
-    config_service = MemoryConfigService(_plugin_settings_config())
-    plugin_bus = _plugin_bus()
+async def test_provider_settings_patch_from_non_owning_provider_is_ignored():
+    config_service = MemoryConfigService(_provider_settings_config())
+    action_bus = _actions_bus()
     registry = MagicMock()
-    registry.host_provides_plugin.return_value = False
-    manager = _plugin_settings_device_manager(
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = False
+    manager = _provider_settings_device_manager(
         config_service=config_service,
-        plugin_bus=plugin_bus,
+        actions_bus=action_bus,
         registry=registry,
     )
 
-    async with plugin_bus.subscribe(host_address("other")) as stream:
+    async with action_bus.subscribe(action_provider_address("other")) as stream:
         await manager.handle_command(
-            _plugin_settings_command(
+            _provider_settings_command(
                 SETTINGS_PATCH,
-                _plugin_settings_target(),
-                sender_host_id="other",
+                _provider_settings_target(),
+                sender_provider_instance_id="other",
                 settings={"timezone": "Europe/Amsterdam"},
             )
         )
-        await _assert_no_plugin_message(stream)
+        await _assert_no_action_message(stream)
 
-    assert config_service.config.plugin_settings["plugin.clock"] == {"timezone": "UTC"}
-    registry.host_provides_plugin.assert_called_once_with("other", "plugin.clock")
+    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
+        "timezone": "UTC"
+    }
+    registry.provider_instance_provides_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_plugin_settings_request_for_unadvertised_plugin_is_ignored():
-    config_service = MemoryConfigService(_plugin_settings_config())
-    plugin_bus = _plugin_bus()
+async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
+    config_service = MemoryConfigService(_provider_settings_config())
+    action_bus = _actions_bus()
     registry = MagicMock()
-    registry.host_provides_plugin.side_effect = (
-        lambda host_id, plugin_id: host_id == HOST_ID and plugin_id == "plugin.clock"
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.side_effect = (
+        lambda provider_instance_id, provider_id: provider_instance_id
+        == PROVIDER_INSTANCE_ID
+        and provider_id == "clock"
     )
-    manager = _plugin_settings_device_manager(
+    manager = _provider_settings_device_manager(
         config_service=config_service,
-        plugin_bus=plugin_bus,
+        actions_bus=action_bus,
         registry=registry,
     )
 
-    async with plugin_bus.subscribe(HOST_ADDR) as stream:
+    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(
-            _plugin_settings_command(
+            _provider_settings_command(
                 SETTINGS_REQUEST,
-                _plugin_settings_target("plugin.other"),
+                _provider_settings_target("other"),
             )
         )
-        await _assert_no_plugin_message(stream)
+        await _assert_no_action_message(stream)
 
-    assert config_service.config.plugin_settings["plugin.clock"] == {"timezone": "UTC"}
-    registry.host_provides_plugin.assert_called_once_with(HOST_ID, "plugin.other")
+    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
+        "timezone": "UTC"
+    }
+    registry.provider_instance_provides_provider.assert_called_once_with(
+        PROVIDER_INSTANCE_ID,
+        "other",
+    )
 
 
 @pytest.mark.asyncio
 async def test_malformed_settings_commands_are_ignored_without_crashing():
-    config_service = MemoryConfigService(_plugin_settings_config())
-    plugin_bus = _plugin_bus()
+    config_service = MemoryConfigService(_provider_settings_config())
+    action_bus = _actions_bus()
     registry = MagicMock()
-    registry.host_provides_plugin.return_value = True
-    manager = _plugin_settings_device_manager(
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    manager = _provider_settings_device_manager(
         config_service=config_service,
-        plugin_bus=plugin_bus,
+        actions_bus=action_bus,
         registry=registry,
     )
 
-    target = _plugin_settings_target()
-    valid = _plugin_settings_command(
+    target = _provider_settings_target()
+    valid = _provider_settings_command(
         SETTINGS_PATCH,
         target,
         settings={"timezone": "Europe/Amsterdam"},
@@ -520,12 +560,14 @@ async def test_malformed_settings_commands_are_ignored_without_crashing():
         update={"body": {"target": target.to_dict(), "settings": "not-an-object"}}
     )
 
-    async with plugin_bus.subscribe(HOST_ADDR) as stream:
+    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(malformed_target)
         await manager.handle_command(malformed_settings)
-        await _assert_no_plugin_message(stream)
+        await _assert_no_action_message(stream)
 
-    assert config_service.config.plugin_settings["plugin.clock"] == {"timezone": "UTC"}
+    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
+        "timezone": "UTC"
+    }
 
 
 @pytest_asyncio.fixture
@@ -559,17 +601,14 @@ async def test_key_press_renders_to_device(
     device_config_set_raster_image, persistence_tmp_dir
 ):
     """Capability bindingOutput writes the selected raster capability."""
-    from deckr.pluginhost.messages import BINDING_OUTPUT
+    from deckr.actions.messages import BINDING_OUTPUT
 
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
-        return_value=ActionMetadata(
-            uuid=SetRasterImageOnAppearAction.uuid,
-            host_id="python",
-        )
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
     )
-    plugin_bus = _plugin_bus()
+    action_bus = _actions_bus()
     command_service = FakeHardwareCommandService()
 
     async with anyio.create_task_group() as tg:
@@ -580,7 +619,7 @@ async def test_key_press_renders_to_device(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=action_bus,
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -588,7 +627,7 @@ async def test_key_press_renders_to_device(
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
         binding = ctx.metadata.model_copy(update={"output_generation": 1})
-        msg = await _plugin_command_for_active_binding(
+        msg = await _action_command_for_active_binding(
             manager,
             BINDING_OUTPUT,
             {
@@ -631,16 +670,13 @@ async def test_set_raster_image_last_write_wins_same_control(
     device_config_set_raster_image, persistence_tmp_dir
 ):
     """bindingOutput rejects stale or mismatched output generations."""
-    from deckr.pluginhost.messages import BINDING_OUTPUT
+    from deckr.actions.messages import BINDING_OUTPUT
 
     device = _make_mock_device()
-    plugin_bus = _plugin_bus()
+    action_bus = _actions_bus()
     registry = MagicMock()
     registry.get_action = AsyncMock(
-        return_value=ActionMetadata(
-            uuid=SetRasterImageOnAppearAction.uuid,
-            host_id="python",
-        )
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
     )
     command_service = FakeHardwareCommandService()
 
@@ -652,14 +688,14 @@ async def test_set_raster_image_last_write_wins_same_control(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=action_bus,
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
         binding = ctx.metadata.model_copy(update={"output_generation": 1})
-        msg = await _plugin_command_for_active_binding(
+        msg = await _action_command_for_active_binding(
             manager,
             BINDING_OUTPUT,
             {
@@ -694,12 +730,9 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
-        return_value=ActionMetadata(
-            uuid=NoopAction.uuid,
-            host_id="python",
-        )
+        return_value=_metadata(NoopAction.uuid)
     )
-    plugin_bus = _plugin_bus()
+    action_bus = _actions_bus()
 
     config = DeviceConfig(
         id="test-device",
@@ -749,27 +782,27 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=action_bus,
             start_soon=start_soon,
             settings_service=settings_service,
         )
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
         page0_ctx = await manager.action_contexts.get("0,0")
-        await page0_ctx.plugin_context.set_settings({"marker": "page0"})
+        await page0_ctx.controller_context.set_settings({"marker": "page0"})
 
         await manager.set_page(profile="default", page=1)
         page1_ctx = await manager.action_contexts.get("0,0")
-        await page1_ctx.plugin_context.set_settings({"marker": "page1"})
+        await page1_ctx.controller_context.set_settings({"marker": "page1"})
 
         await manager.set_page(profile="default", page=0)
         page0_ctx_reload = await manager.action_contexts.get("0,0")
-        page0_settings = await page0_ctx_reload.plugin_context.get_settings()
+        page0_settings = await page0_ctx_reload.controller_context.get_settings()
         assert page0_settings.marker == "page0"
 
         await manager.set_page(profile="default", page=1)
         page1_ctx_reload = await manager.action_contexts.get("0,0")
-        page1_settings = await page1_ctx_reload.plugin_context.get_settings()
+        page1_settings = await page1_ctx_reload.controller_context.get_settings()
         assert page1_settings.marker == "page1"
 
 
@@ -779,12 +812,9 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
-        return_value=ActionMetadata(
-            uuid=NoopAction.uuid,
-            host_id="python",
-        )
+        return_value=_metadata(NoopAction.uuid)
     )
-    plugin_bus = _plugin_bus()
+    action_bus = _actions_bus()
 
     config = DeviceConfig(
         id="test-device",
@@ -830,7 +860,7 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=action_bus,
             start_soon=start_soon,
             settings_service=settings_service,
         )
@@ -838,14 +868,14 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
         await anyio.sleep(0.05)
         control_a = await manager.action_contexts.get("0,0")
         control_b = await manager.action_contexts.get("1,0")
-        await control_a.plugin_context.set_settings({"control_marker": "A"})
-        await control_b.plugin_context.set_settings({"control_marker": "B"})
+        await control_a.controller_context.set_settings({"control_marker": "A"})
+        await control_b.controller_context.set_settings({"control_marker": "B"})
 
         await manager.set_page(profile="default", page=0)
         control_a_reload = await manager.action_contexts.get("0,0")
         control_b_reload = await manager.action_contexts.get("1,0")
-        settings_a = await control_a_reload.plugin_context.get_settings()
-        settings_b = await control_b_reload.plugin_context.get_settings()
+        settings_a = await control_a_reload.controller_context.get_settings()
+        settings_b = await control_b_reload.controller_context.get_settings()
         assert settings_a.control_marker == "A"
         assert settings_b.control_marker == "B"
 
@@ -855,12 +885,9 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
-        return_value=ActionMetadata(
-            uuid=NoopAction.uuid,
-            host_id="python",
-        )
+        return_value=_metadata(NoopAction.uuid)
     )
-    plugin_bus = _plugin_bus()
+    action_bus = _actions_bus()
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
@@ -919,25 +946,25 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=action_bus,
             start_soon=start_soon,
         )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
-        settings = await ctx.plugin_context.get_settings()
+        settings = await ctx.controller_context.get_settings()
         assert settings.label == "from-config"
         assert settings.nested == {"role": {"page": "root"}}
 
-        await ctx.plugin_context.set_settings({"label": "runtime", "extra": True})
-        runtime_settings = await ctx.plugin_context.get_settings()
+        await ctx.controller_context.set_settings({"label": "runtime", "extra": True})
+        runtime_settings = await ctx.controller_context.get_settings()
         assert runtime_settings.label == "runtime"
         assert runtime_settings.extra is True
 
         await manager._on_config_changed(reloaded_config)
         reloaded_ctx = await manager.action_contexts.get("0,0")
         assert reloaded_ctx is not None
-        reloaded_settings = await reloaded_ctx.plugin_context.get_settings()
+        reloaded_settings = await reloaded_ctx.controller_context.get_settings()
         assert vars(reloaded_settings) == {"label": "from-reload"}
 
 
@@ -946,10 +973,7 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
-        return_value=ActionMetadata(
-            uuid=NoopAction.uuid,
-            host_id="python",
-        )
+        return_value=_metadata(NoopAction.uuid)
     )
     command_service = FakeHardwareCommandService()
     manager = DeviceManager(
@@ -979,7 +1003,7 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
             ],
         ),
         manager=registry,
-        plugin_bus=_plugin_bus(),
+        actions_bus=_actions_bus(),
         start_soon=lambda fn, *a, **k: None,
     )
 
@@ -997,29 +1021,56 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
 class ConfigurableActionRegistry:
     """Registry that can add/remove actions for testing on_actions_changed.
 
-    Uses qualified IDs (host_id::action_uuid) internally to match ActionRegistry.
+    Uses qualified IDs (provider_instance_id::action_uuid) internally to match ActionRegistry.
     """
 
     def __init__(self):
         self._actions: dict[str, ActionMetadata] = {}
 
-    def _qualified_id(self, host_id: str, action_uuid: str) -> str:
-        return f"{host_id}::{action_uuid}"
+    def _qualified_id(self, provider_instance_id: str, action_uuid: str) -> str:
+        return f"{provider_instance_id}::{action_uuid}"
 
-    async def get_action(self, address: str) -> ActionMetadata | None:
+    async def get_action(
+        self,
+        address: str,
+        *,
+        provider_instance_id: str | None = None,
+        provider_labels: dict[str, str] | None = None,
+    ) -> ActionMetadata | None:
+        del provider_labels
         if "::" in address:
             return self._actions.get(address)
         for key, meta in self._actions.items():
+            if (
+                provider_instance_id is not None
+                and meta.provider_instance_id != provider_instance_id
+            ):
+                continue
             if key.endswith(f"::{address}"):
                 return meta
         return None
 
+    def provider_instance_provides_provider(
+        self,
+        provider_instance_id: str,
+        provider_id: str,
+    ) -> bool:
+        return any(
+            meta.provider_instance_id == provider_instance_id
+            and meta.provider_id == provider_id
+            for meta in self._actions.values()
+        )
+
+    def provider_session_id(self, provider_instance_id: str) -> str | None:
+        del provider_instance_id
+        return None
+
     def add_action(self, action_uuid: str, meta: ActionMetadata) -> None:
-        qualified = self._qualified_id(meta.host_id, action_uuid)
+        qualified = self._qualified_id(meta.provider_instance_id, action_uuid)
         self._actions[qualified] = meta
 
-    def remove_action(self, action_uuid: str, host_id: str) -> None:
-        qualified = self._qualified_id(host_id, action_uuid)
+    def remove_action(self, action_uuid: str, provider_instance_id: str) -> None:
+        qualified = self._qualified_id(provider_instance_id, action_uuid)
         self._actions.pop(qualified, None)
 
     def get_builtin_action(self, uuid: str):
@@ -1035,7 +1086,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
 ):
     """When action becomes available, on_actions_changed creates context for unavailable control."""
     device = _make_mock_device()
-    plugin_bus = _plugin_bus()
+    action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()
     # Initially no action - control will show unavailable
     config = DeviceConfig(
@@ -1072,7 +1123,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=action_bus,
             start_soon=start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -1085,13 +1136,14 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
         # Add action and notify
         registry.add_action(
             ACTION_X_UUID,
-            ActionMetadata(
-                uuid=ACTION_X_UUID,
-                host_id="test_host",
+            _metadata(
+                ACTION_X_UUID,
+                provider_instance_id="test-provider",
+                provider_id="test",
             ),
         )
         await manager.on_actions_changed(
-            registered=[f"test_host::{ACTION_X_UUID}"],
+            registered=[f"test-provider::{ACTION_X_UUID}"],
             unregistered=[],
         )
 
@@ -1105,13 +1157,14 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
 async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_dir):
     """When action becomes unavailable, on_actions_changed removes context and renders unavailable."""
     device = _make_mock_device()
-    plugin_bus = _plugin_bus()
+    action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()
     registry.add_action(
         ACTION_X_UUID,
-        ActionMetadata(
-            uuid=ACTION_X_UUID,
-            host_id="test_host",
+        _metadata(
+            ACTION_X_UUID,
+            provider_instance_id="test-provider",
+            provider_id="test",
         ),
     )
     config = DeviceConfig(
@@ -1145,7 +1198,7 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
             command_service=command_service,
             config=config,
             manager=registry,
-            plugin_bus=plugin_bus,
+            actions_bus=action_bus,
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -1160,11 +1213,11 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
 
         # Remove action from registry to simulate unregister (otherwise the
         # "registered" handling would re-resolve and recreate the context)
-        registry.remove_action(ACTION_X_UUID, "test_host")
+        registry.remove_action(ACTION_X_UUID, "test-provider")
 
         # Notify that action was unregistered (qualified ID)
         await manager.on_actions_changed(
-            registered=[], unregistered=[f"test_host::{ACTION_X_UUID}"]
+            registered=[], unregistered=[f"test-provider::{ACTION_X_UUID}"]
         )
 
         # Control should no longer have context

@@ -16,6 +16,11 @@ from deckr.components import (
     InactiveComponent,
     RunContext,
 )
+from deckr.contracts.messages import (
+    ACTIONS_LANE,
+    HARDWARE_MESSAGES_LANE,
+    controller_address,
+)
 from deckr.core.util.runtime_id import require_runtime_id
 from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import StateStore
@@ -29,7 +34,7 @@ from deckr.controller._runtime_support import (
     build_config_service,
     build_settings_service,
 )
-from deckr.controller.plugin.action_registry import ActionRegistry
+from deckr.controller.action_provider.action_registry import ActionRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,37 +51,37 @@ class ControllerRuntimeService(BaseComponent):
         runtime_name: str,
         runtime: ControllerRuntime,
         hardware_messages: Lane,
-        plugin_messages: Lane,
+        actions: Lane,
         state: StateStore,
     ) -> None:
         super().__init__(name=runtime_name)
         self._runtime = runtime
         self._hardware_messages = hardware_messages
-        self._plugin_messages = plugin_messages
+        self._actions = actions
         self._state = state
         self._component_manager = ComponentManager()
         self._hardware_endpoint_cm: (
             AbstractAsyncContextManager[RegisteredEndpointLane] | None
         ) = None
-        self._plugin_endpoint_cm: (
+        self._actions_endpoint_cm: (
             AbstractAsyncContextManager[RegisteredEndpointLane] | None
         ) = None
         self._hardware_endpoint: RegisteredEndpointLane | None = None
-        self._plugin_endpoint: RegisteredEndpointLane | None = None
+        self._actions_endpoint: RegisteredEndpointLane | None = None
 
     async def start(self, ctx: RunContext) -> None:
         manager_started = False
         try:
             self._hardware_endpoint_cm = self._hardware_messages.register_endpoint(
-                f"controller:{self._runtime.controller_id}",
+                controller_address(self._runtime.controller_id),
                 metadata={"runtime": self.name, "role": "controller"},
             )
             self._hardware_endpoint = await self._hardware_endpoint_cm.__aenter__()
-            self._plugin_endpoint_cm = self._plugin_messages.register_endpoint(
-                f"controller:{self._runtime.controller_id}",
+            self._actions_endpoint_cm = self._actions.register_endpoint(
+                controller_address(self._runtime.controller_id),
                 metadata={"runtime": self.name, "role": "controller"},
             )
-            self._plugin_endpoint = await self._plugin_endpoint_cm.__aenter__()
+            self._actions_endpoint = await self._actions_endpoint_cm.__aenter__()
 
             ctx.tg.start_soon(self._component_manager.run)
             manager_started = True
@@ -101,7 +106,7 @@ class ControllerRuntimeService(BaseComponent):
                 self._runtime.config,
                 controller_id=self._runtime.controller_id,
                 config_service=config_service,
-                action_descriptor_provider=action_registry.get_action_descriptor,
+                action_provider=action_registry.get_action,
             )
 
             controller_service = ControllerService(
@@ -111,7 +116,7 @@ class ControllerRuntimeService(BaseComponent):
                 settings_service=settings_service,
                 controller_id=self._runtime.controller_id,
                 action_registry=action_registry,
-                plugin_endpoint=self._plugin_endpoint,
+                actions_endpoint=self._actions_endpoint,
             )
             await self._component_manager.add_component(controller_service)
         except BaseException:
@@ -126,11 +131,11 @@ class ControllerRuntimeService(BaseComponent):
         await self._close_endpoint_contexts()
 
     async def _close_endpoint_contexts(self) -> None:
-        plugin_cm = self._plugin_endpoint_cm
-        self._plugin_endpoint_cm = None
-        self._plugin_endpoint = None
-        if plugin_cm is not None:
-            await plugin_cm.__aexit__(None, None, None)
+        actions_cm = self._actions_endpoint_cm
+        self._actions_endpoint_cm = None
+        self._actions_endpoint = None
+        if actions_cm is not None:
+            await actions_cm.__aexit__(None, None, None)
         hardware_cm = self._hardware_endpoint_cm
         self._hardware_endpoint_cm = None
         self._hardware_endpoint = None
@@ -168,8 +173,8 @@ def component_factory(context: ComponentContext):
     return ControllerRuntimeService(
         runtime_name=context.runtime_name,
         runtime=runtime,
-        hardware_messages=context.require_lane("hardware_messages"),
-        plugin_messages=context.require_lane("plugin_messages"),
+        hardware_messages=context.require_lane(HARDWARE_MESSAGES_LANE),
+        actions=context.require_lane(ACTIONS_LANE),
         state=context.state(),
     )
 
@@ -177,8 +182,8 @@ component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="deckr.controller",
         config_prefix="deckr.controller",
-        consumes=("hardware_messages", "plugin_messages"),
-        publishes=("hardware_messages", "plugin_messages"),
+        consumes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
+        publishes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
     ),
     factory=component_factory,
 )

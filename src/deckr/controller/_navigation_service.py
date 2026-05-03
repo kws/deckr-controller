@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deckr.pluginhost.messages import (
+from deckr.actions.messages import (
     DynamicPageCommand,
     TitleOptions,
 )
@@ -21,7 +21,7 @@ from deckr.controller.config._data import (
 def _config_title_options_to_store(
     opts: ConfigTitleOptions | None,
 ) -> TitleOptions | None:
-    """Convert config TitleOptions to plugin message TitleOptions."""
+    """Convert config TitleOptions to action message TitleOptions."""
     if opts is None:
         return None
     return TitleOptions(
@@ -96,6 +96,8 @@ class NavigationService:
             ConfiguredControlBinding(
                 selector=c.selector,
                 action_uuid=c.action,
+                provider_instance_id=c.provider_instance_id,
+                provider_labels=dict(c.provider_labels),
                 settings=dict(c.settings),
                 stable_id=c.id,
                 template_overrides=dict(c.template_overrides),

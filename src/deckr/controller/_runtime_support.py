@@ -20,11 +20,11 @@ def build_settings_service(
     *,
     controller_id: str,
     config_service,
-    action_descriptor_provider=None,
+    action_provider=None,
 ):
     del config
     return ConfigBackedSettingsService(
         controller_id=controller_id,
         config_service=config_service,
-        action_descriptor_provider=action_descriptor_provider,
+        action_provider=action_provider,
     )

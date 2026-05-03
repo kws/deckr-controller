@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deckr.hardware.descriptors import DeviceDescriptor
 
-    from deckr.controller.plugin.provider import ActionMetadata
+    from deckr.controller.action_provider.provider import ActionMetadata
 
 from deckr.controller._binding_resolution import (
     ConfiguredControlBinding,
@@ -93,7 +93,7 @@ class ValidationResult:
 async def validate_page_bindings(
     bindings: list[ConfiguredControlBinding],
     device: DeviceDescriptor,
-    get_action: Callable[[str], Awaitable[ActionMetadata | None]],
+    get_action: Callable[..., Awaitable[ActionMetadata | None]],
     profile_id: str | None = None,
     page_id: str | None = None,
 ) -> ValidationResult:
@@ -113,7 +113,11 @@ async def validate_page_bindings(
             )
             continue
         result.bindings.append(resolution.binding)
-        action = await get_action(binding.action_uuid)
+        action = await get_action(
+            binding.action_uuid,
+            provider_instance_id=binding.provider_instance_id,
+            provider_labels=binding.provider_labels,
+        )
         if action is None:
             # Non-blocking: page loads; this control shows "unavailable"
             result.add_error(
@@ -133,19 +137,23 @@ async def validate_page_bindings(
 async def validate_exact_control_bindings(
     bindings: list,
     device: DeviceDescriptor,
-    get_action: Callable[[str], Awaitable[ActionMetadata | None]],
+    get_action: Callable[..., Awaitable[ActionMetadata | None]],
     *,
     action_uuid: str,
+    provider_instance_id: str | None = None,
+    provider_labels: Mapping[str, str] | None = None,
     profile_id: str | None = None,
     page_id: str | None = None,
 ) -> ValidationResult:
-    """Validate plugin-provided exact control bindings."""
+    """Validate provider-provided exact control bindings."""
 
     return await validate_page_bindings(
         [
             exact_control_binding(
                 control_id=binding.control_id,
                 action_uuid=action_uuid,
+                provider_instance_id=provider_instance_id,
+                provider_labels=provider_labels,
                 settings=binding.settings,
                 title_options=binding.title_options,
             )

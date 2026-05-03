@@ -60,12 +60,12 @@ class TestEventTranslator:
         assert isinstance(out, TranslatedEvent)
         assert out.control_id == "1,2"
         assert out.capability_id == "button.momentary"
-        assert out.plugin_event.event_type == event_type
-        assert out.plugin_event.value == value
-        assert out.plugin_event.capability.control_id == "1,2"
-        assert out.plugin_event.capability.capability_id == "button.momentary"
-        assert out.plugin_event.producer == "manager-main"
-        assert out.plugin_event.view == "native"
+        assert out.action_event.event_type == event_type
+        assert out.action_event.value == value
+        assert out.action_event.capability.control_id == "1,2"
+        assert out.action_event.capability.capability_id == "button.momentary"
+        assert out.action_event.producer == "manager-main"
+        assert out.action_event.view == "native"
 
     def test_non_interaction_events_return_none(self, translator):
         event = hw_messages.DeviceUnavailableMessage(

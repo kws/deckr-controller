@@ -25,7 +25,7 @@ def test_default_config_document_matches_builtin_defaults(
     assert controller.device_config is not None
     assert controller.device_config.file is not None
     assert controller.device_config.file.path == (tmp_path / "settings").resolve()
-    assert document.children("deckr.plugin_hosts") == {}
+    assert document.children("deckr.action_providers") == {}
     assert document.children("deckr.drivers") == {}
 
 
@@ -41,11 +41,13 @@ id = "controller-main"
 [deckr.controller.device_config.file]
 path = "configs"
 
-[deckr.plugin_hosts.python.instances.main]
-host_id = "living-room"
+[deckr.action_providers.python.instances.main]
+provider_id = "clock"
+provider_instance_id = "living-room"
+controller_id = "controller-main"
 
-[deckr.plugin_hosts.python.instances.main.runtime]
-descriptor_roots = ["plugins/runtime"]
+[deckr.action_providers.python.instances.main.labels]
+room = "living"
 
 [deckr.drivers.mqtt.broker]
 hostname = "mqtt.local"
@@ -62,14 +64,13 @@ port = 1884
     assert controller.device_config is not None
     assert controller.device_config.file is not None
     assert controller.device_config.file.path == (tmp_path / "configs").resolve()
-    plugin_host = document.namespace("deckr.plugin_hosts.python")
-    assert plugin_host is not None
-    assert plugin_host["instances"]["main"]["host_id"] == (
+    action_provider = document.namespace("deckr.action_providers.python")
+    assert action_provider is not None
+    assert action_provider["instances"]["main"]["provider_instance_id"] == (
         "living-room"
     )
-    assert plugin_host["instances"]["main"]["runtime"]["descriptor_roots"] == (
-        "plugins/runtime",
-    )
+    assert action_provider["instances"]["main"]["provider_id"] == "clock"
+    assert action_provider["instances"]["main"]["labels"]["room"] == "living"
     manager_config = document.namespace("deckr.drivers.mqtt")
     assert manager_config is not None
     assert manager_config["broker"]["hostname"] == "mqtt.local"
@@ -77,10 +78,12 @@ port = 1884
 
 def test_explicit_config_allows_missing_controller_table(tmp_path: Path) -> None:
     config_path = tmp_path / "deckr.toml"
-    config_path.write_text("[deckr.plugins.openhab]\nurl = 'http://openhab.local:8080'\n")
+    config_path.write_text(
+        "[deckr.action_providers.openhab]\nurl = 'http://openhab.local:8080'\n"
+    )
 
     document = load_config_document(config_path)
-    assert document.namespace("deckr.plugins.openhab") == {
+    assert document.namespace("deckr.action_providers.openhab") == {
         "url": "http://openhab.local:8080"
     }
 
@@ -94,7 +97,7 @@ def test_auto_loads_local_deckr_toml(
         """
 [deckr.controller]
 
-[deckr.plugin_hosts.python.instances.main]
+[deckr.action_providers.python.instances.main]
 enabled = false
 """.strip()
     )
@@ -103,9 +106,9 @@ enabled = false
     document = load_config_document(None)
 
     assert document.source_path == config_path.resolve()
-    plugin_host = document.namespace("deckr.plugin_hosts.python")
-    assert plugin_host is not None
-    assert plugin_host["instances"]["main"]["enabled"] is False
+    action_provider = document.namespace("deckr.action_providers.python")
+    assert action_provider is not None
+    assert action_provider["instances"]["main"]["enabled"] is False
 
 
 def test_default_config_document_text_contains_controller_table() -> None:

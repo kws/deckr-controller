@@ -7,25 +7,25 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import anyio
-from deckr.contracts.models import thaw_json
-from deckr.pluginhost.messages import (
-    ActionDescriptor,
+from deckr.actions.messages import (
     SettingsProvenance,
     SettingsSchemaMetadata,
     SettingsSnapshot,
     SettingsTargetDescription,
     SettingsTargetRef,
 )
+from deckr.contracts.models import thaw_json
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema import validate as validate_json_schema
 
+from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.config._data import Control, DeviceConfig
 from deckr.controller.settings._identity import derive_action_instance_id
 
 logger = logging.getLogger(__name__)
 
-ActionDescriptorProvider = Callable[[str], Awaitable[ActionDescriptor | None]]
+ActionProvider = Callable[..., Awaitable[ActionMetadata | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,16 +86,16 @@ def _split_action_settings(
 
 
 def _schema_metadata(
-    descriptor: ActionDescriptor | None,
+    action: ActionMetadata | None,
     *,
     scope: str,
 ) -> SettingsSchemaMetadata:
     schema = None
-    if descriptor is not None:
+    if action is not None:
         schema = (
-            descriptor.plugin_settings_schema
-            if scope == "plugin"
-            else descriptor.settings_schema
+            action.provider_settings_schema
+            if scope == "action_provider_instance"
+            else action.settings_schema
         )
     return SettingsSchemaMetadata(
         schema=schema,
@@ -126,11 +126,11 @@ class ConfigBackedSettingsService:
         *,
         controller_id: str,
         config_service: DeviceConfigService,
-        action_descriptor_provider: ActionDescriptorProvider | None = None,
+        action_provider: ActionProvider | None = None,
     ) -> None:
         self._controller_id = controller_id
         self._config_service = config_service
-        self._action_descriptor_provider = action_descriptor_provider
+        self._action_provider = action_provider
         self._subscribers: dict[
             str, set[anyio.abc.ObjectSendStream[SettingsSnapshot]]
         ] = {}
@@ -141,63 +141,62 @@ class ConfigBackedSettingsService:
     ) -> tuple[SettingsTargetDescription, ...]:
         config = await self._require_config(config_id)
         descriptions: list[SettingsTargetDescription] = []
-        plugin_ids = {
-            plugin_id
-            for plugin_id in config.plugin_settings
-            if plugin_id.strip()
-        }
+        provider_targets: dict[tuple[str, str], SettingsTargetRef] = {}
         for location in self._control_locations(config):
-            descriptor = await self._action_descriptor(location.control.action)
-            plugin_id = descriptor.plugin_id if descriptor else None
-            if plugin_id:
-                plugin_ids.add(plugin_id)
+            action = await self._action_metadata_for_control(location.control)
+            if action is None:
+                continue
+            provider_targets[(action.provider_instance_id, action.provider_id)] = (
+                self.provider_target(
+                    config,
+                    provider_instance_id=action.provider_instance_id,
+                    provider_id=action.provider_id,
+                )
+            )
             descriptions.append(
                 await self.describe_target(
                     self.action_target(
                         config,
                         location,
-                        plugin_id=plugin_id,
+                        provider_instance_id=action.provider_instance_id,
+                        provider_id=action.provider_id,
                     )
                 )
             )
-        for plugin_id in sorted(plugin_ids):
-            descriptions.append(
-                await self.describe_target(
-                    SettingsTargetRef(
-                        scope="plugin",
-                        controllerId=self._controller_id,
-                        configId=config.id,
-                        pluginId=plugin_id,
-                    )
-                )
-            )
+        for target in provider_targets.values():
+            descriptions.append(await self.describe_target(target))
         return tuple(descriptions)
 
     async def describe_target(
         self, target: SettingsTargetRef
     ) -> SettingsTargetDescription:
         config = await self._require_config(target.config_id)
-        if target.scope == "plugin":
-            descriptor = await self._descriptor_for_target(target)
+        if target.scope == "action_provider_instance":
+            action = await self._action_for_target(target)
             return SettingsTargetDescription(
                 target=target,
-                pluginId=target.plugin_id or "",
-                label=target.plugin_id,
-                schemaMetadata=_schema_metadata(descriptor, scope="plugin"),
+                providerInstanceId=target.provider_instance_id,
+                providerId=target.provider_id,
+                label=target.provider_id,
+                schemaMetadata=_schema_metadata(
+                    action,
+                    scope="action_provider_instance",
+                ),
                 provenance=("config_default",),
             )
-        location, descriptor = await self._find_verified_control(config, target)
+        location, action = await self._find_verified_control(config, target)
         return SettingsTargetDescription(
             target=target,
-            pluginId=target.plugin_id or "",
+            providerInstanceId=target.provider_instance_id,
+            providerId=target.provider_id,
             actionId=target.action_id,
-            label=location.control.id or location.control.selector.label or target.action_id,
+            label=location.control.id or location.control.selector.label,
             placement={
                 "profile": location.profile_id,
                 "page": location.page_id,
                 "control": location.control.selector.control_id,
             },
-            schemaMetadata=_schema_metadata(descriptor, scope="action_instance"),
+            schemaMetadata=_schema_metadata(action, scope="action_instance"),
             provenance=self._action_provenance(location.control),
         )
 
@@ -210,18 +209,20 @@ class ConfigBackedSettingsService:
 
     async def get(self, target: SettingsTargetRef) -> SettingsSnapshot:
         config = await self._require_config(target.config_id)
-        if target.scope == "plugin":
-            descriptor = await self._descriptor_for_target(target)
-            settings = _settings_copy(config.plugin_settings.get(target.plugin_id or ""))
-            metadata = _schema_metadata(descriptor, scope="plugin")
+        if target.scope == "action_provider_instance":
+            action = await self._action_for_target(target)
+            settings = _settings_copy(
+                config.provider_settings.get(target.provider_instance_id)
+            )
+            metadata = _schema_metadata(action, scope="action_provider_instance")
             return SettingsSnapshot(
                 target=target,
                 settings=settings,
                 provenance=("config_default",),
                 schemaMetadata=metadata,
             )
-        location, descriptor = await self._find_verified_control(config, target)
-        metadata = _schema_metadata(descriptor, scope="action_instance")
+        location, action = await self._find_verified_control(config, target)
+        metadata = _schema_metadata(action, scope="action_instance")
         return SettingsSnapshot(
             target=target,
             settings=_action_settings_from_control(location.control),
@@ -241,18 +242,20 @@ class ConfigBackedSettingsService:
         self, target: SettingsTargetRef, settings: Mapping[str, Any]
     ) -> SettingsSnapshot:
         config = await self._require_config(target.config_id)
-        if target.scope == "plugin":
+        if target.scope == "action_provider_instance":
             location = None
-            descriptor = await self._descriptor_for_target(target)
+            action = await self._action_for_target(target)
         else:
-            location, descriptor = await self._find_verified_control(config, target)
-        metadata = _schema_metadata(descriptor, scope=target.scope)
+            location, action = await self._find_verified_control(config, target)
+        metadata = _schema_metadata(action, scope=target.scope)
         next_settings = _settings_copy(settings)
         _validate_settings(next_settings, metadata)
-        if target.scope == "plugin":
-            plugin_settings = dict(config.plugin_settings)
-            plugin_settings[target.plugin_id or ""] = next_settings
-            next_config = config.model_copy(update={"plugin_settings": plugin_settings})
+        if target.scope == "action_provider_instance":
+            provider_settings = dict(config.provider_settings)
+            provider_settings[target.provider_instance_id] = next_settings
+            next_config = config.model_copy(
+                update={"provider_settings": provider_settings}
+            )
         else:
             action_settings, template_overrides = _split_action_settings(next_settings)
             next_config = self._replace_control(
@@ -295,10 +298,26 @@ class ConfigBackedSettingsService:
             scope="action_instance",
             controllerId=self._controller_id,
             configId=config.id,
-            pluginId=target.plugin_id,
+            providerInstanceId=target.provider_instance_id,
+            providerId=target.provider_id,
             actionId=target.action_id,
             actionInstanceId=next_action_instance_id,
             stableId=managed_id,
+        )
+
+    def provider_target(
+        self,
+        config: DeviceConfig,
+        *,
+        provider_instance_id: str,
+        provider_id: str,
+    ) -> SettingsTargetRef:
+        return SettingsTargetRef(
+            scope="action_provider_instance",
+            controllerId=self._controller_id,
+            configId=config.id,
+            providerInstanceId=provider_instance_id,
+            providerId=provider_id,
         )
 
     def action_target(
@@ -306,13 +325,15 @@ class ConfigBackedSettingsService:
         config: DeviceConfig,
         location: _ControlLocation,
         *,
-        plugin_id: str | None,
+        provider_instance_id: str,
+        provider_id: str,
     ) -> SettingsTargetRef:
         return SettingsTargetRef(
             scope="action_instance",
             controllerId=self._controller_id,
             configId=config.id,
-            pluginId=plugin_id or "",
+            providerInstanceId=provider_instance_id,
+            providerId=provider_id,
             actionId=location.control.action,
             actionInstanceId=location.action_instance_id,
             stableId=location.control.id,
@@ -324,23 +345,49 @@ class ConfigBackedSettingsService:
             raise KeyError(f"Unknown device config {config_id!r}")
         return config
 
-    async def _action_descriptor(self, action_id: str) -> ActionDescriptor | None:
-        if self._action_descriptor_provider is None:
+    async def _action_metadata(
+        self,
+        action_id: str,
+        *,
+        provider_instance_id: str | None = None,
+        provider_labels: Mapping[str, str] | None = None,
+    ) -> ActionMetadata | None:
+        if self._action_provider is None:
             return None
-        return await self._action_descriptor_provider(action_id)
+        return await self._action_provider(
+            action_id,
+            provider_instance_id=provider_instance_id,
+            provider_labels=provider_labels,
+        )
 
-    async def _descriptor_for_target(
-        self, target: SettingsTargetRef
-    ) -> ActionDescriptor | None:
-        if target.action_id:
-            return await self._action_descriptor(target.action_id)
-        if target.scope == "plugin" and target.plugin_id:
+    async def _action_metadata_for_control(
+        self,
+        control: Control,
+    ) -> ActionMetadata | None:
+        return await self._action_metadata(
+            control.action,
+            provider_instance_id=control.provider_instance_id,
+            provider_labels=control.provider_labels,
+        )
+
+    async def _action_for_target(self, target: SettingsTargetRef) -> ActionMetadata | None:
+        if target.scope == "action_provider_instance":
             config = await self._require_config(target.config_id)
             for location in self._control_locations(config):
-                descriptor = await self._action_descriptor(location.control.action)
-                if descriptor is not None and descriptor.plugin_id == target.plugin_id:
-                    return descriptor
-        return None
+                action = await self._action_metadata_for_control(location.control)
+                if (
+                    action is not None
+                    and action.provider_instance_id == target.provider_instance_id
+                    and action.provider_id == target.provider_id
+                ):
+                    return action
+            return None
+        if not target.action_id:
+            return None
+        return await self._action_metadata(
+            target.action_id,
+            provider_instance_id=target.provider_instance_id,
+        )
 
     def _control_locations(self, config: DeviceConfig) -> tuple[_ControlLocation, ...]:
         locations: list[_ControlLocation] = []
@@ -384,17 +431,19 @@ class ConfigBackedSettingsService:
         self,
         config: DeviceConfig,
         target: SettingsTargetRef,
-    ) -> tuple[_ControlLocation, ActionDescriptor | None]:
+    ) -> tuple[_ControlLocation, ActionMetadata | None]:
         location = self._find_control(config, target)
-        descriptor = await self._action_descriptor(location.control.action)
+        action = await self._action_metadata_for_control(location.control)
         if target.action_id != location.control.action:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
         if target.stable_id != location.control.id:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
-        if descriptor is not None and descriptor.plugin_id:
-            if target.plugin_id != descriptor.plugin_id:
-                raise KeyError(f"Unknown action settings target {target.key()!r}")
-        return location, descriptor
+        if action is not None and (
+            target.provider_instance_id != action.provider_instance_id
+            or target.provider_id != action.provider_id
+        ):
+            raise KeyError(f"Unknown action settings target {target.key()!r}")
+        return location, action
 
     def _replace_control(
         self,

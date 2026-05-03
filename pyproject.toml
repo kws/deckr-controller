@@ -92,7 +92,7 @@ ignore = [
 
 [tool.pytest.ini_options]
 addopts = [
-    "--cov=src/deckr",
+    "--cov=deckr.controller",
     "--cov-report=term-missing",
 ]
 pythonpath = ["."]

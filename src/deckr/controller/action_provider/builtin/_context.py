@@ -1,9 +1,9 @@
-"""Builtin plugin context: thin facade for builtin actions with direct access to controller."""
+"""Controller action context: thin facade for builtin actions with direct access to controller."""
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from deckr.pluginhost.messages import BindingMetadata, DynamicPageCommand, TitleOptions
+from deckr.actions.messages import BindingMetadata, DynamicPageCommand, TitleOptions
 
 from deckr.controller._command_router import CommandRouter
 from deckr.controller.settings import SettingsService
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from deckr.controller._device_manager import DeviceManager
 
 
-class BuiltInPluginContext:
+class ControllerActionContext:
     """Thin facade for builtin actions: delegates to router and manager."""
 
     def __init__(
@@ -39,12 +39,6 @@ class BuiltInPluginContext:
 
     async def set_raster_image(self, image: str) -> None:
         await self._router.set_raster_image(image)
-
-    async def show_alert(self) -> None:
-        await self._router.show_alert()
-
-    async def show_ok(self) -> None:
-        await self._router.show_ok()
 
     async def set_settings(self, settings: dict) -> SimpleNamespace:
         return await self._router.set_settings(settings)

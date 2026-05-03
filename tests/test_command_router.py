@@ -1,19 +1,16 @@
-"""Targeted tests for CommandRouter routing, overlay race safety, and DeviceOutput."""
+"""Targeted tests for CommandRouter routing and DeviceOutput."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from deckr.pluginhost.messages import SettingsSnapshot, SettingsTargetRef, TitleOptions
+from deckr.actions.messages import SettingsSnapshot, SettingsTargetRef, TitleOptions
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
-from deckr.controller._state_store import (
-    ControlStateStore,
-    TransientOverlay,
-)
+from deckr.controller._state_store import ControlStateStore
 
 
 class FakeHardwareCommandService:
@@ -181,25 +178,6 @@ async def test_render_enqueues_request_without_waiting_for_device_write(
     assert router._output.last_frame is None
 
 
-# --- Overlay expiry: token prevents stale expiry from clearing newer overlay ---
-
-
-@pytest.mark.asyncio
-async def test_overlay_expiry_respects_token(router_with_mocks):
-    """Expiring with an old token does not clear overlay; only matching token clears."""
-    router = router_with_mocks
-    router._overlay_token = 2
-    router._store.overlay = TransientOverlay(type="ok", expires_at=999.0)
-
-    with patch("deckr.controller._command_router.anyio.sleep", new_callable=AsyncMock):
-        await router._expire_overlay(1)
-    assert router._store.overlay is not None
-
-    with patch("deckr.controller._command_router.anyio.sleep", new_callable=AsyncMock):
-        await router._expire_overlay(2)
-    assert router._store.overlay is None
-
-
 @pytest.mark.asyncio
 async def test_get_settings_hydrates_from_runtime_overlay():
     store = ControlStateStore(context_id="dev.slot0")
@@ -231,7 +209,8 @@ async def test_get_settings_hydrates_from_runtime_overlay():
         scope="action_instance",
         controllerId="controller-main",
         configId="config-dev",
-        pluginId="plugin",
+        providerInstanceId="python.clock",
+        providerId="clock",
         actionId="action",
         actionInstanceId="instance-a",
     )
@@ -281,7 +260,8 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
         scope="action_instance",
         controllerId="controller-main",
         configId="config-dev",
-        pluginId="plugin",
+        providerInstanceId="python.clock",
+        providerId="clock",
         actionId="action",
         actionInstanceId="instance-a",
     )

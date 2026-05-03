@@ -10,9 +10,10 @@ from typing import Any
 import anyio
 import pytest
 import yaml
-from deckr.pluginhost.messages import ActionDescriptor, SettingsTargetRef
+from deckr.actions.messages import SettingsTargetRef
 from pydantic import ValidationError
 
+from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import (
     Control,
     DeviceConfig,
@@ -28,6 +29,8 @@ from deckr.controller.settings import (
 
 CONTROLLER_ID = "controller-main"
 CONFIG_ID = "config-1"
+PROVIDER_INSTANCE_ID = "python.clock"
+PROVIDER_ID = "clock"
 
 
 def _config() -> DeviceConfig:
@@ -35,7 +38,7 @@ def _config() -> DeviceConfig:
         id=CONFIG_ID,
         name="Desk",
         match=DeviceConfigMatch(fingerprint="fingerprint:desk"),
-        plugin_settings={"plugin.clock": {"timezone": "UTC"}},
+        provider_settings={PROVIDER_INSTANCE_ID: {"timezone": "UTC"}},
         profiles=[
             Profile(
                 name="default",
@@ -62,13 +65,22 @@ def _config() -> DeviceConfig:
     )
 
 
-async def _descriptor(action_id: str) -> ActionDescriptor | None:
+async def _action_provider(
+    action_id: str,
+    *,
+    provider_instance_id: str | None = None,
+    provider_labels: dict[str, str] | None = None,
+) -> ActionMetadata | None:
+    del provider_labels
+    if provider_instance_id not in {None, PROVIDER_INSTANCE_ID}:
+        return None
     if action_id == "action.clock":
-        return ActionDescriptor(
-            actionId="action.clock",
+        return ActionMetadata(
+            uuid="action.clock",
             name="Clock",
-            pluginId="plugin.clock",
-            settingsSchema={
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+            settings_schema={
                 "type": "object",
                 "properties": {
                     "mode": {"type": "string"},
@@ -76,17 +88,18 @@ async def _descriptor(action_id: str) -> ActionDescriptor | None:
                 },
                 "additionalProperties": False,
             },
-            pluginSettingsSchema={
+            provider_settings_schema={
                 "type": "object",
                 "properties": {"timezone": {"type": "string"}},
                 "additionalProperties": False,
             },
         )
     if action_id == "action.no_schema":
-        return ActionDescriptor(
-            actionId="action.no_schema",
+        return ActionMetadata(
+            uuid="action.no_schema",
             name="No Schema",
-            pluginId="plugin.no_schema",
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id="no_schema",
         )
     return None
 
@@ -99,7 +112,7 @@ async def _service(
     settings_service = ConfigBackedSettingsService(
         controller_id=CONTROLLER_ID,
         config_service=config_service,
-        action_descriptor_provider=_descriptor,
+        action_provider=_action_provider,
     )
     return settings_service, config_service
 
@@ -109,7 +122,8 @@ def _stable_action_target() -> SettingsTargetRef:
         scope="action_instance",
         controllerId=CONTROLLER_ID,
         configId=CONFIG_ID,
-        pluginId="plugin.clock",
+        providerInstanceId=PROVIDER_INSTANCE_ID,
+        providerId=PROVIDER_ID,
         actionId="action.clock",
         actionInstanceId=derive_action_instance_id(
             controller_id=CONTROLLER_ID,
@@ -121,12 +135,16 @@ def _stable_action_target() -> SettingsTargetRef:
     )
 
 
-def _plugin_target(plugin_id: str = "plugin.clock") -> SettingsTargetRef:
+def _provider_target(
+    provider_instance_id: str = PROVIDER_INSTANCE_ID,
+    provider_id: str = PROVIDER_ID,
+) -> SettingsTargetRef:
     return SettingsTargetRef(
-        scope="plugin",
+        scope="action_provider_instance",
         controllerId=CONTROLLER_ID,
         configId=CONFIG_ID,
-        pluginId=plugin_id,
+        providerInstanceId=provider_instance_id,
+        providerId=provider_id,
     )
 
 
@@ -142,14 +160,15 @@ async def _next_with_timeout(stream: AsyncIterator[Any]) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_list_and_describe_plugin_and_action_targets(tmp_path: Path) -> None:
+async def test_list_and_describe_provider_and_action_targets(tmp_path: Path) -> None:
     service, _ = await _service(tmp_path)
 
     descriptions = await service.list_targets(config_id=CONFIG_ID)
     targets = {description.target.key(): description for description in descriptions}
 
     action_description = targets[_stable_action_target().key()]
-    assert action_description.plugin_id == "plugin.clock"
+    assert action_description.provider_instance_id == PROVIDER_INSTANCE_ID
+    assert action_description.provider_id == PROVIDER_ID
     assert action_description.action_id == "action.clock"
     assert action_description.label == "clock-primary"
     assert action_description.placement == {
@@ -161,16 +180,17 @@ async def test_list_and_describe_plugin_and_action_targets(tmp_path: Path) -> No
     assert action_description.schema_metadata.stale is False
     assert action_description.schema_metadata.json_schema is not None
 
-    plugin_description = targets[_plugin_target().key()]
-    assert plugin_description.plugin_id == "plugin.clock"
-    assert plugin_description.schema_metadata.stale is False
+    provider_description = targets[_provider_target().key()]
+    assert provider_description.provider_instance_id == PROVIDER_INSTANCE_ID
+    assert provider_description.provider_id == PROVIDER_ID
+    assert provider_description.schema_metadata.stale is False
 
     missing_schema = next(
         description
         for description in descriptions
         if description.target.action_id == "action.no_schema"
     )
-    assert missing_schema.plugin_id == "plugin.no_schema"
+    assert missing_schema.provider_id == "no_schema"
     assert missing_schema.schema_metadata.stale is True
 
 
@@ -208,17 +228,19 @@ async def test_action_settings_patch_writes_yaml_and_notifies(
 
 
 @pytest.mark.asyncio
-async def test_plugin_settings_replace_writes_plugin_settings(tmp_path: Path) -> None:
+async def test_provider_settings_replace_writes_provider_settings(
+    tmp_path: Path,
+) -> None:
     service, config_service = await _service(tmp_path)
-    target = _plugin_target()
+    target = _provider_target()
 
     snapshot = await service.replace(target, {"timezone": "Europe/Amsterdam"})
 
     assert snapshot.settings == {"timezone": "Europe/Amsterdam"}
     reloaded = await config_service.get_config(CONFIG_ID)
     assert reloaded is not None
-    assert reloaded.plugin_settings == {
-        "plugin.clock": {"timezone": "Europe/Amsterdam"}
+    assert reloaded.provider_settings == {
+        PROVIDER_INSTANCE_ID: {"timezone": "Europe/Amsterdam"}
     }
 
 
@@ -240,7 +262,8 @@ async def test_schema_validation_rejects_invalid_settings(tmp_path: Path) -> Non
     [
         {"actionId": "action.other"},
         {"stableId": "clock-secondary"},
-        {"pluginId": "plugin.other"},
+        {"providerInstanceId": "python.other"},
+        {"providerId": "other"},
         {"stableId": None},
     ],
 )

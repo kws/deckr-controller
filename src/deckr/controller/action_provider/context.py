@@ -2,9 +2,8 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from deckr.contracts.models import thaw_json
-from deckr.hardware.descriptors import DeviceDescriptor
-from deckr.pluginhost.messages import (
+from deckr.actions.endpoints import action_provider_address
+from deckr.actions.messages import (
     BINDING_ATTACHED,
     BINDING_DETACHED,
     CAPABILITY_INPUT,
@@ -15,11 +14,12 @@ from deckr.pluginhost.messages import (
     CapabilityInputEvent,
     SettingsTargetRef,
     TitleOptions,
+    action_message,
     context_subject,
-    controller_address,
-    host_address,
-    plugin_message,
 )
+from deckr.contracts.messages import controller_address
+from deckr.contracts.models import thaw_json
+from deckr.hardware.descriptors import DeviceDescriptor
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
@@ -27,12 +27,12 @@ from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
-from deckr.controller.plugin.builtin._context import BuiltInPluginContext
+from deckr.controller.action_provider.builtin._context import ControllerActionContext
 from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
     from deckr.controller._device_manager import DeviceManager
-    from deckr.controller.plugin.builtin import BuiltinAction
+    from deckr.controller.action_provider.builtin import BuiltinAction
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +46,13 @@ class ControlContext:
         device: DeviceDescriptor,
         config_id: str,
         command_service: HardwareCommandService,
-        host_id: str,
+        provider_instance_id: str,
+        provider_id: str,
         action_uuid: str,
         control: ControlSurface,
         settings: Mapping[str, Any],
         manager: "DeviceManager",
-        plugin_bus: Any,
+        actions_bus: Any,
         start_soon: Callable[..., None],
         render_dispatcher: RenderDispatcher,
         settings_service: SettingsService | None,
@@ -67,7 +68,8 @@ class ControlContext:
         self.device = device
         self.config_id = config_id
         self._command_service = command_service
-        self.host_id = host_id
+        self.provider_instance_id = provider_instance_id
+        self.provider_id = provider_id
         self.action_uuid = action_uuid
         self.action_instance_id = metadata.action_instance_id
         self.binding_id = metadata.binding_id
@@ -77,7 +79,7 @@ class ControlContext:
         self.metadata = metadata
         self.control = control
         self.manager = manager
-        self._plugin_bus = plugin_bus
+        self._actions_bus = actions_bus
         self.profile_id = profile_id
         self.page_id = page_id
         self.settings_target = context_settings_target
@@ -109,7 +111,7 @@ class ControlContext:
             settings_service=settings_service,
             settings_target=context_settings_target,
         )
-        self.plugin_context = BuiltInPluginContext(
+        self.controller_context = ControllerActionContext(
             router=self._router,
             manager=manager,
             context_id=self.id,
@@ -126,26 +128,28 @@ class ControlContext:
         return self._store.settings
 
     async def _publish(self, message_type: str, body: Mapping[str, Any] | Any) -> None:
-        msg = plugin_message(
+        msg = action_message(
             sender=controller_address(self._controller_id),
-            sender_session_id=self._plugin_bus.session_id,
-            recipient=host_address(self.host_id),
+            sender_session_id=self._actions_bus.session_id,
+            recipient=action_provider_address(self.provider_instance_id),
             message_type=message_type,
             body=body,
             subject=context_subject(
                 self.id,
+                provider_instance_id=self.provider_instance_id,
+                provider_id=self.provider_id,
                 config_id=self.config_id,
                 action_instance_id=self.action_instance_id,
                 binding_id=self.binding_id,
                 page_session_id=self.page_session_id,
             ),
         )
-        await self._plugin_bus.publish(msg)
+        await self._actions_bus.publish(msg)
 
     async def on_binding_attached(self) -> None:
         await self._router.hydrate_settings()
         if self._builtin_action is not None:
-            await self._builtin_action.on_bind(self.plugin_context)
+            await self._builtin_action.on_bind(self.controller_context)
             return
         await self._publish(
             BINDING_ATTACHED,
@@ -157,7 +161,7 @@ class ControlContext:
 
     async def on_binding_detached(self, reason: str) -> None:
         if self._builtin_action is not None:
-            await self._builtin_action.on_unbind(self.plugin_context, reason)
+            await self._builtin_action.on_unbind(self.controller_context, reason)
             return
         await self._publish(
             BINDING_DETACHED,
@@ -166,7 +170,7 @@ class ControlContext:
 
     async def on_input(self, event: CapabilityInputEvent) -> None:
         if self._builtin_action is not None:
-            await self._builtin_action.on_input(self.plugin_context, event)
+            await self._builtin_action.on_input(self.controller_context, event)
             return
         await self._publish(
             CAPABILITY_INPUT,

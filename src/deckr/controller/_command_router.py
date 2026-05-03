@@ -1,21 +1,16 @@
-"""Command routing: plugin commands → store update → resolve → enqueue render."""
+"""Command routing: action updates -> store update -> resolve -> enqueue render."""
 
 import logging
-import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-import anyio
+from deckr.actions.messages import SettingsTargetRef, TitleOptions
 from deckr.contracts.models import thaw_json
-from deckr.pluginhost.messages import SettingsTargetRef, TitleOptions
 
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
-from deckr.controller._state_store import (
-    ControlStateStore,
-    TransientOverlay,
-)
+from deckr.controller._state_store import ControlStateStore
 from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
@@ -64,7 +59,7 @@ class DeviceOutput:
 
 
 class CommandRouter:
-    """Receives plugin commands, updates ControlStateStore, triggers resolve → encode → write."""
+    """Receives action commands, updates ControlStateStore, triggers resolve → encode → write."""
 
     def __init__(
         self,
@@ -84,7 +79,6 @@ class CommandRouter:
         self._output = output
         self._image_format = image_format
         self._start_soon = start_soon
-        self._overlay_token: int = 0
         self._settings_service = settings_service
         self._settings_target = settings_target
         self._settings_hydrated = False
@@ -127,37 +121,6 @@ class CommandRouter:
         self._store.content.image = image
         self._store.content.title = None
         await self._render()
-
-    async def show_alert(self) -> None:
-        self._overlay_token += 1
-        token = self._overlay_token
-        self._store.overlay = TransientOverlay(
-            type="alert", expires_at=time.monotonic() + 1.0
-        )
-        await self._render()
-        self._start_soon(self._expire_overlay, token)
-
-    async def show_ok(self) -> None:
-        self._overlay_token += 1
-        token = self._overlay_token
-        self._store.overlay = TransientOverlay(
-            type="ok", expires_at=time.monotonic() + 1.0
-        )
-        await self._render()
-        self._start_soon(self._expire_overlay, token)
-
-    async def _expire_overlay(self, token: int) -> None:
-        try:
-            await anyio.sleep(1.0)
-            if token != self._overlay_token:
-                return
-            self._store.overlay = None
-            await self._render()
-        except Exception:
-            logger.exception(
-                "Failed to expire overlay for context %s",
-                self._store.context_id,
-            )
 
     async def hydrate_settings(self) -> None:
         """Load live runtime settings into store. Precedence: config, then runtime overlay."""

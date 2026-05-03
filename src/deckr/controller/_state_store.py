@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
-from deckr.pluginhost.messages import TitleOptions
+from deckr.actions.messages import TitleOptions
 
 
 @dataclass
@@ -17,14 +16,6 @@ class RenderContent:
     title_options: TitleOptions | None = None
 
 
-@dataclass
-class TransientOverlay:
-    """Temporary success/failure overlay; cleared on expiry."""
-
-    type: Literal["alert", "ok"]
-    expires_at: float  # time.monotonic() deadline
-
-
 class ControlStateStore:
     """In-memory declarations for one control context."""
 
@@ -32,6 +23,5 @@ class ControlStateStore:
         self.context_id = context_id
         self.binding_id = binding_id
         self.content = RenderContent()
-        self.overlay: TransientOverlay | None = None
         self.settings: dict = {}
         self.default_title_options: TitleOptions | None = None

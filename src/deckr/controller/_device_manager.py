@@ -7,22 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
-from deckr.contracts.messages import (
+from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
-    DeckrMessage,
-    parse_host_address,
+    action_provider_address,
+    parse_action_provider_address,
 )
-from deckr.contracts.models import thaw_json
-from deckr.core.util.anyio import AsyncMap
-from deckr.hardware import messages as hw_messages
-from deckr.hardware.descriptors import (
-    DECKR_OUTPUT_RASTER,
-    CapabilityRef,
-    ControlRef,
-    DeviceDescriptor,
-    DeviceRef,
-)
-from deckr.pluginhost.messages import (
+from deckr.actions.messages import (
     ACTION_INSTANCE_CREATED,
     ACTION_INSTANCE_DESTROYED,
     BINDING_OUTPUT,
@@ -48,20 +38,33 @@ from deckr.pluginhost.messages import (
     SettingsReplaceBody,
     SettingsSnapshot,
     SettingsTargetRef,
+    action_body_dict,
+    action_message,
     context_subject,
-    controller_address,
-    host_address,
     make_binding_id,
     make_context_id,
     make_dynamic_page_id,
     make_page_session_id,
-    plugin_body_dict,
-    plugin_message,
     subject_action_instance_id,
     subject_binding_id,
     subject_config_id,
     subject_context_id,
     subject_page_session_id,
+    subject_provider_instance_id,
+)
+from deckr.contracts.messages import (
+    DeckrMessage,
+    controller_address,
+)
+from deckr.contracts.models import thaw_json
+from deckr.core.util.anyio import AsyncMap
+from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import (
+    DECKR_OUTPUT_RASTER,
+    CapabilityRef,
+    ControlRef,
+    DeviceDescriptor,
+    DeviceRef,
 )
 from pydantic import ValidationError
 
@@ -91,10 +94,10 @@ from deckr.controller._render_dispatcher import (
     RenderDispatcher,
     ThreadRenderBackend,
 )
+from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
+from deckr.controller.action_provider.context import ControlContext
+from deckr.controller.action_provider.provider import ActionProviderManager
 from deckr.controller.config._data import DeviceConfig, Profile
-from deckr.controller.plugin.builtin import BUILTIN_ACTION_PROVIDER_ID
-from deckr.controller.plugin.context import ControlContext
-from deckr.controller.plugin.provider import PluginManager
 from deckr.controller.settings import (
     SettingsService,
     derive_action_instance_id,
@@ -161,7 +164,9 @@ class DynamicPageSession:
     owner_binding_id: str
     owner_control_id: str
     owner_action_uuid: str
-    owner_host_id: str
+    owner_provider_instance_id: str
+    owner_provider_id: str
+    owner_provider_session_id: str | None
     owner_profile: str
     owner_page: int
     timeout_ms: int
@@ -175,7 +180,9 @@ class BindingLease:
     context_id: str
     action_instance_id: str
     action_uuid: str
-    host_id: str
+    provider_instance_id: str
+    provider_id: str
+    provider_session_id: str | None
     control_id: str
     control: ControlSurface
     input_capability_ids: frozenset[str]
@@ -192,7 +199,7 @@ class BindingLease:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AuthorizedCommandTarget:
-    sender_host_id: str
+    sender_provider_instance_id: str
     context_id: str
     binding: BindingLease | None = None
     page_session: DynamicPageSession | None = None
@@ -207,8 +214,8 @@ class DeviceManager:
         hardware_ref: DeviceRef,
         command_service: HardwareCommandService,
         config: DeviceConfig,
-        manager: PluginManager,
-        plugin_bus: Any,
+        manager: ActionProviderManager,
+        actions_bus: Any,
         start_soon: Callable,
         render_backend: RenderBackend | None = None,
         settings_service: SettingsService | None = None,
@@ -223,7 +230,7 @@ class DeviceManager:
         self._command_service = command_service
         self.config = config
         self.manager = manager
-        self._plugin_bus = plugin_bus
+        self._actions_bus = actions_bus
         self._start_soon = start_soon
         self._config_stream = config_stream
         self._config_listener_task = None
@@ -243,7 +250,7 @@ class DeviceManager:
         self._binding_by_context: dict[str, str] = {}
         self._active_binding_by_control: dict[str, str] = {}
         self._action_instances: dict[str, ActionInstanceMetadata] = {}
-        self._action_instance_hosts: dict[str, str] = {}
+        self._action_instance_providers: dict[str, str] = {}
         self._clock = clock or time.monotonic
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
@@ -338,13 +345,15 @@ class DeviceManager:
         *,
         action_instance_id: str,
         binding: ResolvedControlBinding,
-        plugin_uuid: str | None = None,
+        provider_instance_id: str,
+        provider_id: str,
     ) -> SettingsTargetRef:
         return SettingsTargetRef(
             scope="action_instance",
             controllerId=self._controller_id,
             configId=self.config_id,
-            pluginId=plugin_uuid or "",
+            providerInstanceId=provider_instance_id,
+            providerId=provider_id,
             actionId=binding.action_uuid,
             actionInstanceId=action_instance_id,
             stableId=binding.stable_id,
@@ -397,20 +406,23 @@ class DeviceManager:
         if action_instance_id in self._action_instances:
             return
         metadata = ActionInstanceMetadata(
-            pluginId=action_meta.plugin_uuid,
+            providerInstanceId=action_meta.provider_instance_id,
+            providerId=action_meta.provider_id,
             actionId=action_meta.uuid,
             actionInstanceId=action_instance_id,
             configId=self.config_id,
             contextId=context_id,
         )
         self._action_instances[action_instance_id] = metadata
-        self._action_instance_hosts[action_instance_id] = action_meta.host_id
-        if action_meta.host_id == BUILTIN_ACTION_PROVIDER_ID:
+        self._action_instance_providers[action_instance_id] = (
+            action_meta.provider_instance_id
+        )
+        if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        msg = plugin_message(
+        msg = action_message(
             sender=controller_address(self._controller_id),
-            sender_session_id=self._plugin_bus.session_id,
-            recipient=host_address(action_meta.host_id),
+            sender_session_id=self._actions_bus.session_id,
+            recipient=action_provider_address(action_meta.provider_instance_id),
             message_type=ACTION_INSTANCE_CREATED,
             body=ActionInstanceLifecycleBody(
                 metadata=metadata,
@@ -418,11 +430,13 @@ class DeviceManager:
             ),
             subject=context_subject(
                 context_id,
+                provider_instance_id=action_meta.provider_instance_id,
+                provider_id=action_meta.provider_id,
                 config_id=self.config_id,
                 action_instance_id=action_instance_id,
             ),
         )
-        await self._plugin_bus.publish(msg)
+        await self._actions_bus.publish(msg)
 
     async def _destroy_action_instance(
         self,
@@ -431,22 +445,31 @@ class DeviceManager:
         reason: str,
     ) -> None:
         metadata = self._action_instances.pop(action_instance_id, None)
-        host_id = self._action_instance_hosts.pop(action_instance_id, None)
-        if metadata is None or host_id is None or host_id == BUILTIN_ACTION_PROVIDER_ID:
+        provider_instance_id = self._action_instance_providers.pop(
+            action_instance_id,
+            None,
+        )
+        if (
+            metadata is None
+            or provider_instance_id is None
+            or provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+        ):
             return
-        msg = plugin_message(
+        msg = action_message(
             sender=controller_address(self._controller_id),
-            sender_session_id=self._plugin_bus.session_id,
-            recipient=host_address(host_id),
+            sender_session_id=self._actions_bus.session_id,
+            recipient=action_provider_address(provider_instance_id),
             message_type=ACTION_INSTANCE_DESTROYED,
             body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
             subject=context_subject(
                 metadata.context_id or "",
+                provider_instance_id=metadata.provider_instance_id,
+                provider_id=metadata.provider_id,
                 config_id=self.config_id,
                 action_instance_id=metadata.action_instance_id,
             ),
         )
-        await self._plugin_bus.publish(msg)
+        await self._actions_bus.publish(msg)
 
     async def _destroy_all_action_instances(self, *, reason: str) -> None:
         for action_instance_id in list(self._action_instances):
@@ -481,7 +504,11 @@ class DeviceManager:
                 binding.control_id,
             )
             return False
-        action_meta = await self.manager.get_action(binding.action_uuid)
+        action_meta = await self.manager.get_action(
+            binding.action_uuid,
+            provider_instance_id=binding.provider_instance_id,
+            provider_labels=binding.provider_labels,
+        )
         if action_meta is None:
             logger.info(
                 "Binding unresolved on profile=%s page=%s control=%s action=%s",
@@ -495,7 +522,8 @@ class DeviceManager:
             self._build_settings_target_for_binding(
                 action_instance_id=action_instance_id,
                 binding=binding,
-                plugin_uuid=action_meta.plugin_uuid or action_meta.host_id,
+                provider_instance_id=action_meta.provider_instance_id,
+                provider_id=action_meta.provider_id,
             )
             if persist_settings
             else None
@@ -508,8 +536,9 @@ class DeviceManager:
             except KeyError:
                 initial_settings = dict(binding.settings)
         builtin_action = None
-        if action_meta.host_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
-            self.manager, "get_builtin_action"
+        if (
+            action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+            and hasattr(self.manager, "get_builtin_action")
         ):
             builtin_action = self.manager.get_builtin_action(action_meta.uuid)
         binding_id = make_binding_id()
@@ -521,7 +550,8 @@ class DeviceManager:
             settings=initial_settings,
         )
         binding_metadata = BindingMetadata(
-            pluginId=action_meta.plugin_uuid,
+            providerInstanceId=action_meta.provider_instance_id,
+            providerId=action_meta.provider_id,
             actionId=action_meta.uuid,
             actionInstanceId=action_instance_id,
             configId=self.config_id,
@@ -543,12 +573,13 @@ class DeviceManager:
             device=self.device,
             config_id=self.config_id,
             command_service=self._command_service,
-            host_id=action_meta.host_id,
+            provider_instance_id=action_meta.provider_instance_id,
+            provider_id=action_meta.provider_id,
             action_uuid=action_meta.uuid,
             control=control,
             settings=initial_settings,
             manager=self,
-            plugin_bus=self._plugin_bus,
+            actions_bus=self._actions_bus,
             start_soon=self._start_soon,
             render_dispatcher=self._render_dispatcher,
             settings_service=self._settings_service,
@@ -564,7 +595,9 @@ class DeviceManager:
             context_id=context_id,
             action_instance_id=action_instance_id,
             action_uuid=action_meta.uuid,
-            host_id=action_meta.host_id,
+            provider_instance_id=action_meta.provider_instance_id,
+            provider_id=action_meta.provider_id,
+            provider_session_id=action_meta.catalog_session_id,
             control_id=control.id,
             control=control,
             input_capability_ids=binding.input_capability_ids,
@@ -584,12 +617,12 @@ class DeviceManager:
         await self.action_contexts.set(control.id, ctx)
         await ctx.on_binding_attached()
         logger.info(
-            "Binding resolved on profile=%s page=%s control=%s action=%s host=%s binding=%s",
+            "Binding resolved on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
             profile_id,
             page_id,
             binding.control_id,
             binding.action_uuid,
-            action_meta.host_id,
+            action_meta.provider_instance_id,
             binding_id,
         )
         return True
@@ -634,6 +667,8 @@ class DeviceManager:
             if lease.page_session_id == session.page_session_id
         )
         return PageSessionMetadata(
+            providerInstanceId=session.owner_provider_instance_id,
+            providerId=session.owner_provider_id,
             actionInstanceId=session.action_instance_id,
             configId=self.config_id,
             pageId=session.page_id,
@@ -650,25 +685,27 @@ class DeviceManager:
         *,
         causation_id: str | None = None,
     ) -> None:
-        if session.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
+        if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        msg = plugin_message(
+        msg = action_message(
             sender=controller_address(self._controller_id),
-            sender_session_id=self._plugin_bus.session_id,
-            recipient=host_address(session.owner_host_id),
+            sender_session_id=self._actions_bus.session_id,
+            recipient=action_provider_address(session.owner_provider_instance_id),
             message_type=PAGE_SESSION_OPENED,
             body=PageSessionLifecycleBody(
                 pageSession=self._page_session_metadata(session)
             ),
             subject=context_subject(
                 session.context_id,
+                provider_instance_id=session.owner_provider_instance_id,
+                provider_id=session.owner_provider_id,
                 config_id=self.config_id,
                 action_instance_id=session.action_instance_id,
                 page_session_id=session.page_session_id,
             ),
             causation_id=causation_id,
         )
-        await self._plugin_bus.publish(msg)
+        await self._actions_bus.publish(msg)
 
     async def _emit_page_closed(
         self,
@@ -677,12 +714,12 @@ class DeviceManager:
         *,
         causation_id: str | None = None,
     ) -> None:
-        if session.owner_host_id == BUILTIN_ACTION_PROVIDER_ID:
+        if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        msg = plugin_message(
+        msg = action_message(
             sender=controller_address(self._controller_id),
-            sender_session_id=self._plugin_bus.session_id,
-            recipient=host_address(session.owner_host_id),
+            sender_session_id=self._actions_bus.session_id,
+            recipient=action_provider_address(session.owner_provider_instance_id),
             message_type=PAGE_SESSION_CLOSED,
             body=PageSessionLifecycleBody(
                 pageSession=self._page_session_metadata(session),
@@ -690,13 +727,15 @@ class DeviceManager:
             ),
             subject=context_subject(
                 session.context_id,
+                provider_instance_id=session.owner_provider_instance_id,
+                provider_id=session.owner_provider_id,
                 config_id=self.config_id,
                 action_instance_id=session.action_instance_id,
                 page_session_id=session.page_session_id,
             ),
             causation_id=causation_id,
         )
-        await self._plugin_bus.publish(msg)
+        await self._actions_bus.publish(msg)
 
     async def _finalize_dynamic_page(
         self,
@@ -765,6 +804,7 @@ class DeviceManager:
                 self.device,
                 self.manager.get_action,
                 action_uuid=page_session.owner_action_uuid,
+                provider_instance_id=page_session.owner_provider_instance_id,
                 profile_id="_dynamic",
                 page_id=arriving.page_id,
             )
@@ -953,7 +993,9 @@ class DeviceManager:
                 owner_binding_id=owner_lease.binding_id,
                 owner_control_id=owner_lease.control_id,
                 owner_action_uuid=owner_lease.action_uuid,
-                owner_host_id=owner_lease.host_id,
+                owner_provider_instance_id=owner_lease.provider_instance_id,
+                owner_provider_id=owner_lease.provider_id,
+                owner_provider_session_id=owner_lease.provider_session_id,
                 owner_profile=owner_lease.profile_id,
                 owner_page=owner_page,
                 timeout_ms=timeout_ms,
@@ -984,7 +1026,7 @@ class DeviceManager:
             return None
         if lease.action_instance_id != session.action_instance_id:
             return None
-        if lease.host_id != session.owner_host_id:
+        if lease.provider_instance_id != session.owner_provider_instance_id:
             return None
         return session
 
@@ -1049,7 +1091,9 @@ class DeviceManager:
                 owner_binding_id=current.owner_binding_id,
                 owner_control_id=current.owner_control_id,
                 owner_action_uuid=current.owner_action_uuid,
-                owner_host_id=current.owner_host_id,
+                owner_provider_instance_id=current.owner_provider_instance_id,
+                owner_provider_id=current.owner_provider_id,
+                owner_provider_session_id=current.owner_provider_session_id,
                 owner_profile=current.owner_profile,
                 owner_page=current.owner_page,
                 timeout_ms=current.timeout_ms,
@@ -1150,7 +1194,7 @@ class DeviceManager:
     ) -> None:
         """Re-resolve bindings when actions become available or unavailable.
 
-        registered/unregistered carry qualified IDs (host_id::action_uuid).
+        registered/unregistered carry qualified provider-instance action IDs.
         """
         unregistered_set = frozenset(unregistered)
         registered_set = frozenset(registered)
@@ -1159,7 +1203,9 @@ class DeviceManager:
         session = self._dynamic_page_session
         if (
             session is not None
-            and f"{session.owner_host_id}::{session.owner_action_uuid}"
+            and (
+                f"{session.owner_provider_instance_id}::{session.owner_action_uuid}"
+            )
             in unregistered_set
         ):
             await self.close_page(
@@ -1171,7 +1217,7 @@ class DeviceManager:
         to_reappear: list[ControlContext] = []
         for lease in list(self._binding_leases.values()):
             ctx = lease.context
-            ctx_qualified = f"{lease.host_id}::{lease.action_uuid}"
+            ctx_qualified = f"{lease.provider_instance_id}::{lease.action_uuid}"
             if ctx_qualified in unregistered_set:
                 to_remove.append(lease)
                 continue
@@ -1218,6 +1264,7 @@ class DeviceManager:
                 self.device,
                 self.manager.get_action,
                 action_uuid=session.owner_action_uuid,
+                provider_instance_id=session.owner_provider_instance_id,
                 profile_id="_dynamic",
                 page_id=current_page.page_id,
             )
@@ -1291,43 +1338,55 @@ class DeviceManager:
             transition = self._nav.update_config(config)
             await self._execute_transition(transition)
 
-    def _command_sender_host_id(self, msg: DeckrMessage) -> str | None:
-        host_id = parse_host_address(msg.sender)
-        if host_id is None:
+    def _command_sender_provider_instance_id(self, msg: DeckrMessage) -> str | None:
+        provider_instance_id = parse_action_provider_address(msg.sender)
+        if provider_instance_id is None:
             logger.warning(
-                "Ignoring plugin command %s from non-host sender %s",
+                "Ignoring action command %s from non-provider sender %s",
                 msg.message_type,
                 msg.sender,
             )
             return None
-        if host_id in RESERVED_BUILTIN_PROVIDER_IDS:
+        if provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS:
             logger.warning(
-                "Ignoring plugin command %s from route-owned host using reserved provider id %s",
+                "Ignoring action command %s from external provider using reserved id %s",
                 msg.message_type,
-                host_id,
+                provider_instance_id,
             )
             return None
-        return host_id
+        return provider_instance_id
 
-    async def _authorize_plugin_command(
+    async def _authorize_action_command(
         self,
         msg: DeckrMessage,
         *,
         context_id: str,
     ) -> AuthorizedCommandTarget | None:
-        sender_host_id = self._command_sender_host_id(msg)
-        if sender_host_id is None:
+        sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
+        if sender_provider_instance_id is None:
             return None
 
         action_instance_id = subject_action_instance_id(msg.subject)
         binding_id = subject_binding_id(msg.subject)
         page_session_id = subject_page_session_id(msg.subject)
+        subject_provider_id = subject_provider_instance_id(msg.subject)
+        if (
+            subject_provider_id is not None
+            and subject_provider_id != sender_provider_instance_id
+        ):
+            logger.warning(
+                "Ignoring action command %s from %s with mismatched subject provider %s",
+                msg.message_type,
+                msg.sender,
+                subject_provider_id,
+            )
+            return None
 
         if binding_id is not None:
             lease = self._binding_leases.get(binding_id)
             if lease is None or lease.context_id != context_id:
                 logger.warning(
-                    "Ignoring plugin command %s from %s for inactive binding %s",
+                    "Ignoring action command %s from %s for inactive binding %s",
                     msg.message_type,
                     msg.sender,
                     binding_id,
@@ -1336,17 +1395,27 @@ class DeviceManager:
             active_binding_id = self._active_binding_by_control.get(lease.control_id)
             if active_binding_id != binding_id:
                 logger.warning(
-                    "Ignoring plugin command %s for inactive control binding %s",
+                    "Ignoring action command %s for inactive control binding %s",
                     msg.message_type,
                     binding_id,
                 )
                 return None
-            if sender_host_id != lease.host_id:
+            if sender_provider_instance_id != lease.provider_instance_id:
                 logger.warning(
-                    "Ignoring plugin command %s from host %s for binding owned by host %s",
+                    "Ignoring action command %s from provider %s for binding owned by provider %s",
                     msg.message_type,
-                    sender_host_id,
-                    lease.host_id,
+                    sender_provider_instance_id,
+                    lease.provider_instance_id,
+                )
+                return None
+            if (
+                lease.provider_session_id is not None
+                and msg.sender_session_id != lease.provider_session_id
+            ):
+                logger.warning(
+                    "Ignoring action command %s from stale provider session %s",
+                    msg.message_type,
+                    msg.sender_session_id,
                 )
                 return None
             if (
@@ -1354,20 +1423,20 @@ class DeviceManager:
                 and action_instance_id != lease.action_instance_id
             ):
                 logger.warning(
-                    "Ignoring plugin command %s for mismatched action instance %s",
+                    "Ignoring action command %s for mismatched action instance %s",
                     msg.message_type,
                     action_instance_id,
                 )
                 return None
             if page_session_id is not None and page_session_id != lease.page_session_id:
                 logger.warning(
-                    "Ignoring plugin command %s for mismatched page session %s",
+                    "Ignoring action command %s for mismatched page session %s",
                     msg.message_type,
                     page_session_id,
                 )
                 return None
             return AuthorizedCommandTarget(
-                sender_host_id=sender_host_id,
+                sender_provider_instance_id=sender_provider_instance_id,
                 context_id=context_id,
                 binding=lease,
             )
@@ -1380,17 +1449,27 @@ class DeviceManager:
                 or context_id != session.context_id
             ):
                 logger.warning(
-                    "Ignoring plugin command %s for inactive page session %s",
+                    "Ignoring action command %s for inactive page session %s",
                     msg.message_type,
                     page_session_id,
                 )
                 return None
-            if sender_host_id != session.owner_host_id:
+            if sender_provider_instance_id != session.owner_provider_instance_id:
                 logger.warning(
-                    "Ignoring plugin command %s from host %s for page owned by host %s",
+                    "Ignoring action command %s from provider %s for page owned by provider %s",
                     msg.message_type,
-                    sender_host_id,
-                    session.owner_host_id,
+                    sender_provider_instance_id,
+                    session.owner_provider_instance_id,
+                )
+                return None
+            if (
+                session.owner_provider_session_id is not None
+                and msg.sender_session_id != session.owner_provider_session_id
+            ):
+                logger.warning(
+                    "Ignoring page action command %s from stale provider session %s",
+                    msg.message_type,
+                    msg.sender_session_id,
                 )
                 return None
             if (
@@ -1398,19 +1477,19 @@ class DeviceManager:
                 and action_instance_id != session.action_instance_id
             ):
                 logger.warning(
-                    "Ignoring plugin command %s for mismatched page action instance %s",
+                    "Ignoring action command %s for mismatched page action instance %s",
                     msg.message_type,
                     action_instance_id,
                 )
                 return None
             return AuthorizedCommandTarget(
-                sender_host_id=sender_host_id,
+                sender_provider_instance_id=sender_provider_instance_id,
                 context_id=context_id,
                 page_session=session,
             )
 
         logger.warning(
-            "Ignoring plugin command %s from %s without binding or page session subject",
+            "Ignoring action command %s from %s without binding or page session subject",
             msg.message_type,
             msg.sender,
         )
@@ -1442,18 +1521,36 @@ class DeviceManager:
             )
             return None
 
-    def _plugin_settings_authorized(
+    def _provider_settings_authorized(
         self,
         *,
-        sender_host_id: str,
+        sender_provider_instance_id: str,
+        sender_session_id: str | None,
         target: SettingsTargetRef,
     ) -> bool:
-        plugin_id = target.plugin_id or ""
-        if not self.manager.host_provides_plugin(sender_host_id, plugin_id):
+        if target.provider_instance_id != sender_provider_instance_id:
             logger.warning(
-                "Ignoring plugin settings command from host %s for plugin %s",
-                sender_host_id,
-                plugin_id or "<missing>",
+                "Ignoring provider settings command from %s for provider instance %s",
+                sender_provider_instance_id,
+                target.provider_instance_id,
+            )
+            return False
+        expected_session = self.manager.provider_session_id(sender_provider_instance_id)
+        if expected_session is not None and sender_session_id != expected_session:
+            logger.warning(
+                "Ignoring provider settings command from %s with stale session %s",
+                sender_provider_instance_id,
+                sender_session_id,
+            )
+            return False
+        if not self.manager.provider_instance_provides_provider(
+            sender_provider_instance_id,
+            target.provider_id,
+        ):
+            logger.warning(
+                "Ignoring provider settings command from %s for provider %s",
+                sender_provider_instance_id,
+                target.provider_id,
             )
             return False
         return True
@@ -1487,12 +1584,12 @@ class DeviceManager:
         return SettingsSnapshot.from_snapshot(snapshot)
 
     async def handle_command(self, msg: DeckrMessage) -> None:
-        """Handle a canonical command message from a plugin host."""
+        """Handle a canonical command message from an action provider."""
         try:
-            payload = plugin_body_dict(msg)
+            payload = action_body_dict(msg)
         except (ValidationError, ValueError):
             logger.warning(
-                "Ignoring invalid plugin command body %s from %s",
+                "Ignoring invalid action command body %s from %s",
                 msg.message_type,
                 msg.sender,
                 exc_info=True,
@@ -1502,7 +1599,7 @@ class DeviceManager:
         settings_target: SettingsTargetRef | None = None
 
         async def send_settings_response(snapshot_body: SettingsSnapshot) -> None:
-            await self._plugin_bus.reply_to(
+            await self._actions_bus.reply_to(
                 msg,
                 message_type=SETTINGS_SNAPSHOT,
                 body=snapshot_body.to_dict(),
@@ -1510,8 +1607,8 @@ class DeviceManager:
             )
 
         if msg_type in _SETTINGS_COMMAND_TYPES:
-            sender_host_id = self._command_sender_host_id(msg)
-            if sender_host_id is None:
+            sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
+            if sender_provider_instance_id is None:
                 return
             settings_target = self._settings_target_from_payload(
                 payload,
@@ -1529,9 +1626,10 @@ class DeviceManager:
                     self.config_id,
                 )
                 return
-            if settings_target.scope == "plugin":
-                if not self._plugin_settings_authorized(
-                    sender_host_id=sender_host_id,
+            if settings_target.scope == "action_provider_instance":
+                if not self._provider_settings_authorized(
+                    sender_provider_instance_id=sender_provider_instance_id,
+                    sender_session_id=msg.sender_session_id,
                     target=settings_target,
                 ):
                     return
@@ -1550,7 +1648,7 @@ class DeviceManager:
         config_id = subject_config_id(msg.subject)
         if config_id != self.config_id:
             return
-        authorization = await self._authorize_plugin_command(
+        authorization = await self._authorize_action_command(
             msg,
             context_id=context_id,
         )
@@ -1746,7 +1844,7 @@ class DeviceManager:
             return
 
         try:
-            await lease.context.on_input(translated.plugin_event)
+            await lease.context.on_input(translated.action_event)
         except Exception as e:
             logger.error(
                 "Error delivering input to action %s: %s",

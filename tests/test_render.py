@@ -1,7 +1,7 @@
 """Tests for render pipeline: resolve, _title_options_to_params, title_options flow."""
 
 import pytest
-from deckr.pluginhost.messages import TitleOptions
+from deckr.actions.messages import TitleOptions
 
 from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import (
@@ -14,7 +14,6 @@ from deckr.controller._render import (
 from deckr.controller._state_store import (
     ControlStateStore,
     RenderContent,
-    TransientOverlay,
 )
 
 # --- _hex_to_rgba ---
@@ -190,15 +189,3 @@ def test_resolve_title_options_override_takes_precedence():
 
     model = resolve(store)
     assert model.title_options.font_family == "OverrideFont"
-
-
-def test_resolve_overlay_ignores_title_options():
-    """Overlay (alert/ok) returns overlay_type, no title."""
-    store = ControlStateStore(context_id="dev.0,0")
-    store.overlay = TransientOverlay(type="alert", expires_at=999999.0)
-
-    model = resolve(store, now=0.0)
-    assert model.overlay_type == "alert"
-    assert model.title is None
-    assert model.title_options is None
-

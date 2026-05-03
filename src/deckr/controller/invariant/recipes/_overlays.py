@@ -1,4 +1,4 @@
-"""Overlay recipes for show_alert / show_ok (temporary key feedback)."""
+"""Overlay recipes for controller-owned status render states."""
 
 from invariant import Node, SubGraphNode
 from invariant.params import ref
