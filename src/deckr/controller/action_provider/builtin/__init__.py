@@ -6,7 +6,17 @@ from deckr.actions.endpoints import (
     BUILTIN_ACTION_PROVIDER_ID,
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
-from deckr.actions.messages import ActionDescriptor, CapabilityInputEvent
+from deckr.actions.messages import (
+    ActionDescriptor,
+    CapabilityInputEvent,
+    CapabilityRequirement,
+    CapabilityRequirementSelector,
+)
+from deckr.hardware.descriptors import (
+    CONTROL_ACTIVATION_EVENTS,
+    DECKR_INPUT_BUTTON,
+    DECKR_INPUT_TOUCH,
+)
 
 from deckr.controller.action_provider.builtin._context import ControllerActionContext
 from deckr.controller.action_provider.builtin._goto import GoToPageAction
@@ -57,4 +67,33 @@ class BuiltinRegistry:
             actionId=action.uuid,
             name=getattr(action, "name", None),
             providerId=getattr(action, "provider_id", BUILTIN_ACTION_PROVIDER_ID),
+            requirements=(_activation_input_requirement(),),
         )
+
+
+def _activation_input_requirement() -> CapabilityRequirement:
+    return CapabilityRequirement(
+        name="input",
+        preferences=(
+            CapabilityRequirementSelector(
+                family=DECKR_INPUT_BUTTON,
+                type="momentary",
+                direction="input",
+                eventTypes=("up",),
+            ),
+            CapabilityRequirementSelector(
+                family=DECKR_INPUT_BUTTON,
+                type="activation",
+                direction="input",
+                eventTypes=("press",),
+            ),
+            CapabilityRequirementSelector(
+                family=DECKR_INPUT_TOUCH,
+                type="gesture",
+                direction="input",
+                eventTypes=("tap",),
+            ),
+        ),
+        eventTypes=CONTROL_ACTIVATION_EVENTS,
+        views=("native",),
+    )

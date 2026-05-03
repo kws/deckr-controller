@@ -271,3 +271,9 @@ async def test_action_registry_loads_builtin_actions_without_provider_catalogs()
     goto_page = await registry.get_action("deckr.controller.builtin.gotopage")
     assert goto_page is not None
     assert goto_page.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+    descriptor = await registry.get_action_descriptor(
+        "deckr.controller.builtin.gotopage"
+    )
+    assert descriptor is not None
+    assert descriptor.requirements is not None
+    assert descriptor.requirements[0].event_types == ("up", "press", "tap")

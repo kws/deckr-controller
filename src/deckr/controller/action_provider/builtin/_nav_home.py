@@ -1,4 +1,5 @@
 from deckr.actions.messages import CapabilityInputEvent
+from deckr.hardware.descriptors import CONTROL_ACTIVATION_EVENTS
 
 from deckr.controller.action_provider.builtin._context import ControllerActionContext
 
@@ -19,5 +20,5 @@ class NavHomeAction:
         context: ControllerActionContext,
         event: CapabilityInputEvent,
     ) -> None:
-        if event.event_type in {"press", "up"}:
+        if event.event_type in CONTROL_ACTIVATION_EVENTS:
             await context.set_page(profile="default", page=0)

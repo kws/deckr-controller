@@ -1,5 +1,6 @@
 import anyio
 from deckr.actions.messages import CapabilityInputEvent
+from deckr.hardware.descriptors import CONTROL_ACTIVATION_EVENTS
 
 from deckr.controller.action_provider.builtin._context import ControllerActionContext
 
@@ -23,7 +24,7 @@ class GoToPageAction:
         context: ControllerActionContext,
         event: CapabilityInputEvent,
     ) -> None:
-        if event.event_type not in {"press", "up"}:
+        if event.event_type not in CONTROL_ACTIVATION_EVENTS:
             return
         settings = await context.get_settings()
         await context.set_page(
