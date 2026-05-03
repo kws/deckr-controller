@@ -5,6 +5,11 @@ import logging
 from dataclasses import dataclass
 
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.capabilities import (
+    RasterBitmapEncoding,
+    device_power_command_params,
+    raster_bitmap_command_params,
+)
 from deckr.hardware.descriptors import (
     DECKR_DEVICE_POWER,
     CapabilityRef,
@@ -131,10 +136,18 @@ class HardwareCommandService:
         control_id: str,
         capability_id: str,
         image: bytes,
+        encoding: RasterBitmapEncoding = "jpeg",
     ) -> None:
         live = await self._live_for(config_id)
         if live is None:
             return
+        params = raster_bitmap_command_params(
+            "set_frame",
+            {
+                "image": base64.b64encode(image).decode("ascii"),
+                "encoding": encoding,
+            },
+        ).model_dump(by_alias=True, exclude_none=True)
         await self._endpoint.publish(
             hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
@@ -145,11 +158,7 @@ class HardwareCommandService:
                     capabilityId=capability_id,
                 ),
                 command_type="set_frame",
-                params={
-                    "commandType": "set_frame",
-                    "image": base64.b64encode(image).decode("ascii"),
-                    "encoding": "jpeg",
-                },
+                params=params,
             )
         )
 
@@ -162,6 +171,10 @@ class HardwareCommandService:
         live = await self._live_for(config_id)
         if live is None:
             return
+        params = raster_bitmap_command_params("clear", {}).model_dump(
+            by_alias=True,
+            exclude_none=True,
+        )
         await self._endpoint.publish(
             hw_messages.control_command_for_capability(
                 controller_id=self._controller_id,
@@ -172,7 +185,7 @@ class HardwareCommandService:
                     capabilityId=capability_id,
                 ),
                 command_type="clear",
-                params={"commandType": "clear"},
+                params=params,
             )
         )
 
@@ -203,7 +216,10 @@ class HardwareCommandService:
                     capabilityId=capability_id,
                 ),
                 command_type=command_type,
-                params={"commandType": command_type},
+                params=device_power_command_params({}).model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                ),
             )
         )
 

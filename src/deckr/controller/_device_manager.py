@@ -59,6 +59,11 @@ from deckr.contracts.messages import (
 from deckr.contracts.models import thaw_json
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.capabilities import (
+    RasterBitmapClearParams,
+    RasterBitmapSetFrameParams,
+    raster_bitmap_command_params,
+)
 from deckr.hardware.descriptors import (
     DECKR_OUTPUT_RASTER,
     CapabilityRef,
@@ -1778,30 +1783,27 @@ class DeviceManager:
                 lease.binding_id,
             )
             return
-        if body.command_type == "clear":
+        try:
+            params = raster_bitmap_command_params(body.command_type, body.params)
+        except (ValueError, ValidationError) as exc:
+            logger.warning(
+                "Ignoring invalid raster output command %s on binding %s: %s",
+                body.command_type,
+                lease.binding_id,
+                exc,
+            )
+            return
+        if isinstance(params, RasterBitmapClearParams):
             await self._command_service.clear_raster(
                 self.config_id,
                 lease.control_id,
                 body.capability.capability_id,
             )
             return
-        if body.command_type != "set_frame":
-            logger.warning(
-                "Ignoring unsupported binding output command %s on binding %s",
-                body.command_type,
-                lease.binding_id,
-            )
-            return
-        image = body.params.get("image")
-        encoding = body.params.get("encoding")
-        if not isinstance(image, str) or encoding != "jpeg":
-            logger.warning(
-                "Ignoring raster output without jpeg image payload on binding %s",
-                lease.binding_id,
-            )
+        if not isinstance(params, RasterBitmapSetFrameParams):
             return
         try:
-            frame = base64.b64decode(image, validate=True)
+            frame = base64.b64decode(params.image, validate=True)
         except (ValueError, binascii.Error):
             logger.warning(
                 "Ignoring raster output with invalid base64 image on binding %s",
@@ -1813,6 +1815,7 @@ class DeviceManager:
             lease.control_id,
             body.capability.capability_id,
             frame,
+            encoding=params.encoding,
         )
 
     async def on_event(self, message: DeckrMessage):
