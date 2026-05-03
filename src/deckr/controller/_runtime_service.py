@@ -75,11 +75,13 @@ class ControllerRuntimeService(BaseComponent):
             self._hardware_endpoint_cm = self._hardware_messages.register_endpoint(
                 controller_address(self._runtime.controller_id),
                 metadata={"runtime": self.name, "role": "controller"},
+                task_group=ctx.tg,
             )
             self._hardware_endpoint = await self._hardware_endpoint_cm.__aenter__()
             self._actions_endpoint_cm = self._actions.register_endpoint(
                 controller_address(self._runtime.controller_id),
                 metadata={"runtime": self.name, "role": "controller"},
+                task_group=ctx.tg,
             )
             self._actions_endpoint = await self._actions_endpoint_cm.__aenter__()
 
