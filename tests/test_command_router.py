@@ -165,6 +165,26 @@ async def test_set_raster_image_replaces_title_content(router_with_mocks):
 
 
 @pytest.mark.asyncio
+async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
+    """clear removes current render content and invalidates pending output."""
+    router = router_with_mocks
+    router._store.binding_id = "binding-1"
+
+    await router.set_raster_image("https://example.com/img.png")
+    await router.clear()
+
+    assert router._store.content.image is None
+    assert router._store.content.title is None
+    assert router._store.content.title_options is None
+    router._render_dispatcher.clear_control.assert_awaited_once_with(
+        router._output.control_id,
+        context_id=router._store.context_id,
+        binding_id="binding-1",
+        output=router._output,
+    )
+
+
+@pytest.mark.asyncio
 async def test_render_enqueues_request_without_waiting_for_device_write(
     router_with_mocks,
 ):

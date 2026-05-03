@@ -176,3 +176,9 @@ class ControlContext:
             CAPABILITY_INPUT,
             CapabilityInputBody(binding=self.metadata, event=event),
         )
+
+    async def set_raster_image(self, image: str) -> None:
+        await self._router.set_raster_image(image)
+
+    async def clear_raster(self) -> None:
+        await self._router.clear()

@@ -600,7 +600,7 @@ def device_config_set_raster_image():
 async def test_key_press_renders_to_device(
     device_config_set_raster_image, persistence_tmp_dir
 ):
-    """Capability bindingOutput writes the selected raster capability."""
+    """Capability bindingOutput is rendered through the controller raster path."""
     from deckr.actions.messages import BINDING_OUTPUT
 
     device = _make_mock_device()
@@ -610,6 +610,7 @@ async def test_key_press_renders_to_device(
     )
     action_bus = _actions_bus()
     command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
 
     async with anyio.create_task_group() as tg:
         manager = DeviceManager(
@@ -621,6 +622,7 @@ async def test_key_press_renders_to_device(
             manager=registry,
             actions_bus=action_bus,
             start_soon=tg.start_soon,
+            render_backend=render_backend,
         )
         await manager.set_page(profile="default", page=0)
         baseline_calls = command_service.set_raster_frame.call_count
@@ -653,6 +655,10 @@ async def test_key_press_renders_to_device(
             await manager.handle_command(msg)
 
         with anyio.fail_after(5.0):
+            while not render_backend.calls:
+                await anyio.sleep(0.01)
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
             while command_service.set_raster_frame.call_count <= baseline_calls:
                 await anyio.sleep(0.01)
         tg.cancel_scope.cancel()
@@ -662,7 +668,80 @@ async def test_key_press_renders_to_device(
     assert call_args[0][0] == "test-device"
     assert call_args[0][1] == "0,0"
     assert call_args[0][2] == "raster.bitmap"
-    assert call_args[0][3] == b"frame"
+    assert call_args[0][3] == f"frame-{render_backend.calls[-1]}".encode()
+
+
+@pytest.mark.asyncio
+async def test_binding_output_accepts_graph_data_uri(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    """Graph outputs from action providers are still controller-rendered images."""
+    from deckr.actions.messages import BINDING_OUTPUT
+
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+        binding = ctx.metadata.model_copy(update={"output_generation": 1})
+        msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OUTPUT,
+            {
+                "binding": binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": "test-device",
+                    },
+                    "controlId": "0,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "set_frame",
+                "params": {"image": _solid_key_image()},
+                "generation": 1,
+            },
+        )
+
+        await manager.handle_command(msg)
+
+        with anyio.fail_after(5.0):
+            while not render_backend.calls:
+                await anyio.sleep(0.01)
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
+            while command_service.set_raster_frame.call_count == 0:
+                await anyio.sleep(0.01)
+        tg.cancel_scope.cancel()
+
+    call_args = command_service.set_raster_frame.call_args
+    assert call_args[0][0] == "test-device"
+    assert call_args[0][1] == "0,0"
+    assert call_args[0][2] == "raster.bitmap"
+    assert call_args[0][3] == f"frame-{render_backend.calls[-1]}".encode()
 
 
 @pytest.mark.asyncio

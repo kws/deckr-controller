@@ -1,5 +1,3 @@
-import base64
-import binascii
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -61,7 +59,6 @@ from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.capabilities import (
     RasterBitmapClearParams,
-    RasterBitmapSetFrameParams,
     raster_bitmap_command_params,
 )
 from deckr.hardware.descriptors import (
@@ -118,6 +115,7 @@ _SETTINGS_COMMAND_TYPES = frozenset(
         SETTINGS_REPLACE,
     }
 )
+_IMAGE_SOURCE_SCHEMES = ("data:", "http://", "https://")
 
 
 def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
@@ -132,6 +130,18 @@ def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
     except ValidationError:
         logger.warning("Ignoring invalid dynamic page descriptor payload", exc_info=True)
         return None
+
+
+def _binding_output_image_source(params: Mapping[str, Any]) -> str | None:
+    image = params.get("image")
+    if not isinstance(image, str) or not image:
+        return None
+    if image.startswith(_IMAGE_SOURCE_SCHEMES):
+        return image
+    encoding = params.get("encoding")
+    if encoding in {"jpeg", "png"}:
+        return f"data:image/{encoding};base64,{image}"
+    return None
 
 
 def _find_control_surface(
@@ -1783,40 +1793,36 @@ class DeviceManager:
                 lease.binding_id,
             )
             return
-        try:
-            params = raster_bitmap_command_params(body.command_type, body.params)
-        except (ValueError, ValidationError) as exc:
+        if body.command_type == "clear":
+            try:
+                params = raster_bitmap_command_params(body.command_type, body.params)
+            except (ValueError, ValidationError) as exc:
+                logger.warning(
+                    "Ignoring invalid raster output command %s on binding %s: %s",
+                    body.command_type,
+                    lease.binding_id,
+                    exc,
+                )
+                return
+            if not isinstance(params, RasterBitmapClearParams):
+                return
+            await lease.context.clear_raster()
+            return
+        if body.command_type != "set_frame":
             logger.warning(
-                "Ignoring invalid raster output command %s on binding %s: %s",
+                "Ignoring unsupported raster output command %s on binding %s",
                 body.command_type,
                 lease.binding_id,
-                exc,
             )
             return
-        if isinstance(params, RasterBitmapClearParams):
-            await self._command_service.clear_raster(
-                self.config_id,
-                lease.control_id,
-                body.capability.capability_id,
-            )
-            return
-        if not isinstance(params, RasterBitmapSetFrameParams):
-            return
-        try:
-            frame = base64.b64decode(params.image, validate=True)
-        except (ValueError, binascii.Error):
+        image_source = _binding_output_image_source(body.params)
+        if image_source is None:
             logger.warning(
-                "Ignoring raster output with invalid base64 image on binding %s",
+                "Ignoring raster output without a valid image source on binding %s",
                 lease.binding_id,
             )
             return
-        await self._command_service.set_raster_frame(
-            self.config_id,
-            lease.control_id,
-            body.capability.capability_id,
-            frame,
-            encoding=params.encoding,
-        )
+        await lease.context.set_raster_image(image_source)
 
     async def on_event(self, message: DeckrMessage):
         event = hw_messages.hardware_body_from_message(message)

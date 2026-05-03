@@ -122,6 +122,19 @@ class CommandRouter:
         self._store.content.title = None
         await self._render()
 
+    async def clear(self) -> None:
+        self._store.content.image = None
+        self._store.content.title = None
+        self._store.content.title_options = None
+        if self._output is None:
+            return
+        await self._render_dispatcher.clear_control(
+            self._output.control_id,
+            context_id=self._store.context_id,
+            binding_id=self._store.binding_id,
+            output=self._output,
+        )
+
     async def hydrate_settings(self) -> None:
         """Load live runtime settings into store. Precedence: config, then runtime overlay."""
         if self._settings_hydrated:
