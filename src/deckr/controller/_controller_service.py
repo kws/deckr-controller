@@ -36,9 +36,12 @@ from deckr.state import (
     StateUnavailable,
     device_claim_key,
     encode_key_token,
+    hardware_inventory_key,
+    observe_prefix_current,
     parse_device_claim_key,
     parse_hardware_inventory_key,
     parse_presence_endpoint_key,
+    presence_endpoint_key,
 )
 
 from deckr.controller._device_manager import DeviceManager
@@ -87,7 +90,8 @@ class ControllerService(BaseComponent):
     def __init__(
         self,
         hardware_endpoint: RegisteredEndpointLane,
-        state: StateStore,
+        lease_state: StateStore,
+        discovery_state: StateStore,
         config_service: DeviceConfigService,
         settings_service: SettingsService,
         *,
@@ -98,7 +102,8 @@ class ControllerService(BaseComponent):
     ):
         super().__init__()
         self._hardware_endpoint = hardware_endpoint
-        self._state = state
+        self._lease_state = lease_state
+        self._discovery_state = discovery_state
         self._device_registry = DeviceRouteRegistry()
         self._config_service = config_service
         self._settings_service = settings_service
@@ -228,7 +233,11 @@ class ControllerService(BaseComponent):
                     continue
                 if isinstance(event, hw_messages.DeviceUnavailableMessage):
                     if live is not None:
-                        await self._disconnect_live(live, release_claim=True)
+                        await self._disconnect_live(
+                            live,
+                            release_claim=True,
+                            reason="deviceUnavailable message",
+                        )
                     continue
                 if live is None:
                     continue
@@ -245,13 +254,18 @@ class ControllerService(BaseComponent):
     async def _inventory_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch(_HARDWARE_INVENTORY_PREFIX) as stream:
+                async with self._discovery_state.watch(
+                    _HARDWARE_INVENTORY_PREFIX
+                ) as stream:
                     async for change in stream:
                         manager_id = parse_hardware_inventory_key(change.key)
                         if manager_id is None:
                             continue
                         await self._reconcile_hardware_current_state(
-                            reason="hardware inventory watch"
+                            reason=(
+                                f"hardware inventory watch {change.operation} "
+                                f"{change.key}"
+                            )
                         )
             except StateUnavailable:
                 logger.warning("Hardware inventory state unavailable; retrying")
@@ -284,7 +298,7 @@ class ControllerService(BaseComponent):
             return
         claim_key = device_claim_key(manager_id=ref.manager_id, device_id=ref.device_id)
         try:
-            current_claim = await self._state.get(claim_key)
+            current_claim = await self._lease_state.get(claim_key)
         except StateUnavailable:
             logger.warning("Could not inspect claim %s; retrying later", claim_key)
             return
@@ -293,10 +307,14 @@ class ControllerService(BaseComponent):
             return
         claim = self._new_claim()
         try:
-            entry = await self._state.create(claim_key, claim, ttl=CLAIM_TTL_SECONDS)
+            entry = await self._lease_state.create(
+                claim_key,
+                claim,
+                ttl=CLAIM_TTL_SECONDS,
+            )
         except StateConflict:
             try:
-                current_claim = await self._state.get(claim_key)
+                current_claim = await self._lease_state.get(claim_key)
             except StateUnavailable:
                 logger.warning("Could not inspect conflicting claim %s", claim_key)
                 return
@@ -351,7 +369,9 @@ class ControllerService(BaseComponent):
     async def _manager_presence_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch(_HARDWARE_MANAGER_PRESENCE_PREFIX) as stream:
+                async with self._lease_state.watch(
+                    _HARDWARE_MANAGER_PRESENCE_PREFIX
+                ) as stream:
                     async for change in stream:
                         parsed = parse_presence_endpoint_key(change.key)
                         if parsed is None:
@@ -363,7 +383,10 @@ class ControllerService(BaseComponent):
                         ):
                             continue
                         await self._reconcile_hardware_current_state(
-                            reason="manager presence watch"
+                            reason=(
+                                f"manager presence watch {change.operation} "
+                                f"{change.key}"
+                            )
                         )
             except StateUnavailable:
                 logger.warning("Manager presence state unavailable; retrying")
@@ -372,13 +395,13 @@ class ControllerService(BaseComponent):
     async def _claim_watch_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch(_DEVICE_CLAIM_PREFIX) as stream:
+                async with self._lease_state.watch(_DEVICE_CLAIM_PREFIX) as stream:
                     async for change in stream:
                         parsed = parse_device_claim_key(change.key)
                         if parsed is None:
                             continue
                         await self._reconcile_hardware_current_state(
-                            reason="device claim watch"
+                            reason=f"device claim watch {change.operation} {change.key}"
                         )
             except StateUnavailable:
                 logger.warning("Device claim state unavailable; retrying")
@@ -400,15 +423,54 @@ class ControllerService(BaseComponent):
             await self._reconcile_hardware_current_state_locked(reason=reason)
 
     async def _reconcile_hardware_current_state_locked(self, *, reason: str) -> None:
-        presence_entries = await self._state.items(_HARDWARE_MANAGER_PRESENCE_PREFIX)
-        inventory_entries = await self._state.items(_HARDWARE_INVENTORY_PREFIX)
-        claim_entries = await self._state.items(_DEVICE_CLAIM_PREFIX)
+        presence_observation = await observe_prefix_current(
+            self._lease_state,
+            _HARDWARE_MANAGER_PRESENCE_PREFIX,
+            known_keys=(
+                presence_endpoint_key(
+                    lane="hardware_messages",
+                    endpoint=hardware_manager_address(manager_id),
+                )
+                for manager_id in self._manager_presence_sessions
+            ),
+        )
+        inventory_observation = await observe_prefix_current(
+            self._discovery_state,
+            _HARDWARE_INVENTORY_PREFIX,
+            known_keys=(
+                hardware_inventory_key(manager_id)
+                for manager_id in self._inventory_by_manager
+            ),
+        )
+        claim_observation = await observe_prefix_current(
+            self._lease_state,
+            _DEVICE_CLAIM_PREFIX,
+            known_keys=(
+                set(self._owned_claims)
+                | set(self._blocked_claim_revisions)
+                | {
+                    device_claim_key(
+                        manager_id=live.ref.manager_id,
+                        device_id=live.ref.device_id,
+                    )
+                    for live in self._device_registry.all()
+                }
+            ),
+        )
 
-        next_presence_sessions: dict[str, str] = {}
-        next_inventory: dict[str, HardwareInventory] = {}
+        next_presence_sessions = dict(self._manager_presence_sessions)
+        next_inventory = dict(self._inventory_by_manager)
         current_claims: dict[str, StateEntry] = {}
 
-        for entry in presence_entries:
+        for key in presence_observation.confirmed_missing:
+            parsed = parse_presence_endpoint_key(key)
+            if parsed is None:
+                continue
+            lane, endpoint = parsed
+            if lane == "hardware_messages" and endpoint.family == "hardware_manager":
+                next_presence_sessions.pop(endpoint.endpoint_id, None)
+
+        for entry in presence_observation.entries:
             parsed = parse_presence_endpoint_key(entry.key)
             if parsed is None:
                 continue
@@ -418,16 +480,25 @@ class ControllerService(BaseComponent):
             presence = _valid_endpoint_presence(entry)
             if presence is not None:
                 next_presence_sessions[endpoint.endpoint_id] = presence.session_id
+            else:
+                next_presence_sessions.pop(endpoint.endpoint_id, None)
 
-        for entry in inventory_entries:
+        for key in inventory_observation.confirmed_missing:
+            manager_id = parse_hardware_inventory_key(key)
+            if manager_id is not None:
+                next_inventory.pop(manager_id, None)
+
+        for entry in inventory_observation.entries:
             manager_id = parse_hardware_inventory_key(entry.key)
             if manager_id is None:
                 continue
             inventory = _valid_hardware_inventory(entry, manager_id=manager_id)
             if inventory is not None:
                 next_inventory[manager_id] = inventory
+            else:
+                next_inventory.pop(manager_id, None)
 
-        for entry in claim_entries:
+        for entry in claim_observation.entries:
             parsed = parse_device_claim_key(entry.key)
             if parsed is None:
                 continue
@@ -440,23 +511,33 @@ class ControllerService(BaseComponent):
             if key not in current_claims:
                 self._blocked_claim_revisions.pop(key, None)
 
-        await self._reconcile_owned_claims(current_claims)
-        await self._reconcile_live_hardware(current_claims)
+        await self._reconcile_owned_claims(current_claims, reason=reason)
+        await self._reconcile_live_hardware(current_claims, reason=reason)
         await self._reconcile_available_inventory(current_claims)
 
     async def _reconcile_owned_claims(
         self,
         current_claims: Mapping[str, StateEntry],
+        *,
+        reason: str,
     ) -> None:
         for owned in tuple(self._owned_claims.values()):
             entry = current_claims.get(owned.key)
             if entry is None:
-                await self._revoke_owned_claim(owned, release_claim=False)
+                await self._revoke_owned_claim(
+                    owned,
+                    release_claim=False,
+                    reason=f"owned claim missing during {reason}",
+                )
                 continue
 
             claim = _valid_device_claim(entry)
             if claim is None or not self._claim_belongs_to_this_session(claim):
-                await self._revoke_owned_claim(owned, release_claim=False)
+                await self._revoke_owned_claim(
+                    owned,
+                    release_claim=False,
+                    reason=f"owned claim changed during {reason}",
+                )
                 continue
 
             self._owned_claims[owned.key] = OwnedDeviceClaim(
@@ -469,15 +550,22 @@ class ControllerService(BaseComponent):
                 await self._revoke_owned_claim(
                     self._owned_claims[owned.key],
                     release_claim=True,
+                    reason=self._ref_unavailable_reason(owned.ref, source=reason),
                 )
 
     async def _reconcile_live_hardware(
         self,
         current_claims: Mapping[str, StateEntry],
+        *,
+        reason: str,
     ) -> None:
         for live in tuple(self._device_registry.all()):
             if not self._ref_is_available(live.ref):
-                await self._disconnect_live(live, release_claim=True)
+                await self._disconnect_live(
+                    live,
+                    release_claim=True,
+                    reason=self._ref_unavailable_reason(live.ref, source=reason),
+                )
                 continue
             claim_key = device_claim_key(
                 manager_id=live.ref.manager_id,
@@ -490,7 +578,11 @@ class ControllerService(BaseComponent):
                 or claim is None
                 or not self._claim_belongs_to_this_session(claim)
             ):
-                await self._disconnect_live(live, release_claim=False)
+                await self._disconnect_live(
+                    live,
+                    release_claim=False,
+                    reason=f"live claim changed during {reason}",
+                )
                 continue
             await self._refresh_live_descriptor(live)
 
@@ -532,6 +624,30 @@ class ControllerService(BaseComponent):
             return False
         return (ref.manager_id, ref.device_id) in _hardware_inventory_ref_keys(inventory)
 
+    def _ref_unavailable_reason(self, ref: DeviceRef, *, source: str) -> str:
+        inventory = self._inventory_by_manager.get(ref.manager_id)
+        if inventory is None:
+            return (
+                f"hardware ref {ref.manager_id}/{ref.device_id} unavailable: "
+                f"missing inventory during {source}"
+            )
+        manager_session_id = self._manager_presence_sessions.get(ref.manager_id)
+        if manager_session_id != inventory.session_id:
+            return (
+                f"hardware ref {ref.manager_id}/{ref.device_id} unavailable: "
+                "manager presence session "
+                f"{manager_session_id!r} does not match inventory session "
+                f"{inventory.session_id!r} during {source}"
+            )
+        if (ref.manager_id, ref.device_id) not in _hardware_inventory_ref_keys(
+            inventory
+        ):
+            return (
+                f"hardware ref {ref.manager_id}/{ref.device_id} unavailable: "
+                f"device missing from inventory during {source}"
+            )
+        return f"hardware ref {ref.manager_id}/{ref.device_id} unavailable during {source}"
+
     async def _refresh_live_descriptor(self, live: LiveDeviceRoute) -> None:
         inventory = self._inventory_by_manager.get(live.ref.manager_id)
         if inventory is None or not self._inventory_is_usable(inventory):
@@ -568,10 +684,15 @@ class ControllerService(BaseComponent):
         owned: OwnedDeviceClaim,
         *,
         release_claim: bool,
+        reason: str,
     ) -> None:
         live = self._device_registry.get_by_ref(owned.ref)
         if live is not None:
-            await self._disconnect_live(live, release_claim=release_claim)
+            await self._disconnect_live(
+                live,
+                release_claim=release_claim,
+                reason=reason,
+            )
             return
         self._owned_claims.pop(owned.key, None)
         if release_claim:
@@ -584,7 +705,7 @@ class ControllerService(BaseComponent):
                 return
             for owned in tuple(self._owned_claims.values()):
                 try:
-                    entry = await self._state.update(
+                    entry = await self._lease_state.update(
                         owned.key,
                         self._new_claim(),
                         revision=owned.revision,
@@ -593,7 +714,11 @@ class ControllerService(BaseComponent):
                 except StateConflict:
                     live = self._device_registry.get_by_ref(owned.ref)
                     if live is not None:
-                        await self._disconnect_live(live, release_claim=False)
+                        await self._disconnect_live(
+                            live,
+                            release_claim=False,
+                            reason=f"claim refresh conflict for {owned.key}",
+                        )
                     self._owned_claims.pop(owned.key, None)
                     continue
                 except StateUnavailable:
@@ -602,18 +727,23 @@ class ControllerService(BaseComponent):
                         owned.key,
                     )
                     continue
-                self._owned_claims[owned.key] = OwnedDeviceClaim(
+                refreshed = OwnedDeviceClaim(
                     key=owned.key,
                     config_id=owned.config_id,
                     ref=owned.ref,
                     revision=entry.revision,
                 )
+                if self._owned_claims.get(owned.key) != owned:
+                    await self._delete_owned_claim(refreshed)
+                    continue
+                self._owned_claims[owned.key] = refreshed
 
     async def _disconnect_live(
         self,
         live: LiveDeviceRoute,
         *,
         release_claim: bool,
+        reason: str,
     ) -> None:
         self._device_registry.disconnect_config(live.config_id)
         self._command_service.unregister_config(live.config_id)
@@ -624,7 +754,7 @@ class ControllerService(BaseComponent):
         owned = self._owned_claims.pop(claim_key, None)
         if release_claim and owned is not None:
             await self._delete_owned_claim(owned)
-        await self.on_device_disconnected(live.config_id)
+        await self.on_device_disconnected(live.config_id, reason=reason)
 
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
@@ -644,7 +774,11 @@ class ControllerService(BaseComponent):
         if self._stopping is not None:
             self._stopping.set()
         for live in self._device_registry.all():
-            await self._disconnect_live(live, release_claim=True)
+            await self._disconnect_live(
+                live,
+                release_claim=True,
+                reason="controller stop",
+            )
         for ctrl_ctx in await self._controller_contexts.values():
             await ctrl_ctx.clear_page(clear_outputs=False)
         await self._controller_contexts.clear()
@@ -659,12 +793,31 @@ class ControllerService(BaseComponent):
 
     async def _delete_owned_claim(self, owned: OwnedDeviceClaim) -> None:
         with anyio.CancelScope(shield=True):
-            try:
-                await self._state.delete(owned.key, revision=owned.revision)
-            except StateConflict:
-                logger.info("Claim %s changed before release", owned.key)
-            except StateUnavailable:
-                logger.warning("Could not release claim %s", owned.key)
+            revision = owned.revision
+            while True:
+                try:
+                    await self._lease_state.delete(owned.key, revision=revision)
+                    return
+                except StateConflict:
+                    try:
+                        current = await self._lease_state.get(owned.key)
+                    except StateUnavailable:
+                        logger.warning("Could not inspect claim %s for release", owned.key)
+                        return
+                    if current is None:
+                        return
+                    claim = _valid_device_claim(current)
+                    if claim is None or not self._claim_belongs_to_this_session(claim):
+                        logger.info("Claim %s changed before release", owned.key)
+                        return
+                    logger.info(
+                        "Claim %s refreshed during release; retrying release",
+                        owned.key,
+                    )
+                    revision = current.revision
+                except StateUnavailable:
+                    logger.warning("Could not release claim %s", owned.key)
+                    return
 
     async def _device_lifecycle(
         self,
@@ -738,7 +891,10 @@ class ControllerService(BaseComponent):
         initial_config,
     ):
         if await self._controller_contexts.get(live.config_id) is not None:
-            await self.on_device_disconnected(live.config_id)
+            await self.on_device_disconnected(
+                live.config_id,
+                reason="replacement live device connected",
+            )
         logger.info(
             "Starting controller service for config %s from %s/%s",
             live.config_id,
@@ -747,7 +903,7 @@ class ControllerService(BaseComponent):
         )
         self._start_soon(self._device_lifecycle, live, initial_config)
 
-    async def on_device_disconnected(self, config_id: str):
+    async def on_device_disconnected(self, config_id: str, *, reason: str = "unknown"):
         ctrl_ctx = await self._controller_contexts.pop(config_id)
         disconnect_ev = self._device_disconnect_events.get(config_id)
         if disconnect_ev is not None:
@@ -756,7 +912,11 @@ class ControllerService(BaseComponent):
             if ctrl_ctx is not None:
                 await ctrl_ctx.clear_page(clear_outputs=False)
         finally:
-            logger.info("Stopped controller service for config %s", config_id)
+            logger.info(
+                "Stopped controller service for config %s (reason: %s)",
+                config_id,
+                reason,
+            )
 
 
 def _valid_endpoint_presence(entry: StateEntry) -> EndpointPresence | None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import anyio
 import pytest
@@ -16,6 +16,8 @@ from deckr.hardware.descriptors import (
     DeviceRef,
 )
 from deckr.state import (
+    DEFAULT_DISCOVERY_STATE_STORE_NAME,
+    DEFAULT_LEASE_STATE_STORE_NAME,
     DeviceClaim,
     EndpointPresence,
     HardwareInventory,
@@ -179,7 +181,8 @@ async def test_manager_presence_loss_cleans_only_configs_for_lost_manager_endpoi
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -237,7 +240,10 @@ async def test_manager_presence_loss_cleans_only_configs_for_lost_manager_endpoi
                 await anyio.sleep(0.01)
         tg.cancel_scope.cancel()
 
-    controller.on_device_disconnected.assert_awaited_once_with("config-room-a")
+    controller.on_device_disconnected.assert_awaited_once_with(
+        "config-room-a",
+        reason=ANY,
+    )
     assert controller._device_registry.get("config-room-a") is None
     assert controller._device_registry.get("config-room-b") is not None
 
@@ -247,7 +253,8 @@ async def test_manager_presence_session_change_invalidates_owned_device():
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -267,7 +274,7 @@ async def test_manager_presence_session_change_invalidates_owned_device():
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId=controller._session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
         ),
     )
     controller._owned_claims[claim_key] = OwnedDeviceClaim(
@@ -287,7 +294,10 @@ async def test_manager_presence_session_change_invalidates_owned_device():
                 await anyio.sleep(0.01)
         tg.cancel_scope.cancel()
 
-    controller.on_device_disconnected.assert_awaited_once_with("config-room-a")
+    controller.on_device_disconnected.assert_awaited_once_with(
+        "config-room-a",
+        reason=ANY,
+    )
     assert controller._device_registry.get("config-room-a") is None
     assert await bus.deckr.state().get(claim_key) is None
 
@@ -297,7 +307,8 @@ async def test_device_disconnect_tears_down_without_hardware_clears():
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -316,7 +327,8 @@ async def test_device_reconnect_replaces_existing_context_without_hardware_clear
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -349,7 +361,8 @@ async def test_device_lifecycle_renders_once_before_listening_for_config_changes
     )
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=_MatchingConfigService(config),
         settings_service=None,
         controller_id="controller-main",
@@ -410,7 +423,8 @@ async def test_claim_loss_retries_cached_matching_inventory():
     )
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=_MatchingConfigService(config),
         settings_service=None,
         controller_id="controller-main",
@@ -423,7 +437,7 @@ async def test_claim_loss_retries_cached_matching_inventory():
             claimedByEndpoint=controller_address("other"),
             claimedBySessionId="other-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
         ),
     )
     await _put_presence(bus, "room-a", session_id="manager-session")
@@ -457,7 +471,8 @@ async def test_same_endpoint_old_session_claim_blocks_until_claim_loss():
     )
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=_MatchingConfigService(config),
         settings_service=None,
         controller_id="controller-main",
@@ -470,7 +485,7 @@ async def test_same_endpoint_old_session_claim_blocks_until_claim_loss():
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId="old-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
         ),
     )
     await _put_presence(bus, "room-a", session_id="manager-session")
@@ -502,7 +517,8 @@ async def test_broker_snapshot_inventory_removal_revokes_live_device():
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -532,20 +548,22 @@ async def test_broker_snapshot_inventory_removal_revokes_live_device():
     )
     await controller._reconcile_hardware_current_state(reason="test snapshot")
 
-    await bus.deckr.state().put(
+    await _discovery_state(bus).put(
         "inventory.hardware.room-a",
         HardwareInventory(
             managerId="room-a",
             managerEndpoint=hardware_manager_address("room-a"),
             sessionId="manager-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
             devices={},
         ),
     )
     await controller._reconcile_hardware_current_state(reason="test snapshot")
 
-    controller.on_device_disconnected.assert_awaited_once_with("config-room-a")
+    controller.on_device_disconnected.assert_awaited_once_with(
+        "config-room-a",
+        reason=ANY,
+    )
     assert controller._device_registry.get("config-room-a") is None
     assert await bus.deckr.state().get(claim_key) is None
 
@@ -555,7 +573,8 @@ async def test_broker_snapshot_claim_takeover_revokes_owned_device():
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -589,13 +608,16 @@ async def test_broker_snapshot_claim_takeover_revokes_owned_device():
             claimedByEndpoint=controller_address("other"),
             claimedBySessionId="other-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
         ),
     )
 
     await controller._reconcile_hardware_current_state(reason="test snapshot")
 
-    controller.on_device_disconnected.assert_awaited_once_with("config-room-a")
+    controller.on_device_disconnected.assert_awaited_once_with(
+        "config-room-a",
+        reason=ANY,
+    )
     assert controller._device_registry.get("config-room-a") is None
     assert claim_key not in controller._owned_claims
     claim = await bus.deckr.state().get(claim_key)
@@ -608,7 +630,8 @@ async def test_hardware_snapshot_unavailable_keeps_live_device(monkeypatch):
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -624,7 +647,7 @@ async def test_hardware_snapshot_unavailable_keeps_live_device(monkeypatch):
         del args, kwargs
         raise StateUnavailable("nats down")
 
-    monkeypatch.setattr(controller._state, "items", unavailable_items)
+    monkeypatch.setattr(controller._lease_state, "items", unavailable_items)
 
     with pytest.raises(StateUnavailable):
         await controller._reconcile_hardware_current_state(reason="test outage")
@@ -633,11 +656,66 @@ async def test_hardware_snapshot_unavailable_keeps_live_device(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_prefix_observation_omissions_do_not_revoke_live_device(monkeypatch):
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
+        config_service=NullDeviceConfigService(),
+        settings_service=None,
+        controller_id="controller-main",
+    )
+    controller.on_device_disconnected = AsyncMock()
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
+    controller._device_registry.connect(
+        config_id="config-room-a",
+        ref=ref,
+        device=_device("deck", "serial-a"),
+    )
+    controller._command_service.register_device(
+        config_id="config-room-a",
+        ref=ref,
+        device=_device("deck", "serial-a"),
+    )
+    claim_key = device_claim_key(manager_id="room-a", device_id="deck")
+    claim_entry = await _put_claim(bus, controller, "room-a", "deck")
+    controller._owned_claims[claim_key] = OwnedDeviceClaim(
+        key=claim_key,
+        config_id="config-room-a",
+        ref=ref,
+        revision=claim_entry.revision,
+    )
+    await _put_presence(bus, "room-a", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "room-a",
+        fingerprint="serial-a",
+        session_id="manager-session",
+    )
+    await controller._reconcile_hardware_current_state(reason="initial snapshot")
+
+    async def omitted_items(prefix: str = ""):
+        del prefix
+        return ()
+
+    monkeypatch.setattr(controller._lease_state, "items", omitted_items)
+    monkeypatch.setattr(controller._discovery_state, "items", omitted_items)
+
+    await controller._reconcile_hardware_current_state(reason="omitted snapshot")
+
+    controller.on_device_disconnected.assert_not_awaited()
+    assert controller._device_registry.get("config-room-a") is not None
+    assert claim_key in controller._owned_claims
+
+
+@pytest.mark.asyncio
 async def test_stop_releases_owned_claims_without_hardware_clears():
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -658,7 +736,7 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId=controller._session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
         ),
     )
     controller._owned_claims[claim_key] = OwnedDeviceClaim(
@@ -677,11 +755,56 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
 
 
 @pytest.mark.asyncio
+async def test_owned_claim_release_retries_after_concurrent_refresh():
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
+        config_service=NullDeviceConfigService(),
+        settings_service=None,
+        controller_id="controller-main",
+    )
+    ref = DeviceRef(manager_id="room-a", device_id="deck")
+    claim_key = device_claim_key(manager_id="room-a", device_id="deck")
+    entry = await bus.deckr.state().create(
+        claim_key,
+        DeviceClaim(
+            claimedByEndpoint=controller_address("controller-main"),
+            claimedBySessionId=controller._session_id,
+            timestamp=datetime.now(UTC),
+            ttlSeconds=30,
+        ),
+    )
+    stale_owned = OwnedDeviceClaim(
+        key=claim_key,
+        config_id="config-room-a",
+        ref=ref,
+        revision=entry.revision,
+    )
+    await bus.deckr.state().update(
+        claim_key,
+        DeviceClaim(
+            claimedByEndpoint=controller_address("controller-main"),
+            claimedBySessionId=controller._session_id,
+            timestamp=datetime.now(UTC),
+            ttlSeconds=30,
+        ),
+        revision=entry.revision,
+    )
+
+    await controller._delete_owned_claim(stale_owned)
+
+    assert await bus.deckr.state().get(claim_key) is None
+
+
+@pytest.mark.asyncio
 async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     controller = ControllerService(
         hardware_endpoint=bus.endpoint("controller:controller-main"),
-        state=bus.deckr.state(),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
         config_service=NullDeviceConfigService(),
         settings_service=None,
         controller_id="controller-main",
@@ -708,7 +831,7 @@ async def test_claim_refresh_unavailable_keeps_live_device(monkeypatch):
         raise StateUnavailable("nats down")
 
     monkeypatch.setattr(controller_module, "CLAIM_HEARTBEAT_SECONDS", 0.01)
-    monkeypatch.setattr(controller._state, "update", unavailable_update)
+    monkeypatch.setattr(controller._lease_state, "update", unavailable_update)
 
     await controller._claim_refresh_loop()
 
@@ -724,14 +847,14 @@ async def _put_presence(
     session_id: str | None = None,
 ) -> None:
     endpoint = hardware_manager_address(manager_id)
-    await bus.deckr.state().put(
+    await _lease_state(bus).put(
         presence_endpoint_key(lane="hardware_messages", endpoint=endpoint),
         EndpointPresence(
             endpoint=endpoint,
             lane="hardware_messages",
             sessionId=session_id or f"session-{manager_id}",
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
             metadata={},
         ),
     )
@@ -744,14 +867,13 @@ async def _put_inventory(
     fingerprint: str,
     session_id: str | None = None,
 ) -> None:
-    await bus.deckr.state().put(
+    await _discovery_state(bus).put(
         f"inventory.hardware.{manager_id}",
         HardwareInventory(
             managerId=manager_id,
             managerEndpoint=hardware_manager_address(manager_id),
             sessionId=session_id or f"session-{manager_id}",
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
             devices={
                 "deck": HardwareInventoryDevice(
                     deviceRef=DeviceRef(
@@ -778,7 +900,7 @@ async def _put_claim(
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId=controller._session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
         ),
     )
 
@@ -802,3 +924,11 @@ class _MatchingConfigService:
     async def _stream(self):
         yield self.config
         await anyio.sleep_forever()
+
+
+def _lease_state(bus: LaneHarness):
+    return bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+
+
+def _discovery_state(bus: LaneHarness):
+    return bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)

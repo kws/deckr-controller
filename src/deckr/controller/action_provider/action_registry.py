@@ -18,11 +18,17 @@ from deckr.actions.state import (
     parse_action_provider_catalog_key,
 )
 from deckr.components import BaseComponent, RunContext
+from deckr.contracts.messages import ACTIONS_LANE
 from deckr.contracts.models import thaw_json
 from deckr.state import (
+    EndpointPresence,
     StateEntry,
     StateStore,
     StateUnavailable,
+    encode_key_token,
+    observe_prefix_current,
+    parse_presence_endpoint_key,
+    presence_endpoint_key,
 )
 
 from deckr.controller.action_provider.builtin import (
@@ -35,6 +41,15 @@ from deckr.controller.action_provider.provider import ActionMetadata
 logger = logging.getLogger(__name__)
 
 _ACTION_PROVIDER_CATALOG_PREFIX = "catalog.actions.providers."
+_ACTION_PROVIDER_PRESENCE_PREFIX = ".".join(
+    (
+        "presence",
+        "endpoint",
+        encode_key_token(ACTIONS_LANE),
+        encode_key_token("action_provider"),
+        "",
+    )
+)
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 
@@ -57,19 +72,22 @@ class ActionRegistry(BaseComponent):
 
     def __init__(
         self,
-        state: StateStore,
+        lease_state: StateStore,
+        discovery_state: StateStore,
         *,
         controller_id: str,
         on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]] | None = None,
     ):
         super().__init__(name="ActionRegistry")
-        self._state = state
+        self._lease_state = lease_state
+        self._discovery_state = discovery_state
         self._controller_id = controller_id
         self._on_actions_changed = on_actions_changed
         self._builtin_registry = BuiltinRegistry()
         self._builtin_action_registry: dict[str, ActionDescriptor] = {}
         self._action_registry: dict[str, _CatalogAction] = {}
         self._catalogs: dict[str, ActionProviderCatalog] = {}
+        self._provider_presence_sessions: dict[str, str] = {}
         self._reconcile_lock = anyio.Lock()
 
     async def get_action(
@@ -161,7 +179,14 @@ class ActionRegistry(BaseComponent):
 
     def provider_session_id(self, provider_instance_id: str) -> str | None:
         catalog = self._catalogs.get(provider_instance_id)
-        return catalog.session_id if catalog is not None else None
+        if catalog is None:
+            return None
+        if (
+            self._provider_presence_sessions.get(provider_instance_id)
+            != catalog.session_id
+        ):
+            return None
+        return catalog.session_id
 
     def _builtin_action_metadata(self, action_uuid: str) -> ActionMetadata | None:
         descriptor = self._builtin_action_registry.get(action_uuid)
@@ -192,17 +217,21 @@ class ActionRegistry(BaseComponent):
                 self._builtin_action_registry[action_uuid] = descriptor
 
         start_soon(self._catalog_loop)
+        start_soon(self._provider_presence_loop)
         start_soon(self._reconciliation_loop)
 
     async def stop(self) -> None:
         self._action_registry.clear()
         self._builtin_action_registry.clear()
         self._catalogs.clear()
+        self._provider_presence_sessions.clear()
 
     async def _catalog_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch(_ACTION_PROVIDER_CATALOG_PREFIX) as stream:
+                async with self._discovery_state.watch(
+                    _ACTION_PROVIDER_CATALOG_PREFIX
+                ) as stream:
                     async for change in stream:
                         provider_instance_id = parse_action_provider_catalog_key(
                             change.key
@@ -211,10 +240,42 @@ class ActionRegistry(BaseComponent):
                             _is_allowed_provider_instance_id(provider_instance_id)
                         ):
                             continue
-                        await self._reconcile_current_state(reason="catalog watch")
+                        await self._reconcile_current_state(
+                            reason=(
+                                f"catalog watch {change.operation} {change.key}"
+                            )
+                        )
             except StateUnavailable:
                 logger.warning(
                     "Action provider catalog state unavailable; retrying",
+                    exc_info=True,
+                )
+                await anyio.sleep(_WATCH_RETRY_SECONDS)
+
+    async def _provider_presence_loop(self) -> None:
+        while True:
+            try:
+                async with self._lease_state.watch(
+                    _ACTION_PROVIDER_PRESENCE_PREFIX
+                ) as stream:
+                    async for change in stream:
+                        parsed = parse_presence_endpoint_key(change.key)
+                        if parsed is None:
+                            continue
+                        lane, endpoint = parsed
+                        if lane != ACTIONS_LANE or endpoint.family != "action_provider":
+                            continue
+                        if not _is_allowed_provider_instance_id(endpoint.endpoint_id):
+                            continue
+                        await self._reconcile_current_state(
+                            reason=(
+                                f"provider presence watch {change.operation} "
+                                f"{change.key}"
+                            )
+                        )
+            except StateUnavailable:
+                logger.warning(
+                    "Action provider presence state unavailable; retrying",
                     exc_info=True,
                 )
                 await anyio.sleep(_WATCH_RETRY_SECONDS)
@@ -235,12 +296,36 @@ class ActionRegistry(BaseComponent):
             await self._reconcile_current_state_locked(reason=reason)
 
     async def _reconcile_current_state_locked(self, *, reason: str) -> None:
-        catalog_entries = await self._state.items(_ACTION_PROVIDER_CATALOG_PREFIX)
+        catalog_observation = await observe_prefix_current(
+            self._discovery_state,
+            _ACTION_PROVIDER_CATALOG_PREFIX,
+            known_keys=(
+                action_provider_catalog_key(provider_instance_id)
+                for provider_instance_id in self._catalogs
+            ),
+        )
+        presence_observation = await observe_prefix_current(
+            self._lease_state,
+            _ACTION_PROVIDER_PRESENCE_PREFIX,
+            known_keys=(
+                presence_endpoint_key(
+                    lane=ACTIONS_LANE,
+                    endpoint=action_provider_address(provider_instance_id),
+                )
+                for provider_instance_id in self._provider_presence_sessions
+            ),
+        )
 
-        next_catalogs: dict[str, ActionProviderCatalog] = {}
         affected_providers = set(self._catalogs)
+        next_catalogs = dict(self._catalogs)
 
-        for entry in catalog_entries:
+        for key in catalog_observation.confirmed_missing:
+            provider_instance_id = parse_action_provider_catalog_key(key)
+            if provider_instance_id is not None:
+                affected_providers.add(provider_instance_id)
+                next_catalogs.pop(provider_instance_id, None)
+
+        for entry in catalog_observation.entries:
             provider_instance_id = parse_action_provider_catalog_key(entry.key)
             if provider_instance_id is None or not (
                 _is_allowed_provider_instance_id(provider_instance_id)
@@ -250,8 +335,37 @@ class ActionRegistry(BaseComponent):
             catalog = _valid_catalog(entry, provider_instance_id=provider_instance_id)
             if catalog is not None:
                 next_catalogs[provider_instance_id] = catalog
+            else:
+                next_catalogs.pop(provider_instance_id, None)
+
+        next_presence_sessions = dict(self._provider_presence_sessions)
+        for key in presence_observation.confirmed_missing:
+            parsed = parse_presence_endpoint_key(key)
+            if parsed is None:
+                continue
+            lane, endpoint = parsed
+            if lane == ACTIONS_LANE and endpoint.family == "action_provider":
+                affected_providers.add(endpoint.endpoint_id)
+                next_presence_sessions.pop(endpoint.endpoint_id, None)
+
+        for entry in presence_observation.entries:
+            parsed = parse_presence_endpoint_key(entry.key)
+            if parsed is None:
+                continue
+            lane, endpoint = parsed
+            if lane != ACTIONS_LANE or endpoint.family != "action_provider":
+                continue
+            if not _is_allowed_provider_instance_id(endpoint.endpoint_id):
+                continue
+            affected_providers.add(endpoint.endpoint_id)
+            presence = _valid_provider_presence(entry)
+            if presence is None:
+                next_presence_sessions.pop(endpoint.endpoint_id, None)
+            else:
+                next_presence_sessions[endpoint.endpoint_id] = presence.session_id
 
         self._catalogs = next_catalogs
+        self._provider_presence_sessions = next_presence_sessions
         for provider_instance_id in sorted(affected_providers):
             await self._reconcile_provider(provider_instance_id, reason=reason)
 
@@ -303,6 +417,11 @@ class ActionRegistry(BaseComponent):
     ) -> dict[str, _CatalogAction]:
         catalog = self._catalogs.get(provider_instance_id)
         if catalog is None:
+            return {}
+        if (
+            self._provider_presence_sessions.get(provider_instance_id)
+            != catalog.session_id
+        ):
             return {}
         return {
             _qualified_id(provider_instance_id, descriptor.action_id): _CatalogAction(
@@ -389,3 +508,27 @@ def _valid_catalog(
         )
         return None
     return catalog
+
+
+def _valid_provider_presence(entry: StateEntry) -> EndpointPresence | None:
+    parsed = parse_presence_endpoint_key(entry.key)
+    if parsed is None:
+        return None
+    lane, endpoint = parsed
+    try:
+        presence = EndpointPresence.model_validate(entry.value)
+    except ValueError:
+        logger.warning("Ignoring invalid action provider presence %s", entry.key)
+        return None
+    if (
+        lane != ACTIONS_LANE
+        or endpoint.family != "action_provider"
+        or presence.lane != lane
+        or presence.endpoint != endpoint
+    ):
+        logger.warning(
+            "Ignoring action provider presence %s with mismatched payload",
+            entry.key,
+        )
+        return None
+    return presence

@@ -10,6 +10,12 @@ from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import ActionDescriptor, ActionProviderCatalog
 from deckr.actions.state import action_provider_catalog_key
 from deckr.components import RunContext
+from deckr.state import (
+    DEFAULT_DISCOVERY_STATE_STORE_NAME,
+    DEFAULT_LEASE_STATE_STORE_NAME,
+    EndpointPresence,
+    presence_endpoint_key,
+)
 
 from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
@@ -39,7 +45,6 @@ def _catalog(
         providerId=provider_id,
         sessionId=session_id,
         timestamp=datetime.now(UTC),
-        ttlSeconds=90,
         labels=labels or {"room": "office"},
         actions={
             action_uuid: ActionDescriptor(
@@ -48,6 +53,21 @@ def _catalog(
                 providerId=provider_id,
             )
         },
+    )
+
+
+async def _put_presence(bus: LaneHarness, session_id: str = "session-1") -> None:
+    endpoint = action_provider_address(PROVIDER_INSTANCE_ID)
+    await bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME).put(
+        presence_endpoint_key(lane="actions", endpoint=endpoint),
+        EndpointPresence(
+            endpoint=endpoint,
+            lane="actions",
+            sessionId=session_id,
+            timestamp=datetime.now(UTC),
+            ttlSeconds=30,
+            metadata={},
+        ),
     )
 
 
@@ -68,11 +88,20 @@ async def _run_registry(registry: ActionRegistry, callback):
 @pytest.mark.asyncio
 async def test_action_registry_uses_catalog_as_action_availability_source():
     bus = _state_bus()
-    state = bus.deckr.state()
-    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    lease_state = bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=lease_state,
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
 
     async def scenario(events):
-        await state.put(action_provider_catalog_key(PROVIDER_INSTANCE_ID), _catalog())
+        await _put_presence(bus)
+        await discovery_state.put(
+            action_provider_catalog_key(PROVIDER_INSTANCE_ID),
+            _catalog(),
+        )
         with anyio.fail_after(1):
             while await registry.get_action(ACTION_UUID) is None:
                 await anyio.sleep(0.01)
@@ -90,12 +119,21 @@ async def test_action_registry_uses_catalog_as_action_availability_source():
 @pytest.mark.asyncio
 async def test_action_registry_filters_by_provider_instance_and_labels():
     bus = _state_bus()
-    state = bus.deckr.state()
-    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    lease_state = bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=lease_state,
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
 
     async def scenario(events):
         del events
-        await state.put(action_provider_catalog_key(PROVIDER_INSTANCE_ID), _catalog())
+        await _put_presence(bus)
+        await discovery_state.put(
+            action_provider_catalog_key(PROVIDER_INSTANCE_ID),
+            _catalog(),
+        )
         with anyio.fail_after(1):
             while await registry.get_action(ACTION_UUID) is None:
                 await anyio.sleep(0.01)
@@ -119,12 +157,18 @@ async def test_action_registry_filters_by_provider_instance_and_labels():
 @pytest.mark.asyncio
 async def test_action_registry_provider_settings_authority_uses_catalog_session():
     bus = _state_bus()
-    state = bus.deckr.state()
-    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    lease_state = bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=lease_state,
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
 
     async def scenario(events):
         del events
-        await state.put(
+        await _put_presence(bus, session_id="old")
+        await discovery_state.put(
             action_provider_catalog_key(PROVIDER_INSTANCE_ID),
             _catalog(session_id="old"),
         )
@@ -133,7 +177,8 @@ async def test_action_registry_provider_settings_authority_uses_catalog_session(
                 await anyio.sleep(0.01)
         assert registry.provider_instance_provides_provider(PROVIDER_INSTANCE_ID, PROVIDER_ID)
 
-        await state.put(
+        await _put_presence(bus, session_id="new")
+        await discovery_state.put(
             action_provider_catalog_key(PROVIDER_INSTANCE_ID),
             _catalog(session_id="new"),
         )
@@ -148,11 +193,17 @@ async def test_action_registry_provider_settings_authority_uses_catalog_session(
 @pytest.mark.asyncio
 async def test_action_registry_rejects_mismatched_catalog_payload_identity():
     bus = _state_bus()
-    state = bus.deckr.state()
-    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    lease_state = bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=lease_state,
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
 
     async def scenario(events):
-        await state.put(
+        await _put_presence(bus)
+        await discovery_state.put(
             action_provider_catalog_key(PROVIDER_INSTANCE_ID),
             _catalog("python.other"),
         )
@@ -167,17 +218,24 @@ async def test_action_registry_rejects_mismatched_catalog_payload_identity():
 @pytest.mark.asyncio
 async def test_action_registry_catalog_session_change_refreshes_action_metadata():
     bus = _state_bus()
-    state = bus.deckr.state()
-    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    lease_state = bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=lease_state,
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
 
     async def scenario(events):
         catalog_key = action_provider_catalog_key(PROVIDER_INSTANCE_ID)
-        await state.put(catalog_key, _catalog(session_id="old"))
+        await _put_presence(bus, session_id="old")
+        await discovery_state.put(catalog_key, _catalog(session_id="old"))
         with anyio.fail_after(1):
             while await registry.get_action(ACTION_UUID) is None:
                 await anyio.sleep(0.01)
 
-        await state.put(catalog_key, _catalog(session_id="new"))
+        await _put_presence(bus, session_id="new")
+        await discovery_state.put(catalog_key, _catalog(session_id="new"))
         with anyio.fail_after(1):
             while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
                 await anyio.sleep(0.01)
@@ -190,10 +248,113 @@ async def test_action_registry_catalog_session_change_refreshes_action_metadata(
 
 
 @pytest.mark.asyncio
+async def test_action_registry_keeps_catalog_omitted_from_prefix_observation():
+    bus = _state_bus()
+    lease_state = bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=lease_state,
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
+
+    async def scenario(events):
+        await _put_presence(bus)
+        await discovery_state.put(
+            action_provider_catalog_key(PROVIDER_INSTANCE_ID),
+            _catalog(),
+        )
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is None:
+                await anyio.sleep(0.01)
+
+        async def empty_items(prefix: str = ""):
+            del prefix
+            return ()
+
+        discovery_state.items = empty_items
+        await registry._reconcile_current_state(reason="test omitted catalog")
+
+        assert await registry.get_action(ACTION_UUID) is not None
+        assert events[-1].registered == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
+
+    await _run_registry(registry, scenario)
+
+
+@pytest.mark.asyncio
+async def test_action_registry_requires_exact_provider_presence_absence():
+    bus = _state_bus()
+    lease_state = bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME)
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=lease_state,
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
+
+    async def scenario(events):
+        await _put_presence(bus)
+        await discovery_state.put(
+            action_provider_catalog_key(PROVIDER_INSTANCE_ID),
+            _catalog(),
+        )
+        with anyio.fail_after(1):
+            while await registry.get_action(ACTION_UUID) is None:
+                await anyio.sleep(0.01)
+
+        async def empty_items(prefix: str = ""):
+            del prefix
+            return ()
+
+        lease_state.items = empty_items
+        await registry._reconcile_current_state(reason="test omitted presence")
+        assert await registry.get_action(ACTION_UUID) is not None
+
+        await lease_state.delete(
+            presence_endpoint_key(
+                lane="actions",
+                endpoint=action_provider_address(PROVIDER_INSTANCE_ID),
+            )
+        )
+        await registry._reconcile_current_state(reason="test confirmed absence")
+
+        assert await registry.get_action(ACTION_UUID) is None
+        assert events[-1].unregistered == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
+
+    await _run_registry(registry, scenario)
+
+
+@pytest.mark.asyncio
+async def test_action_registry_does_not_make_stale_catalog_live_without_presence():
+    bus = _state_bus()
+    discovery_state = bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME)
+    registry = ActionRegistry(
+        lease_state=bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+        discovery_state=discovery_state,
+        controller_id=CONTROLLER_ID,
+    )
+
+    async def scenario(_events):
+        await discovery_state.put(
+            action_provider_catalog_key(PROVIDER_INSTANCE_ID),
+            _catalog(),
+        )
+        await registry._reconcile_current_state(reason="stale catalog")
+
+        assert await registry.get_action(ACTION_UUID) is None
+        assert registry.provider_session_id(PROVIDER_INSTANCE_ID) is None
+
+    await _run_registry(registry, scenario)
+
+
+@pytest.mark.asyncio
 async def test_action_registry_loads_builtin_actions_without_provider_catalogs():
     bus = _state_bus()
-    state = bus.deckr.state()
-    registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
+    registry = ActionRegistry(
+        lease_state=bus.deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+        discovery_state=bus.deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
+        controller_id=CONTROLLER_ID,
+    )
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None

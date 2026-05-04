@@ -23,7 +23,11 @@ from deckr.contracts.messages import (
 )
 from deckr.core.util.runtime_id import require_runtime_id
 from deckr.lanes import Lane, RegisteredEndpointLane
-from deckr.state import StateStore
+from deckr.state import (
+    DEFAULT_DISCOVERY_STATE_STORE_NAME,
+    DEFAULT_LEASE_STATE_STORE_NAME,
+    StateStore,
+)
 
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
@@ -52,13 +56,15 @@ class ControllerRuntimeService(BaseComponent):
         runtime: ControllerRuntime,
         hardware_messages: Lane,
         actions: Lane,
-        state: StateStore,
+        lease_state: StateStore,
+        discovery_state: StateStore,
     ) -> None:
         super().__init__(name=runtime_name)
         self._runtime = runtime
         self._hardware_messages = hardware_messages
         self._actions = actions
-        self._state = state
+        self._lease_state = lease_state
+        self._discovery_state = discovery_state
         self._component_manager = ComponentManager()
         self._hardware_endpoint_cm: (
             AbstractAsyncContextManager[RegisteredEndpointLane] | None
@@ -99,7 +105,8 @@ class ControllerRuntimeService(BaseComponent):
                     await controller_service.handle_actions_changed_event(event)
 
             action_registry = ActionRegistry(
-                state=self._state,
+                lease_state=self._lease_state,
+                discovery_state=self._discovery_state,
                 controller_id=self._runtime.controller_id,
                 on_actions_changed=on_actions_changed,
             )
@@ -113,7 +120,8 @@ class ControllerRuntimeService(BaseComponent):
 
             controller_service = ControllerService(
                 hardware_endpoint=self._hardware_endpoint,
-                state=self._state,
+                lease_state=self._lease_state,
+                discovery_state=self._discovery_state,
                 config_service=config_service,
                 settings_service=settings_service,
                 controller_id=self._runtime.controller_id,
@@ -177,7 +185,8 @@ def component_factory(context: ComponentContext):
         runtime=runtime,
         hardware_messages=context.require_lane(HARDWARE_MESSAGES_LANE),
         actions=context.require_lane(ACTIONS_LANE),
-        state=context.state(),
+        lease_state=context.state(DEFAULT_LEASE_STATE_STORE_NAME),
+        discovery_state=context.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
     )
 
 component = ComponentDefinition(
