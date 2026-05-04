@@ -130,10 +130,10 @@ class EndpointHarness:
                 lane=self.lane.name,
                 sessionId=self.session_id,
                 timestamp=datetime.now(UTC),
-                ttlSeconds=15,
+                ttlSeconds=90,
                 metadata={"runtime": "test"},
             ),
-            ttl=15,
+            ttl=90,
         )
         self._claimed_revision = entry.revision
 

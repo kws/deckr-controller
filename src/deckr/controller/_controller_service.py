@@ -26,6 +26,7 @@ from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.lanes import RegisteredEndpointLane
 from deckr.state import (
+    DEFAULT_STATE_LEASE_TTL_SECONDS,
     DeviceClaim,
     EndpointPresence,
     HardwareInventory,
@@ -57,7 +58,7 @@ from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)
 
-CLAIM_TTL_SECONDS = 15
+CLAIM_TTL_SECONDS = DEFAULT_STATE_LEASE_TTL_SECONDS
 CLAIM_HEARTBEAT_SECONDS = 5.0
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0

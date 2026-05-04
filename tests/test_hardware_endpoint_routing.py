@@ -267,7 +267,7 @@ async def test_manager_presence_session_change_invalidates_owned_device():
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId=controller._session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
         ),
     )
     controller._owned_claims[claim_key] = OwnedDeviceClaim(
@@ -423,7 +423,7 @@ async def test_claim_loss_retries_cached_matching_inventory():
             claimedByEndpoint=controller_address("other"),
             claimedBySessionId="other-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
         ),
     )
     await _put_presence(bus, "room-a", session_id="manager-session")
@@ -470,7 +470,7 @@ async def test_same_endpoint_old_session_claim_blocks_until_claim_loss():
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId="old-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
         ),
     )
     await _put_presence(bus, "room-a", session_id="manager-session")
@@ -539,7 +539,7 @@ async def test_broker_snapshot_inventory_removal_revokes_live_device():
             managerEndpoint=hardware_manager_address("room-a"),
             sessionId="manager-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
             devices={},
         ),
     )
@@ -589,7 +589,7 @@ async def test_broker_snapshot_claim_takeover_revokes_owned_device():
             claimedByEndpoint=controller_address("other"),
             claimedBySessionId="other-session",
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
         ),
     )
 
@@ -658,7 +658,7 @@ async def test_stop_releases_owned_claims_without_hardware_clears():
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId=controller._session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
         ),
     )
     controller._owned_claims[claim_key] = OwnedDeviceClaim(
@@ -731,7 +731,7 @@ async def _put_presence(
             lane="hardware_messages",
             sessionId=session_id or f"session-{manager_id}",
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
             metadata={},
         ),
     )
@@ -751,7 +751,7 @@ async def _put_inventory(
             managerEndpoint=hardware_manager_address(manager_id),
             sessionId=session_id or f"session-{manager_id}",
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
             devices={
                 "deck": HardwareInventoryDevice(
                     deviceRef=DeviceRef(
@@ -778,7 +778,7 @@ async def _put_claim(
             claimedByEndpoint=controller_address("controller-main"),
             claimedBySessionId=controller._session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
         ),
     )
 

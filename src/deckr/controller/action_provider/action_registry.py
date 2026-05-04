@@ -20,11 +20,9 @@ from deckr.actions.state import (
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.models import thaw_json
 from deckr.state import (
-    EndpointPresence,
     StateEntry,
     StateStore,
     StateUnavailable,
-    parse_presence_endpoint_key,
 )
 
 from deckr.controller.action_provider.builtin import (
@@ -37,7 +35,6 @@ from deckr.controller.action_provider.provider import ActionMetadata
 logger = logging.getLogger(__name__)
 
 _ACTION_PROVIDER_CATALOG_PREFIX = "catalog.actions.providers."
-_ACTION_PROVIDER_PRESENCE_PREFIX = "presence.endpoint.actions.action_provider."
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 
@@ -73,7 +70,6 @@ class ActionRegistry(BaseComponent):
         self._builtin_action_registry: dict[str, ActionDescriptor] = {}
         self._action_registry: dict[str, _CatalogAction] = {}
         self._catalogs: dict[str, ActionProviderCatalog] = {}
-        self._provider_presence_sessions: dict[str, str] = {}
         self._reconcile_lock = anyio.Lock()
 
     async def get_action(
@@ -157,8 +153,6 @@ class ActionRegistry(BaseComponent):
             return False
         if provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS:
             return False
-        if provider_instance_id not in self._provider_presence_sessions:
-            return False
         return any(
             entry.provider_instance_id == provider_instance_id
             and entry.provider_id == provider_id
@@ -166,7 +160,8 @@ class ActionRegistry(BaseComponent):
         )
 
     def provider_session_id(self, provider_instance_id: str) -> str | None:
-        return self._provider_presence_sessions.get(provider_instance_id)
+        catalog = self._catalogs.get(provider_instance_id)
+        return catalog.session_id if catalog is not None else None
 
     def _builtin_action_metadata(self, action_uuid: str) -> ActionMetadata | None:
         descriptor = self._builtin_action_registry.get(action_uuid)
@@ -196,7 +191,6 @@ class ActionRegistry(BaseComponent):
             if descriptor:
                 self._builtin_action_registry[action_uuid] = descriptor
 
-        start_soon(self._presence_loop)
         start_soon(self._catalog_loop)
         start_soon(self._reconciliation_loop)
 
@@ -204,31 +198,6 @@ class ActionRegistry(BaseComponent):
         self._action_registry.clear()
         self._builtin_action_registry.clear()
         self._catalogs.clear()
-        self._provider_presence_sessions.clear()
-
-    async def _presence_loop(self) -> None:
-        while True:
-            try:
-                async with self._state.watch(_ACTION_PROVIDER_PRESENCE_PREFIX) as stream:
-                    async for change in stream:
-                        parsed = parse_presence_endpoint_key(change.key)
-                        if parsed is None:
-                            continue
-                        lane, endpoint = parsed
-                        if lane != "actions" or endpoint.family != "action_provider":
-                            continue
-                        provider_instance_id = endpoint.endpoint_id
-                        if not _is_allowed_provider_instance_id(provider_instance_id):
-                            continue
-                        await self._reconcile_current_state(
-                            reason="action provider presence watch"
-                        )
-            except StateUnavailable:
-                logger.warning(
-                    "Action provider presence state unavailable; retrying",
-                    exc_info=True,
-                )
-                await anyio.sleep(_WATCH_RETRY_SECONDS)
 
     async def _catalog_loop(self) -> None:
         while True:
@@ -266,30 +235,10 @@ class ActionRegistry(BaseComponent):
             await self._reconcile_current_state_locked(reason=reason)
 
     async def _reconcile_current_state_locked(self, *, reason: str) -> None:
-        presence_entries = await self._state.items(_ACTION_PROVIDER_PRESENCE_PREFIX)
         catalog_entries = await self._state.items(_ACTION_PROVIDER_CATALOG_PREFIX)
 
-        next_presence_sessions: dict[str, str] = {}
         next_catalogs: dict[str, ActionProviderCatalog] = {}
-        affected_providers = set(self._provider_presence_sessions) | set(self._catalogs)
-
-        for entry in presence_entries:
-            parsed = parse_presence_endpoint_key(entry.key)
-            if parsed is None:
-                continue
-            lane, endpoint = parsed
-            if lane != "actions" or endpoint.family != "action_provider":
-                continue
-            provider_instance_id = endpoint.endpoint_id
-            if not _is_allowed_provider_instance_id(provider_instance_id):
-                continue
-            affected_providers.add(provider_instance_id)
-            presence = _valid_provider_presence(
-                entry,
-                provider_instance_id=provider_instance_id,
-            )
-            if presence is not None:
-                next_presence_sessions[provider_instance_id] = presence.session_id
+        affected_providers = set(self._catalogs)
 
         for entry in catalog_entries:
             provider_instance_id = parse_action_provider_catalog_key(entry.key)
@@ -302,7 +251,6 @@ class ActionRegistry(BaseComponent):
             if catalog is not None:
                 next_catalogs[provider_instance_id] = catalog
 
-        self._provider_presence_sessions = next_presence_sessions
         self._catalogs = next_catalogs
         for provider_instance_id in sorted(affected_providers):
             await self._reconcile_provider(provider_instance_id, reason=reason)
@@ -355,8 +303,6 @@ class ActionRegistry(BaseComponent):
     ) -> dict[str, _CatalogAction]:
         catalog = self._catalogs.get(provider_instance_id)
         if catalog is None:
-            return {}
-        if self._provider_presence_sessions.get(provider_instance_id) != catalog.session_id:
             return {}
         return {
             _qualified_id(provider_instance_id, descriptor.action_id): _CatalogAction(
@@ -414,29 +360,6 @@ def _is_allowed_provider_instance_id(provider_instance_id: str) -> bool:
         )
         return False
     return True
-
-
-def _valid_provider_presence(
-    entry: StateEntry,
-    *,
-    provider_instance_id: str,
-) -> EndpointPresence | None:
-    try:
-        presence = EndpointPresence.model_validate(entry.value)
-    except ValueError:
-        logger.warning("Ignoring invalid action provider presence %s", entry.key)
-        return None
-    expected_endpoint = action_provider_address(provider_instance_id)
-    if presence.endpoint != expected_endpoint or presence.lane != "actions":
-        logger.warning(
-            "Ignoring action provider presence %s with mismatched payload "
-            "endpoint=%s lane=%s",
-            entry.key,
-            presence.endpoint,
-            presence.lane,
-        )
-        return None
-    return presence
 
 
 def _valid_catalog(

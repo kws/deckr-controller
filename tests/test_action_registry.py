@@ -10,7 +10,6 @@ from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import ActionDescriptor, ActionProviderCatalog
 from deckr.actions.state import action_provider_catalog_key
 from deckr.components import RunContext
-from deckr.state import EndpointPresence, presence_endpoint_key
 
 from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
@@ -24,21 +23,6 @@ PROVIDER_ID = "clock"
 
 def _state_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint="controller:controller-main")
-
-
-def _presence(
-    provider_instance_id: str = PROVIDER_INSTANCE_ID,
-    *,
-    session_id: str = "session-1",
-) -> EndpointPresence:
-    return EndpointPresence(
-        endpoint=action_provider_address(provider_instance_id),
-        lane="actions",
-        sessionId=session_id,
-        timestamp=datetime.now(UTC),
-        ttlSeconds=15,
-        metadata={"runtime": "test"},
-    )
 
 
 def _catalog(
@@ -55,7 +39,7 @@ def _catalog(
         providerId=provider_id,
         sessionId=session_id,
         timestamp=datetime.now(UTC),
-        ttlSeconds=15,
+        ttlSeconds=90,
         labels=labels or {"room": "office"},
         actions={
             action_uuid: ActionDescriptor(
@@ -82,23 +66,13 @@ async def _run_registry(registry: ActionRegistry, callback):
 
 
 @pytest.mark.asyncio
-async def test_action_registry_uses_catalog_only_with_matching_presence():
+async def test_action_registry_uses_catalog_as_action_availability_source():
     bus = _state_bus()
     state = bus.deckr.state()
     registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
 
     async def scenario(events):
         await state.put(action_provider_catalog_key(PROVIDER_INSTANCE_ID), _catalog())
-        await anyio.sleep(0.05)
-        assert await registry.get_action(ACTION_UUID) is None
-
-        await state.put(
-            presence_endpoint_key(
-                lane="actions",
-                endpoint=action_provider_address(PROVIDER_INSTANCE_ID),
-            ),
-            _presence(),
-        )
         with anyio.fail_after(1):
             while await registry.get_action(ACTION_UUID) is None:
                 await anyio.sleep(0.01)
@@ -121,13 +95,6 @@ async def test_action_registry_filters_by_provider_instance_and_labels():
 
     async def scenario(events):
         del events
-        await state.put(
-            presence_endpoint_key(
-                lane="actions",
-                endpoint=action_provider_address(PROVIDER_INSTANCE_ID),
-            ),
-            _presence(),
-        )
         await state.put(action_provider_catalog_key(PROVIDER_INSTANCE_ID), _catalog())
         with anyio.fail_after(1):
             while await registry.get_action(ACTION_UUID) is None:
@@ -150,48 +117,30 @@ async def test_action_registry_filters_by_provider_instance_and_labels():
 
 
 @pytest.mark.asyncio
-async def test_action_registry_provider_settings_authority_uses_live_session():
+async def test_action_registry_provider_settings_authority_uses_catalog_session():
     bus = _state_bus()
     state = bus.deckr.state()
     registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
 
     async def scenario(events):
         del events
-        await state.put(action_provider_catalog_key(PROVIDER_INSTANCE_ID), _catalog())
-        await anyio.sleep(0.05)
-        assert not registry.provider_instance_provides_provider(
-            PROVIDER_INSTANCE_ID,
-            PROVIDER_ID,
-        )
-
-        await state.put(
-            presence_endpoint_key(
-                lane="actions",
-                endpoint=action_provider_address(PROVIDER_INSTANCE_ID),
-            ),
-            _presence(session_id="new"),
-        )
         await state.put(
             action_provider_catalog_key(PROVIDER_INSTANCE_ID),
             _catalog(session_id="old"),
         )
-        await anyio.sleep(0.05)
-        assert registry.provider_session_id(PROVIDER_INSTANCE_ID) == "new"
-        assert not registry.provider_instance_provides_provider(
-            PROVIDER_INSTANCE_ID,
-            PROVIDER_ID,
-        )
+        with anyio.fail_after(1):
+            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "old":
+                await anyio.sleep(0.01)
+        assert registry.provider_instance_provides_provider(PROVIDER_INSTANCE_ID, PROVIDER_ID)
 
         await state.put(
             action_provider_catalog_key(PROVIDER_INSTANCE_ID),
             _catalog(session_id="new"),
         )
         with anyio.fail_after(1):
-            while not registry.provider_instance_provides_provider(
-                PROVIDER_INSTANCE_ID,
-                PROVIDER_ID,
-            ):
+            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
                 await anyio.sleep(0.01)
+        assert registry.provider_instance_provides_provider(PROVIDER_INSTANCE_ID, PROVIDER_ID)
 
     await _run_registry(registry, scenario)
 
@@ -203,13 +152,6 @@ async def test_action_registry_rejects_mismatched_catalog_payload_identity():
     registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
 
     async def scenario(events):
-        await state.put(
-            presence_endpoint_key(
-                lane="actions",
-                endpoint=action_provider_address(PROVIDER_INSTANCE_ID),
-            ),
-            _presence(),
-        )
         await state.put(
             action_provider_catalog_key(PROVIDER_INSTANCE_ID),
             _catalog("python.other"),
@@ -223,36 +165,26 @@ async def test_action_registry_rejects_mismatched_catalog_payload_identity():
 
 
 @pytest.mark.asyncio
-async def test_action_registry_session_change_unregisters_stale_catalog():
+async def test_action_registry_catalog_session_change_refreshes_action_metadata():
     bus = _state_bus()
     state = bus.deckr.state()
     registry = ActionRegistry(state=state, controller_id=CONTROLLER_ID)
 
     async def scenario(events):
-        presence_key = presence_endpoint_key(
-            lane="actions",
-            endpoint=action_provider_address(PROVIDER_INSTANCE_ID),
-        )
         catalog_key = action_provider_catalog_key(PROVIDER_INSTANCE_ID)
-        await state.put(presence_key, _presence(session_id="old"))
         await state.put(catalog_key, _catalog(session_id="old"))
         with anyio.fail_after(1):
             while await registry.get_action(ACTION_UUID) is None:
                 await anyio.sleep(0.01)
 
-        await state.put(presence_key, _presence(session_id="new"))
-        with anyio.fail_after(1):
-            while await registry.get_action(ACTION_UUID) is not None:
-                await anyio.sleep(0.01)
-
         await state.put(catalog_key, _catalog(session_id="new"))
         with anyio.fail_after(1):
-            while await registry.get_action(ACTION_UUID) is None:
+            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
                 await anyio.sleep(0.01)
 
         qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
-        assert events[-2].unregistered == [qualified]
         assert events[-1].registered == [qualified]
+        assert events[-1].unregistered == [qualified]
 
     await _run_registry(registry, scenario)
 
