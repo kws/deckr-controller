@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 from conftest import LaneHarness
-from deckr.actions.messages import PageChildBindingDescriptor
+from deckr.actions.messages import PageChildBindingDescriptor, PageChildBindingTarget
 from deckr.contracts.messages import controller_address
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
@@ -22,7 +22,7 @@ from deckr.controller._binding_validator import (
     ValidationError,
     ValidationResult,
     format_validation_summary,
-    validate_exact_control_bindings,
+    validate_dynamic_page_bindings,
     validate_page_bindings,
 )
 from deckr.controller._render import RenderResult
@@ -124,6 +124,14 @@ def _make_key_action():
     )
 
 
+def _page_child(control_id: str, **kwargs) -> PageChildBindingDescriptor:
+    return PageChildBindingDescriptor(
+        controlId=control_id,
+        target=PageChildBindingTarget(kind="self"),
+        **kwargs,
+    )
+
+
 @pytest.mark.asyncio
 async def test_validate_page_bindings_all_valid():
     device = _make_device(controls=[_make_control("0,0"), _make_control("0,1")])
@@ -134,14 +142,61 @@ async def test_validate_page_bindings_all_valid():
         return action
 
     bindings = [
-        PageChildBindingDescriptor(controlId="0,0", settings={}),
-        PageChildBindingDescriptor(controlId="0,1", settings={}),
+        _page_child("0,0", settings={}),
+        _page_child("0,1", settings={}),
     ]
-    result = await validate_exact_control_bindings(
-        bindings, device, get_action, action_uuid="action.a"
+    result = await validate_dynamic_page_bindings(
+        bindings,
+        device,
+        get_action,
+        owner_action_uuid="action.a",
+        owner_provider_instance_id="python",
     )
     assert result.valid is True
     assert len(result.errors) == 0
+
+
+@pytest.mark.asyncio
+async def test_validate_dynamic_page_bindings_resolves_explicit_child_action_target():
+    device = _make_device(controls=[_make_control("3,0")])
+    action = ActionMetadata(
+        uuid="action.volume",
+        provider_instance_id="sonos-bedroom",
+        provider_id="sonos",
+    )
+
+    get_action = AsyncMock(return_value=action)
+
+    bindings = [
+        PageChildBindingDescriptor(
+            controlId="3,0",
+            target=PageChildBindingTarget(
+                kind="action",
+                actionId="action.volume",
+                providerInstanceId="sonos-bedroom",
+                instanceKey="bedroom-volume",
+            ),
+            settings={"zoneName": "Bedroom"},
+        )
+    ]
+
+    result = await validate_dynamic_page_bindings(
+        bindings,
+        device,
+        get_action,
+        owner_action_uuid="action.pager",
+        owner_provider_instance_id="kaj",
+    )
+
+    assert result.valid is True
+    assert result.bindings[0].action_uuid == "action.volume"
+    assert result.bindings[0].provider_instance_id == "sonos-bedroom"
+    assert result.bindings[0].settings["zoneName"] == "Bedroom"
+    get_action.assert_awaited_once_with(
+        "action.volume",
+        provider_instance_id="sonos-bedroom",
+        provider_labels={},
+    )
 
 
 @pytest.mark.asyncio
@@ -154,10 +209,14 @@ async def test_validate_page_bindings_missing_control():
         return action
 
     bindings = [
-        PageChildBindingDescriptor(controlId="99,99", settings={})
+        _page_child("99,99", settings={})
     ]
-    result = await validate_exact_control_bindings(
-        bindings, device, get_action, action_uuid="action.a"
+    result = await validate_dynamic_page_bindings(
+        bindings,
+        device,
+        get_action,
+        owner_action_uuid="action.a",
+        owner_provider_instance_id="python",
     )
     assert result.valid is False
     assert len(result.errors) == 1
@@ -175,10 +234,14 @@ async def test_validate_page_bindings_missing_action():
         return None
 
     bindings = [
-        PageChildBindingDescriptor(controlId="0,0", settings={})
+        _page_child("0,0", settings={})
     ]
-    result = await validate_exact_control_bindings(
-        bindings, device, get_action, action_uuid="nonexistent"
+    result = await validate_dynamic_page_bindings(
+        bindings,
+        device,
+        get_action,
+        owner_action_uuid="nonexistent",
+        owner_provider_instance_id="python",
     )
     assert result.valid is True  # Page can load (partial activation)
     assert result.has_blocking_errors is False

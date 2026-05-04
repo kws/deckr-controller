@@ -30,6 +30,7 @@ from deckr.actions.messages import (
     BindingOutputBody,
     DynamicPageCommand,
     MatchedCapability,
+    PageChildBindingDescriptor,
     PageSessionLifecycleBody,
     PageSessionMetadata,
     SettingsPatchBody,
@@ -74,7 +75,7 @@ from deckr.controller._binding_resolution import ResolvedControlBinding
 from deckr.controller._binding_validator import (
     BLOCKING_ERROR_CODES,
     format_validation_summary,
-    validate_exact_control_bindings,
+    validate_dynamic_page_bindings,
     validate_page_bindings,
 )
 from deckr.controller._command_router import DeviceOutput
@@ -372,6 +373,43 @@ class DeviceManager:
             actionId=binding.action_uuid,
             actionInstanceId=action_instance_id,
             stableId=binding.stable_id,
+        )
+
+    def _dynamic_child_action_instance_id(
+        self,
+        *,
+        page_session: DynamicPageSession,
+        child: PageChildBindingDescriptor,
+        binding: ResolvedControlBinding,
+    ) -> str:
+        if child.target.kind == "self":
+            return page_session.action_instance_id
+
+        provider_key = binding.provider_instance_id or ""
+        if binding.provider_labels:
+            provider_key = "|".join(
+                (
+                    provider_key,
+                    *(
+                        f"{key}={value}"
+                        for key, value in sorted(binding.provider_labels.items())
+                    ),
+                )
+            )
+        target_key = child.target.instance_key or child.control_id
+        stable_id = "\x1f".join(
+            (
+                "dynamic-page",
+                page_session.page_session_id,
+                provider_key,
+                target_key,
+            )
+        )
+        return derive_action_instance_id(
+            controller_id=self._controller_id,
+            config_id=self.config_id,
+            action_id=binding.action_uuid,
+            stable_id=stable_id,
         )
 
     def _matched_capabilities(
@@ -814,12 +852,12 @@ class DeviceManager:
             if page_session is None:
                 logger.error("Dynamic page validation missing page session")
                 return False
-            result = await validate_exact_control_bindings(
+            result = await validate_dynamic_page_bindings(
                 list(arriving.bindings),
                 self.device,
                 self.manager.get_action,
-                action_uuid=page_session.owner_action_uuid,
-                provider_instance_id=page_session.owner_provider_instance_id,
+                owner_action_uuid=page_session.owner_action_uuid,
+                owner_provider_instance_id=page_session.owner_provider_instance_id,
                 profile_id="_dynamic",
                 page_id=arriving.page_id,
             )
@@ -888,7 +926,11 @@ class DeviceManager:
                     binding,
                     profile_id="_dynamic",
                     page_id=arriving.page_id,
-                    action_instance_id=page_session.action_instance_id,
+                    action_instance_id=self._dynamic_child_action_instance_id(
+                        page_session=page_session,
+                        child=child,
+                        binding=binding,
+                    ),
                     page_session_id=page_session.page_session_id,
                     persist_settings=False,
                     role_id=child.role_id,
@@ -1269,17 +1311,18 @@ class DeviceManager:
             page_id = str(current_page.page_index)
             page_session_id = None
             action_instance_id = None
+            dynamic_page_session = None
             persist_settings = True
         else:
             session = self._dynamic_page_session
             if session is None:
                 return
-            result = await validate_exact_control_bindings(
+            result = await validate_dynamic_page_bindings(
                 list(current_page.bindings),
                 self.device,
                 self.manager.get_action,
-                action_uuid=session.owner_action_uuid,
-                provider_instance_id=session.owner_provider_instance_id,
+                owner_action_uuid=session.owner_action_uuid,
+                owner_provider_instance_id=session.owner_provider_instance_id,
                 profile_id="_dynamic",
                 page_id=current_page.page_id,
             )
@@ -1287,6 +1330,7 @@ class DeviceManager:
             page_id = current_page.page_id
             page_session_id = session.page_session_id
             action_instance_id = session.action_instance_id
+            dynamic_page_session = session
             persist_settings = False
 
         if result.has_blocking_errors:
@@ -1312,15 +1356,22 @@ class DeviceManager:
         for child, binding in zip(child_bindings, result.bindings, strict=True):
             if await self.action_contexts.has_key(binding.control_id):
                 continue  # Already has context
-            resolved_action_instance_id = action_instance_id or derive_action_instance_id(
-                controller_id=self._controller_id,
-                config_id=self.config_id,
-                action_id=binding.action_uuid,
-                stable_id=binding.stable_id,
-                profile_id=profile_id,
-                page_id=page_id,
-                control_id=binding.control_id,
-            )
+            if child is not None and dynamic_page_session is not None:
+                resolved_action_instance_id = self._dynamic_child_action_instance_id(
+                    page_session=dynamic_page_session,
+                    child=child,
+                    binding=binding,
+                )
+            else:
+                resolved_action_instance_id = action_instance_id or derive_action_instance_id(
+                    controller_id=self._controller_id,
+                    config_id=self.config_id,
+                    action_id=binding.action_uuid,
+                    stable_id=binding.stable_id,
+                    profile_id=profile_id,
+                    page_id=page_id,
+                    control_id=binding.control_id,
+                )
             await self._try_resolve_binding(
                 binding,
                 profile_id=profile_id,

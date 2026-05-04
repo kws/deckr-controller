@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from deckr.actions.messages import PageChildBindingDescriptor
+
 if TYPE_CHECKING:
     from deckr.hardware.descriptors import DeviceDescriptor
 
@@ -134,28 +136,24 @@ async def validate_page_bindings(
     return result
 
 
-async def validate_exact_control_bindings(
-    bindings: list,
+async def validate_dynamic_page_bindings(
+    bindings: list[PageChildBindingDescriptor],
     device: DeviceDescriptor,
     get_action: Callable[..., Awaitable[ActionMetadata | None]],
     *,
-    action_uuid: str,
-    provider_instance_id: str | None = None,
-    provider_labels: Mapping[str, str] | None = None,
+    owner_action_uuid: str,
+    owner_provider_instance_id: str,
     profile_id: str | None = None,
     page_id: str | None = None,
 ) -> ValidationResult:
-    """Validate provider-provided exact control bindings."""
+    """Validate provider-provided dynamic page child bindings."""
 
     return await validate_page_bindings(
         [
-            exact_control_binding(
-                control_id=binding.control_id,
-                action_uuid=action_uuid,
-                provider_instance_id=provider_instance_id,
-                provider_labels=provider_labels,
-                settings=binding.settings,
-                title_options=binding.title_options,
+            _dynamic_page_child_binding(
+                binding,
+                owner_action_uuid=owner_action_uuid,
+                owner_provider_instance_id=owner_provider_instance_id,
             )
             for binding in bindings
         ],
@@ -163,6 +161,34 @@ async def validate_exact_control_bindings(
         get_action,
         profile_id=profile_id,
         page_id=page_id,
+    )
+
+
+def _dynamic_page_child_binding(
+    binding: PageChildBindingDescriptor,
+    *,
+    owner_action_uuid: str,
+    owner_provider_instance_id: str,
+) -> ConfiguredControlBinding:
+    target = binding.target
+    if target.kind == "self":
+        action_uuid = owner_action_uuid
+        provider_instance_id = owner_provider_instance_id
+        provider_labels: Mapping[str, str] | None = None
+    else:
+        if target.action_id is None:
+            raise ValueError("action page child target missing actionId")
+        action_uuid = target.action_id
+        provider_instance_id = target.provider_instance_id
+        provider_labels = target.provider_labels
+
+    return exact_control_binding(
+        control_id=binding.control_id,
+        action_uuid=action_uuid,
+        provider_instance_id=provider_instance_id,
+        provider_labels=provider_labels,
+        settings=binding.settings,
+        title_options=binding.title_options,
     )
 
 
