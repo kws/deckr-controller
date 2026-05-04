@@ -11,14 +11,17 @@ from pydantic import BaseModel, ConfigDict
 _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 #
 # Reserved top-level namespaces:
-#   [deckr.controller]
 #   [deckr.runtime.substrate]
-#   [deckr.action_providers.<component>.instances.<instance>]
-#   [deckr.drivers.<component>]
+#   [deckr.components.instances.<instance>]
 
-[deckr.controller]
+[deckr.components.instances.controller_main]
+component = "com.k-si.deckr.controller"
+instance_id = "main"
 
-[deckr.controller.device_config.file]
+[deckr.components.instances.controller_main.endpoints]
+controller = "controller-main"
+
+[deckr.components.instances.controller_main.config.device_config.file]
 path = "settings"
 """
 
@@ -40,8 +43,6 @@ class DeviceConfigSection(_StrictModel):
 
 
 class ControllerRuntimeConfig(_StrictModel):
-    enabled: bool = True
-    id: str | None = None
     device_config: DeviceConfigSection | None = None
 
 
@@ -66,11 +67,21 @@ def _resolve_controller_paths(
 
 
 def controller_payload_from_document(document: ConfigDocument) -> Mapping[str, Any]:
-    payload = document.namespace("deckr.controller")
+    instances = document.children("deckr.components.instances")
+    matches = [
+        source.get("config", {})
+        for source in instances.values()
+        if source.get("component") == "com.k-si.deckr.controller"
+    ]
+    if not matches:
+        return {}
+    if len(matches) > 1:
+        raise ValueError("Configuration defines more than one Deckr controller")
+    payload = matches[0]
     if payload is None:
         return {}
     if not isinstance(payload, Mapping):
-        raise ValueError("[deckr.controller] must be a table")
+        raise ValueError("Deckr controller component config must be a table")
     return payload
 
 

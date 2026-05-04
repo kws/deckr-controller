@@ -3,11 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from deckr.components import (
-    InactiveComponent,
-    resolve_component_host_plan,
-    start_components,
-)
+from deckr.components import resolve_component_host_plan, start_components
 from deckr.core.config import ConfigDocument
 from deckr.lanes import Lane
 from deckr.runtime import Deckr
@@ -22,19 +18,26 @@ def _document(raw: dict) -> ConfigDocument:
 
 @pytest.mark.asyncio
 async def test_controller_component_uses_shared_lanes(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "deckr.components._host.available_component_ids",
-        lambda: ["deckr.controller"],
+    document = _document(
+        {
+            "deckr": {
+                "components": {
+                    "instances": {
+                        "controller_main": {
+                            "component": "com.k-si.deckr.controller",
+                            "instance_id": "main",
+                            "endpoints": {"controller": "controller-main"},
+                        }
+                    }
+                }
+            }
+        }
     )
-    monkeypatch.setattr(
-        "deckr.components._host.load_component_definition",
-        lambda component_id: component,
+    plan = resolve_component_host_plan(
+        document,
+        definitions={"com.k-si.deckr.controller": component},
     )
-
-    document = _document({"deckr": {"controller": {"id": "controller-main"}}})
-    plan = resolve_component_host_plan(document)
     substrate = MemoryLaneSubstrate(lane_contracts=plan.lane_contracts)
     async with Deckr(
         lane_contracts=plan.lane_contracts,
@@ -42,37 +45,22 @@ async def test_controller_component_uses_shared_lanes(
         substrate=substrate,
     ) as deckr, start_components(deckr, plan) as result:
         assert [created.name for created in result.components] == [
-            "deckr.controller"
+            "com.k-si.deckr.controller:main"
         ]
         assert set(result.lane_names) == {"hardware_messages", "actions"}
         assert isinstance(result.get_lane("hardware_messages"), Lane)
         assert isinstance(result.get_lane("actions"), Lane)
 
 
-def test_controller_component_can_be_disabled_explicitly() -> None:
-    created = component.factory(
-        type(
-            "Context",
-            (),
-            {
-                "raw_config": {"enabled": False},
-                "runtime_name": "deckr.controller",
-                "base_dir": Path.cwd(),
-                "require_lane": lambda self, name: None,
-            },
-        )()
-    )
-
-    assert isinstance(created, InactiveComponent)
-
-
-def test_controller_runtime_requires_configured_id_even_when_env_is_set(
+def test_controller_runtime_uses_endpoint_id_not_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CONTROLLER_ID", "from-env")
 
-    with pytest.raises(ValueError, match=r"Set `\[deckr\.controller\]\.id`"):
-        build_controller_runtime(
-            raw_config={},
-            base_dir=Path.cwd(),
-        )
+    runtime = build_controller_runtime(
+        config_source={},
+        base_dir=Path.cwd(),
+        controller_id="controller-main",
+    )
+
+    assert runtime.controller_id == "controller-main"

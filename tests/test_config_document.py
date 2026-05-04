@@ -25,8 +25,7 @@ def test_default_config_document_matches_builtin_defaults(
     assert controller.device_config is not None
     assert controller.device_config.file is not None
     assert controller.device_config.file.path == (tmp_path / "settings").resolve()
-    assert document.children("deckr.action_providers") == {}
-    assert document.children("deckr.drivers") == {}
+    assert "controller_main" in document.children("deckr.components.instances")
 
 
 def test_load_config_document_resolves_relative_paths_and_namespaces(
@@ -35,21 +34,37 @@ def test_load_config_document_resolves_relative_paths_and_namespaces(
     config_path = tmp_path / "deckr.toml"
     config_path.write_text(
         """
-[deckr.controller]
-id = "controller-main"
+[deckr.components.instances.controller_main]
+component = "com.k-si.deckr.controller"
+instance_id = "main"
 
-[deckr.controller.device_config.file]
+[deckr.components.instances.controller_main.endpoints]
+controller = "controller-main"
+
+[deckr.components.instances.controller_main.config.device_config.file]
 path = "configs"
 
-[deckr.action_providers.python.instances.main]
-provider_id = "clock"
-provider_instance_id = "living-room"
-controller_id = "controller-main"
+[deckr.components.instances.clock_actions]
+component = "com.k-si.deckr.action_provider_runtime.python"
+instance_id = "clock-main"
 
-[deckr.action_providers.python.instances.main.labels]
+[deckr.components.instances.clock_actions.endpoints]
+action_provider = "living-room"
+
+[deckr.components.instances.clock_actions.config]
+provider_id = "clock"
+
+[deckr.components.instances.clock_actions.config.labels]
 room = "living"
 
-[deckr.drivers.mqtt.broker]
+[deckr.components.instances.mqtt_main]
+component = "com.k-si.deckr.hardware.mqtt"
+instance_id = "main"
+
+[deckr.components.instances.mqtt_main.endpoints]
+hardware_manager = "mqtt-main"
+
+[deckr.components.instances.mqtt_main.config.broker]
 hostname = "mqtt.local"
 port = 1884
 """.strip()
@@ -60,32 +75,26 @@ port = 1884
 
     assert document.source_path == config_path.resolve()
     assert document.base_dir == tmp_path.resolve()
-    assert controller.id == "controller-main"
     assert controller.device_config is not None
     assert controller.device_config.file is not None
     assert controller.device_config.file.path == (tmp_path / "configs").resolve()
-    action_provider = document.namespace("deckr.action_providers.python")
-    assert action_provider is not None
-    assert action_provider["instances"]["main"]["provider_instance_id"] == (
-        "living-room"
+    action_provider = document.namespace(
+        "deckr.components.instances.clock_actions.config"
     )
-    assert action_provider["instances"]["main"]["provider_id"] == "clock"
-    assert action_provider["instances"]["main"]["labels"]["room"] == "living"
-    manager_config = document.namespace("deckr.drivers.mqtt")
+    assert action_provider is not None
+    assert action_provider["provider_id"] == "clock"
+    assert action_provider["labels"]["room"] == "living"
+    manager_config = document.namespace("deckr.components.instances.mqtt_main.config")
     assert manager_config is not None
     assert manager_config["broker"]["hostname"] == "mqtt.local"
 
 
 def test_explicit_config_allows_missing_controller_table(tmp_path: Path) -> None:
     config_path = tmp_path / "deckr.toml"
-    config_path.write_text(
-        "[deckr.action_providers.openhab]\nurl = 'http://openhab.local:8080'\n"
-    )
+    config_path.write_text("[deckr]\n")
 
     document = load_config_document(config_path)
-    assert document.namespace("deckr.action_providers.openhab") == {
-        "url": "http://openhab.local:8080"
-    }
+    assert controller_config_from_document(document).device_config is None
 
 
 def test_auto_loads_local_deckr_toml(
@@ -95,10 +104,12 @@ def test_auto_loads_local_deckr_toml(
     config_path = tmp_path / "deckr.toml"
     config_path.write_text(
         """
-[deckr.controller]
+[deckr.components.instances.controller_main]
+component = "com.k-si.deckr.controller"
+instance_id = "main"
 
-[deckr.action_providers.python.instances.main]
-enabled = false
+[deckr.components.instances.controller_main.endpoints]
+controller = "controller-main"
 """.strip()
     )
     monkeypatch.chdir(tmp_path)
@@ -106,10 +117,8 @@ enabled = false
     document = load_config_document(None)
 
     assert document.source_path == config_path.resolve()
-    action_provider = document.namespace("deckr.action_providers.python")
-    assert action_provider is not None
-    assert action_provider["instances"]["main"]["enabled"] is False
+    assert "controller_main" in document.children("deckr.components.instances")
 
 
 def test_default_config_document_text_contains_controller_table() -> None:
-    assert "[deckr.controller]" in default_config_document_text()
+    assert "[deckr.components.instances.controller_main]" in default_config_document_text()

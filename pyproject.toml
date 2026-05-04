@@ -45,7 +45,7 @@ dependencies = [
 ]
 
 [project.entry-points."deckr.components"]
-"deckr.controller" = "deckr.controller._runtime_service:component"
+"com.k-si.deckr.controller" = "deckr.controller._runtime_service:component"
 
 [project.urls]
 Documentation = "https://github.com/kws/deckr-controller#readme"

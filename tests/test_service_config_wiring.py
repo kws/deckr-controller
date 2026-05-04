@@ -19,7 +19,16 @@ from deckr.controller.settings import ConfigBackedSettingsService
 
 def test_build_services_disable_when_sections_are_absent(tmp_path: Path) -> None:
     config_path = tmp_path / "deckr.toml"
-    config_path.write_text("[deckr.controller]\n")
+    config_path.write_text(
+        """
+[deckr.components.instances.controller_main]
+component = "com.k-si.deckr.controller"
+instance_id = "main"
+
+[deckr.components.instances.controller_main.endpoints]
+controller = "controller-main"
+""".strip()
+    )
     document = load_config_document(config_path)
     config = controller_config_from_document(document)
 
@@ -37,9 +46,14 @@ def test_build_services_enable_when_sections_are_present(tmp_path: Path) -> None
     config_path = tmp_path / "deckr.toml"
     config_path.write_text(
         """
-[deckr.controller]
+[deckr.components.instances.controller_main]
+component = "com.k-si.deckr.controller"
+instance_id = "main"
 
-[deckr.controller.device_config.file]
+[deckr.components.instances.controller_main.endpoints]
+controller = "controller-main"
+
+[deckr.components.instances.controller_main.config.device_config.file]
 path = "configs"
 """.strip()
     )

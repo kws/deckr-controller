@@ -13,7 +13,6 @@ from deckr.components import (
     ComponentDefinition,
     ComponentManager,
     ComponentManifest,
-    InactiveComponent,
     RunContext,
 )
 from deckr.contracts.messages import (
@@ -21,7 +20,6 @@ from deckr.contracts.messages import (
     HARDWARE_MESSAGES_LANE,
     controller_address,
 )
-from deckr.core.util.runtime_id import require_runtime_id
 from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import (
     DEFAULT_DISCOVERY_STATE_STORE_NAME,
@@ -43,7 +41,7 @@ from deckr.controller.action_provider.action_registry import ActionRegistry
 
 @dataclass(frozen=True, slots=True)
 class ControllerRuntime:
-    raw_config: Mapping[str, object]
+    config_source: Mapping[str, object]
     config: ControllerRuntimeConfig
     controller_id: str
 
@@ -155,30 +153,24 @@ class ControllerRuntimeService(BaseComponent):
 
 def build_controller_runtime(
     *,
-    raw_config: dict,
+    config_source: dict,
     base_dir: Path,
+    controller_id: str,
 ) -> ControllerRuntime:
-    config = parse_controller_config(raw_config, base_dir=base_dir)
-    controller_id = require_runtime_id(
-        config.id,
-        label="Controller ID",
-        source_hint="Set `[deckr.controller].id`.",
-    )
+    config = parse_controller_config(config_source, base_dir=base_dir)
     return ControllerRuntime(
-        raw_config=dict(raw_config),
+        config_source=dict(config_source),
         config=config,
         controller_id=controller_id,
     )
 
 
 def component_factory(context: ComponentContext):
-    source = dict(context.raw_config)
-    if source.get("enabled") is False:
-        return InactiveComponent(name=context.runtime_name)
-
+    source = dict(context.config)
     runtime = build_controller_runtime(
-        raw_config=source,
+        config_source=source,
         base_dir=context.base_dir,
+        controller_id=context.require_endpoint_id("controller"),
     )
     return ControllerRuntimeService(
         runtime_name=context.runtime_name,
@@ -191,10 +183,11 @@ def component_factory(context: ComponentContext):
 
 component = ComponentDefinition(
     manifest=ComponentManifest(
-        component_id="deckr.controller",
-        config_prefix="deckr.controller",
+        component_id="com.k-si.deckr.controller",
         consumes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
         publishes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
+        endpoint_slots=("controller",),
+        role="controller",
     ),
     factory=component_factory,
 )
