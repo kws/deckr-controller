@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deckr.actions.messages import TitleOptions
+from deckr.contracts.models import JsonObject
 
 
 @dataclass
@@ -16,6 +17,17 @@ class RenderContent:
     title_options: TitleOptions | None = None
 
 
+@dataclass
+class RenderOverlay:
+    """Current transient overlay declaration for one control context."""
+
+    template: str
+    title: str | None = None
+    params: JsonObject = field(default_factory=dict)
+    overlay_id: str | None = None
+    generation: int = 0
+
+
 class ControlStateStore:
     """In-memory declarations for one control context."""
 
@@ -23,5 +35,8 @@ class ControlStateStore:
         self.context_id = context_id
         self.binding_id = binding_id
         self.content = RenderContent()
+        self.overlay: RenderOverlay | None = None
+        self.base_output_generation = 0
+        self.overlay_generation = 0
         self.settings: dict = {}
         self.default_title_options: TitleOptions | None = None

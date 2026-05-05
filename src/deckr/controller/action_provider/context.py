@@ -177,8 +177,42 @@ class ControlContext:
             CapabilityInputBody(binding=self.metadata, event=event),
         )
 
-    async def set_raster_image(self, image: str) -> None:
-        await self._router.set_raster_image(image)
+    async def set_raster_image(self, image: str, *, generation: int | None = None) -> None:
+        await self._router.set_raster_image(image, generation=generation)
 
-    async def clear_raster(self) -> None:
-        await self._router.clear()
+    async def clear_raster(self, *, generation: int | None = None) -> None:
+        await self._router.clear(generation=generation)
+
+    async def show_overlay(
+        self,
+        *,
+        template: str,
+        title: str | None,
+        params: dict,
+        duration_seconds: float | None,
+        overlay_id: str | None,
+        generation: int,
+        binding_output_generation: int,
+    ) -> bool:
+        return await self._router.show_overlay(
+            template=template,
+            title=title,
+            params=params,
+            duration_seconds=duration_seconds,
+            overlay_id=overlay_id,
+            generation=generation,
+            binding_output_generation=binding_output_generation,
+        )
+
+    async def clear_overlay(
+        self,
+        *,
+        overlay_id: str | None,
+        generation: int,
+        binding_output_generation: int,
+    ) -> bool:
+        return await self._router.clear_overlay(
+            overlay_id=overlay_id,
+            generation=generation,
+            binding_output_generation=binding_output_generation,
+        )

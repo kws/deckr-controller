@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 from invariant import (
     Node,
@@ -27,10 +27,10 @@ from deckr.controller._title_defaults import (
 )
 from deckr.controller.invariant.executor import get_executor
 from deckr.controller.invariant.recipes import (
+    feedback_overlay,
     image_card,
     solid_card,
     title_card,
-    unavailable_overlay,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,8 @@ class RenderModel:
 
     title: str | None = None
     image: str | None = None
-    overlay_type: Literal["unavailable", "blank"] | None = None
+    overlay_type: str | None = None
+    overlay_title: str | None = None
     title_options: TitleOptions | None = None
 
 
@@ -104,7 +105,11 @@ def resolve(
 ) -> RenderModel:
     """Pure function: declarations -> RenderModel."""
     del now
-    return _content_to_model(store.content, store.default_title_options)
+    model = _content_to_model(store.content, store.default_title_options)
+    if store.overlay is not None:
+        model.overlay_type = store.overlay.template
+        model.overlay_title = store.overlay.title
+    return model
 
 
 def _hex_to_rgba(hex_color: str) -> tuple[int, int, int, int]:
@@ -264,10 +269,21 @@ def _model_to_graph(
 ) -> Node | SubGraphNode | None:
     """Resolve a RenderModel to the graph that should be executed."""
 
-    if model.overlay_type == "unavailable":
-        return unavailable_overlay()
     if model.overlay_type == "blank":
         return solid_card()
+    if model.overlay_type is not None:
+        base = _base_model_to_graph(model, image_format)
+        return feedback_overlay(
+            model.overlay_type,
+            title=model.overlay_title,
+            base=base,
+        )
+    return _base_model_to_graph(model, image_format)
+
+
+def _base_model_to_graph(
+    model: RenderModel, image_format: RasterImageFormat
+) -> Node | SubGraphNode | None:
     if model.image is not None:
         parsed = load_graph_output_data_uri(model.image)
         if parsed is not None:

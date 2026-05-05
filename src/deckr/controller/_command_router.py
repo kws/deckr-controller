@@ -5,12 +5,13 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import anyio
 from deckr.actions.messages import SettingsTargetRef, TitleOptions
 from deckr.contracts.models import thaw_json
 
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
-from deckr.controller._state_store import ControlStateStore
+from deckr.controller._state_store import ControlStateStore, RenderOverlay
 from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
@@ -18,6 +19,22 @@ if TYPE_CHECKING:
     from deckr.controller._hardware_service import HardwareCommandService
 
 logger = logging.getLogger(__name__)
+
+OVERLAY_TEMPLATE_DEFAULT_SECONDS = {
+    "ok": 1.2,
+    "error": 2.0,
+    "unavailable": 2.0,
+    "unknown": 2.0,
+}
+OVERLAY_TEMPLATES = frozenset(
+    {
+        "ok",
+        "error",
+        "unavailable",
+        "loading",
+        "unknown",
+    }
+)
 
 
 class DeviceOutput:
@@ -83,7 +100,7 @@ class CommandRouter:
         self._settings_target = settings_target
         self._settings_hydrated = False
 
-    async def _render(self) -> None:
+    async def _render(self, *, clear_when_empty: bool = False) -> None:
         if self._image_format is None or self._output is None:
             return
         model = resolve(self._store)
@@ -94,6 +111,14 @@ class CommandRouter:
             binding_id=self._store.binding_id,
             control_id=self._output.control_id,
         )
+        if request is None and clear_when_empty:
+            await self._render_dispatcher.clear_control(
+                self._output.control_id,
+                context_id=self._store.context_id,
+                binding_id=self._store.binding_id,
+                output=self._output,
+            )
+            return
         await self._render_dispatcher.submit_request(
             control_id=self._output.control_id,
             context_id=self._store.context_id,
@@ -111,21 +136,37 @@ class CommandRouter:
         text: str,
         *,
         title_options: TitleOptions | None = None,
+        generation: int | None = None,
     ) -> None:
+        previous_generation = self._store.base_output_generation
+        if not self._accept_base_generation(generation):
+            return
         self._store.content.title = text
         self._store.content.image = None
         self._store.content.title_options = title_options
+        if generation is None or self._store.base_output_generation > previous_generation:
+            self._store.overlay = None
         await self._render()
 
-    async def set_raster_image(self, image: str) -> None:
+    async def set_raster_image(self, image: str, *, generation: int | None = None) -> None:
+        previous_generation = self._store.base_output_generation
+        if not self._accept_base_generation(generation):
+            return
         self._store.content.image = image
         self._store.content.title = None
+        if generation is None or self._store.base_output_generation > previous_generation:
+            self._store.overlay = None
         await self._render()
 
-    async def clear(self) -> None:
+    async def clear(self, *, generation: int | None = None) -> None:
+        previous_generation = self._store.base_output_generation
+        if not self._accept_base_generation(generation):
+            return
         self._store.content.image = None
         self._store.content.title = None
         self._store.content.title_options = None
+        if generation is None or self._store.base_output_generation > previous_generation:
+            self._store.overlay = None
         if self._output is None:
             return
         await self._render_dispatcher.clear_control(
@@ -134,6 +175,96 @@ class CommandRouter:
             binding_id=self._store.binding_id,
             output=self._output,
         )
+
+    async def show_overlay(
+        self,
+        *,
+        template: str,
+        title: str | None,
+        params: dict,
+        duration_seconds: float | None,
+        overlay_id: str | None,
+        generation: int,
+        binding_output_generation: int,
+    ) -> bool:
+        if binding_output_generation < self._store.base_output_generation:
+            return False
+        if generation < self._store.overlay_generation:
+            return False
+
+        resolved_template = template
+        resolved_duration = duration_seconds
+        if template not in OVERLAY_TEMPLATES:
+            logger.warning(
+                "Unknown binding overlay template %s; rendering unknown fallback",
+                template,
+            )
+            resolved_template = "unknown"
+
+        if resolved_duration is None:
+            resolved_duration = OVERLAY_TEMPLATE_DEFAULT_SECONDS.get(resolved_template)
+
+        self._store.overlay_generation = generation
+        self._store.overlay = RenderOverlay(
+            template=resolved_template,
+            title=title,
+            params=params,
+            overlay_id=overlay_id,
+            generation=generation,
+        )
+        await self._render()
+        if resolved_duration is not None:
+            self._start_soon(
+                self._clear_overlay_after,
+                overlay_id,
+                generation,
+                resolved_duration,
+            )
+        return True
+
+    async def clear_overlay(
+        self,
+        *,
+        overlay_id: str | None,
+        generation: int,
+        binding_output_generation: int,
+    ) -> bool:
+        if binding_output_generation < self._store.base_output_generation:
+            return False
+        if generation < self._store.overlay_generation:
+            return False
+        overlay = self._store.overlay
+        if overlay is None:
+            return False
+        if overlay_id is not None and overlay.overlay_id != overlay_id:
+            return False
+
+        self._store.overlay_generation = generation
+        self._store.overlay = None
+        await self._render(clear_when_empty=True)
+        return True
+
+    async def _clear_overlay_after(
+        self,
+        overlay_id: str | None,
+        generation: int,
+        duration_seconds: float,
+    ) -> None:
+        await anyio.sleep(duration_seconds)
+        await self.clear_overlay(
+            overlay_id=overlay_id,
+            generation=generation,
+            binding_output_generation=self._store.base_output_generation,
+        )
+
+    def _accept_base_generation(self, generation: int | None) -> bool:
+        if generation is None:
+            self._store.base_output_generation += 1
+            return True
+        if generation < self._store.base_output_generation:
+            return False
+        self._store.base_output_generation = generation
+        return True
 
     async def hydrate_settings(self) -> None:
         """Load live runtime settings into store. Precedence: config, then runtime overlay."""

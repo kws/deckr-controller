@@ -165,6 +165,150 @@ async def test_set_raster_image_replaces_title_content(router_with_mocks):
 
 
 @pytest.mark.asyncio
+async def test_binding_overlay_renders_over_base_state(router_with_mocks):
+    router = router_with_mocks
+
+    await router.set_title("Album", generation=3)
+    ok = await router.show_overlay(
+        template="ok",
+        title="OK",
+        params={},
+        duration_seconds=None,
+        overlay_id="playback-ok",
+        generation=1,
+        binding_output_generation=3,
+    )
+
+    assert ok is True
+    assert router._store.content.title == "Album"
+    assert router._store.overlay is not None
+    assert router._store.overlay.template == "ok"
+    assert router._store.overlay.overlay_id == "playback-ok"
+    assert router._render_dispatcher.submit_request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_binding_overlay_clear_restores_base_state(router_with_mocks):
+    router = router_with_mocks
+    await router.set_title("Album", generation=3)
+    await router.show_overlay(
+        template="ok",
+        title="OK",
+        params={},
+        duration_seconds=None,
+        overlay_id="playback-ok",
+        generation=1,
+        binding_output_generation=3,
+    )
+
+    ok = await router.clear_overlay(
+        overlay_id="playback-ok",
+        generation=1,
+        binding_output_generation=3,
+    )
+
+    assert ok is True
+    assert router._store.content.title == "Album"
+    assert router._store.overlay is None
+    assert router._render_dispatcher.submit_request.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_binding_overlay_unknown_template_uses_unknown_fallback():
+    store = ControlStateStore(context_id="dev.slot0")
+    render_service = MagicMock(spec=RenderService)
+    render_service.build_request = MagicMock(return_value=object())
+    render_dispatcher = MagicMock(spec=RenderDispatcher)
+    render_dispatcher.submit_request = AsyncMock()
+    started = []
+
+    router = CommandRouter(
+        store=store,
+        render_service=render_service,
+        render_dispatcher=render_dispatcher,
+        output=_make_output(),
+        image_format=RasterImageFormat(width=72, height=72),
+        start_soon=lambda func, *args: started.append((func, args)),
+    )
+
+    await router.show_overlay(
+        template="surprise",
+        title=None,
+        params={},
+        duration_seconds=None,
+        overlay_id=None,
+        generation=1,
+        binding_output_generation=0,
+    )
+
+    assert store.overlay is not None
+    assert store.overlay.template == "unknown"
+    assert started[0][1][-1] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_binding_overlay_stale_generations_do_not_render(router_with_mocks):
+    router = router_with_mocks
+    await router.set_raster_image("https://example.invalid/base.jpg", generation=5)
+
+    old_base = await router.show_overlay(
+        template="ok",
+        title=None,
+        params={},
+        duration_seconds=None,
+        overlay_id=None,
+        generation=1,
+        binding_output_generation=4,
+    )
+    current_base = await router.show_overlay(
+        template="ok",
+        title=None,
+        params={},
+        duration_seconds=None,
+        overlay_id=None,
+        generation=2,
+        binding_output_generation=5,
+    )
+    old_overlay = await router.show_overlay(
+        template="error",
+        title=None,
+        params={},
+        duration_seconds=None,
+        overlay_id=None,
+        generation=1,
+        binding_output_generation=5,
+    )
+
+    assert old_base is False
+    assert current_base is True
+    assert old_overlay is False
+    assert router._store.overlay is not None
+    assert router._store.overlay.template == "ok"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_base_output_generation_does_not_clear_overlay(
+    router_with_mocks,
+):
+    router = router_with_mocks
+    await router.set_raster_image("https://example.invalid/base.jpg", generation=5)
+    await router.show_overlay(
+        template="ok",
+        title=None,
+        params={},
+        duration_seconds=None,
+        overlay_id=None,
+        generation=1,
+        binding_output_generation=5,
+    )
+
+    await router.set_raster_image("https://example.invalid/base.jpg", generation=5)
+
+    assert router._store.overlay is not None
+    assert router._store.overlay.template == "ok"
+
+
+@pytest.mark.asyncio
 async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
     """clear removes current render content and invalidates pending output."""
     router = router_with_mocks

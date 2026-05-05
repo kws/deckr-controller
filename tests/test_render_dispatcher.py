@@ -253,10 +253,11 @@ async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
         (RenderModel(title="Hello"), "title"),
         (RenderModel(image=_png_data_uri()), "image"),
         (RenderModel(overlay_type="unavailable"), "unavailable"),
+        (RenderModel(title="Album", overlay_type="ok"), "ok-overlay"),
         (RenderModel(overlay_type="blank"), "blank"),
         (RenderModel(image=_graph_data_uri()), "graph"),
     ],
-    ids=["title", "image", "unavailable", "blank", "graph"],
+    ids=["title", "image", "unavailable", "ok-overlay", "blank", "graph"],
 )
 def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
     fmt = RasterImageFormat(width=72, height=72)

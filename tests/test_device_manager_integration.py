@@ -12,6 +12,9 @@ from deckr.actions.messages import (
     SETTINGS_PATCH,
     SETTINGS_REQUEST,
     SETTINGS_SNAPSHOT,
+    DynamicPageCommand,
+    PageChildBindingDescriptor,
+    PageChildBindingTarget,
     SettingsSnapshot,
     SettingsTargetRef,
     action_message,
@@ -299,6 +302,21 @@ def _solid_key_graph() -> SubGraphNode:
 def _solid_key_image() -> str:
     graph = _solid_key_graph()
     return dump_graph_output_data_uri(graph.graph, graph.output)
+
+
+def _dynamic_page(page_id: str, *control_ids: str) -> DynamicPageCommand:
+    return DynamicPageCommand(
+        pageId=page_id,
+        bindings=tuple(
+            PageChildBindingDescriptor(
+                controlId=control_id,
+                target=PageChildBindingTarget(kind="self"),
+                roleId="album",
+                itemKey=f"item-{ix}",
+            )
+            for ix, control_id in enumerate(control_ids)
+        ),
+    )
 
 
 class ControlledFrameBackend:
@@ -742,6 +760,117 @@ async def test_binding_output_accepts_graph_data_uri(
     assert call_args[0][1] == "0,0"
     assert call_args[0][2] == "raster.bitmap"
     assert call_args[0][3] == f"frame-{render_backend.calls[-1]}".encode()
+
+
+@pytest.mark.asyncio
+async def test_binding_overlay_renders_and_expires(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    """bindingOverlay renders transient controller-owned feedback."""
+    from deckr.actions.messages import BINDING_OVERLAY
+
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+        msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OVERLAY,
+            {
+                "binding": ctx.metadata.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "template": "ok",
+                "title": "OK",
+                "durationSeconds": 1.0,
+                "generation": 1,
+            },
+        )
+
+        await manager.handle_command(msg)
+
+        with anyio.fail_after(5.0):
+            while not render_backend.calls:
+                await anyio.sleep(0.01)
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
+            while command_service.set_raster_frame.call_count == 0:
+                await anyio.sleep(0.01)
+        with anyio.fail_after(5.0):
+            while command_service.clear_raster.call_count == 0:
+                await anyio.sleep(0.01)
+        tg.cancel_scope.cancel()
+
+    call_args = command_service.set_raster_frame.call_args
+    assert call_args[0][0] == "test-device"
+    assert call_args[0][1] == "0,0"
+    assert call_args[0][2] == "raster.bitmap"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_page_update_preserves_rebound_control_outputs(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    """Dynamic page refreshes should not blank controls that are rebound immediately."""
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+        await manager.open_page(
+            descriptor=_dynamic_page("dynamic-page", "0,0", "1,0"),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+
+        command_service.clear_raster.reset_mock()
+        await manager.update_page(
+            descriptor=_dynamic_page(session.page_id, "0,0", "1,0"),
+            context_id=session.context_id,
+        )
+
+        command_service.clear_raster.assert_not_awaited()
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio

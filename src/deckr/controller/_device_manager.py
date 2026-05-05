@@ -14,6 +14,8 @@ from deckr.actions.messages import (
     ACTION_INSTANCE_CREATED,
     ACTION_INSTANCE_DESTROYED,
     BINDING_OUTPUT,
+    BINDING_OVERLAY,
+    BINDING_OVERLAY_CLEAR,
     CLOSE_PAGE,
     OPEN_PAGE,
     PAGE_SESSION_CLOSED,
@@ -28,6 +30,8 @@ from deckr.actions.messages import (
     ActionInstanceMetadata,
     BindingMetadata,
     BindingOutputBody,
+    BindingOverlayBody,
+    BindingOverlayClearBody,
     DynamicPageCommand,
     MatchedCapability,
     PageChildBindingDescriptor,
@@ -221,6 +225,14 @@ class AuthorizedCommandTarget:
     page_session: DynamicPageSession | None = None
 
 
+def _binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
+    return (
+        binding.context_id == lease.context_id
+        and binding.binding_id == lease.binding_id
+        and binding.action_instance_id == lease.action_instance_id
+    )
+
+
 class DeviceManager:
     def __init__(
         self,
@@ -340,12 +352,33 @@ class DeviceManager:
         return lease
 
     async def _revoke_active_bindings(self, *, clear_outputs: bool = True) -> None:
-        for binding_id in list(self._binding_leases):
-            await self._revoke_binding(binding_id, clear_output=clear_outputs)
+        await self._revoke_active_bindings_except(
+            clear_outputs=clear_outputs,
+            preserve_output_control_ids=frozenset(),
+        )
 
-    async def _clear_all_raster_controls(self) -> None:
+    async def _revoke_active_bindings_except(
+        self,
+        *,
+        clear_outputs: bool = True,
+        preserve_output_control_ids: frozenset[str],
+    ) -> None:
+        for binding_id in list(self._binding_leases):
+            lease = self._binding_leases.get(binding_id)
+            clear_output = clear_outputs
+            if lease is not None and lease.control_id in preserve_output_control_ids:
+                clear_output = False
+            await self._revoke_binding(binding_id, clear_output=clear_output)
+
+    async def _clear_all_raster_controls(
+        self,
+        *,
+        preserve_control_ids: frozenset[str] = frozenset(),
+    ) -> None:
         """Clear raster-capable controls before rendering a new page."""
         for control in raster_controls(self.device):
+            if control.control_id in preserve_control_ids:
+                continue
             await self._render_dispatcher.clear_control(
                 control.control_id,
                 output=DeviceOutput(
@@ -811,6 +844,7 @@ class DeviceManager:
         transition: PageTransition,
         *,
         page_session: DynamicPageSession | None = None,
+        preserve_rebound_outputs: bool = False,
     ) -> bool:
         arriving = transition.arriving
 
@@ -888,10 +922,20 @@ class DeviceManager:
                         err.action_uuid,
                     )
 
-        if transition.departing is not None:
-            await self._revoke_active_bindings()
+        preserve_output_control_ids = (
+            frozenset(binding.control_id for binding in result.bindings)
+            if preserve_rebound_outputs
+            else frozenset()
+        )
 
-        await self._clear_all_raster_controls()
+        if transition.departing is not None:
+            await self._revoke_active_bindings_except(
+                preserve_output_control_ids=preserve_output_control_ids,
+            )
+
+        await self._clear_all_raster_controls(
+            preserve_control_ids=preserve_output_control_ids,
+        )
 
         if isinstance(arriving, StaticPageRef):
             for binding in result.bindings:
@@ -971,6 +1015,11 @@ class DeviceManager:
         ok = await self._execute_transition(
             transition,
             page_session=page_session,
+            preserve_rebound_outputs=(
+                page_session is not None
+                and isinstance(transition.departing, DynamicPageCommand)
+                and isinstance(transition.arriving, DynamicPageCommand)
+            ),
         )
         if ok and session_to_close is not None:
             await self._finalize_dynamic_page(
@@ -1768,6 +1817,18 @@ class DeviceManager:
                 await self._handle_binding_output(authorization.binding, body)
             return
 
+        if msg_type == BINDING_OVERLAY:
+            if authorization.binding is not None:
+                body = BindingOverlayBody.model_validate(payload)
+                await self._handle_binding_overlay(authorization.binding, body)
+            return
+
+        if msg_type == BINDING_OVERLAY_CLEAR:
+            if authorization.binding is not None:
+                body = BindingOverlayClearBody.model_validate(payload)
+                await self._handle_binding_overlay_clear(authorization.binding, body)
+            return
+
         page_session = authorization.page_session
         if page_session is not None:
             if msg_type in _SETTINGS_COMMAND_TYPES:
@@ -1815,11 +1876,7 @@ class DeviceManager:
         lease: BindingLease,
         body: BindingOutputBody,
     ) -> None:
-        if (
-            body.binding.context_id != lease.context_id
-            or body.binding.binding_id != lease.binding_id
-            or body.binding.action_instance_id != lease.action_instance_id
-        ):
+        if not _binding_body_matches_lease(lease, body.binding):
             logger.warning(
                 "Ignoring binding output with mismatched mirrored lease identity"
             )
@@ -1857,7 +1914,7 @@ class DeviceManager:
                 return
             if not isinstance(params, RasterBitmapClearParams):
                 return
-            await lease.context.clear_raster()
+            await lease.context.clear_raster(generation=body.generation)
             return
         if body.command_type != "set_frame":
             logger.warning(
@@ -1873,7 +1930,55 @@ class DeviceManager:
                 lease.binding_id,
             )
             return
-        await lease.context.set_raster_image(image_source)
+        await lease.context.set_raster_image(image_source, generation=body.generation)
+
+    async def _handle_binding_overlay(
+        self,
+        lease: BindingLease,
+        body: BindingOverlayBody,
+    ) -> None:
+        if not _binding_body_matches_lease(lease, body.binding):
+            logger.warning(
+                "Ignoring binding overlay with mismatched mirrored lease identity"
+            )
+            return
+        ok = await lease.context.show_overlay(
+            template=body.template,
+            title=body.title,
+            params=dict(body.params),
+            duration_seconds=body.duration_seconds,
+            overlay_id=body.overlay_id,
+            generation=body.generation,
+            binding_output_generation=body.binding.output_generation,
+        )
+        if not ok:
+            logger.info(
+                "Ignoring stale binding overlay for binding %s generation=%s",
+                lease.binding_id,
+                body.generation,
+            )
+
+    async def _handle_binding_overlay_clear(
+        self,
+        lease: BindingLease,
+        body: BindingOverlayClearBody,
+    ) -> None:
+        if not _binding_body_matches_lease(lease, body.binding):
+            logger.warning(
+                "Ignoring binding overlay clear with mismatched mirrored lease identity"
+            )
+            return
+        ok = await lease.context.clear_overlay(
+            overlay_id=body.overlay_id,
+            generation=body.generation,
+            binding_output_generation=body.binding.output_generation,
+        )
+        if not ok:
+            logger.info(
+                "Ignoring stale binding overlay clear for binding %s generation=%s",
+                lease.binding_id,
+                body.generation,
+            )
 
     async def on_event(self, message: DeckrMessage):
         event = hw_messages.hardware_body_from_message(message)
