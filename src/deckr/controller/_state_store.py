@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deckr.actions.messages import TitleOptions
 from deckr.contracts.models import JsonObject
 
 
@@ -14,7 +13,6 @@ class RenderContent:
 
     title: str | None = None
     image: str | None = None
-    title_options: TitleOptions | None = None
 
 
 @dataclass
@@ -39,4 +37,3 @@ class ControlStateStore:
         self.base_output_generation = 0
         self.overlay_generation = 0
         self.settings: dict = {}
-        self.default_title_options: TitleOptions | None = None

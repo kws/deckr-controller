@@ -7,16 +7,6 @@ class _ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class TitleOptions(_ConfigModel):
-    """Font and styling options for title rendering (from config)."""
-
-    font_family: str | None = None
-    font_size: int | str | None = None
-    font_style: Literal["", "Bold Italic", "Bold", "Italic", "Regular"] | None = None
-    title_color: str | None = None
-    title_alignment: Literal["top", "middle", "bottom"] | None = None
-
-
 class CapabilitySelector(_ConfigModel):
     """A required capability advertised by a device control."""
 
@@ -135,7 +125,6 @@ class Control(_ConfigModel):
     provider_labels: dict[str, str] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
     template_overrides: dict[str, Any] = Field(default_factory=dict)
-    title_options: TitleOptions | None = None
 
 
 class Page(_ConfigModel):

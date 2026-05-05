@@ -188,7 +188,6 @@ def _dynamic_page_child_binding(
         provider_instance_id=provider_instance_id,
         provider_labels=provider_labels,
         settings=binding.settings,
-        title_options=binding.title_options,
     )
 
 

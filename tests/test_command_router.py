@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from deckr.actions.messages import SettingsSnapshot, SettingsTargetRef, TitleOptions
+from deckr.actions.messages import SettingsSnapshot, SettingsTargetRef
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import RasterImageFormat
@@ -135,30 +135,10 @@ async def test_set_title_updates_current_content(router_with_mocks):
 
 
 @pytest.mark.asyncio
-async def test_set_title_applies_explicit_title_options(router_with_mocks):
-    """set_title can update title styling alongside the text."""
-    router = router_with_mocks
-    title_options = TitleOptions(font_family="Audiowide", font_size="85vw")
-    await router.set_title("Styled", title_options=title_options)
-    assert router._store.content.title == "Styled"
-    assert router._store.content.title_options == title_options
-
-
-@pytest.mark.asyncio
-async def test_set_title_without_title_options_clears_explicit_options(router_with_mocks):
-    """A plain title update should fall back to binding defaults instead of reusing old explicit styles."""
-    router = router_with_mocks
-    await router.set_title("Styled", title_options=TitleOptions(font_family="Inter"))
-    await router.set_title("Plain")
-    assert router._store.content.title == "Plain"
-    assert router._store.content.title_options is None
-
-
-@pytest.mark.asyncio
 async def test_set_raster_image_replaces_title_content(router_with_mocks):
     """set_raster_image replaces title content with an explicit raster image."""
     router = router_with_mocks
-    await router.set_title("Styled", title_options=TitleOptions(font_family="Inter"))
+    await router.set_title("Styled")
     await router.set_raster_image("https://example.com/img.png")
     assert router._store.content.image == "https://example.com/img.png"
     assert router._store.content.title is None
@@ -319,7 +299,6 @@ async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
 
     assert router._store.content.image is None
     assert router._store.content.title is None
-    assert router._store.content.title_options is None
     router._render_dispatcher.clear_control.assert_awaited_once_with(
         router._output.control_id,
         context_id=router._store.context_id,

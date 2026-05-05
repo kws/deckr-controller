@@ -4,33 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deckr.actions.messages import (
-    DynamicPageCommand,
-    TitleOptions,
-)
+from deckr.actions.messages import DynamicPageCommand
 
 from deckr.controller._binding_resolution import ConfiguredControlBinding
-from deckr.controller.config._data import (
-    DeviceConfig,
-)
-from deckr.controller.config._data import (
-    TitleOptions as ConfigTitleOptions,
-)
-
-
-def _config_title_options_to_store(
-    opts: ConfigTitleOptions | None,
-) -> TitleOptions | None:
-    """Convert config TitleOptions to action message TitleOptions."""
-    if opts is None:
-        return None
-    return TitleOptions(
-        font_family=opts.font_family,
-        font_size=opts.font_size,
-        font_style=opts.font_style,
-        title_color=opts.title_color,
-        title_alignment=opts.title_alignment,
-    )
+from deckr.controller.config._data import DeviceConfig
 
 
 @dataclass(frozen=True)
@@ -101,7 +78,6 @@ class NavigationService:
                 settings=dict(c.settings),
                 stable_id=c.id,
                 template_overrides=dict(c.template_overrides),
-                title_options=_config_title_options_to_store(c.title_options),
             )
             for c in page.controls
         ]

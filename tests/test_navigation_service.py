@@ -1,6 +1,7 @@
 """Tests for NavigationService: current page and transitions (no stack)."""
 
 import pytest
+from pydantic import ValidationError
 
 from deckr.controller._navigation_service import (
     NavigationService,
@@ -11,7 +12,6 @@ from deckr.controller.config._data import (
     DeviceConfig,
     Page,
     Profile,
-    TitleOptions,
 )
 
 
@@ -27,13 +27,25 @@ def device_config():
                 pages=[
                     Page(
                         controls=[
-                            Control(selector={"control_id": "0,0"}, action="action.a", settings={"x": 1}),
-                            Control(selector={"control_id": "0,1"}, action="action.b", settings={}),
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action="action.a",
+                                settings={"x": 1},
+                            ),
+                            Control(
+                                selector={"control_id": "0,1"},
+                                action="action.b",
+                                settings={},
+                            ),
                         ]
                     ),
                     Page(
                         controls=[
-                            Control(selector={"control_id": "1,0"}, action="action.c", settings={}),
+                            Control(
+                                selector={"control_id": "1,0"},
+                                action="action.c",
+                                settings={},
+                            ),
                         ]
                     ),
                 ],
@@ -74,42 +86,19 @@ def test_resolve_static_bindings_returns_control_bindings(device_config):
     assert bindings[1].action_uuid == "action.b"
 
 
-def test_resolve_static_bindings_includes_title_options():
-    """When Control has title_options, binding receives converted TitleOptions."""
-    config = DeviceConfig(
-        id="dev1",
-        name="Test",
-        match={"fingerprint": "fingerprint-dev1"},
-        profiles=[
-            Profile(
-                name="default",
-                pages=[
-                    Page(
-                        controls=[
-                            Control(
-                                selector={"control_id": "0,0"},
-                                action="action.a",
-                                settings={},
-                                title_options=TitleOptions(
-                                    font_family="Roboto Mono",
-                                    font_size=36,
-                                    title_color="#00FF00",
-                                    title_alignment="top",
-                                ),
-                            ),
-                        ]
-                    ),
-                ],
-            ),
-        ],
-    )
-    nav = NavigationService(config)
-    bindings = nav.resolve_static_bindings(
-        StaticPageRef(profile_name="default", page_index=0)
-    )
-    assert len(bindings) == 1
-    assert bindings[0].title_options is not None
-    assert bindings[0].title_options.font_family == "Roboto Mono"
-    assert bindings[0].title_options.font_size == 36
-    assert bindings[0].title_options.title_color == "#00FF00"
-    assert bindings[0].title_options.title_alignment == "top"
+def test_control_rejects_controller_render_styling_field():
+    field = "title_" + "options"
+    with pytest.raises(ValidationError, match=field):
+        Control.model_validate(
+            {
+                "selector": {"control_id": "0,0"},
+                "action": "action.a",
+                "settings": {},
+                field: {
+                    "font_family": "Roboto Mono",
+                    "font_size": 36,
+                    "title_color": "#00FF00",
+                    "title_alignment": "top",
+                },
+            }
+        )

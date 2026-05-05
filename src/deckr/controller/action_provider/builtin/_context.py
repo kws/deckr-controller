@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from deckr.actions.messages import BindingMetadata, DynamicPageCommand, TitleOptions
+from deckr.actions.messages import BindingMetadata, DynamicPageCommand
 
 from deckr.controller._command_router import CommandRouter
 from deckr.controller.settings import SettingsService
@@ -29,13 +29,8 @@ class ControllerActionContext:
         self.binding_metadata = binding_metadata
         self._settings_service = settings_service
 
-    async def set_title(
-        self,
-        text: str,
-        *,
-        title_options: TitleOptions | None = None,
-    ) -> None:
-        await self._router.set_title(text, title_options=title_options)
+    async def set_title(self, text: str) -> None:
+        await self._router.set_title(text)
 
     async def set_raster_image(self, image: str) -> None:
         await self._router.set_raster_image(image)
@@ -56,11 +51,6 @@ class ControllerActionContext:
 
     async def open_page(self, descriptor: DynamicPageCommand) -> None:
         await self._manager.open_page(
-            descriptor=descriptor, context_id=self._context_id
-        )
-
-    async def update_page(self, descriptor: DynamicPageCommand) -> None:
-        await self._manager.update_page(
             descriptor=descriptor, context_id=self._context_id
         )
 

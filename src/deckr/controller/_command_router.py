@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
-from deckr.actions.messages import SettingsTargetRef, TitleOptions
+from deckr.actions.messages import SettingsTargetRef
 from deckr.contracts.models import thaw_json
 
 from deckr.controller._render import RenderService, resolve
@@ -135,7 +135,6 @@ class CommandRouter:
         self,
         text: str,
         *,
-        title_options: TitleOptions | None = None,
         generation: int | None = None,
     ) -> None:
         previous_generation = self._store.base_output_generation
@@ -143,7 +142,6 @@ class CommandRouter:
             return
         self._store.content.title = text
         self._store.content.image = None
-        self._store.content.title_options = title_options
         if generation is None or self._store.base_output_generation > previous_generation:
             self._store.overlay = None
         await self._render()
@@ -164,7 +162,6 @@ class CommandRouter:
             return
         self._store.content.image = None
         self._store.content.title = None
-        self._store.content.title_options = None
         if generation is None or self._store.base_output_generation > previous_generation:
             self._store.overlay = None
         if self._output is None:

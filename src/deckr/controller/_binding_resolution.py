@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from deckr.actions.messages import TitleOptions
 from deckr.hardware.descriptors import CapabilityDescriptor, ControlDescriptor
 
 from deckr.controller.config import CapabilitySelector, ControlSelector
@@ -31,7 +30,6 @@ class ConfiguredControlBinding:
     settings: Mapping[str, Any]
     stable_id: str | None = None
     template_overrides: Mapping[str, Any] | None = None
-    title_options: TitleOptions | None = None
 
     @property
     def control_id(self) -> str | None:
@@ -49,7 +47,6 @@ class ResolvedControlBinding:
     settings: Mapping[str, Any]
     stable_id: str | None
     template_overrides: Mapping[str, Any] | None
-    title_options: TitleOptions | None
     selector: ControlSelector
     input_capability_ids: frozenset[str]
     output_capability_ids: frozenset[str]
@@ -126,7 +123,6 @@ def resolve_binding(
             settings=binding.settings,
             stable_id=binding.stable_id,
             template_overrides=binding.template_overrides,
-            title_options=binding.title_options,
             selector=binding.selector,
             input_capability_ids=_selected_capability_ids(
                 control,
@@ -169,7 +165,6 @@ def exact_control_binding(
     provider_instance_id: str | None = None,
     provider_labels: Mapping[str, str] | None = None,
     settings: Mapping[str, Any],
-    title_options: TitleOptions | None = None,
 ) -> ConfiguredControlBinding:
     """Construct a selector binding for an exact descriptor control id."""
 
@@ -181,7 +176,6 @@ def exact_control_binding(
         settings=settings,
         stable_id=None,
         template_overrides=None,
-        title_options=title_options,
     )
 
 

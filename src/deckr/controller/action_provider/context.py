@@ -13,7 +13,6 @@ from deckr.actions.messages import (
     CapabilityInputBody,
     CapabilityInputEvent,
     SettingsTargetRef,
-    TitleOptions,
     action_message,
     context_subject,
 )
@@ -60,7 +59,6 @@ class ControlContext:
         *,
         profile_id: str,
         page_id: str,
-        title_options: TitleOptions | None = None,
         builtin_action: "BuiltinAction | None" = None,
         metadata: BindingMetadata,
     ):
@@ -89,7 +87,6 @@ class ControlContext:
             binding_id=metadata.binding_id,
         )
         self._store.settings = dict(thaw_json(settings))
-        self._store.default_title_options = title_options
 
         output = (
             DeviceOutput(

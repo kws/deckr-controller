@@ -311,10 +311,32 @@ def _dynamic_page(page_id: str, *control_ids: str) -> DynamicPageCommand:
             PageChildBindingDescriptor(
                 controlId=control_id,
                 target=PageChildBindingTarget(kind="self"),
-                roleId="album",
                 itemKey=f"item-{ix}",
             )
             for ix, control_id in enumerate(control_ids)
+        ),
+    )
+
+
+def _dynamic_page_with_action_child(
+    page_id: str,
+    control_id: str,
+    *,
+    action_id: str,
+    provider_instance_id: str,
+) -> DynamicPageCommand:
+    return DynamicPageCommand(
+        pageId=page_id,
+        bindings=(
+            PageChildBindingDescriptor(
+                controlId=control_id,
+                target=PageChildBindingTarget(
+                    kind="action",
+                    actionId=action_id,
+                    providerInstanceId=provider_instance_id,
+                    instanceKey=control_id,
+                ),
+            ),
         ),
     )
 
@@ -830,10 +852,10 @@ async def test_binding_overlay_renders_and_expires(
 
 
 @pytest.mark.asyncio
-async def test_dynamic_page_update_preserves_rebound_control_outputs(
+async def test_dynamic_page_replace_preserves_rebound_control_outputs(
     device_config_set_raster_image, persistence_tmp_dir
 ):
-    """Dynamic page refreshes should not blank controls that are rebound immediately."""
+    """Dynamic page replacement should not blank controls that are rebound immediately."""
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = MagicMock()
@@ -864,12 +886,174 @@ async def test_dynamic_page_update_preserves_rebound_control_outputs(
         assert session is not None
 
         command_service.clear_raster.reset_mock()
-        await manager.update_page(
+        await manager.replace_page(
             descriptor=_dynamic_page(session.page_id, "0,0", "1,0"),
             context_id=session.context_id,
         )
 
         command_service.clear_raster.assert_not_awaited()
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_open_page_from_dynamic_child_dismisses_previous_owner(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, provider_instance_id=None, **_: _metadata(
+            uuid,
+            provider_instance_id=provider_instance_id or PROVIDER_INSTANCE_ID,
+        )
+    )
+    command_service = FakeHardwareCommandService()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+        await manager.open_page(
+            descriptor=_dynamic_page_with_action_child(
+                "first-page",
+                "1,0",
+                action_id="test.virtual.child",
+                provider_instance_id="python-child",
+            ),
+            context_id=owner_ctx.id,
+        )
+        first_session = manager._dynamic_page_session
+        assert first_session is not None
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        await manager.open_page(
+            descriptor=_dynamic_page("second-page", "0,0"),
+            context_id=child_ctx.id,
+        )
+
+        second_session = manager._dynamic_page_session
+        assert second_session is not None
+        assert second_session.page_id == "second-page"
+        assert second_session.page_session_id != first_session.page_session_id
+        assert second_session.owner_binding_id == child_ctx.binding_id
+        assert second_session.owner_provider_instance_id == "python-child"
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_replace_page_from_non_owner_is_noop(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, provider_instance_id=None, **_: _metadata(
+            uuid,
+            provider_instance_id=provider_instance_id or PROVIDER_INSTANCE_ID,
+        )
+    )
+    command_service = FakeHardwareCommandService()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+        await manager.open_page(
+            descriptor=_dynamic_page_with_action_child(
+                "dynamic-page",
+                "1,0",
+                action_id="test.virtual.child",
+                provider_instance_id="python-child",
+            ),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        await manager.replace_page(
+            descriptor=_dynamic_page(session.page_id, "0,0"),
+            context_id=child_ctx.id,
+        )
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
+        assert await manager.action_contexts.get("0,0") is None
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_close_page_from_non_owner_is_noop(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, provider_instance_id=None, **_: _metadata(
+            uuid,
+            provider_instance_id=provider_instance_id or PROVIDER_INSTANCE_ID,
+        )
+    )
+    command_service = FakeHardwareCommandService()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+        await manager.open_page(
+            descriptor=_dynamic_page_with_action_child(
+                "dynamic-page",
+                "1,0",
+                action_id="test.virtual.child",
+                provider_instance_id="python-child",
+            ),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        await manager.close_page(context_id=child_ctx.id)
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
+        assert await manager.action_contexts.get("0,0") is None
         tg.cancel_scope.cancel()
 
 
