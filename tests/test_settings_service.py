@@ -29,8 +29,8 @@ from deckr.controller.settings import (
 
 CONTROLLER_ID = "controller-main"
 CONFIG_ID = "config-1"
-PROVIDER_INSTANCE_ID = "python.clock"
-PROVIDER_ID = "clock"
+PROVIDER_INSTANCE_ID = "python-dev.deckr.clock"
+PROVIDER_ID = "dev.deckr.clock"
 
 
 def _config() -> DeviceConfig:

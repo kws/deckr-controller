@@ -35,7 +35,7 @@ def test_load_config_document_resolves_relative_paths_and_namespaces(
     config_path.write_text(
         """
 [deckr.components.instances.controller_main]
-component = "com.k-si.deckr.controller"
+component = "dev.deckr.controller"
 instance_id = "main"
 
 [deckr.components.instances.controller_main.endpoints]
@@ -45,20 +45,20 @@ controller = "controller-main"
 path = "configs"
 
 [deckr.components.instances.clock_actions]
-component = "com.k-si.deckr.action_provider_runtime.python"
+component = "dev.deckr.action_provider_runtime.python"
 instance_id = "clock-main"
 
 [deckr.components.instances.clock_actions.endpoints]
 action_provider = "living-room"
 
 [deckr.components.instances.clock_actions.config]
-provider_id = "clock"
+provider_id = "dev.deckr.clock"
 
 [deckr.components.instances.clock_actions.config.labels]
 room = "living"
 
 [deckr.components.instances.mqtt_main]
-component = "com.k-si.deckr.hardware.mqtt"
+component = "dev.deckr.hardware.mqtt"
 instance_id = "main"
 
 [deckr.components.instances.mqtt_main.endpoints]
@@ -82,7 +82,7 @@ port = 1884
         "deckr.components.instances.clock_actions.config"
     )
     assert action_provider is not None
-    assert action_provider["provider_id"] == "clock"
+    assert action_provider["provider_id"] == "dev.deckr.clock"
     assert action_provider["labels"]["room"] == "living"
     manager_config = document.namespace("deckr.components.instances.mqtt_main.config")
     assert manager_config is not None
@@ -105,7 +105,7 @@ def test_auto_loads_local_deckr_toml(
     config_path.write_text(
         """
 [deckr.components.instances.controller_main]
-component = "com.k-si.deckr.controller"
+component = "dev.deckr.controller"
 instance_id = "main"
 
 [deckr.components.instances.controller_main.endpoints]

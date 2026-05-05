@@ -80,7 +80,7 @@ def _action_command(
 
 
 def _provider_settings_target(
-    provider_id: str = "clock",
+    provider_id: str = "dev.deckr.clock",
     *,
     config_id: str = "test-device",
 ) -> SettingsTargetRef:
@@ -438,7 +438,7 @@ async def test_provider_settings_patch_from_owning_provider_writes_and_replies()
     registry.provider_instance_provides_provider.side_effect = (
         lambda provider_instance_id, provider_id: provider_instance_id
         == PROVIDER_INSTANCE_ID
-        and provider_id == "clock"
+        and provider_id == "dev.deckr.clock"
     )
     manager = _provider_settings_device_manager(
         config_service=config_service,
@@ -465,7 +465,7 @@ async def test_provider_settings_patch_from_owning_provider_writes_and_replies()
     assert snapshot.target.key() == _provider_settings_target().key()
     registry.provider_instance_provides_provider.assert_called_once_with(
         PROVIDER_INSTANCE_ID,
-        "clock",
+        "dev.deckr.clock",
     )
 
 
@@ -508,7 +508,7 @@ async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
     registry.provider_instance_provides_provider.side_effect = (
         lambda provider_instance_id, provider_id: provider_instance_id
         == PROVIDER_INSTANCE_ID
-        and provider_id == "clock"
+        and provider_id == "dev.deckr.clock"
     )
     manager = _provider_settings_device_manager(
         config_service=config_service,

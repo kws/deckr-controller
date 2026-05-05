@@ -5,7 +5,7 @@ from deckr.controller.action_provider.builtin._context import ControllerActionCo
 
 
 class NavHomeAction:
-    uuid: str = "deckr.controller.builtin.navhome"
+    uuid: str = "dev.deckr.controller.builtin.action.nav_home"
 
     async def on_bind(self, context: ControllerActionContext) -> None:
         settings = await context.get_settings()

@@ -229,8 +229,8 @@ async def test_get_settings_hydrates_from_runtime_overlay():
         scope="action_instance",
         controllerId="controller-main",
         configId="config-dev",
-        providerInstanceId="python.clock",
-        providerId="clock",
+        providerInstanceId="python-dev.deckr.clock",
+        providerId="dev.deckr.clock",
         actionId="action",
         actionInstanceId="instance-a",
     )
@@ -280,8 +280,8 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
         scope="action_instance",
         controllerId="controller-main",
         configId="config-dev",
-        providerInstanceId="python.clock",
-        providerId="clock",
+        providerInstanceId="python-dev.deckr.clock",
+        providerId="dev.deckr.clock",
         actionId="action",
         actionInstanceId="instance-a",
     )

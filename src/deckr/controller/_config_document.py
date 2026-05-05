@@ -15,7 +15,7 @@ _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 #   [deckr.components.instances.<instance>]
 
 [deckr.components.instances.controller_main]
-component = "com.k-si.deckr.controller"
+component = "dev.deckr.controller"
 instance_id = "main"
 
 [deckr.components.instances.controller_main.endpoints]
@@ -71,7 +71,7 @@ def controller_payload_from_document(document: ConfigDocument) -> Mapping[str, A
     matches = [
         source.get("config", {})
         for source in instances.values()
-        if source.get("component") == "com.k-si.deckr.controller"
+        if source.get("component") == "dev.deckr.controller"
     ]
     if not matches:
         return {}

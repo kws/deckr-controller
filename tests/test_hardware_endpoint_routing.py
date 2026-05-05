@@ -54,7 +54,7 @@ def _device(device_id: str, fingerprint: str) -> DeviceDescriptor:
                 outputCapabilities=(
                     CapabilityDescriptor(
                         capabilityId="raster.bitmap",
-                        family="deckr.output.raster",
+                        family="dev.deckr.output.raster",
                         type="bitmap",
                         direction="output",
                         access=("settable",),
@@ -66,7 +66,7 @@ def _device(device_id: str, fingerprint: str) -> DeviceDescriptor:
         capabilities=(
             CapabilityDescriptor(
                 capabilityId="device.power",
-                family="deckr.device.power",
+                family="dev.deckr.device.power",
                 type="screen",
                 direction="command",
                 access=("invokable",),

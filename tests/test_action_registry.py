@@ -23,8 +23,8 @@ from deckr.controller.action_provider.events import ActionsChangedEvent
 
 CONTROLLER_ID = "controller-main"
 ACTION_UUID = "test.stub.action"
-PROVIDER_INSTANCE_ID = "python.clock"
-PROVIDER_ID = "clock"
+PROVIDER_INSTANCE_ID = "python-dev.deckr.clock"
+PROVIDER_ID = "dev.deckr.clock"
 
 
 def _state_bus() -> LaneHarness:
@@ -361,11 +361,11 @@ async def test_action_registry_loads_builtin_actions_without_provider_catalogs()
 
     await registry.start(RunContext(tg=mock_tg, stopping=stopping))
 
-    goto_page = await registry.get_action("deckr.controller.builtin.gotopage")
+    goto_page = await registry.get_action("dev.deckr.controller.builtin.action.go_to_page")
     assert goto_page is not None
     assert goto_page.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
     descriptor = await registry.get_action_descriptor(
-        "deckr.controller.builtin.gotopage"
+        "dev.deckr.controller.builtin.action.go_to_page"
     )
     assert descriptor is not None
     assert descriptor.requirements is not None

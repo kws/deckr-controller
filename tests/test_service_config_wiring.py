@@ -22,7 +22,7 @@ def test_build_services_disable_when_sections_are_absent(tmp_path: Path) -> None
     config_path.write_text(
         """
 [deckr.components.instances.controller_main]
-component = "com.k-si.deckr.controller"
+component = "dev.deckr.controller"
 instance_id = "main"
 
 [deckr.components.instances.controller_main.endpoints]
@@ -47,7 +47,7 @@ def test_build_services_enable_when_sections_are_present(tmp_path: Path) -> None
     config_path.write_text(
         """
 [deckr.components.instances.controller_main]
-component = "com.k-si.deckr.controller"
+component = "dev.deckr.controller"
 instance_id = "main"
 
 [deckr.components.instances.controller_main.endpoints]

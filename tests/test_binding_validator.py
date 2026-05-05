@@ -162,7 +162,7 @@ async def test_validate_dynamic_page_bindings_resolves_explicit_child_action_tar
     action = ActionMetadata(
         uuid="action.volume",
         provider_instance_id="sonos-bedroom",
-        provider_id="sonos",
+        provider_id="dev.deckr.sonos",
     )
 
     get_action = AsyncMock(return_value=action)
@@ -185,7 +185,7 @@ async def test_validate_dynamic_page_bindings_resolves_explicit_child_action_tar
         device,
         get_action,
         owner_action_uuid="action.pager",
-        owner_provider_instance_id="kaj",
+        owner_provider_instance_id="python-com.k-si.deckr.kaj",
     )
 
     assert result.valid is True
@@ -372,7 +372,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
                         controls=[
                             Control(
                                 selector={"control_id": "99,99"},
-                                action="deckr.controller.builtin.gotopage",
+                                action="dev.deckr.controller.builtin.action.go_to_page",
                                 settings={},
                             ),
                         ]
@@ -385,9 +385,9 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
     registry = MagicMock()
     registry.get_action = AsyncMock(
         return_value=ActionMetadata(
-            uuid="deckr.controller.builtin.gotopage",
+            uuid="dev.deckr.controller.builtin.action.go_to_page",
             provider_instance_id="builtin",
-            provider_id="deckr.builtin",
+            provider_id="dev.deckr.controller.builtin",
         )
     )
     registry.provider_session_id.return_value = "provider-session"
@@ -439,7 +439,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
                         controls=[
                             Control(
                                 selector={"control_id": "0,0"},
-                                action="deckr.controller.builtin.gotopage",
+                                action="dev.deckr.controller.builtin.action.go_to_page",
                                 settings={},
                             ),
                             Control(
@@ -456,15 +456,15 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
 
     registry = MagicMock()
     action = _make_key_action()
-    action.uuid = "deckr.controller.builtin.gotopage"
+    action.uuid = "dev.deckr.controller.builtin.action.go_to_page"
 
     async def get_action(uuid, **kwargs):
         del kwargs
-        if uuid == "deckr.controller.builtin.gotopage":
+        if uuid == "dev.deckr.controller.builtin.action.go_to_page":
             return ActionMetadata(
                 uuid=action.uuid,
                 provider_instance_id="builtin",
-                provider_id="deckr.builtin",
+                provider_id="dev.deckr.controller.builtin",
             )
         return None
 

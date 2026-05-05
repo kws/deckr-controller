@@ -25,7 +25,7 @@ async def test_controller_component_uses_shared_lanes(
                 "components": {
                     "instances": {
                         "controller_main": {
-                            "component": "com.k-si.deckr.controller",
+                            "component": "dev.deckr.controller",
                             "instance_id": "main",
                             "endpoints": {"controller": "controller-main"},
                         }
@@ -36,7 +36,7 @@ async def test_controller_component_uses_shared_lanes(
     )
     plan = resolve_component_host_plan(
         document,
-        definitions={"com.k-si.deckr.controller": component},
+        definitions={"dev.deckr.controller": component},
     )
     substrate = MemoryLaneSubstrate(lane_contracts=plan.lane_contracts)
     async with Deckr(
@@ -45,11 +45,12 @@ async def test_controller_component_uses_shared_lanes(
         substrate=substrate,
     ) as deckr, start_components(deckr, plan) as result:
         assert [created.name for created in result.components] == [
-            "com.k-si.deckr.controller:main"
+            "dev.deckr.controller:main"
         ]
-        assert set(result.lane_names) == {"hardware_messages", "actions"}
+        assert set(result.lane_names) == {"hardware_messages", "actions", "services"}
         assert isinstance(result.get_lane("hardware_messages"), Lane)
         assert isinstance(result.get_lane("actions"), Lane)
+        assert isinstance(result.get_lane("services"), Lane)
 
 
 def test_controller_runtime_uses_endpoint_id_not_environment(

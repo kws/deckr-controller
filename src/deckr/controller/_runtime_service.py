@@ -183,7 +183,7 @@ def component_factory(context: ComponentContext):
 
 component = ComponentDefinition(
     manifest=ComponentManifest(
-        component_id="com.k-si.deckr.controller",
+        component_id="dev.deckr.controller",
         consumes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
         publishes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
         endpoint_slots=("controller",),

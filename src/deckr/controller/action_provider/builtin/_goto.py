@@ -6,7 +6,7 @@ from deckr.controller.action_provider.builtin._context import ControllerActionCo
 
 
 class GoToPageAction:
-    uuid: str = "deckr.controller.builtin.gotopage"
+    uuid: str = "dev.deckr.controller.builtin.action.go_to_page"
 
     async def run(self):
         while True:
