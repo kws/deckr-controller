@@ -8,6 +8,19 @@ from ._data import (
     Page,
     Profile,
 )
+from ._materialized import (
+    CONFIG_PROJECTION_SCHEMA,
+    CONFIG_RESULT_SCHEMA,
+    CONFIG_STATE_BUCKET,
+    MaterializedConfigDiagnostic,
+    MaterializedConfigProducer,
+    MaterializedConfigProjection,
+    MaterializedConfigPublisher,
+    MaterializedConfigResult,
+    MaterializedDeviceConfigService,
+    materialized_config_key,
+    materialized_config_result_key,
+)
 from ._service import (
     DeviceConfigService,
     FileBackedDeviceConfigService,
@@ -23,7 +36,18 @@ __all__ = [
     "DeviceConfigService",
     "FileBackedDeviceConfigService",
     "GeometrySelector",
+    "CONFIG_PROJECTION_SCHEMA",
+    "CONFIG_RESULT_SCHEMA",
+    "CONFIG_STATE_BUCKET",
+    "MaterializedConfigDiagnostic",
+    "MaterializedConfigProducer",
+    "MaterializedConfigProjection",
+    "MaterializedConfigPublisher",
+    "MaterializedConfigResult",
+    "MaterializedDeviceConfigService",
     "NullDeviceConfigService",
     "Page",
     "Profile",
+    "materialized_config_key",
+    "materialized_config_result_key",
 ]

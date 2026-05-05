@@ -15,6 +15,7 @@ from decouple import config as decouple_config
 from watchfiles import Change, awatch
 
 from deckr.controller.config._data import DeviceConfig
+from deckr.controller.config._materialized import MaterializedConfigPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +83,17 @@ class DeviceConfigService(Protocol):
 class FileBackedDeviceConfigService(BaseComponent):
     """DeviceConfigService implementation backed by a watched YAML directory."""
 
-    def __init__(self, config_dir: Path | None = None):
+    def __init__(
+        self,
+        config_dir: Path | None = None,
+        *,
+        materialized_publisher: MaterializedConfigPublisher | None = None,
+    ):
         super().__init__(name="FileBackedDeviceConfigService")
         self._config_dir = (
             config_dir if config_dir is not None else resolve_default_config_dir()
         )
+        self._materialized_publisher = materialized_publisher
         self._path_to_config: dict[Path, str] = {}
         self._config_by_id: dict[str, DeviceConfig] = {}
         self._subscribers: dict[
@@ -163,7 +170,12 @@ class FileBackedDeviceConfigService(BaseComponent):
         tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
         os.replace(tmp_path, path)
         await self._cache_and_notify(path, config)
+        await self._publish_materialized_snapshot()
         return config
+
+    async def refresh(self) -> None:
+        await self._scan_configs()
+        await self._publish_materialized_snapshot()
 
     def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
         return self._subscribe_impl(config_id)
@@ -247,7 +259,7 @@ class FileBackedDeviceConfigService(BaseComponent):
 
     async def _watch_loop(self) -> None:
         """Background task: watch config_dir and emit to subscribers on changes."""
-        await self._scan_configs()
+        await self.refresh()
         if self._stop_event is None:
             return
         try:
@@ -306,6 +318,17 @@ class FileBackedDeviceConfigService(BaseComponent):
                     await send.send(config)
                 except Exception:
                     logger.exception("Failed to send config update to subscriber")
+        await self._publish_materialized_snapshot()
+
+    async def _publish_materialized_snapshot(self) -> None:
+        if self._materialized_publisher is None:
+            return
+        async with self._lock:
+            configs = tuple(self._config_by_id.values())
+        try:
+            await self._materialized_publisher.publish_configs(configs)
+        except Exception:
+            logger.exception("Failed to publish materialized config snapshot")
 
 
 class NullDeviceConfigService(BaseComponent):

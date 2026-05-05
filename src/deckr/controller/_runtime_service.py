@@ -24,6 +24,7 @@ from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import (
     DEFAULT_DISCOVERY_STATE_STORE_NAME,
     DEFAULT_LEASE_STATE_STORE_NAME,
+    PERSISTENT_STATE_STORE_POLICY,
     StateStore,
 )
 
@@ -56,6 +57,7 @@ class ControllerRuntimeService(BaseComponent):
         actions: Lane,
         lease_state: StateStore,
         discovery_state: StateStore,
+        materialized_config_state: StateStore | None = None,
     ) -> None:
         super().__init__(name=runtime_name)
         self._runtime = runtime
@@ -63,6 +65,7 @@ class ControllerRuntimeService(BaseComponent):
         self._actions = actions
         self._lease_state = lease_state
         self._discovery_state = discovery_state
+        self._materialized_config_state = materialized_config_state
         self._component_manager = ComponentManager()
         self._hardware_endpoint_cm: (
             AbstractAsyncContextManager[RegisteredEndpointLane] | None
@@ -92,7 +95,11 @@ class ControllerRuntimeService(BaseComponent):
             ctx.tg.start_soon(self._component_manager.run)
             manager_started = True
 
-            config_service = build_config_service(self._runtime.config)
+            config_service = build_config_service(
+                self._runtime.config,
+                controller_id=self._runtime.controller_id,
+                materialized_state=self._materialized_config_state,
+            )
             if isinstance(config_service, Component):
                 await self._component_manager.add_component(config_service)
 
@@ -172,6 +179,14 @@ def component_factory(context: ComponentContext):
         base_dir=context.base_dir,
         controller_id=context.require_endpoint_id("controller"),
     )
+    materialized_config_state = None
+    device_config = runtime.config.device_config
+    if device_config is not None and device_config.materialized is not None:
+        materialized_config_state = context.state(
+            device_config.materialized.bucket,
+            policy=PERSISTENT_STATE_STORE_POLICY,
+        )
+
     return ControllerRuntimeService(
         runtime_name=context.runtime_name,
         runtime=runtime,
@@ -179,6 +194,7 @@ def component_factory(context: ComponentContext):
         actions=context.require_lane(ACTIONS_LANE),
         lease_state=context.state(DEFAULT_LEASE_STATE_STORE_NAME),
         discovery_state=context.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
+        materialized_config_state=materialized_config_state,
     )
 
 component = ComponentDefinition(

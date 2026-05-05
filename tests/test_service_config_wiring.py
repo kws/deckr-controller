@@ -12,6 +12,7 @@ from deckr.controller._runtime_support import (
 )
 from deckr.controller.config import (
     FileBackedDeviceConfigService,
+    MaterializedDeviceConfigService,
     NullDeviceConfigService,
 )
 from deckr.controller.settings import ConfigBackedSettingsService
@@ -70,3 +71,34 @@ path = "configs"
     assert isinstance(config_service, FileBackedDeviceConfigService)
     assert config_service._config_dir == (tmp_path / "configs").resolve()
     assert isinstance(settings_service, ConfigBackedSettingsService)
+
+
+def test_build_services_enable_materialized_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "deckr.toml"
+    config_path.write_text(
+        """
+[deckr.components.instances.controller_main]
+component = "dev.deckr.controller"
+instance_id = "main"
+
+[deckr.components.instances.controller_main.endpoints]
+controller = "controller-main"
+
+[deckr.components.instances.controller_main.config.device_config.materialized]
+bucket = "dev_deckr_controller_config_v1"
+""".strip()
+    )
+    config = controller_config_from_document(load_config_document(config_path))
+
+    class State:
+        pass
+
+    state = State()
+    config_service = build_config_service(
+        config,
+        controller_id="controller-main",
+        materialized_state=state,
+    )
+
+    assert isinstance(config_service, MaterializedDeviceConfigService)
+    assert config_service._state is state

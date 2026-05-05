@@ -44,6 +44,44 @@ uv run ruff check .
 uv run pytest
 ```
 
+## Materialized Config
+
+Local monolith runs can use the direct file-backed config service:
+
+```toml
+[deckr.components.instances.controller_main.config.device_config.file]
+path = "settings"
+```
+
+For a controller that consumes config from NATS KV, configure the materialized
+source instead:
+
+```toml
+[deckr.components.instances.controller_main.config.device_config.materialized]
+bucket = "dev_deckr_controller_config_v1"
+```
+
+To push local files to a remote broker, configure the same file-backed watcher
+as a standalone Deckr component instance in a normal `deckr.toml`:
+
+```toml
+[deckr.runtime.substrate]
+kind = "nats"
+url = "nats://remote.example:4222"
+
+[deckr.components.instances.local_config_watcher]
+component = "dev.deckr.controller.config_watcher"
+instance_id = "local"
+
+[deckr.components.instances.local_config_watcher.config]
+path = "settings"
+target_controller_id = "controller-main"
+```
+
+The watcher has no endpoint slots and does not register a Deckr endpoint. It
+writes the whole projection to
+`dev_deckr_controller_config_v1/config.controllers.<controller-id>.materialized`.
+
 Build distributables:
 
 ```bash

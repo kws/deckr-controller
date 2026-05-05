@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from deckr.core.config import ConfigDocument
 from deckr.core.config import load_config_document as load_core_config
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from deckr.controller.config._materialized import CONFIG_STATE_BUCKET
 
 _DEFAULT_CONFIG_DOCUMENT_TEXT = """# Deckr configuration document
 #
@@ -25,6 +28,8 @@ controller = "controller-main"
 path = "settings"
 """
 
+_STATE_BUCKET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 
 def default_config_document_text() -> str:
     return _DEFAULT_CONFIG_DOCUMENT_TEXT
@@ -38,8 +43,29 @@ class DeviceConfigFileSection(_StrictModel):
     path: Path = Path("settings")
 
 
+class DeviceConfigMaterializedSection(_StrictModel):
+    bucket: str = CONFIG_STATE_BUCKET
+
+    @field_validator("bucket")
+    @classmethod
+    def _validate_bucket(cls, value: str) -> str:
+        bucket = value.strip()
+        if not bucket:
+            raise ValueError("materialized bucket must not be empty")
+        if not _STATE_BUCKET_RE.fullmatch(bucket):
+            raise ValueError(
+                "materialized bucket must use JetStream-safe underscore tokens"
+            )
+        return bucket
+
+
 class DeviceConfigSection(_StrictModel):
     file: DeviceConfigFileSection | None = None
+    materialized: DeviceConfigMaterializedSection | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.file is not None and self.materialized is not None:
+            raise ValueError("device_config may configure either file or materialized")
 
 
 class ControllerRuntimeConfig(_StrictModel):
