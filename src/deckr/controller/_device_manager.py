@@ -274,6 +274,7 @@ class DeviceManager:
         self._binding_leases: dict[str, BindingLease] = {}
         self._binding_by_context: dict[str, str] = {}
         self._active_binding_by_control: dict[str, str] = {}
+        self._held_input_bindings: dict[tuple[str, str], str] = {}
         self._action_instances: dict[str, ActionInstanceMetadata] = {}
         self._action_instance_providers: dict[str, str] = {}
         self._clock = clock or time.monotonic
@@ -1220,6 +1221,7 @@ class DeviceManager:
 
     async def clear_page(self, *, clear_outputs: bool = True):
         async with self._nav_lock:
+            self._held_input_bindings.clear()
             await self._finalize_dynamic_page(reason="clear")
             await self._revoke_active_bindings(clear_outputs=clear_outputs)
             await self._destroy_all_action_instances(reason="clear")
@@ -1418,6 +1420,7 @@ class DeviceManager:
             await self.clear_page()
             return
         async with self._nav_lock:
+            self._held_input_bindings.clear()
             self.config = config
             if self._dynamic_page_session is not None:
                 await self._finalize_dynamic_page(reason="config_change")
@@ -1951,6 +1954,14 @@ class DeviceManager:
 
         control_id = translated.control_id
         binding_id = self._active_binding_by_control.get(control_id)
+        if self._consume_release_for_rebound_control(translated, binding_id):
+            logger.info(
+                "Ignoring release for rebound control config=%s control=%s capability=%s",
+                self.config_id,
+                control_id,
+                translated.capability_id,
+            )
+            return
         lease = self._binding_leases.get(binding_id) if binding_id is not None else None
         if lease is None:
             logger.info(
@@ -1969,6 +1980,7 @@ class DeviceManager:
             )
             return
 
+        self._record_held_input_binding(translated, binding_id)
         try:
             await lease.context.on_input(translated.action_event)
         except Exception as e:
@@ -1978,3 +1990,21 @@ class DeviceManager:
                 e,
                 exc_info=True,
             )
+
+    def _record_held_input_binding(self, translated, binding_id: str) -> None:
+        if translated.action_event.event_type != "down":
+            return
+        self._held_input_bindings[
+            (translated.control_id, translated.capability_id)
+        ] = binding_id
+
+    def _consume_release_for_rebound_control(
+        self,
+        translated,
+        binding_id: str | None,
+    ) -> bool:
+        if translated.action_event.event_type != "up":
+            return False
+        key = (translated.control_id, translated.capability_id)
+        down_binding_id = self._held_input_bindings.pop(key, None)
+        return down_binding_id is not None and down_binding_id != binding_id

@@ -9,9 +9,11 @@ import pytest_asyncio
 from conftest import LaneHarness
 from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import (
+    CAPABILITY_INPUT,
     SETTINGS_PATCH,
     SETTINGS_REQUEST,
     SETTINGS_SNAPSHOT,
+    CapabilityInputBody,
     DynamicPageCommand,
     PageChildBindingDescriptor,
     PageChildBindingTarget,
@@ -22,6 +24,7 @@ from deckr.actions.messages import (
     context_subject,
 )
 from deckr.contracts.messages import DeckrMessage, controller_address
+from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_INPUT_ENCODER,
@@ -274,6 +277,24 @@ def _hardware_ref(device: DeviceDescriptor) -> DeviceRef:
     )
 
 
+def _hardware_input(
+    control_id: str,
+    event_type: str,
+    *,
+    capability_id: str = "button.momentary",
+    sequence: int | None = None,
+) -> DeckrMessage:
+    return hw_messages.control_input_message(
+        manager_id="manager-main",
+        sender_session_id="manager-session",
+        device_id="test-device",
+        control_id=control_id,
+        capability_id=capability_id,
+        event_type=event_type,
+        sequence=sequence,
+    )
+
+
 class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
@@ -467,6 +488,26 @@ async def _assert_no_action_message(
     with anyio.move_on_after(timeout) as scope:
         await anext(stream)
     assert scope.cancel_called
+
+
+async def _drain_action_messages(
+    stream: AsyncIterator[DeckrMessage],
+    *,
+    timeout: float = 0.05,
+) -> None:
+    while True:
+        with anyio.move_on_after(timeout) as scope:
+            await anext(stream)
+        if scope.cancel_called:
+            return
+
+
+async def _next_capability_input(
+    stream: AsyncIterator[DeckrMessage],
+) -> CapabilityInputBody:
+    msg = await _next_action_message(stream)
+    assert msg.message_type == CAPABILITY_INPUT
+    return CapabilityInputBody.model_validate(msg.body)
 
 
 @pytest.mark.asyncio
@@ -892,6 +933,105 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
         )
 
         command_service.clear_raster.assert_not_awaited()
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_release_after_dynamic_page_rebind_is_consumed(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            await manager.set_page(profile="default", page=0)
+            await _drain_action_messages(stream)
+            owner_ctx = await manager.action_contexts.get("0,0")
+            assert owner_ctx is not None
+
+            await manager.on_event(_hardware_input("0,0", "down", sequence=1))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == owner_ctx.binding_id
+
+            await manager.open_page(
+                descriptor=_dynamic_page("dynamic-page", "0,0"),
+                context_id=owner_ctx.id,
+            )
+            child_ctx = await manager.action_contexts.get("0,0")
+            assert child_ctx is not None
+            assert child_ctx.binding_id != owner_ctx.binding_id
+            await _drain_action_messages(stream)
+
+            await manager.on_event(_hardware_input("0,0", "up", sequence=2))
+            await _assert_no_action_message(stream)
+
+            await manager.on_event(_hardware_input("0,0", "down", sequence=3))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == child_ctx.binding_id
+
+            await manager.on_event(_hardware_input("0,0", "up", sequence=4))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "up"
+            assert body.binding.binding_id == child_ctx.binding_id
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_release_on_same_binding_is_delivered(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            await manager.set_page(profile="default", page=0)
+            await _drain_action_messages(stream)
+            ctx = await manager.action_contexts.get("0,0")
+            assert ctx is not None
+
+            await manager.on_event(_hardware_input("0,0", "down", sequence=1))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == ctx.binding_id
+
+            await manager.on_event(_hardware_input("0,0", "up", sequence=2))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "up"
+            assert body.binding.binding_id == ctx.binding_id
         tg.cancel_scope.cancel()
 
 
