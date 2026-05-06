@@ -121,6 +121,10 @@ class ControllerService(BaseComponent):
         self._session_id = hardware_endpoint.session_id
         self._owned_claims: dict[str, OwnedDeviceClaim] = {}
         self._blocked_claim_revisions: dict[str, int] = {}
+        self._unmatched_inventory_signatures: dict[
+            str,
+            tuple[str, tuple[tuple[str, str], ...]],
+        ] = {}
         self._inventory_by_manager: dict[str, HardwareInventory] = {}
         self._manager_presence_sessions: dict[str, str] = {}
         self._hardware_reconcile_lock = anyio.Lock()
@@ -278,6 +282,8 @@ class ControllerService(BaseComponent):
         labels: Mapping[str, str],
     ) -> None:
         device = self._device_from_inventory(ref, item)
+        claim_key = device_claim_key(manager_id=ref.manager_id, device_id=ref.device_id)
+        unmatched_signature = _unmatched_inventory_signature(device, labels)
         try:
             config = await self._config_service.match_device(
                 fingerprint=device.fingerprint,
@@ -292,14 +298,20 @@ class ControllerService(BaseComponent):
             )
             return
         if config is None:
-            logger.info(
-                "No controller config matched hardware fingerprint=%s labels=%s manager=%s",
-                device.fingerprint,
-                dict(labels),
-                ref.manager_id,
-            )
+            if (
+                self._unmatched_inventory_signatures.get(claim_key)
+                != unmatched_signature
+            ):
+                logger.info(
+                    "No controller config matched hardware fingerprint=%s "
+                    "labels=%s manager=%s",
+                    device.fingerprint,
+                    dict(labels),
+                    ref.manager_id,
+                )
+                self._unmatched_inventory_signatures[claim_key] = unmatched_signature
             return
-        claim_key = device_claim_key(manager_id=ref.manager_id, device_id=ref.device_id)
+        self._unmatched_inventory_signatures.pop(claim_key, None)
         try:
             current_claim = await self._lease_state.get(claim_key)
         except StateUnavailable:
@@ -593,6 +605,7 @@ class ControllerService(BaseComponent):
         self,
         current_claims: Mapping[str, StateEntry],
     ) -> None:
+        available_claim_keys: set[str] = set()
         for inventory in self._inventory_by_manager.values():
             if not self._inventory_is_usable(inventory):
                 continue
@@ -600,20 +613,26 @@ class ControllerService(BaseComponent):
                 ref = item.device_ref
                 if ref.device_id != device_id:
                     continue
-                if self._device_registry.get_by_ref(ref) is not None:
-                    continue
                 claim_key = device_claim_key(
                     manager_id=ref.manager_id,
                     device_id=ref.device_id,
                 )
+                available_claim_keys.add(claim_key)
+                if self._device_registry.get_by_ref(ref) is not None:
+                    self._unmatched_inventory_signatures.pop(claim_key, None)
+                    continue
                 claim_entry = current_claims.get(claim_key)
                 if claim_entry is not None:
+                    self._unmatched_inventory_signatures.pop(claim_key, None)
                     claim = _valid_device_claim(claim_entry)
                     if claim is None or not self._claim_belongs_to_this_session(claim):
                         self._blocked_claim_revisions[claim_key] = claim_entry.revision
                     continue
                 self._blocked_claim_revisions.pop(claim_key, None)
                 await self._try_claim_inventory_device(ref, item, inventory.labels)
+        for claim_key in tuple(self._unmatched_inventory_signatures):
+            if claim_key not in available_claim_keys:
+                self._unmatched_inventory_signatures.pop(claim_key, None)
 
     def _inventory_is_usable(self, inventory: HardwareInventory) -> bool:
         return (
@@ -971,6 +990,13 @@ def _valid_device_claim(entry: StateEntry) -> DeviceClaim | None:
     except ValueError:
         logger.warning("Ignoring invalid device claim %s", entry.key)
         return None
+
+
+def _unmatched_inventory_signature(
+    device: DeviceDescriptor,
+    labels: Mapping[str, str],
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return device.fingerprint, tuple(sorted(labels.items()))
 
 
 def _hardware_inventory_ref_keys(

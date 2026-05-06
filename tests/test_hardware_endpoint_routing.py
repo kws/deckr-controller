@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from unittest.mock import ANY, AsyncMock
 
@@ -508,6 +509,112 @@ async def test_inventory_claim_requires_matching_manager_labels():
     claim = await bus.deckr.state().get(claim_key)
     assert claim is not None
     assert claim.value["claimedByEndpoint"] == "controller:controller-main"
+    controller.on_device_connected.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unmatched_inventory_device_logs_once_until_removed(caplog):
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
+        config_service=NullDeviceConfigService(),
+        settings_service=None,
+        controller_id="controller-main",
+    )
+    await _put_presence(bus, "mqtt-main", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "mqtt-main",
+        fingerprint="remote-0x0330",
+        labels={"mqtt-host": "openhabian"},
+        session_id="manager-session",
+    )
+
+    with caplog.at_level(logging.INFO, logger=controller_module.__name__):
+        await controller._reconcile_hardware_current_state(reason="test snapshot")
+        await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+        await _discovery_state(bus).put(
+            "inventory.hardware.mqtt-main",
+            HardwareInventory(
+                managerId="mqtt-main",
+                managerEndpoint=hardware_manager_address("mqtt-main"),
+                sessionId="manager-session",
+                timestamp=datetime.now(UTC),
+                labels={"mqtt-host": "openhabian"},
+                devices={},
+            ),
+        )
+        await controller._reconcile_hardware_current_state(reason="test snapshot")
+        await _put_inventory(
+            bus,
+            "mqtt-main",
+            fingerprint="remote-0x0330",
+            labels={"mqtt-host": "openhabian"},
+            session_id="manager-session",
+        )
+        await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+    unmatched_logs = [
+        record
+        for record in caplog.records
+        if record.message.startswith("No controller config matched hardware")
+    ]
+    assert len(unmatched_logs) == 2
+
+
+@pytest.mark.asyncio
+async def test_matched_inventory_device_clears_unmatched_log_suppression(caplog):
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    config = DeviceConfig(
+        id="remote-bedroom",
+        name="Bedroom remote",
+        match=DeviceConfigMatch(
+            fingerprint="remote-0x0330",
+            labels={"mqtt-host": "openhabian"},
+        ),
+        profiles=[Profile(name="default", pages=[])],
+    )
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
+        config_service=_MatchingConfigService(config),
+        settings_service=None,
+        controller_id="controller-main",
+    )
+    controller.on_device_connected = AsyncMock()
+    claim_key = device_claim_key(manager_id="mqtt-main", device_id="deck")
+    await _put_presence(bus, "mqtt-main", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "mqtt-main",
+        fingerprint="remote-0x0330",
+        labels={"mqtt-host": "other"},
+        session_id="manager-session",
+    )
+
+    with caplog.at_level(logging.INFO, logger=controller_module.__name__):
+        await controller._reconcile_hardware_current_state(reason="test snapshot")
+        await _put_inventory(
+            bus,
+            "mqtt-main",
+            fingerprint="remote-0x0330",
+            labels={"mqtt-host": "openhabian"},
+            session_id="manager-session",
+        )
+        await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+    unmatched_logs = [
+        record
+        for record in caplog.records
+        if record.message.startswith("No controller config matched hardware")
+    ]
+    assert len(unmatched_logs) == 1
+    assert claim_key not in controller._unmatched_inventory_signatures
+    assert await bus.deckr.state().get(claim_key) is not None
     controller.on_device_connected.assert_awaited_once()
 
 
