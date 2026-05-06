@@ -21,6 +21,13 @@ CONFIG_RESULT_SCHEMA = "dev.deckr.controller.config.result.v1"
 CONFIG_WATCH_RETRY_SECONDS = 1.0
 
 
+def _labels_match(
+    actual: Mapping[str, str],
+    required: Mapping[str, str],
+) -> bool:
+    return all(actual.get(key) == value for key, value in required.items())
+
+
 def materialized_config_key(controller_id: str) -> str:
     return ".".join(
         (
@@ -181,7 +188,7 @@ class MaterializedDeviceConfigService(BaseComponent):
         self,
         *,
         fingerprint: str,
-        manager_id: str,
+        labels: Mapping[str, str],
     ) -> DeviceConfig | None:
         async with self._lock:
             candidates = [
@@ -189,25 +196,25 @@ class MaterializedDeviceConfigService(BaseComponent):
                 for config in self._config_by_id.values()
                 if config.enabled
                 and config.match.fingerprint == fingerprint
-                and config.match.manager_id in {None, manager_id}
+                and _labels_match(labels, config.match.labels)
             ]
         if not candidates:
             return None
         candidates.sort(
-            key=lambda config: config.match.manager_id is not None,
+            key=lambda config: len(config.match.labels),
             reverse=True,
         )
-        best_specificity = candidates[0].match.manager_id is not None
+        best_specificity = len(candidates[0].match.labels)
         best = [
             config
             for config in candidates
-            if (config.match.manager_id is not None) == best_specificity
+            if len(config.match.labels) == best_specificity
         ]
         if len(best) > 1:
             ids = ", ".join(sorted(config.id for config in best))
             raise ValueError(
                 f"Ambiguous device config match for fingerprint {fingerprint!r} "
-                f"manager {manager_id!r}: {ids}"
+                f"labels {dict(labels)!r}: {ids}"
             )
         return best[0]
 

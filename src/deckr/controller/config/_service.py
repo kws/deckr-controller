@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Protocol
 
@@ -49,6 +49,13 @@ def _load_config_file(path: Path) -> DeviceConfig | None:
         return None
 
 
+def _labels_match(
+    actual: Mapping[str, str],
+    required: Mapping[str, str],
+) -> bool:
+    return all(actual.get(key) == value for key, value in required.items())
+
+
 class DeviceConfigService(Protocol):
     """Configuration service: subscribe to receive config and change notifications."""
 
@@ -56,7 +63,7 @@ class DeviceConfigService(Protocol):
         self,
         *,
         fingerprint: str,
-        manager_id: str,
+        labels: Mapping[str, str],
     ) -> DeviceConfig | None:
         """Return the best controller config for a live hardware device."""
         ...
@@ -118,7 +125,7 @@ class FileBackedDeviceConfigService(BaseComponent):
         self,
         *,
         fingerprint: str,
-        manager_id: str,
+        labels: Mapping[str, str],
     ) -> DeviceConfig | None:
         await self._scan_configs()
         async with self._lock:
@@ -127,25 +134,25 @@ class FileBackedDeviceConfigService(BaseComponent):
                 for config in self._config_by_id.values()
                 if config.enabled
                 and config.match.fingerprint == fingerprint
-                and config.match.manager_id in {None, manager_id}
+                and _labels_match(labels, config.match.labels)
             ]
         if not candidates:
             return None
         candidates.sort(
-            key=lambda config: config.match.manager_id is not None,
+            key=lambda config: len(config.match.labels),
             reverse=True,
         )
-        best_specificity = candidates[0].match.manager_id is not None
+        best_specificity = len(candidates[0].match.labels)
         best = [
             config
             for config in candidates
-            if (config.match.manager_id is not None) == best_specificity
+            if len(config.match.labels) == best_specificity
         ]
         if len(best) > 1:
             ids = ", ".join(sorted(config.id for config in best))
             raise ValueError(
                 f"Ambiguous device config match for fingerprint {fingerprint!r} "
-                f"manager {manager_id!r}: {ids}"
+                f"labels {dict(labels)!r}: {ids}"
             )
         return best[0]
 
@@ -347,9 +354,9 @@ class NullDeviceConfigService(BaseComponent):
         self,
         *,
         fingerprint: str,
-        manager_id: str,
+        labels: Mapping[str, str],
     ) -> DeviceConfig | None:
-        del fingerprint, manager_id
+        del fingerprint, labels
         return None
 
     async def get_config(self, config_id: str) -> DeviceConfig | None:

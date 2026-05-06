@@ -275,24 +275,27 @@ class ControllerService(BaseComponent):
         self,
         ref: DeviceRef,
         item,
+        labels: Mapping[str, str],
     ) -> None:
         device = self._device_from_inventory(ref, item)
         try:
             config = await self._config_service.match_device(
                 fingerprint=device.fingerprint,
-                manager_id=ref.manager_id,
+                labels=labels,
             )
         except ValueError:
             logger.exception(
-                "Ambiguous config for hardware fingerprint=%s manager=%s",
+                "Ambiguous config for hardware fingerprint=%s labels=%s manager=%s",
                 device.fingerprint,
+                dict(labels),
                 ref.manager_id,
             )
             return
         if config is None:
             logger.info(
-                "No controller config matched hardware fingerprint=%s manager=%s",
+                "No controller config matched hardware fingerprint=%s labels=%s manager=%s",
                 device.fingerprint,
+                dict(labels),
                 ref.manager_id,
             )
             return
@@ -610,7 +613,7 @@ class ControllerService(BaseComponent):
                         self._blocked_claim_revisions[claim_key] = claim_entry.revision
                     continue
                 self._blocked_claim_revisions.pop(claim_key, None)
-                await self._try_claim_inventory_device(ref, item)
+                await self._try_claim_inventory_device(ref, item, inventory.labels)
 
     def _inventory_is_usable(self, inventory: HardwareInventory) -> bool:
         return (

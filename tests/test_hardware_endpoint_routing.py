@@ -356,7 +356,7 @@ async def test_device_lifecycle_renders_once_before_listening_for_config_changes
     config = DeviceConfig(
         id="config-room-a",
         name="Room A",
-        match=DeviceConfigMatch(fingerprint="serial-a", manager_id="room-a"),
+        match=DeviceConfigMatch(fingerprint="serial-a"),
         profiles=[Profile(name="default", pages=[])],
     )
     controller = ControllerService(
@@ -418,7 +418,7 @@ async def test_claim_loss_retries_cached_matching_inventory():
     config = DeviceConfig(
         id="config-room-a",
         name="Room A",
-        match=DeviceConfigMatch(fingerprint="serial-a", manager_id="room-a"),
+        match=DeviceConfigMatch(fingerprint="serial-a"),
         profiles=[Profile(name="default", pages=[])],
     )
     controller = ControllerService(
@@ -461,12 +461,63 @@ async def test_claim_loss_retries_cached_matching_inventory():
 
 
 @pytest.mark.asyncio
+async def test_inventory_claim_requires_matching_manager_labels():
+    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    config = DeviceConfig(
+        id="remote-bedroom",
+        name="Bedroom remote",
+        match=DeviceConfigMatch(
+            fingerprint="remote-0x0330",
+            labels={"mqtt-host": "openhabian"},
+        ),
+        profiles=[Profile(name="default", pages=[])],
+    )
+    controller = ControllerService(
+        hardware_endpoint=bus.endpoint("controller:controller-main"),
+        lease_state=_lease_state(bus),
+        discovery_state=_discovery_state(bus),
+        config_service=_MatchingConfigService(config),
+        settings_service=None,
+        controller_id="controller-main",
+    )
+    controller.on_device_connected = AsyncMock()
+    claim_key = device_claim_key(manager_id="mqtt-main", device_id="deck")
+    await _put_presence(bus, "mqtt-main", session_id="manager-session")
+    await _put_inventory(
+        bus,
+        "mqtt-main",
+        fingerprint="remote-0x0330",
+        labels={"mqtt-host": "other"},
+        session_id="manager-session",
+    )
+
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+    assert await bus.deckr.state().get(claim_key) is None
+    controller.on_device_connected.assert_not_awaited()
+
+    await _put_inventory(
+        bus,
+        "mqtt-main",
+        fingerprint="remote-0x0330",
+        labels={"mqtt-host": "openhabian"},
+        session_id="manager-session",
+    )
+    await controller._reconcile_hardware_current_state(reason="test snapshot")
+
+    claim = await bus.deckr.state().get(claim_key)
+    assert claim is not None
+    assert claim.value["claimedByEndpoint"] == "controller:controller-main"
+    controller.on_device_connected.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_same_endpoint_old_session_claim_blocks_until_claim_loss():
     bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
     config = DeviceConfig(
         id="config-room-a",
         name="Room A",
-        match=DeviceConfigMatch(fingerprint="serial-a", manager_id="room-a"),
+        match=DeviceConfigMatch(fingerprint="serial-a"),
         profiles=[Profile(name="default", pages=[])],
     )
     controller = ControllerService(
@@ -865,6 +916,7 @@ async def _put_inventory(
     manager_id: str,
     *,
     fingerprint: str,
+    labels: dict[str, str] | None = None,
     session_id: str | None = None,
 ) -> None:
     await _discovery_state(bus).put(
@@ -874,6 +926,7 @@ async def _put_inventory(
             managerEndpoint=hardware_manager_address(manager_id),
             sessionId=session_id or f"session-{manager_id}",
             timestamp=datetime.now(UTC),
+            labels=labels or {},
             devices={
                 "deck": HardwareInventoryDevice(
                     deviceRef=DeviceRef(
@@ -909,10 +962,13 @@ class _MatchingConfigService:
     def __init__(self, config: DeviceConfig) -> None:
         self.config = config
 
-    async def match_device(self, *, fingerprint: str, manager_id: str):
+    async def match_device(self, *, fingerprint: str, labels):
         if (
             fingerprint == self.config.match.fingerprint
-            and manager_id == self.config.match.manager_id
+            and all(
+                labels.get(key) == value
+                for key, value in self.config.match.labels.items()
+            )
         ):
             return self.config
         return None

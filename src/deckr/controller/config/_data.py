@@ -140,7 +140,7 @@ class Profile(_ConfigModel):
 
 class DeviceConfigMatch(_ConfigModel):
     fingerprint: str
-    manager_id: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
 
 
 class DeviceConfig(_ConfigModel):

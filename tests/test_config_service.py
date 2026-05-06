@@ -20,7 +20,7 @@ def _make_config(
     name: str = "Test",
     *,
     fingerprint: str | None = None,
-    manager_id: str | None = None,
+    labels: dict[str, str] | None = None,
     enabled: bool = True,
 ) -> DeviceConfig:
     return DeviceConfig(
@@ -28,7 +28,7 @@ def _make_config(
         name=name,
         match={
             "fingerprint": fingerprint or f"fingerprint-{config_id}",
-            "manager_id": manager_id,
+            "labels": labels or {},
         },
         enabled=enabled,
         profiles=[
@@ -201,19 +201,19 @@ def test_navigation_service_update_config():
 
 
 @pytest.mark.asyncio
-async def test_match_device_prefers_manager_specific_config(config_service, tmp_path):
+async def test_match_device_prefers_label_specific_config(config_service, tmp_path):
     generic = _make_config("generic", fingerprint="serial-a")
     specific = _make_config(
         "specific",
         fingerprint="serial-a",
-        manager_id="room-a",
+        labels={"location": "room-a"},
     )
     (tmp_path / "generic.yml").write_text(_config_to_yaml(generic))
     (tmp_path / "specific.yml").write_text(_config_to_yaml(specific))
 
     match = await config_service.match_device(
         fingerprint="serial-a",
-        manager_id="room-a",
+        labels={"location": "room-a"},
     )
 
     assert match is not None
@@ -221,7 +221,7 @@ async def test_match_device_prefers_manager_specific_config(config_service, tmp_
 
 
 @pytest.mark.asyncio
-async def test_match_device_uses_fingerprint_only_config_for_other_manager(
+async def test_match_device_uses_fingerprint_only_config_for_other_labels(
     config_service,
     tmp_path,
 ):
@@ -229,18 +229,42 @@ async def test_match_device_uses_fingerprint_only_config_for_other_manager(
     specific = _make_config(
         "specific",
         fingerprint="serial-a",
-        manager_id="room-a",
+        labels={"location": "room-a"},
     )
     (tmp_path / "generic.yml").write_text(_config_to_yaml(generic))
     (tmp_path / "specific.yml").write_text(_config_to_yaml(specific))
 
     match = await config_service.match_device(
         fingerprint="serial-a",
-        manager_id="room-b",
+        labels={"location": "room-b"},
     )
 
     assert match is not None
     assert match.id == "generic"
+
+
+@pytest.mark.asyncio
+async def test_match_device_prefers_more_label_requirements(config_service, tmp_path):
+    location = _make_config(
+        "location",
+        fingerprint="serial-a",
+        labels={"location": "bedroom"},
+    )
+    host = _make_config(
+        "host",
+        fingerprint="serial-a",
+        labels={"location": "bedroom", "mqtt-host": "openhabian"},
+    )
+    (tmp_path / "location.yml").write_text(_config_to_yaml(location))
+    (tmp_path / "host.yml").write_text(_config_to_yaml(host))
+
+    match = await config_service.match_device(
+        fingerprint="serial-a",
+        labels={"location": "bedroom", "mqtt-host": "openhabian"},
+    )
+
+    assert match is not None
+    assert match.id == "host"
 
 
 @pytest.mark.asyncio
@@ -256,7 +280,7 @@ async def test_match_device_rejects_ambiguous_same_specificity(
     with pytest.raises(ValueError, match="Ambiguous device config match"):
         await config_service.match_device(
             fingerprint="serial-a",
-            manager_id="room-a",
+            labels={"location": "room-a"},
         )
 
 
@@ -265,7 +289,7 @@ async def test_match_device_ignores_disabled_configs(config_service, tmp_path):
     disabled = _make_config(
         "disabled",
         fingerprint="serial-a",
-        manager_id="room-a",
+        labels={"location": "room-a"},
         enabled=False,
     )
     generic = _make_config("generic", fingerprint="serial-a")
@@ -274,7 +298,7 @@ async def test_match_device_ignores_disabled_configs(config_service, tmp_path):
 
     match = await config_service.match_device(
         fingerprint="serial-a",
-        manager_id="room-a",
+        labels={"location": "room-a"},
     )
 
     assert match is not None

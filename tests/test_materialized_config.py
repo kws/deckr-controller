@@ -40,12 +40,12 @@ def _config(
     *,
     name: str = "Desk",
     fingerprint: str = "fingerprint:desk",
-    manager_id: str | None = None,
+    labels: dict[str, str] | None = None,
 ) -> DeviceConfig:
     return DeviceConfig(
         id=config_id,
         name=name,
-        match=DeviceConfigMatch(fingerprint=fingerprint, manager_id=manager_id),
+        match=DeviceConfigMatch(fingerprint=fingerprint, labels=labels or {}),
         profiles=[
             Profile(
                 name="default",
@@ -111,7 +111,7 @@ async def test_materialized_service_activates_valid_projection() -> None:
             assert config.name == "Desk"
             match = await service.match_device(
                 fingerprint="fingerprint:desk",
-                manager_id="manager-a",
+                labels={"location": "desk"},
             )
             assert match is not None
             assert match.id == "config-1"

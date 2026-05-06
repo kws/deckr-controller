@@ -397,9 +397,9 @@ class MemoryConfigService:
         self,
         *,
         fingerprint: str,
-        manager_id: str,
+        labels,
     ) -> DeviceConfig | None:
-        del manager_id
+        del labels
         return self.config if self.config.match.fingerprint == fingerprint else None
 
     async def get_config(self, config_id: str) -> DeviceConfig | None:
