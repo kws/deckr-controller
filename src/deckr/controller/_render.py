@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from invariant import (
     Node,
     SubGraphNode,
-    dump_graph_output_to_dict,
-    load_graph_output_data_uri,
-    load_graph_output_from_dict,
+    dump_graph_to_dict,
+    load_graph_data_uri,
+    load_graph_document_from_dict,
     ref,
 )
 
@@ -57,6 +57,7 @@ class RenderRequest:
     generation: int
     image_format: RenderImageFormat
     graph: dict[str, Any]
+    context: dict[str, Any] = field(default_factory=dict)
     binding_id: str | None = None
     delay_ms: int = 0
 
@@ -71,6 +72,19 @@ class RenderResult:
     frame: bytes | None
     binding_id: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _GraphDocument:
+    graph: dict[str, Any]
+    output: str
+    context: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderNode:
+    node: SubGraphNode
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 def _content_to_model(content: RenderContent) -> RenderModel:
@@ -97,30 +111,70 @@ def resolve(
     return model
 
 
-def _node_to_wire(node: Node | SubGraphNode) -> dict[str, Any]:
-    """Serialize a render node to the invariant graph wire format."""
+def _require_output(output: str | None) -> str:
+    if output is None:
+        raise ValueError("Invariant graph render documents must declare an output")
+    return output
+
+
+def _node_to_document(node: Node | SubGraphNode) -> _GraphDocument:
+    """Convert a render node to a graph document."""
 
     if isinstance(node, SubGraphNode):
-        return dump_graph_output_to_dict(node.graph, node.output)
-    return dump_graph_output_to_dict({"output": node}, "output")
+        return _GraphDocument(node.graph, node.output)
+    return _GraphDocument({"output": node}, "output")
 
 
-def _graph_output_to_node(graph_dict: dict[str, Any], output: str) -> SubGraphNode:
-    """Build a canvas-aware SubGraphNode from graph/output parts."""
+def _document_to_wire(document: _GraphDocument) -> dict[str, Any]:
+    """Serialize a render graph document to the invariant graph wire format."""
 
-    return SubGraphNode(
-        params={"canvas": ref("canvas")},
-        deps=["canvas"],
-        graph=graph_dict,
-        output=output,
+    return dump_graph_to_dict(document.graph, output=document.output)
+
+
+def _bind_document_context(
+    context: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    """Bind graph execution context through refs so values stay literal."""
+
+    params: dict[str, Any] = {"canvas": ref("canvas")}
+    deps = ["canvas"]
+    bound_context: dict[str, Any] = {}
+    for index, key in enumerate(sorted(context)):
+        if not isinstance(key, str) or not key:
+            raise ValueError("Invariant graph render context keys must be non-empty strings")
+        if key == "canvas":
+            raise ValueError("Invariant graph render context must not include 'canvas'")
+        dep = f"__deckr_graph_context_{index}"
+        params[key] = ref(dep)
+        deps.append(dep)
+        bound_context[dep] = context[key]
+    return params, deps, bound_context
+
+
+def _graph_document_to_node(
+    graph_dict: dict[str, Any],
+    output: str | None,
+    context: dict[str, Any] | None = None,
+) -> _RenderNode:
+    """Build a canvas-aware SubGraphNode from a graph document."""
+
+    params, deps, bound_context = _bind_document_context(context or {})
+    return _RenderNode(
+        node=SubGraphNode(
+            params=params,
+            deps=deps,
+            graph=graph_dict,
+            output=_require_output(output),
+        ),
+        context=bound_context,
     )
 
 
-def _wire_to_node(wire: dict[str, Any]) -> SubGraphNode:
+def _wire_to_node(wire: dict[str, Any], context: dict[str, Any]) -> _RenderNode:
     """Rehydrate a wire-serialized graph into a canvas-aware SubGraphNode."""
 
-    graph_dict, output = load_graph_output_from_dict(wire)
-    return _graph_output_to_node(graph_dict, output)
+    graph_dict, output = load_graph_document_from_dict(wire)
+    return _graph_document_to_node(graph_dict, output, context)
 
 
 def _to_render_image_format(image_format: RasterImageFormat) -> RenderImageFormat:
@@ -139,32 +193,45 @@ def _to_hw_image_format(image_format: RenderImageFormat) -> RasterImageFormat:
     )
 
 
-def _model_to_graph(
+def _model_to_graph_document(
     model: RenderModel, image_format: RasterImageFormat
-) -> Node | SubGraphNode | None:
+) -> _GraphDocument | None:
     """Resolve a RenderModel to the graph that should be executed."""
 
     del image_format
     if model.overlay_type == "blank":
-        return solid_card()
+        return _node_to_document(solid_card())
     if model.overlay_type is not None:
-        base = _base_model_to_graph(model)
-        return feedback_overlay(
+        base_document = _base_model_to_graph_document(model)
+        base_node = None
+        context: dict[str, Any] = {}
+        if base_document is not None:
+            bound_base = _graph_document_to_node(
+                base_document.graph,
+                base_document.output,
+                base_document.context,
+            )
+            base_node = bound_base.node
+            context = bound_base.context
+        overlay = feedback_overlay(
             model.overlay_type,
             title=model.overlay_title,
-            base=base,
+            base=base_node,
         )
-    return _base_model_to_graph(model)
+        document = _node_to_document(overlay)
+        return _GraphDocument(document.graph, document.output, context)
+    return _base_model_to_graph_document(model)
 
 
-def _base_model_to_graph(model: RenderModel) -> Node | SubGraphNode | None:
+def _base_model_to_graph_document(model: RenderModel) -> _GraphDocument | None:
     if model.image is not None:
-        parsed = load_graph_output_data_uri(model.image)
+        parsed = load_graph_data_uri(model.image)
         if parsed is not None:
-            return _graph_output_to_node(*parsed)
-        return image_card(model.image)
+            graph_dict, output, context = parsed
+            return _GraphDocument(graph_dict, _require_output(output), context)
+        return _node_to_document(image_card(model.image))
     if model.title is not None:
-        return title_card(model.title)
+        return _node_to_document(title_card(model.title))
     return None
 
 
@@ -179,8 +246,8 @@ def build_render_request(
 ) -> RenderRequest | None:
     """Convert a RenderModel to a serialized render request."""
 
-    graph = _model_to_graph(model, image_format)
-    if graph is None:
+    document = _model_to_graph_document(model, image_format)
+    if document is None:
         return None
 
     return RenderRequest(
@@ -189,16 +256,17 @@ def build_render_request(
         control_id=control_id,
         generation=generation,
         image_format=_to_render_image_format(image_format),
-        graph=_node_to_wire(graph),
+        graph=_document_to_wire(document),
+        context=document.context,
     )
 
 
 def _graph_to_jpeg_bytes(
-    node: Node | SubGraphNode, image_format: RasterImageFormat
+    render_node: _RenderNode, image_format: RasterImageFormat
 ) -> bytes:
     """Run invariant-gfx graph with canvas context; apply rotation; return JPEG bytes."""
 
-    graph = {"src": node}
+    graph = {"src": render_node.node}
     img_name = "src"
     if image_format.rotation != 0:
         graph["rotated"] = Node(
@@ -215,7 +283,9 @@ def _graph_to_jpeg_bytes(
     )
 
     canvas = {"width": image_format.width, "height": image_format.height}
-    results = get_executor().execute(graph, context={"canvas": canvas})
+    context = dict(render_node.context)
+    context["canvas"] = canvas
+    results = get_executor().execute(graph, ["output"], context=context)
     artifact = results["output"]
     return artifact.data
 
@@ -225,7 +295,7 @@ def render_request_to_jpeg(request: RenderRequest) -> bytes:
 
     if request.delay_ms > 0:
         time.sleep(request.delay_ms / 1000)
-    node = _wire_to_node(request.graph)
+    node = _wire_to_node(request.graph, request.context)
     image_format = _to_hw_image_format(request.image_format)
     return _graph_to_jpeg_bytes(node, image_format)
 

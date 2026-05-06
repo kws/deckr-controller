@@ -33,7 +33,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from invariant import Node, SubGraphNode, dump_graph_output_data_uri
+from invariant import Node, SubGraphNode, dump_graph_data_uri
 from invariant.params import ref
 
 from deckr.controller._device_manager import DeviceManager
@@ -301,7 +301,7 @@ def _solid_key_graph() -> SubGraphNode:
 
 def _solid_key_image() -> str:
     graph = _solid_key_graph()
-    return dump_graph_output_data_uri(graph.graph, graph.output)
+    return dump_graph_data_uri(graph.graph, output=graph.output)
 
 
 def _dynamic_page(page_id: str, *control_ids: str) -> DynamicPageCommand:
