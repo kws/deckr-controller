@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
-from invariant import Node, SubGraphNode, dump_graph_output_data_uri
+from invariant import Node, SubGraphNode, dump_graph_data_uri, dump_graph_to_dict
 from invariant.params import ref
 from invariant.store.disk import DiskStore
 from invariant_gfx.artifacts import BlobArtifact
@@ -79,12 +79,19 @@ class ControlledBackend:
 
 
 def _solid_request() -> RenderRequest:
+    graph = {
+        "output": Node(
+            op_name="stdlib:identity",
+            params={"value": None},
+            deps=[],
+        )
+    }
     return RenderRequest(
         context_id="ctx",
         control_id="0,0",
         generation=0,
         image_format=RenderImageFormat(width=72, height=72),
-        graph={"graph": {}, "output": "output"},
+        graph=dump_graph_to_dict(graph, output="output"),
     )
 
 
@@ -109,7 +116,25 @@ def _custom_graph() -> SubGraphNode:
 
 def _graph_data_uri() -> str:
     graph = _custom_graph()
-    return dump_graph_output_data_uri(graph.graph, graph.output)
+    return dump_graph_data_uri(graph.graph, output=graph.output)
+
+
+def _graph_data_uri_with_query_context() -> str:
+    graph = {
+        "bg": Node(
+            op_name="gfx:create_solid",
+            params={
+                "size": ["${canvas.width}", "${canvas.height}"],
+                "color": ref("color"),
+            },
+            deps=["canvas", "color"],
+        )
+    }
+    return dump_graph_data_uri(
+        graph,
+        output="bg",
+        context={"color": (32, 64, 96, 255)},
+    )
 
 
 @pytest.mark.asyncio
@@ -256,8 +281,17 @@ async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
         (RenderModel(title="Album", overlay_type="ok"), "ok-overlay"),
         (RenderModel(overlay_type="blank"), "blank"),
         (RenderModel(image=_graph_data_uri()), "graph"),
+        (RenderModel(image=_graph_data_uri_with_query_context()), "graph-context"),
     ],
-    ids=["title", "image", "unavailable", "ok-overlay", "blank", "graph"],
+    ids=[
+        "title",
+        "image",
+        "unavailable",
+        "ok-overlay",
+        "blank",
+        "graph",
+        "graph-context",
+    ],
 )
 def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
     fmt = RasterImageFormat(width=72, height=72)
