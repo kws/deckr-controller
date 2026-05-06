@@ -92,7 +92,7 @@ class ControllerRuntimeService(BaseComponent):
             )
             self._actions_endpoint = await self._actions_endpoint_cm.__aenter__()
 
-            ctx.tg.start_soon(self._component_manager.run)
+            await ctx.tg.start(self._component_manager.run)
             manager_started = True
 
             config_service = build_config_service(
@@ -142,8 +142,9 @@ class ControllerRuntimeService(BaseComponent):
             raise
 
     async def stop(self) -> None:
-        await self._component_manager.stop()
-        await self._close_endpoint_contexts()
+        with anyio.CancelScope(shield=True):
+            await self._component_manager.stop()
+            await self._close_endpoint_contexts()
 
     async def _close_endpoint_contexts(self) -> None:
         actions_cm = self._actions_endpoint_cm
