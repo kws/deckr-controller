@@ -278,7 +278,7 @@ def _graph_to_jpeg_bytes(
 
     graph["output"] = Node(
         op_name="deckr:encode_jpeg",
-        params={"image": ref(img_name), "quality": 100},
+        params={"image": ref(img_name), "quality": 50},
         deps=[img_name],
     )
 
