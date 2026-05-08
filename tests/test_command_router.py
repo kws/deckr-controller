@@ -227,6 +227,41 @@ async def test_binding_overlay_unknown_template_uses_unknown_fallback():
 
 
 @pytest.mark.asyncio
+async def test_pending_overlay_is_persistent_until_replaced_or_cleared():
+    store = ControlStateStore(context_id="dev.slot0")
+    render_service = MagicMock(spec=RenderService)
+    render_service.build_request = MagicMock(return_value=object())
+    render_dispatcher = MagicMock(spec=RenderDispatcher)
+    render_dispatcher.submit_request = AsyncMock()
+    started = []
+
+    router = CommandRouter(
+        store=store,
+        render_service=render_service,
+        render_dispatcher=render_dispatcher,
+        output=_make_output(),
+        image_format=RasterImageFormat(width=72, height=72),
+        start_soon=lambda func, *args: started.append((func, args)),
+    )
+
+    ok = await router.show_overlay(
+        template="pending",
+        title=None,
+        params={},
+        duration_seconds=None,
+        overlay_id="playback",
+        generation=1,
+        binding_output_generation=0,
+    )
+
+    assert ok is True
+    assert store.overlay is not None
+    assert store.overlay.template == "pending"
+    assert store.overlay.overlay_id == "playback"
+    assert started == []
+
+
+@pytest.mark.asyncio
 async def test_binding_overlay_stale_generations_do_not_render(router_with_mocks):
     router = router_with_mocks
     await router.set_raster_image("https://example.invalid/base.jpg", generation=5)

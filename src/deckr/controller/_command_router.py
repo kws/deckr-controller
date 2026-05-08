@@ -31,6 +31,7 @@ OVERLAY_TEMPLATES = frozenset(
         "ok",
         "error",
         "unavailable",
+        "pending",
         "loading",
         "unknown",
     }

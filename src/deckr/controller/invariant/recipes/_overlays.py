@@ -18,6 +18,7 @@ _OVERLAY_ICON: dict[str, str] = {
     "ok": "lucide:check",
     "error": "lucide:triangle-alert",
     "unavailable": "lucide:circle-alert",
+    "pending": "lucide:loader-circle",
     "loading": "lucide:ellipsis",
     "unknown": "lucide:message-circle-question-mark",
 }
@@ -26,6 +27,7 @@ _OVERLAY_COLOR: dict[str, tuple[int, int, int, int]] = {
     "ok": COLOR_GREEN,
     "error": COLOR_RED,
     "unavailable": COLOR_SLATE,
+    "pending": COLOR_BLUE,
     "loading": COLOR_BLUE,
     "unknown": COLOR_AMBER,
 }
@@ -34,6 +36,7 @@ _OVERLAY_TITLE: dict[str, str] = {
     "ok": "OK",
     "error": "Error",
     "unavailable": "Unavailable",
+    "pending": "Pending",
     "loading": "Loading",
     "unknown": "Unknown",
 }
