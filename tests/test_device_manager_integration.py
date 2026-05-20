@@ -1028,6 +1028,48 @@ async def test_action_binding_revokes_when_provider_beacon_session_changes(
 
 
 @pytest.mark.asyncio
+async def test_action_binding_revokes_when_provider_beacon_disappears(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            binding_concord=concord,
+            hardware_claim_id="hardware-claim-1",
+        )
+        await manager.set_page(profile="default", page=0)
+        lease = next(iter(manager._binding_leases.values()))
+        await concord.attach(lease.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await manager._reconcile_binding_contracts()
+        assert await manager.action_contexts.get("0,0") is not None
+
+        registry.provider_session_id.return_value = None
+        await manager._reconcile_binding_contracts()
+
+        assert await manager.action_contexts.get("0,0") is None
+        assert manager._binding_leases == {}
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_dynamic_page_replace_preserves_rebound_control_outputs(
     device_config_set_raster_image, persistence_tmp_dir
 ):

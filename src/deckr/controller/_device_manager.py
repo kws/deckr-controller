@@ -566,6 +566,8 @@ class DeviceManager:
         current_provider_session = self.manager.provider_session_id(
             lease.provider_instance_id
         )
+        if current_provider_session is None:
+            return False
         if not isinstance(current_provider_session, str):
             current_provider_session = lease.provider_session_id
         if (
@@ -1712,6 +1714,13 @@ class DeviceManager:
             current_provider_session = self.manager.provider_session_id(
                 sender_provider_instance_id
             )
+            if current_provider_session is None:
+                logger.warning(
+                    "Ignoring action command %s from provider without live Beacon session %s",
+                    msg.message_type,
+                    sender_provider_instance_id,
+                )
+                return None
             if not isinstance(current_provider_session, str):
                 current_provider_session = lease.provider_session_id
             if current_provider_session is None:
@@ -1788,6 +1797,13 @@ class DeviceManager:
             current_provider_session = self.manager.provider_session_id(
                 sender_provider_instance_id
             )
+            if current_provider_session is None:
+                logger.warning(
+                    "Ignoring page action command %s from provider without live Beacon session %s",
+                    msg.message_type,
+                    sender_provider_instance_id,
+                )
+                return None
             if not isinstance(current_provider_session, str):
                 current_provider_session = session.owner_provider_session_id
             if current_provider_session is None:
