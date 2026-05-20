@@ -1,6 +1,6 @@
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +54,13 @@ from deckr.actions.messages import (
     subject_page_session_id,
     subject_provider_instance_id,
 )
+from deckr.concord import (
+    ConcordCoordinator,
+    ContractHandle,
+    ContractPointer,
+    ContractValidityStatus,
+    ParticipantHandle,
+)
 from deckr.contracts.messages import (
     DeckrMessage,
     controller_address,
@@ -72,6 +79,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
+from deckr.profiles import ACTION_BINDING_PROFILE_ID, ActionBindingTerms
 from pydantic import ValidationError
 
 from deckr.controller._binding_resolution import ResolvedControlBinding
@@ -102,7 +110,10 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.action_provider.context import ControlContext
-from deckr.controller.action_provider.provider import ActionProviderManager
+from deckr.controller.action_provider.provider import (
+    ActionMetadata,
+    ActionProviderManager,
+)
 from deckr.controller.config._data import DeviceConfig, Profile
 from deckr.controller.settings import (
     SettingsService,
@@ -112,6 +123,8 @@ from deckr.controller.settings import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_WIDGET_TIMEOUT_MS = 60_000
+BINDING_CONTRACT_RECONCILE_SECONDS = 1.0
+BINDING_CONTRACT_HEARTBEAT_SECONDS = 5.0
 _SETTINGS_COMMAND_TYPES = frozenset(
     {
         SETTINGS_REQUEST,
@@ -201,6 +214,10 @@ class BindingLease:
     provider_instance_id: str
     provider_id: str
     provider_session_id: str | None
+    binding_contract: ContractPointer
+    contract: ContractHandle | None
+    controller_token: ParticipantHandle | None
+    attached: bool
     control_id: str
     control: ControlSurface
     input_capability_ids: frozenset[str]
@@ -245,6 +262,9 @@ class DeviceManager:
         render_backend: RenderBackend | None = None,
         settings_service: SettingsService | None = None,
         config_stream: AsyncIterator[DeviceConfig | None] | None = None,
+        on_config_removed: Callable[[str], Awaitable[None]] | None = None,
+        binding_concord: ConcordCoordinator | None = None,
+        hardware_claim_id: str = "controller-local-test-claim",
         clock: Callable[[], float] | None = None,
         page_timeout_check_interval: float = 0.25,
     ):
@@ -267,6 +287,9 @@ class DeviceManager:
             start_soon=start_soon,
         )
         self._settings_service = settings_service
+        self._on_config_removed = on_config_removed
+        self._binding_concord = binding_concord
+        self._hardware_claim_id = hardware_claim_id
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
         self._nav = NavigationService(config)
@@ -281,6 +304,9 @@ class DeviceManager:
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
         self._start_soon(self._page_timeout_loop)
+        if self._binding_concord is not None:
+            self._start_soon(self._binding_contract_loop)
+            self._start_soon(self._binding_contract_refresh_loop)
 
     async def _render_unavailable_to_control(self, control: ControlSurface) -> None:
         """Render a not-available overlay to an output-capable control."""
@@ -329,7 +355,9 @@ class DeviceManager:
         if active_binding == binding_id:
             self._active_binding_by_control.pop(lease.control_id, None)
             await self.action_contexts.delete(lease.control_id)
-        await lease.context.on_binding_detached("detach")
+        if lease.attached:
+            await lease.context.on_binding_detached("detach")
+        await self._cancel_binding_contract(lease)
         output = (
             DeviceOutput(
                 self._command_service,
@@ -479,6 +507,151 @@ class DeviceManager:
                 )
         return tuple(matches)
 
+    async def _create_binding_contract(
+        self,
+        *,
+        binding_id: str,
+        action_meta: ActionMetadata,
+        action_instance_id: str,
+        context_id: str,
+        binding: ResolvedControlBinding,
+        control: ControlSurface,
+        matched_capabilities: tuple[MatchedCapability, ...],
+    ) -> tuple[ContractPointer, ContractHandle | None, ParticipantHandle | None]:
+        pointer = ContractPointer(contractId=binding_id, generation=1)
+        if (
+            self._binding_concord is None
+            or action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+        ):
+            return pointer, None, None
+
+        terms = ActionBindingTerms(
+            bindingId=binding_id,
+            controllerEndpoint=controller_address(self._controller_id),
+            providerEndpoint=action_provider_address(action_meta.provider_instance_id),
+            providerInstanceId=action_meta.provider_instance_id,
+            providerId=action_meta.provider_id,
+            actionId=action_meta.uuid,
+            actionInstanceId=action_instance_id,
+            configId=self.config_id,
+            contextId=context_id,
+            hardwareClaimId=self._hardware_claim_id,
+            deviceRef=self.hardware_ref,
+            controlRef=ControlRef(
+                deviceRef=self.hardware_ref,
+                controlId=control.id,
+            ),
+            matchedCapabilities=matched_capabilities,
+        )
+        contract = await self._binding_concord.create_contract(
+            (
+                controller_address(self._controller_id),
+                action_provider_address(action_meta.provider_instance_id),
+            ),
+            contract_id=binding_id,
+            profile=ACTION_BINDING_PROFILE_ID,
+            terms=terms,
+            created_by=controller_address(self._controller_id),
+        )
+        token = await self._binding_concord.attach(
+            contract,
+            controller_address(self._controller_id),
+            self._actions_bus.session_id,
+        )
+        return pointer, contract, token
+
+    async def _binding_contract_valid(self, lease: BindingLease) -> bool:
+        if self._binding_concord is None or lease.contract is None:
+            return True
+        current_provider_session = self.manager.provider_session_id(
+            lease.provider_instance_id
+        )
+        if not isinstance(current_provider_session, str):
+            current_provider_session = lease.provider_session_id
+        if (
+            current_provider_session is None
+            or current_provider_session != lease.provider_session_id
+        ):
+            return False
+        validity = await self._binding_concord.validate(
+            lease.contract,
+            current_sessions={
+                str(controller_address(self._controller_id)): self._actions_bus.session_id,
+                str(action_provider_address(lease.provider_instance_id)): (
+                    current_provider_session
+                ),
+            },
+        )
+        return validity.status == ContractValidityStatus.VALID
+
+    async def _activate_binding(self, lease: BindingLease) -> bool:
+        if lease.attached:
+            return True
+        if not await self._binding_contract_valid(lease):
+            return False
+        await self._ensure_action_instance(
+            action_meta=ActionMetadata(
+                uuid=lease.action_uuid,
+                provider_instance_id=lease.provider_instance_id,
+                provider_id=lease.provider_id,
+                provider_session_id=lease.provider_session_id,
+            ),
+            action_instance_id=lease.action_instance_id,
+            context_id=lease.context_id,
+            settings=lease.context.settings,
+        )
+        self._binding_by_context[lease.context_id] = lease.binding_id
+        self._active_binding_by_control[lease.control_id] = lease.binding_id
+        await self.action_contexts.set(lease.control_id, lease.context)
+        lease.attached = True
+        await lease.context.on_binding_attached()
+        return True
+
+    async def _cancel_binding_contract(self, lease: BindingLease) -> None:
+        if self._binding_concord is None or lease.contract is None:
+            return
+        try:
+            await self._binding_concord.cancel(
+                lease.contract,
+                controller_address(self._controller_id),
+                reason="binding_detached",
+            )
+        except ValueError:
+            logger.warning("Could not cancel binding contract %s", lease.binding_id)
+
+    async def _binding_contract_loop(self) -> None:
+        while True:
+            await anyio.sleep(BINDING_CONTRACT_RECONCILE_SECONDS)
+            await self._reconcile_binding_contracts()
+
+    async def _binding_contract_refresh_loop(self) -> None:
+        while True:
+            await anyio.sleep(BINDING_CONTRACT_HEARTBEAT_SECONDS)
+            if self._binding_concord is None:
+                continue
+            for lease in tuple(self._binding_leases.values()):
+                token = lease.controller_token
+                if token is None:
+                    continue
+                try:
+                    lease.controller_token = await self._binding_concord.refresh(token)
+                except Exception:
+                    logger.info(
+                        "Binding contract token refresh failed for %s",
+                        lease.binding_id,
+                        exc_info=True,
+                    )
+                    await self._revoke_binding(lease.binding_id)
+
+    async def _reconcile_binding_contracts(self) -> None:
+        for lease in tuple(self._binding_leases.values()):
+            valid = await self._binding_contract_valid(lease)
+            if valid:
+                await self._activate_binding(lease)
+                continue
+            if lease.attached:
+                await self._revoke_binding(lease.binding_id)
+
     async def _ensure_action_instance(
         self,
         *,
@@ -601,6 +774,12 @@ class DeviceManager:
                 binding.action_uuid,
             )
             return False
+        registry_session = self.manager.provider_session_id(
+            action_meta.provider_instance_id
+        )
+        if not isinstance(registry_session, str):
+            registry_session = None
+        provider_session_id = action_meta.provider_session_id or registry_session
         settings_target = (
             self._build_settings_target_for_binding(
                 action_instance_id=action_instance_id,
@@ -626,11 +805,15 @@ class DeviceManager:
             builtin_action = self.manager.get_builtin_action(action_meta.uuid)
         binding_id = make_binding_id()
         context_id = make_context_id()
-        await self._ensure_action_instance(
+        matched_capabilities = self._matched_capabilities(binding)
+        binding_contract, contract, controller_token = await self._create_binding_contract(
+            binding_id=binding_id,
             action_meta=action_meta,
             action_instance_id=action_instance_id,
             context_id=context_id,
-            settings=initial_settings,
+            binding=binding,
+            control=control,
+            matched_capabilities=matched_capabilities,
         )
         binding_metadata = BindingMetadata(
             providerInstanceId=action_meta.provider_instance_id,
@@ -640,6 +823,7 @@ class DeviceManager:
             configId=self.config_id,
             contextId=context_id,
             bindingId=binding_id,
+            bindingContract=binding_contract,
             pageSessionId=page_session_id,
             deviceRef=self.hardware_ref,
             controlRef=ControlRef(
@@ -648,7 +832,7 @@ class DeviceManager:
             ),
             itemKey=item_key,
             handler=handler,
-            matchedCapabilities=self._matched_capabilities(binding),
+            matchedCapabilities=matched_capabilities,
         )
         ctx = ControlContext(
             controller_id=self._controller_id,
@@ -678,7 +862,11 @@ class DeviceManager:
             action_uuid=action_meta.uuid,
             provider_instance_id=action_meta.provider_instance_id,
             provider_id=action_meta.provider_id,
-            provider_session_id=action_meta.catalog_session_id,
+            provider_session_id=provider_session_id,
+            binding_contract=binding_contract,
+            contract=contract,
+            controller_token=controller_token,
+            attached=False,
             control_id=control.id,
             control=control,
             input_capability_ids=binding.input_capability_ids,
@@ -692,12 +880,20 @@ class DeviceManager:
             handler=handler,
         )
         self._binding_leases[binding_id] = lease
-        self._binding_by_context[context_id] = binding_id
-        self._active_binding_by_control[control.id] = binding_id
-        await self.action_contexts.set(control.id, ctx)
-        await ctx.on_binding_attached()
+        attached = await self._activate_binding(lease)
+        if attached:
+            logger.info(
+                "Binding resolved on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
+                profile_id,
+                page_id,
+                binding.control_id,
+                binding.action_uuid,
+                action_meta.provider_instance_id,
+                binding_id,
+            )
+            return True
         logger.info(
-            "Binding resolved on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
+            "Binding pending Concord agreement on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
             profile_id,
             page_id,
             binding.control_id,
@@ -705,7 +901,7 @@ class DeviceManager:
             action_meta.provider_instance_id,
             binding_id,
         )
-        return True
+        return False
 
     def _resolve_widget_timeout_ms(self, profile_name: str, page_index: int) -> int:
         profile = self._find_profile(profile_name)
@@ -744,7 +940,7 @@ class DeviceManager:
         bindings = tuple(
             lease.context.metadata
             for lease in self._binding_leases.values()
-            if lease.page_session_id == session.page_session_id
+            if lease.attached and lease.page_session_id == session.page_session_id
         )
         return PageSessionMetadata(
             providerInstanceId=session.owner_provider_instance_id,
@@ -1380,6 +1576,12 @@ class DeviceManager:
         for child, binding in zip(child_bindings, result.bindings, strict=True):
             if await self.action_contexts.has_key(binding.control_id):
                 continue  # Already has context
+            if any(
+                lease.control_id == binding.control_id
+                for lease in self._binding_leases.values()
+            ):
+                await self._reconcile_binding_contracts()
+                continue
             if child is not None and dynamic_page_session is not None:
                 resolved_action_instance_id = self._dynamic_child_action_instance_id(
                     page_session=dynamic_page_session,
@@ -1418,6 +1620,8 @@ class DeviceManager:
         """Handle config update or removal."""
         if config is None:
             await self.clear_page()
+            if self._on_config_removed is not None:
+                await self._on_config_removed(self.config_id)
             return
         async with self._nav_lock:
             self._held_input_bindings.clear()
@@ -1490,6 +1694,13 @@ class DeviceManager:
                     binding_id,
                 )
                 return None
+            if not lease.attached:
+                logger.warning(
+                    "Ignoring action command %s for pending binding %s",
+                    msg.message_type,
+                    binding_id,
+                )
+                return None
             if sender_provider_instance_id != lease.provider_instance_id:
                 logger.warning(
                     "Ignoring action command %s from provider %s for binding owned by provider %s",
@@ -1498,15 +1709,37 @@ class DeviceManager:
                     lease.provider_instance_id,
                 )
                 return None
+            current_provider_session = self.manager.provider_session_id(
+                sender_provider_instance_id
+            )
+            if not isinstance(current_provider_session, str):
+                current_provider_session = lease.provider_session_id
+            if current_provider_session is None:
+                logger.warning(
+                    "Ignoring action command %s from provider without live Beacon session %s",
+                    msg.message_type,
+                    sender_provider_instance_id,
+                )
+                return None
             if (
-                lease.provider_session_id is not None
-                and msg.sender_session_id != lease.provider_session_id
+                msg.sender_session_id != lease.provider_session_id
+                or msg.sender_session_id != current_provider_session
             ):
                 logger.warning(
                     "Ignoring action command %s from stale provider session %s",
                     msg.message_type,
                     msg.sender_session_id,
                 )
+                return None
+            if self._binding_concord is not None and not await self._binding_contract_valid(
+                lease
+            ):
+                logger.warning(
+                    "Ignoring action command %s for invalid binding contract %s",
+                    msg.message_type,
+                    binding_id,
+                )
+                await self._revoke_binding(binding_id)
                 return None
             if (
                 action_instance_id is not None
@@ -1552,9 +1785,21 @@ class DeviceManager:
                     session.owner_provider_instance_id,
                 )
                 return None
+            current_provider_session = self.manager.provider_session_id(
+                sender_provider_instance_id
+            )
+            if not isinstance(current_provider_session, str):
+                current_provider_session = session.owner_provider_session_id
+            if current_provider_session is None:
+                logger.warning(
+                    "Ignoring page action command %s from provider without live Beacon session %s",
+                    msg.message_type,
+                    sender_provider_instance_id,
+                )
+                return None
             if (
-                session.owner_provider_session_id is not None
-                and msg.sender_session_id != session.owner_provider_session_id
+                msg.sender_session_id != session.owner_provider_session_id
+                or msg.sender_session_id != current_provider_session
             ):
                 logger.warning(
                     "Ignoring page action command %s from stale provider session %s",
@@ -1626,7 +1871,15 @@ class DeviceManager:
             )
             return False
         expected_session = self.manager.provider_session_id(sender_provider_instance_id)
-        if expected_session is not None and sender_session_id != expected_session:
+        if not isinstance(expected_session, str):
+            expected_session = None
+        if expected_session is None:
+            logger.warning(
+                "Ignoring provider settings command from %s without live Beacon session",
+                sender_provider_instance_id,
+            )
+            return False
+        if sender_session_id != expected_session:
             logger.warning(
                 "Ignoring provider settings command from %s with stale session %s",
                 sender_provider_instance_id,

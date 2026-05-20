@@ -9,6 +9,7 @@ import pytest_asyncio
 from conftest import LaneHarness
 from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import (
+    BINDING_OUTPUT,
     CAPABILITY_INPUT,
     SETTINGS_PATCH,
     SETTINGS_REQUEST,
@@ -22,6 +23,11 @@ from deckr.actions.messages import (
     action_message,
     action_provider_instance_subject,
     context_subject,
+)
+from deckr.concord import (
+    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
+    DEFAULT_CONCORD_TOKEN_STORE_NAME,
+    ConcordCoordinator,
 )
 from deckr.contracts.messages import DeckrMessage, controller_address
 from deckr.hardware import messages as hw_messages
@@ -55,6 +61,13 @@ PROVIDER_SESSION_ID = "action-provider-session"
 
 def _actions_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint=CONTROLLER_ADDR)
+
+
+def _concord(bus: LaneHarness) -> ConcordCoordinator:
+    return ConcordCoordinator(
+        bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
+        bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+    )
 
 
 def _action_command(
@@ -127,13 +140,13 @@ def _metadata(
     *,
     provider_instance_id: str = PROVIDER_INSTANCE_ID,
     provider_id: str = PROVIDER_ID,
-    catalog_session_id: str | None = None,
+    provider_session_id: str | None = PROVIDER_SESSION_ID,
 ) -> ActionMetadata:
     return ActionMetadata(
         uuid=uuid,
         provider_instance_id=provider_instance_id,
         provider_id=provider_id,
-        catalog_session_id=catalog_session_id,
+        provider_session_id=provider_session_id,
     )
 
 
@@ -890,6 +903,128 @@ async def test_binding_overlay_renders_and_expires(
     assert call_args[0][0] == "test-device"
     assert call_args[0][1] == "0,0"
     assert call_args[0][2] == "raster.bitmap"
+
+
+@pytest.mark.asyncio
+async def test_action_binding_waits_for_concord_provider_token(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            binding_concord=concord,
+            hardware_claim_id="hardware-claim-1",
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            await manager.set_page(profile="default", page=0)
+
+            assert await manager.action_contexts.get("0,0") is None
+            lease = next(iter(manager._binding_leases.values()))
+            assert not lease.attached
+            assert lease.binding_contract.contract_id == lease.binding_id
+            assert await manager._authorize_action_command(
+                _action_command(
+                    BINDING_OUTPUT,
+                    {
+                        "binding": lease.context.metadata.model_dump(
+                            by_alias=True,
+                            exclude_none=True,
+                            mode="json",
+                        ),
+                        "capability": {
+                            "deviceRef": {
+                                "managerId": "manager-main",
+                                "deviceId": "test-device",
+                            },
+                            "controlId": "0,0",
+                            "capabilityId": "raster.bitmap",
+                        },
+                        "commandType": "clear",
+                        "generation": 1,
+                    },
+                    context_id=lease.context_id,
+                    action_instance_id=lease.action_instance_id,
+                    binding_id=lease.binding_id,
+                ),
+                context_id=lease.context_id,
+            ) is None
+
+            with anyio.move_on_after(0.05) as scope:
+                await stream.receive()
+            assert scope.cancel_called
+
+            await concord.attach(lease.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+            await manager._reconcile_binding_contracts()
+
+            with anyio.fail_after(1):
+                while await manager.action_contexts.get("0,0") is None:
+                    await anyio.sleep(0.01)
+            created = await stream.receive()
+            attached = await stream.receive()
+            assert created.message_type == "actionInstanceCreated"
+            assert attached.message_type == "bindingAttached"
+            assert lease.attached
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_action_binding_revokes_when_provider_beacon_session_changes(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            binding_concord=concord,
+            hardware_claim_id="hardware-claim-1",
+        )
+        await manager.set_page(profile="default", page=0)
+        lease = next(iter(manager._binding_leases.values()))
+        await concord.attach(lease.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await manager._reconcile_binding_contracts()
+        assert await manager.action_contexts.get("0,0") is not None
+
+        registry.provider_session_id.return_value = "new-provider-session"
+        await manager._reconcile_binding_contracts()
+
+        assert await manager.action_contexts.get("0,0") is None
+        assert manager._binding_leases == {}
+
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio

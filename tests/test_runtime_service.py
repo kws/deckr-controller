@@ -4,6 +4,7 @@ from pathlib import Path
 
 import anyio
 import pytest
+from deckr.beacon import DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME, BeaconDiscovery
 from deckr.components import (
     BaseComponent,
     ComponentState,
@@ -11,12 +12,16 @@ from deckr.components import (
     resolve_component_host_plan,
     start_components,
 )
+from deckr.concord import (
+    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
+    DEFAULT_CONCORD_TOKEN_STORE_NAME,
+    ConcordCoordinator,
+)
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, LaneContractRegistry
 from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE
 from deckr.core.config import ConfigDocument
 from deckr.lanes import Lane
 from deckr.runtime import Deckr
-from deckr.state import DEFAULT_DISCOVERY_STATE_STORE_NAME
 
 from deckr.controller._runtime_service import (
     ControllerRuntimeService,
@@ -117,8 +122,13 @@ async def test_controller_runtime_keeps_actions_endpoint_open_until_children_sto
             runtime=runtime,
             hardware_messages=deckr.lane(HARDWARE_MESSAGES_LANE),
             actions=deckr.lane(ACTIONS_LANE),
-            lease_state=deckr.state(),
-            discovery_state=deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
+            beacon=BeaconDiscovery(
+                deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME)
+            ),
+            concord=ConcordCoordinator(
+                deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
+                deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+            ),
         )
         await service.start(RunContext(tg=tg, stopping=anyio.Event()))
         assert service._actions_endpoint is not None

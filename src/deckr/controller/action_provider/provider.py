@@ -15,7 +15,7 @@ class ActionMetadata:
     provider_instance_id: str
     provider_id: str
     name: str | None = None
-    catalog_session_id: str | None = None
+    provider_session_id: str | None = None
     provider_labels: Mapping[str, str] | None = None
     settings_schema: dict | None = None
     provider_settings_schema: dict | None = None

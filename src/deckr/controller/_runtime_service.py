@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import anyio
+from deckr.beacon import (
+    BEACON_ADVERTISEMENT_STORE_POLICY,
+    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+    BeaconDiscovery,
+)
 from deckr.components import (
     BaseComponent,
     Component,
@@ -15,18 +20,20 @@ from deckr.components import (
     ComponentManifest,
     RunContext,
 )
+from deckr.concord import (
+    CONCORD_CONTRACT_STORE_POLICY,
+    CONCORD_TOKEN_STORE_POLICY,
+    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
+    DEFAULT_CONCORD_TOKEN_STORE_NAME,
+    ConcordCoordinator,
+)
 from deckr.contracts.messages import (
     ACTIONS_LANE,
     HARDWARE_MESSAGES_LANE,
     controller_address,
 )
 from deckr.lanes import Lane, RegisteredEndpointLane
-from deckr.state import (
-    DEFAULT_DISCOVERY_STATE_STORE_NAME,
-    DEFAULT_LEASE_STATE_STORE_NAME,
-    PERSISTENT_STATE_STORE_POLICY,
-    StateStore,
-)
+from deckr.state import PERSISTENT_STATE_STORE_POLICY, StateStore
 
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
@@ -55,16 +62,16 @@ class ControllerRuntimeService(BaseComponent):
         runtime: ControllerRuntime,
         hardware_messages: Lane,
         actions: Lane,
-        lease_state: StateStore,
-        discovery_state: StateStore,
+        beacon: BeaconDiscovery,
+        concord: ConcordCoordinator,
         materialized_config_state: StateStore | None = None,
     ) -> None:
         super().__init__(name=runtime_name)
         self._runtime = runtime
         self._hardware_messages = hardware_messages
         self._actions = actions
-        self._lease_state = lease_state
-        self._discovery_state = discovery_state
+        self._beacon = beacon
+        self._concord = concord
         self._materialized_config_state = materialized_config_state
         self._component_manager = ComponentManager()
         self._hardware_endpoint_cm: (
@@ -110,8 +117,7 @@ class ControllerRuntimeService(BaseComponent):
                     await controller_service.handle_actions_changed_event(event)
 
             action_registry = ActionRegistry(
-                lease_state=self._lease_state,
-                discovery_state=self._discovery_state,
+                self._beacon,
                 controller_id=self._runtime.controller_id,
                 on_actions_changed=on_actions_changed,
             )
@@ -125,8 +131,8 @@ class ControllerRuntimeService(BaseComponent):
 
             controller_service = ControllerService(
                 hardware_endpoint=self._hardware_endpoint,
-                lease_state=self._lease_state,
-                discovery_state=self._discovery_state,
+                beacon=self._beacon,
+                concord=self._concord,
                 config_service=config_service,
                 settings_service=settings_service,
                 controller_id=self._runtime.controller_id,
@@ -193,8 +199,22 @@ def component_factory(context: ComponentContext):
         runtime=runtime,
         hardware_messages=context.require_lane(HARDWARE_MESSAGES_LANE),
         actions=context.require_lane(ACTIONS_LANE),
-        lease_state=context.state(DEFAULT_LEASE_STATE_STORE_NAME),
-        discovery_state=context.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
+        beacon=BeaconDiscovery(
+            context.state(
+                DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+                policy=BEACON_ADVERTISEMENT_STORE_POLICY,
+            )
+        ),
+        concord=ConcordCoordinator(
+            context.state(
+                DEFAULT_CONCORD_CONTRACT_STORE_NAME,
+                policy=CONCORD_CONTRACT_STORE_POLICY,
+            ),
+            context.state(
+                DEFAULT_CONCORD_TOKEN_STORE_NAME,
+                policy=CONCORD_TOKEN_STORE_POLICY,
+            ),
+        ),
         materialized_config_state=materialized_config_state,
     )
 

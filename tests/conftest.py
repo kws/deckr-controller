@@ -2,7 +2,6 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 
 import pytest
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, LaneContractRegistry
@@ -13,7 +12,6 @@ from deckr.contracts.messages import (
 )
 from deckr.lanes import RegisteredEndpointLane
 from deckr.runtime import Deckr
-from deckr.state import EndpointPresence, StateStore, presence_endpoint_key
 
 from test_support.memory_lane_substrate import MemoryLaneSubstrate
 
@@ -54,7 +52,6 @@ class LaneHarness:
             handle = EndpointHarness(
                 lane=self.lane,
                 endpoint=parsed,
-                state=self.deckr.state(),
                 session_id=f"{parsed.family.replace('_', '-')}-session",
             )
             self._endpoints[parsed] = handle
@@ -93,18 +90,14 @@ class EndpointHarness:
         *,
         lane,
         endpoint: EndpointAddress,
-        state: StateStore,
         session_id: str,
     ) -> None:
         self._registered = RegisteredEndpointLane(
             lane=lane,
             endpoint=endpoint,
             session_id=session_id,
-            state=state,
             metadata={"runtime": "test"},
         )
-        self._state = state
-        self._claimed_revision: int | None = None
 
     @property
     def lane(self):
@@ -118,35 +111,13 @@ class EndpointHarness:
     def session_id(self) -> str:
         return self._registered.session_id
 
-    async def _ensure_presence(self) -> None:
-        key = presence_endpoint_key(
-            lane=self.lane.name,
-            endpoint=self.endpoint,
-        )
-        entry = await self._state.put(
-            key,
-            EndpointPresence(
-                endpoint=self.endpoint,
-                lane=self.lane.name,
-                sessionId=self.session_id,
-                timestamp=datetime.now(UTC),
-                ttlSeconds=30,
-                metadata={"runtime": "test"},
-            ),
-            ttl=30,
-        )
-        self._claimed_revision = entry.revision
-
     async def publish(self, message: DeckrMessage) -> DeckrMessage:
-        await self._ensure_presence()
         return await self._registered.publish(message)
 
     async def reply_to(self, request: DeckrMessage, **kwargs) -> DeckrMessage:
-        await self._ensure_presence()
         return await self._registered.reply_to(request, **kwargs)
 
     @asynccontextmanager
     async def subscribe(self) -> AsyncIterator:
-        await self._ensure_presence()
         async with self._registered.subscribe() as stream:
             yield stream

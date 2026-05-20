@@ -7,8 +7,9 @@ from typing import Any, Literal
 
 import anyio
 from deckr.components import BaseComponent, RunContext
+from deckr.contracts.keys import encode_key_token
 from deckr.contracts.models import DeckrModel
-from deckr.state import StateEntry, StateStore, StateUnavailable, encode_key_token
+from deckr.state import StateEntry, StateStore, StateUnavailable
 from pydantic import Field, field_serializer, field_validator
 
 from deckr.controller.config._data import DeviceConfig
