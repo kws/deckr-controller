@@ -24,7 +24,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from deckr.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
+from deckr.hardware.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
 
 from deckr.controller._controller_service import ControllerService
 from deckr.controller._hardware_service import (

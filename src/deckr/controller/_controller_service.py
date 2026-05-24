@@ -31,8 +31,7 @@ from deckr.contracts.messages import (
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
-from deckr.lanes import RegisteredEndpointLane
-from deckr.profiles import (
+from deckr.hardware.profiles import (
     HARDWARE_CLAIM_PROFILE_ID,
     HARDWARE_FEATURE_ID,
     HardwareBeaconPayload,
@@ -40,6 +39,7 @@ from deckr.profiles import (
     HardwareClaimTerms,
     hardware_payload_from_advertisement,
 )
+from deckr.lanes import RegisteredEndpointLane
 from deckr.state import StateConflict, StateUnavailable
 
 from deckr.controller._device_manager import DeviceManager
