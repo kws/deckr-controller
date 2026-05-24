@@ -55,7 +55,8 @@ from deckr.actions.messages import (
     subject_provider_instance_id,
 )
 from deckr.concord import (
-    ConcordCoordinator,
+    ConcordParticipantLease,
+    ConcordService,
     ContractHandle,
     ContractPointer,
     ContractValidityStatus,
@@ -217,6 +218,7 @@ class BindingLease:
     binding_contract: ContractPointer
     contract: ContractHandle | None
     controller_token: ParticipantHandle | None
+    controller_lease: ConcordParticipantLease | None
     attached: bool
     control_id: str
     control: ControlSurface
@@ -263,7 +265,7 @@ class DeviceManager:
         settings_service: SettingsService | None = None,
         config_stream: AsyncIterator[DeviceConfig | None] | None = None,
         on_config_removed: Callable[[str], Awaitable[None]] | None = None,
-        binding_concord: ConcordCoordinator | None = None,
+        binding_concord: ConcordService | None = None,
         hardware_claim_id: str = "controller-local-test-claim",
         clock: Callable[[], float] | None = None,
         page_timeout_check_interval: float = 0.25,
@@ -306,7 +308,6 @@ class DeviceManager:
         self._start_soon(self._page_timeout_loop)
         if self._binding_concord is not None:
             self._start_soon(self._binding_contract_loop)
-            self._start_soon(self._binding_contract_refresh_loop)
 
     async def _render_unavailable_to_control(self, control: ControlSurface) -> None:
         """Render a not-available overlay to an output-capable control."""
@@ -517,13 +518,18 @@ class DeviceManager:
         binding: ResolvedControlBinding,
         control: ControlSurface,
         matched_capabilities: tuple[MatchedCapability, ...],
-    ) -> tuple[ContractPointer, ContractHandle | None, ParticipantHandle | None]:
+    ) -> tuple[
+        ContractPointer,
+        ContractHandle | None,
+        ParticipantHandle | None,
+        ConcordParticipantLease | None,
+    ]:
         pointer = ContractPointer(contractId=binding_id, generation=1)
         if (
             self._binding_concord is None
             or action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
         ):
-            return pointer, None, None
+            return pointer, None, None, None
 
         terms = ActionBindingTerms(
             bindingId=binding_id,
@@ -552,13 +558,18 @@ class DeviceManager:
             profile=ACTION_BINDING_PROFILE_ID,
             terms=terms,
             created_by=controller_address(self._controller_id),
+            log_label="ActionBinding",
         )
-        token = await self._binding_concord.attach(
-            contract,
-            controller_address(self._controller_id),
-            self._actions_bus.session_id,
+        lease = self._binding_concord.participant_lease(
+            contract=contract,
+            participant=controller_address(self._controller_id),
+            session_id=self._actions_bus.session_id,
+            refresh_interval=BINDING_CONTRACT_HEARTBEAT_SECONDS,
+            log_label="ActionBinding",
         )
-        return pointer, contract, token
+        lease.start_soon(self._start_soon)
+        token = await lease.attach_or_refresh()
+        return pointer, contract, token, lease
 
     async def _binding_contract_valid(self, lease: BindingLease) -> bool:
         if self._binding_concord is None or lease.contract is None:
@@ -583,6 +594,7 @@ class DeviceManager:
                     current_provider_session
                 ),
             },
+            log_label="ActionBinding",
         )
         return validity.status == ContractValidityStatus.VALID
 
@@ -612,11 +624,14 @@ class DeviceManager:
     async def _cancel_binding_contract(self, lease: BindingLease) -> None:
         if self._binding_concord is None or lease.contract is None:
             return
+        if lease.controller_lease is not None:
+            await lease.controller_lease.aclose()
         try:
             await self._binding_concord.cancel(
                 lease.contract,
                 controller_address(self._controller_id),
                 reason="binding_detached",
+                log_label="ActionBinding",
             )
         except ValueError:
             logger.warning("Could not cancel binding contract %s", lease.binding_id)
@@ -625,25 +640,6 @@ class DeviceManager:
         while True:
             await anyio.sleep(BINDING_CONTRACT_RECONCILE_SECONDS)
             await self._reconcile_binding_contracts()
-
-    async def _binding_contract_refresh_loop(self) -> None:
-        while True:
-            await anyio.sleep(BINDING_CONTRACT_HEARTBEAT_SECONDS)
-            if self._binding_concord is None:
-                continue
-            for lease in tuple(self._binding_leases.values()):
-                token = lease.controller_token
-                if token is None:
-                    continue
-                try:
-                    lease.controller_token = await self._binding_concord.refresh(token)
-                except Exception:
-                    logger.info(
-                        "Binding contract token refresh failed for %s",
-                        lease.binding_id,
-                        exc_info=True,
-                    )
-                    await self._revoke_binding(lease.binding_id)
 
     async def _reconcile_binding_contracts(self) -> None:
         for lease in tuple(self._binding_leases.values()):
@@ -808,7 +804,12 @@ class DeviceManager:
         binding_id = make_binding_id()
         context_id = make_context_id()
         matched_capabilities = self._matched_capabilities(binding)
-        binding_contract, contract, controller_token = await self._create_binding_contract(
+        (
+            binding_contract,
+            contract,
+            controller_token,
+            controller_lease,
+        ) = await self._create_binding_contract(
             binding_id=binding_id,
             action_meta=action_meta,
             action_instance_id=action_instance_id,
@@ -868,6 +869,7 @@ class DeviceManager:
             binding_contract=binding_contract,
             contract=contract,
             controller_token=controller_token,
+            controller_lease=controller_lease,
             attached=False,
             control_id=control.id,
             control=control,

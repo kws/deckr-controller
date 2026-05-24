@@ -10,6 +10,7 @@ from deckr.beacon import (
     BEACON_ADVERTISEMENT_STORE_POLICY,
     DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
     BeaconDiscovery,
+    BeaconService,
 )
 from deckr.components import (
     BaseComponent,
@@ -26,6 +27,7 @@ from deckr.concord import (
     DEFAULT_CONCORD_CONTRACT_STORE_NAME,
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
+    ConcordService,
 )
 from deckr.contracts.messages import (
     ACTIONS_LANE,
@@ -62,8 +64,8 @@ class ControllerRuntimeService(BaseComponent):
         runtime: ControllerRuntime,
         hardware_messages: Lane,
         actions: Lane,
-        beacon: BeaconDiscovery,
-        concord: ConcordCoordinator,
+        beacon: BeaconService,
+        concord: ConcordService,
         materialized_config_state: StateStore | None = None,
     ) -> None:
         super().__init__(name=runtime_name)
@@ -199,13 +201,13 @@ def component_factory(context: ComponentContext):
         runtime=runtime,
         hardware_messages=context.require_lane(HARDWARE_MESSAGES_LANE),
         actions=context.require_lane(ACTIONS_LANE),
-        beacon=BeaconDiscovery(
+        beacon=BeaconService(BeaconDiscovery(
             context.state(
                 DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
                 policy=BEACON_ADVERTISEMENT_STORE_POLICY,
             )
-        ),
-        concord=ConcordCoordinator(
+        )),
+        concord=ConcordService(ConcordCoordinator(
             context.state(
                 DEFAULT_CONCORD_CONTRACT_STORE_NAME,
                 policy=CONCORD_CONTRACT_STORE_POLICY,
@@ -214,7 +216,7 @@ def component_factory(context: ComponentContext):
                 DEFAULT_CONCORD_TOKEN_STORE_NAME,
                 policy=CONCORD_TOKEN_STORE_POLICY,
             ),
-        ),
+        )),
         materialized_config_state=materialized_config_state,
     )
 

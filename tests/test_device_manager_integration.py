@@ -28,6 +28,7 @@ from deckr.concord import (
     DEFAULT_CONCORD_CONTRACT_STORE_NAME,
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
+    ConcordService,
 )
 from deckr.contracts.messages import DeckrMessage, controller_address
 from deckr.hardware import messages as hw_messages
@@ -63,10 +64,12 @@ def _actions_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint=CONTROLLER_ADDR)
 
 
-def _concord(bus: LaneHarness) -> ConcordCoordinator:
-    return ConcordCoordinator(
-        bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
-        bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+def _concord(bus: LaneHarness) -> ConcordService:
+    return ConcordService(
+        ConcordCoordinator(
+            bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
+            bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+        )
     )
 
 

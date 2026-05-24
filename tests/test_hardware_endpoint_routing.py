@@ -7,12 +7,17 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 from conftest import LaneHarness
-from deckr.beacon import DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME, BeaconDiscovery
+from deckr.beacon import (
+    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+    BeaconDiscovery,
+    BeaconService,
+)
 from deckr.components import RunContext
 from deckr.concord import (
     DEFAULT_CONCORD_CONTRACT_STORE_NAME,
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
+    ConcordService,
     ContractValidityStatus,
 )
 from deckr.contracts.messages import controller_address, hardware_manager_address
@@ -145,19 +150,23 @@ def _config(
     )
 
 
-def _beacon(bus: LaneHarness) -> BeaconDiscovery:
-    return BeaconDiscovery(bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
+def _beacon(bus: LaneHarness) -> BeaconService:
+    return BeaconService(
+        BeaconDiscovery(bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
+    )
 
 
-def _concord(bus: LaneHarness) -> ConcordCoordinator:
-    return ConcordCoordinator(
-        bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
-        bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+def _concord(bus: LaneHarness) -> ConcordService:
+    return ConcordService(
+        ConcordCoordinator(
+            bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
+            bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+        )
     )
 
 
 async def _advertise_hardware(
-    beacon: BeaconDiscovery,
+    beacon: BeaconService,
     *,
     manager_id: str = "room-a",
     session_id: str = "manager-session",

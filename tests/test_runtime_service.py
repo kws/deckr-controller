@@ -4,7 +4,11 @@ from pathlib import Path
 
 import anyio
 import pytest
-from deckr.beacon import DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME, BeaconDiscovery
+from deckr.beacon import (
+    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+    BeaconDiscovery,
+    BeaconService,
+)
 from deckr.components import (
     BaseComponent,
     ComponentState,
@@ -16,6 +20,7 @@ from deckr.concord import (
     DEFAULT_CONCORD_CONTRACT_STORE_NAME,
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
+    ConcordService,
 )
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, LaneContractRegistry
 from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE
@@ -122,12 +127,14 @@ async def test_controller_runtime_keeps_actions_endpoint_open_until_children_sto
             runtime=runtime,
             hardware_messages=deckr.lane(HARDWARE_MESSAGES_LANE),
             actions=deckr.lane(ACTIONS_LANE),
-            beacon=BeaconDiscovery(
-                deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME)
+            beacon=BeaconService(
+                BeaconDiscovery(deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
             ),
-            concord=ConcordCoordinator(
-                deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
-                deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+            concord=ConcordService(
+                ConcordCoordinator(
+                    deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
+                    deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+                )
             ),
         )
         await service.start(RunContext(tg=tg, stopping=anyio.Event()))

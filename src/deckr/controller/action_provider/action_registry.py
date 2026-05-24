@@ -12,7 +12,7 @@ from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
 from deckr.actions.messages import ActionDescriptor
-from deckr.beacon import BeaconDiscovery, Candidate
+from deckr.beacon import BeaconService, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.models import thaw_json
 from deckr.profiles import (
@@ -53,7 +53,7 @@ class ActionRegistry(BaseComponent):
 
     def __init__(
         self,
-        beacon: BeaconDiscovery,
+        beacon: BeaconService,
         *,
         controller_id: str,
         on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]] | None = None,
@@ -198,10 +198,12 @@ class ActionRegistry(BaseComponent):
     async def _advertisement_loop(self) -> None:
         while True:
             try:
-                async with self._beacon.watch(ACTIONS_FEATURE_ID) as stream:
-                    async for change in stream:
+                async with self._beacon.watch_feature(ACTIONS_FEATURE_ID) as stream:
+                    async for event in stream:
                         await self._reconcile_current_state(
-                            reason=f"actions beacon watch {change.operation} {change.key}"
+                            reason=(
+                                f"actions beacon {event.event_type.value} {event.key}"
+                            )
                         )
             except StateUnavailable:
                 logger.warning(

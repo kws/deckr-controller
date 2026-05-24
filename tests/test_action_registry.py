@@ -10,6 +10,7 @@ from deckr.beacon import (
     DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
     AdvertisementHandle,
     BeaconDiscovery,
+    BeaconService,
     beacon_advertisement_key,
 )
 from deckr.components import RunContext
@@ -29,8 +30,10 @@ def _state_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint="controller:controller-main")
 
 
-def _beacon(bus: LaneHarness) -> BeaconDiscovery:
-    return BeaconDiscovery(bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
+def _beacon(bus: LaneHarness) -> BeaconService:
+    return BeaconService(
+        BeaconDiscovery(bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
+    )
 
 
 def _actions_payload(
@@ -58,7 +61,7 @@ def _actions_payload(
 
 
 async def _advertise_actions(
-    beacon: BeaconDiscovery,
+    beacon: BeaconService,
     payload: ActionsBeaconPayload | None = None,
     *,
     advertisement_id: str = "ad-1",
