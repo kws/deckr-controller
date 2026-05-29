@@ -110,7 +110,7 @@ class FileBackedDeviceConfigService(BaseComponent):
         self._stop_event: anyio.Event | None = None
 
     async def start(self, ctx: RunContext) -> None:
-        logger.warning(
+        logger.debug(
             "Using device config path %s",
             self._config_dir,
         )

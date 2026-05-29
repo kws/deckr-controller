@@ -896,7 +896,7 @@ class DeviceManager:
                 binding_id,
             )
             return True
-        logger.info(
+        logger.debug(
             "Binding pending Concord agreement on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
             profile_id,
             page_id,

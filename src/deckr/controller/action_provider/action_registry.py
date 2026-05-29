@@ -270,7 +270,7 @@ class ActionRegistry(BaseComponent):
         self._action_registry.update(desired)
 
         if registered or unregistered:
-            logger.info(
+            logger.debug(
                 "Action provider %s Beacon advertisement changed via %s: +%s -%s",
                 provider_instance_id,
                 reason,

@@ -169,7 +169,8 @@ class ControllerService(BaseComponent):
 
     async def handle_actions_changed_event(self, event: ActionsChangedEvent) -> None:
         controller_contexts = await self._controller_contexts.values()
-        logger.info(
+        logger.log(
+            logging.INFO if controller_contexts else logging.DEBUG,
             "Applying ActionsChangedEvent to %d device(s): +%s -%s",
             len(controller_contexts),
             event.registered,
