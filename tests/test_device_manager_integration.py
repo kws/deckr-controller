@@ -46,6 +46,7 @@ from deckr.hardware.descriptors import (
 from invariant import Node, SubGraphNode, dump_graph_data_uri
 from invariant.params import ref
 
+from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
 from deckr.controller.action_provider.provider import ActionMetadata
@@ -70,6 +71,19 @@ def _concord(bus: LaneHarness) -> ConcordService:
             bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
             bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
         )
+    )
+
+
+def _provider_session_manager(
+    concord: ConcordService,
+    action_bus: LaneHarness,
+    start_soon,
+) -> ActionProviderSessionManager:
+    return ActionProviderSessionManager(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        concord=concord,
+        start_soon=start_soon,
     )
 
 
@@ -909,13 +923,16 @@ async def test_binding_overlay_renders_and_expires(
 
 
 @pytest.mark.asyncio
-async def test_action_binding_waits_for_concord_provider_token(
+async def test_binding_waits_for_provider_session_token(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(
-        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+        return_value=_metadata(
+            SetRasterImageOnAppearAction.uuid,
+            provider_session_id=None,
+        )
     )
     registry.provider_session_id.return_value = PROVIDER_SESSION_ID
     registry.provider_instance_provides_provider.return_value = True
@@ -923,6 +940,11 @@ async def test_action_binding_waits_for_concord_provider_token(
     concord = _concord(action_bus)
 
     async with anyio.create_task_group() as tg:
+        provider_sessions = _provider_session_manager(
+            concord,
+            action_bus,
+            tg.start_soon,
+        )
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
@@ -932,16 +954,16 @@ async def test_action_binding_waits_for_concord_provider_token(
             manager=registry,
             actions_bus=action_bus,
             start_soon=tg.start_soon,
-            binding_concord=concord,
-            hardware_claim_id="hardware-claim-1",
+            provider_sessions=provider_sessions,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             await manager.set_page(profile="default", page=0)
 
             assert await manager.action_contexts.get("0,0") is None
             lease = next(iter(manager._binding_leases.values()))
+            session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
             assert not lease.attached
-            assert lease.binding_contract.contract_id == lease.binding_id
+            assert session.provider_session_id == PROVIDER_SESSION_ID
             assert await manager._authorize_action_command(
                 _action_command(
                     BINDING_OUTPUT,
@@ -973,8 +995,8 @@ async def test_action_binding_waits_for_concord_provider_token(
                 await stream.receive()
             assert scope.cancel_called
 
-            await concord.attach(lease.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
-            await manager._reconcile_binding_contracts()
+            await concord.attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+            await manager._reconcile_binding_sessions()
 
             with anyio.fail_after(1):
                 while await manager.action_contexts.get("0,0") is None:
@@ -989,7 +1011,7 @@ async def test_action_binding_waits_for_concord_provider_token(
 
 
 @pytest.mark.asyncio
-async def test_action_binding_revokes_when_provider_beacon_session_changes(
+async def test_binding_revokes_when_provider_session_changes(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1003,6 +1025,11 @@ async def test_action_binding_revokes_when_provider_beacon_session_changes(
     concord = _concord(action_bus)
 
     async with anyio.create_task_group() as tg:
+        provider_sessions = _provider_session_manager(
+            concord,
+            action_bus,
+            tg.start_soon,
+        )
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
@@ -1012,17 +1039,16 @@ async def test_action_binding_revokes_when_provider_beacon_session_changes(
             manager=registry,
             actions_bus=action_bus,
             start_soon=tg.start_soon,
-            binding_concord=concord,
-            hardware_claim_id="hardware-claim-1",
+            provider_sessions=provider_sessions,
         )
         await manager.set_page(profile="default", page=0)
-        lease = next(iter(manager._binding_leases.values()))
-        await concord.attach(lease.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
-        await manager._reconcile_binding_contracts()
+        session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
+        await concord.attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
 
         registry.provider_session_id.return_value = "new-provider-session"
-        await manager._reconcile_binding_contracts()
+        await manager._reconcile_binding_sessions()
 
         assert await manager.action_contexts.get("0,0") is None
         assert manager._binding_leases == {}
@@ -1031,7 +1057,7 @@ async def test_action_binding_revokes_when_provider_beacon_session_changes(
 
 
 @pytest.mark.asyncio
-async def test_action_binding_revokes_when_provider_beacon_disappears(
+async def test_binding_revokes_when_provider_session_disappears(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1045,6 +1071,11 @@ async def test_action_binding_revokes_when_provider_beacon_disappears(
     concord = _concord(action_bus)
 
     async with anyio.create_task_group() as tg:
+        provider_sessions = _provider_session_manager(
+            concord,
+            action_bus,
+            tg.start_soon,
+        )
         manager = DeviceManager(
             controller_id=CONTROLLER_ID,
             device=device,
@@ -1054,17 +1085,16 @@ async def test_action_binding_revokes_when_provider_beacon_disappears(
             manager=registry,
             actions_bus=action_bus,
             start_soon=tg.start_soon,
-            binding_concord=concord,
-            hardware_claim_id="hardware-claim-1",
+            provider_sessions=provider_sessions,
         )
         await manager.set_page(profile="default", page=0)
-        lease = next(iter(manager._binding_leases.values()))
-        await concord.attach(lease.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
-        await manager._reconcile_binding_contracts()
+        session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
+        await concord.attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
 
         registry.provider_session_id.return_value = None
-        await manager._reconcile_binding_contracts()
+        await manager._reconcile_binding_sessions()
 
         assert await manager.action_contexts.get("0,0") is None
         assert manager._binding_leases == {}
@@ -1099,10 +1129,12 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
         assert owner_ctx is not None
+        registry.get_action.reset_mock()
         await manager.open_page(
             descriptor=_dynamic_page("dynamic-page", "0,0", "1,0"),
             context_id=owner_ctx.id,
         )
+        assert registry.get_action.await_count == 2
         session = manager._dynamic_page_session
         assert session is not None
 

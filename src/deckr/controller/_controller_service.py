@@ -43,6 +43,7 @@ from deckr.hardware.profiles import (
 from deckr.lanes import RegisteredEndpointLane
 from deckr.state import StateConflict, StateUnavailable
 
+from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
@@ -128,6 +129,7 @@ class ControllerService(BaseComponent):
             tuple[str, tuple[tuple[str, str], ...]],
         ] = {}
         self._hardware_candidates: dict[tuple[str, str], HardwareCandidate] = {}
+        self._provider_sessions: ActionProviderSessionManager | None = None
         self._hardware_reconcile_lock = anyio.Lock()
         self._stopping: anyio.Event | None = None
 
@@ -293,7 +295,10 @@ class ControllerService(BaseComponent):
                     await self._refresh_live_descriptor(owned, candidate)
                 continue
 
-            if validity.status == ContractValidityStatus.MISSING_TOKEN and not owned.live:
+            if not owned.live and validity.status in {
+                ContractValidityStatus.MISSING_TOKEN,
+                ContractValidityStatus.NOT_YET_FULFILLED,
+            }:
                 continue
 
             await self._revoke_owned_claim(
@@ -565,15 +570,16 @@ class ControllerService(BaseComponent):
             reason="config removed",
         )
 
-    def _hardware_claim_id_for_ref(self, ref: DeviceRef) -> str:
-        owned = self._owned_claims.get(_ref_key(ref))
-        if owned is None:
-            return "missing-hardware-claim"
-        return owned.claim_id
-
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
         self._start_soon = ctx.tg.start_soon
+        if self._actions_endpoint is not None:
+            self._provider_sessions = ActionProviderSessionManager(
+                controller_id=self._controller_id,
+                controller_session_id=self._actions_endpoint.session_id,
+                concord=self._concord,
+                start_soon=ctx.tg.start_soon,
+            )
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
         if self._actions_endpoint is not None:
@@ -595,6 +601,9 @@ class ControllerService(BaseComponent):
             await ctrl_ctx.clear_page(clear_outputs=False)
         await self._controller_contexts.clear()
         await self._release_owned_claims()
+        if self._provider_sessions is not None:
+            await self._provider_sessions.aclose()
+            self._provider_sessions = None
         if self._render_backend is not None:
             await self._render_backend.aclose()
 
@@ -646,8 +655,7 @@ class ControllerService(BaseComponent):
                 settings_service=self._settings_service,
                 config_stream=stream,
                 on_config_removed=handle_config_removed,
-                binding_concord=self._concord,
-                hardware_claim_id=self._hardware_claim_id_for_ref(live.ref),
+                provider_sessions=self._provider_sessions,
             )
             await self._controller_contexts.set(live.config_id, ctrl_ctx)
             async with anyio.create_task_group() as device_tg:

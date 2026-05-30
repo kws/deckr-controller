@@ -301,6 +301,10 @@ async def test_hardware_claim_stays_pending_until_manager_token_attaches():
             while not controller._owned_claims:
                 await anyio.sleep(0.01)
 
+        owned = next(iter(controller._owned_claims.values()))
+        await controller._reconcile_hardware_current_state(reason="test pending claim")
+
+        assert next(iter(controller._owned_claims.values())).claim_id == owned.claim_id
         assert controller._device_registry.all() == ()
 
 

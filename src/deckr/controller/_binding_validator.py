@@ -57,6 +57,7 @@ class ValidationResult:
     valid: bool
     errors: list[ValidationError] = field(default_factory=list)
     bindings: list[ResolvedControlBinding] = field(default_factory=list)
+    actions: list[ActionMetadata | None] = field(default_factory=list)
 
     @property
     def has_blocking_errors(self) -> bool:
@@ -120,6 +121,7 @@ async def validate_page_bindings(
             provider_instance_id=binding.provider_instance_id,
             provider_labels=binding.provider_labels,
         )
+        result.actions.append(action)
         if action is None:
             # Non-blocking: page loads; this control shows "unavailable"
             result.add_error(
