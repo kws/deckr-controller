@@ -6,13 +6,15 @@ from dataclasses import dataclass
 import anyio
 from deckr.actions.endpoints import action_provider_address
 from deckr.concord import (
-    ConcordParticipantLease,
+    ConcordParticipantManager,
     ConcordService,
     ContractHandle,
+    ContractRecord,
     ContractValidityStatus,
     ParticipantHandle,
 )
 from deckr.contracts.messages import controller_address
+from deckr.contracts.models import thaw_json
 from deckr.profiles import (
     ACTION_PROVIDER_SESSION_PROFILE_ID,
     ActionProviderSessionTerms,
@@ -32,8 +34,7 @@ class ProviderSessionLease:
     provider_id: str
     provider_session_id: str
     contract: ContractHandle
-    controller_token: ParticipantHandle
-    controller_lease: ConcordParticipantLease
+    controller_token: ParticipantHandle | None = None
 
 
 class ActionProviderSessionManager:
@@ -50,8 +51,18 @@ class ActionProviderSessionManager:
         self._controller_id = controller_id
         self._controller_session_id = controller_session_id
         self._concord = concord
-        self._start_soon = start_soon
         self._sessions: dict[str, ProviderSessionLease] = {}
+        self._participant_manager = ConcordParticipantManager(
+            concord=concord,
+            participant=controller_address(controller_id),
+            session_id=controller_session_id,
+            profile=ACTION_PROVIDER_SESSION_PROFILE_ID,
+            refresh_interval=PROVIDER_SESSION_HEARTBEAT_SECONDS,
+            log_label="ActionProviderSession",
+            accept_contract=self._accept_session_contract,
+            current_sessions=self._session_current_sessions,
+        )
+        self._participant_manager.start_soon(start_soon)
         self._lock = anyio.Lock()
 
     async def ensure(self, action: ActionMetadata) -> bool:
@@ -91,23 +102,21 @@ class ActionProviderSessionManager:
             created_by=controller_address(self._controller_id),
             log_label="ActionProviderSession",
         )
-        controller_lease = self._concord.participant_lease(
-            contract=contract,
-            participant=controller_address(self._controller_id),
-            session_id=self._controller_session_id,
-            refresh_interval=PROVIDER_SESSION_HEARTBEAT_SECONDS,
-            log_label="ActionProviderSession",
-        )
-        controller_lease.start_soon(self._start_soon)
-        controller_token = await controller_lease.attach_or_refresh()
-        self._sessions[action.provider_instance_id] = ProviderSessionLease(
+        session = ProviderSessionLease(
             provider_instance_id=action.provider_instance_id,
             provider_id=action.provider_id,
             provider_session_id=provider_session_id,
             contract=contract,
-            controller_token=controller_token,
-            controller_lease=controller_lease,
         )
+        self._sessions[action.provider_instance_id] = session
+        managed = {
+            item.contract.key: item
+            for item in await self._participant_manager.reconcile(
+                reason="new action provider session"
+            )
+        }.get(contract.key)
+        if managed is not None:
+            session.controller_token = managed.token
         return True
 
     async def valid(
@@ -141,6 +150,16 @@ class ActionProviderSessionManager:
             or session.provider_session_id != provider_session_id
         ):
             return False
+        managed = self._participant_manager.managed_contract(session.contract)
+        if managed is None:
+            managed = {
+                item.contract.key: item
+                for item in await self._participant_manager.reconcile(
+                    reason="action provider session validity"
+                )
+            }.get(session.contract.key)
+        if managed is not None:
+            session.controller_token = managed.token
         validity = await self._concord.validate(
             session.contract,
             current_sessions={
@@ -159,7 +178,6 @@ class ActionProviderSessionManager:
         session = self._sessions.pop(provider_instance_id, None)
         if session is None:
             return
-        await session.controller_lease.aclose()
         try:
             await self._concord.cancel(
                 session.contract,
@@ -172,6 +190,41 @@ class ActionProviderSessionManager:
                 "Could not cancel action provider session contract for %s",
                 provider_instance_id,
             )
+        await self._participant_manager.release(session.contract, reason=reason)
+
+    async def _accept_session_contract(
+        self,
+        contract: ContractHandle,
+        record: ContractRecord,
+    ) -> bool:
+        session = next(
+            (
+                item
+                for item in self._sessions.values()
+                if item.contract.key == contract.key
+            ),
+            None,
+        )
+        if session is None:
+            return False
+        try:
+            terms = ActionProviderSessionTerms.model_validate(
+                thaw_json(record.terms or {})
+            )
+        except ValueError:
+            return False
+        return (
+            terms.controller_endpoint == controller_address(self._controller_id)
+            and terms.provider_endpoint
+            == action_provider_address(session.provider_instance_id)
+            and terms.provider_instance_id == session.provider_instance_id
+            and terms.provider_id == session.provider_id
+            and terms.session_id == session.provider_session_id
+            and terms.provider_endpoint in contract.participants
+        )
+
+    def _session_current_sessions(self, _contract: ContractHandle) -> dict[str, str]:
+        return {str(controller_address(self._controller_id)): self._controller_session_id}
 
     async def aclose(self) -> None:
         async with self._lock:
@@ -180,3 +233,4 @@ class ActionProviderSessionManager:
                     provider_instance_id,
                     reason="controller_stop",
                 )
+            await self._participant_manager.aclose()

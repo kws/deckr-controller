@@ -18,9 +18,10 @@ from deckr.actions.messages import (
 from deckr.beacon import BeaconService, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.concord import (
-    ConcordParticipantLease,
+    ConcordParticipantManager,
     ConcordService,
     ContractHandle,
+    ContractRecord,
     ContractValidity,
     ContractValidityStatus,
     ParticipantHandle,
@@ -29,6 +30,7 @@ from deckr.contracts.messages import (
     DeckrMessage,
     controller_address,
 )
+from deckr.contracts.models import thaw_json
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
@@ -83,10 +85,7 @@ class OwnedHardwareClaim:
     ref: DeviceRef
     device: DeviceDescriptor
     contract: ContractHandle
-    controller_token: ParticipantHandle
-    controller_lease: ConcordParticipantLease
-    manager_session_id: str
-    manager_advertisement_id: str
+    controller_token: ParticipantHandle | None = None
     live: bool = False
 
 
@@ -124,6 +123,17 @@ class ControllerService(BaseComponent):
         self._render_backend = render_backend
         self._session_id = hardware_endpoint.session_id
         self._owned_claims: dict[tuple[str, str], OwnedHardwareClaim] = {}
+        self._hardware_claim_manager = ConcordParticipantManager(
+            concord=self._concord,
+            participant=controller_address(self._controller_id),
+            session_id=self._session_id,
+            profile=HARDWARE_CLAIM_PROFILE_ID,
+            refresh_interval=CLAIM_HEARTBEAT_SECONDS,
+            reconcile_interval=_STATE_RECONCILE_SECONDS,
+            log_label="ControllerHardware",
+            accept_contract=self._accept_owned_hardware_contract,
+            current_sessions=self._hardware_claim_current_sessions,
+        )
         self._unmatched_hardware_signatures: dict[
             tuple[str, str],
             tuple[str, tuple[tuple[str, str], ...]],
@@ -264,6 +274,13 @@ class ControllerService(BaseComponent):
                 )
             await anyio.sleep(_STATE_RECONCILE_SECONDS)
 
+    async def _hardware_claim_event_loop(self) -> None:
+        async with self._hardware_claim_manager.watch() as stream:
+            async for event in stream:
+                await self._reconcile_hardware_current_state(
+                    reason=f"managed hardware claim {event.event_type.value}"
+                )
+
     async def _reconcile_hardware_current_state(self, *, reason: str) -> None:
         async with self._hardware_reconcile_lock:
             await self._reconcile_hardware_current_state_locked(reason=reason)
@@ -272,28 +289,51 @@ class ControllerService(BaseComponent):
         logger.debug("Reconciling hardware current state via %s", reason)
         candidates = await self._hardware_candidates_from_beacon()
         self._hardware_candidates = candidates
+        managed_claims = {
+            item.contract.key: item
+            for item in await self._hardware_claim_manager.reconcile(reason=reason)
+        }
 
         for owned in tuple(self._owned_claims.values()):
             candidate = candidates.get(_ref_key(owned.ref))
-            if (
-                candidate is None
-                or candidate.advertisement_id != owned.manager_advertisement_id
-                or candidate.payload.session_id != owned.manager_session_id
-            ):
+            managed = managed_claims.get(owned.contract.key)
+            validity = (
+                managed.validity
+                if managed is not None
+                else await self._hardware_claim_contract_validity(owned)
+            )
+            if managed is not None:
+                owned.controller_token = managed.token
+
+            if candidate is None:
+                if owned.live:
+                    if validity.status in {
+                        ContractValidityStatus.VALID,
+                        ContractValidityStatus.UNAVAILABLE,
+                    }:
+                        continue
+                else:
+                    validity = ContractValidity(ContractValidityStatus.MISSING_CONTRACT)
                 await self._revoke_owned_claim(
                     owned,
                     cancel_contract=True,
-                    reason=f"hardware Beacon candidate changed during {reason}",
+                    reason=f"hardware claim invalid during {reason}: {validity.status}",
                 )
                 continue
 
-            validity = await self._hardware_claim_validity(owned, candidate)
             if validity.status == ContractValidityStatus.VALID:
                 if not owned.live:
                     await self._connect_owned_claim(owned, candidate)
                 else:
                     await self._refresh_live_descriptor(owned, candidate)
                 continue
+
+            if owned.live:
+                if validity.status in {
+                    ContractValidityStatus.VALID,
+                    ContractValidityStatus.UNAVAILABLE,
+                }:
+                    continue
 
             if not owned.live and validity.status in {
                 ContractValidityStatus.MISSING_TOKEN,
@@ -380,7 +420,6 @@ class ControllerService(BaseComponent):
             claimId=claim_id,
             controllerEndpoint=controller_address(self._controller_id),
             managerEndpoint=candidate.payload.manager_endpoint,
-            managerAdvertisementId=candidate.advertisement_id,
             devices=(
                 HardwareClaimDevice(
                     deviceRef=candidate.ref,
@@ -400,16 +439,6 @@ class ControllerService(BaseComponent):
                 created_by=controller_address(self._controller_id),
                 log_label="ControllerHardware",
             )
-            lease = self._concord.participant_lease(
-                contract=contract,
-                participant=controller_address(self._controller_id),
-                session_id=self._session_id,
-                refresh_interval=CLAIM_HEARTBEAT_SECONDS,
-                log_label="ControllerHardware",
-            )
-            if self._start_soon is not None:
-                lease.start_soon(self._start_soon)
-            token = await lease.attach_or_refresh()
         except StateConflict:
             logger.info("Hardware claim contract already exists for %s", claim_id)
             return
@@ -423,29 +452,69 @@ class ControllerService(BaseComponent):
             ref=candidate.ref,
             device=device,
             contract=contract,
-            controller_token=token,
-            controller_lease=lease,
-            manager_session_id=candidate.payload.session_id,
-            manager_advertisement_id=candidate.advertisement_id,
         )
         self._owned_claims[key] = owned
-        validity = await self._hardware_claim_validity(owned, candidate)
+        managed_claims = {
+            item.contract.key: item
+            for item in await self._hardware_claim_manager.reconcile(
+                reason="new hardware claim"
+            )
+        }
+        managed = managed_claims.get(contract.key)
+        validity = (
+            managed.validity
+            if managed is not None
+            else await self._hardware_claim_contract_validity(owned)
+        )
+        if managed is not None:
+            owned.controller_token = managed.token
         if validity.status == ContractValidityStatus.VALID:
             await self._connect_owned_claim(owned, candidate)
 
-    async def _hardware_claim_validity(
+    async def _hardware_claim_contract_validity(
         self,
         owned: OwnedHardwareClaim,
-        candidate: HardwareCandidate,
     ) -> ContractValidity:
         return await self._concord.validate(
             owned.contract,
             current_sessions={
                 str(controller_address(self._controller_id)): self._session_id,
-                str(candidate.payload.manager_endpoint): candidate.payload.session_id,
             },
             log_label="ControllerHardware",
         )
+
+    async def _accept_owned_hardware_contract(
+        self,
+        contract: ContractHandle,
+        record: ContractRecord,
+    ) -> bool:
+        owned = next(
+            (
+                claim
+                for claim in self._owned_claims.values()
+                if claim.contract.key == contract.key
+            ),
+            None,
+        )
+        if owned is None:
+            return False
+        try:
+            terms = HardwareClaimTerms.model_validate(thaw_json(record.terms or {}))
+        except ValueError:
+            return False
+        return (
+            terms.claim_id == owned.claim_id
+            and terms.controller_endpoint == controller_address(self._controller_id)
+            and terms.manager_endpoint in contract.participants
+            and len(terms.devices) == 1
+            and terms.devices[0].device_ref == owned.ref
+        )
+
+    def _hardware_claim_current_sessions(
+        self,
+        _contract: ContractHandle,
+    ) -> Mapping[str, str]:
+        return {str(controller_address(self._controller_id)): self._session_id}
 
     async def _connect_owned_claim(
         self,
@@ -516,7 +585,7 @@ class ControllerService(BaseComponent):
             await self.on_device_disconnected(live.config_id, reason=reason)
         if cancel_contract:
             await self._cancel_hardware_claim(owned, reason=reason)
-        await owned.controller_lease.aclose()
+        await self._hardware_claim_manager.release(owned.contract, reason=reason)
 
     async def _cancel_hardware_claim(
         self,
@@ -573,6 +642,7 @@ class ControllerService(BaseComponent):
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
         self._start_soon = ctx.tg.start_soon
+        self._hardware_claim_manager.start_soon(ctx.tg.start_soon)
         if self._actions_endpoint is not None:
             self._provider_sessions = ActionProviderSessionManager(
                 controller_id=self._controller_id,
@@ -586,6 +656,7 @@ class ControllerService(BaseComponent):
             ctx.tg.start_soon(self._actions_subscription_loop)
         ctx.tg.start_soon(self._hardware_input_loop)
         ctx.tg.start_soon(self._hardware_beacon_loop)
+        ctx.tg.start_soon(self._hardware_claim_event_loop)
         ctx.tg.start_soon(self._hardware_reconciliation_loop)
 
     async def stop(self):
@@ -601,6 +672,7 @@ class ControllerService(BaseComponent):
             await ctrl_ctx.clear_page(clear_outputs=False)
         await self._controller_contexts.clear()
         await self._release_owned_claims()
+        await self._hardware_claim_manager.aclose()
         if self._provider_sessions is not None:
             await self._provider_sessions.aclose()
             self._provider_sessions = None
