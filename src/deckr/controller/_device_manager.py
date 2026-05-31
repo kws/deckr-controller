@@ -294,6 +294,10 @@ class DeviceManager:
         self._held_input_bindings: dict[tuple[str, str], str] = {}
         self._action_instances: dict[str, ActionInstanceMetadata] = {}
         self._action_instance_providers: dict[str, str] = {}
+        self._action_instance_provider_sessions: dict[
+            str,
+            ProviderSessionKey | None,
+        ] = {}
         self._clock = clock or time.monotonic
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
@@ -339,17 +343,22 @@ class DeviceManager:
         binding_id: str,
         *,
         clear_output: bool = True,
+        notify_provider: bool = True,
+        reason: str = "detach",
+        clear_held_input: bool = False,
     ) -> BindingLease | None:
         lease = self._binding_leases.pop(binding_id, None)
         if lease is None:
             return None
+        if clear_held_input:
+            self._clear_held_inputs_for_binding(binding_id)
         self._binding_by_context.pop(lease.context_id, None)
         active_binding = self._active_binding_by_control.get(lease.control_id)
         if active_binding == binding_id:
             self._active_binding_by_control.pop(lease.control_id, None)
             await self.action_contexts.delete(lease.control_id)
-        if lease.attached:
-            await lease.context.on_binding_detached("detach")
+        if lease.attached and notify_provider:
+            await lease.context.on_binding_detached(reason)
         output = (
             DeviceOutput(
                 self._command_service,
@@ -368,6 +377,11 @@ class DeviceManager:
             clear_output=clear_output,
         )
         return lease
+
+    def _clear_held_inputs_for_binding(self, binding_id: str) -> None:
+        for key, held_binding_id in tuple(self._held_input_bindings.items()):
+            if held_binding_id == binding_id:
+                self._held_input_bindings.pop(key, None)
 
     async def _revoke_active_bindings(self, *, clear_outputs: bool = True) -> None:
         await self._revoke_active_bindings_except(
@@ -615,6 +629,16 @@ class DeviceManager:
                 if lease.provider_session_key is not None
                 else None
             )
+            if snapshot is not None and snapshot.terminal:
+                await self._cleanup_terminal_provider_session(snapshot)
+
+        leases = tuple(self._binding_leases.values())
+        for lease in leases:
+            snapshot = (
+                snapshots.get(lease.provider_session_key)
+                if lease.provider_session_key is not None
+                else None
+            )
             valid = self._binding_session_ready(lease, snapshot=snapshot)
             if valid:
                 await self._activate_binding(
@@ -624,6 +648,70 @@ class DeviceManager:
                 continue
             if lease.attached or (snapshot is not None and snapshot.terminal):
                 await self._revoke_binding(lease.binding_id)
+
+    def _dynamic_page_owned_by_provider_session(
+        self,
+        session: DynamicPageSession,
+        key: ProviderSessionKey,
+    ) -> bool:
+        return (
+            session.owner_provider_instance_id == key.provider_instance_id
+            and session.owner_provider_id == key.provider_id
+            and session.owner_provider_session_id == key.provider_session_id
+        )
+
+    async def _cleanup_terminal_provider_session(
+        self,
+        snapshot: ProviderSessionSnapshot,
+    ) -> None:
+        key = snapshot.key
+        reason = snapshot.reason or "provider_session_terminal"
+        closed_page_session_id: str | None = None
+        page_session = self._dynamic_page_session
+        if page_session is not None and self._dynamic_page_owned_by_provider_session(
+            page_session,
+            key,
+        ):
+            closed_page_session_id = page_session.page_session_id
+            self._dynamic_page_session = None
+            if isinstance(self._nav.current_page, DynamicPageCommand):
+                self._nav.set_page(
+                    StaticPageRef(
+                        profile_name=page_session.owner_profile,
+                        page_index=page_session.owner_page,
+                    )
+                )
+
+        binding_ids: list[str] = []
+        for binding_id, lease in tuple(self._binding_leases.items()):
+            if lease.provider_session_key == key:
+                binding_ids.append(binding_id)
+                continue
+            if (
+                closed_page_session_id is not None
+                and lease.page_session_id == closed_page_session_id
+            ):
+                binding_ids.append(binding_id)
+
+        for binding_id in binding_ids:
+            lease = self._binding_leases.get(binding_id)
+            notify_provider = lease is not None and lease.provider_session_key != key
+            await self._revoke_binding(
+                binding_id,
+                notify_provider=notify_provider,
+                reason=reason,
+                clear_held_input=True,
+            )
+
+        for action_instance_id, owned_session_key in tuple(
+            self._action_instance_provider_sessions.items()
+        ):
+            if owned_session_key == key:
+                await self._destroy_action_instance(
+                    action_instance_id,
+                    reason=reason,
+                    notify_provider=False,
+                )
 
     async def _ensure_action_instance(
         self,
@@ -646,6 +734,11 @@ class DeviceManager:
         self._action_instances[action_instance_id] = metadata
         self._action_instance_providers[action_instance_id] = (
             action_meta.provider_instance_id
+        )
+        self._action_instance_provider_sessions[action_instance_id] = (
+            None
+            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+            else provider_session_key(action_meta)
         )
         if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
@@ -673,16 +766,19 @@ class DeviceManager:
         action_instance_id: str,
         *,
         reason: str,
+        notify_provider: bool = True,
     ) -> None:
         metadata = self._action_instances.pop(action_instance_id, None)
         provider_instance_id = self._action_instance_providers.pop(
             action_instance_id,
             None,
         )
+        self._action_instance_provider_sessions.pop(action_instance_id, None)
         if (
             metadata is None
             or provider_instance_id is None
             or provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+            or not notify_provider
         ):
             return
         msg = action_message(
@@ -757,6 +853,8 @@ class DeviceManager:
             if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
             else provider_session_key(action_meta)
         )
+        if provider_session_snapshot is not None and provider_session_snapshot.terminal:
+            return False
         settings_target = (
             self._build_settings_target_for_binding(
                 action_instance_id=action_instance_id,
@@ -1490,18 +1588,6 @@ class DeviceManager:
 
         registered/unregistered carry qualified provider-instance action IDs.
         """
-        registered_set = frozenset(registered)
-        reattached_set = frozenset(registered_set - set(unregistered))
-
-        to_reappear: list[ControlContext] = []
-        for lease in list(self._binding_leases.values()):
-            ctx = lease.context
-            ctx_qualified = f"{lease.provider_instance_id}::{lease.action_uuid}"
-            if ctx_qualified in reattached_set:
-                to_reappear.append(ctx)
-        for ctx in to_reappear:
-            await ctx.on_binding_attached()
-
         # Handle registered: try to resolve bindings that were previously unavailable
         current_page = self._nav.current_page
         if current_page is None:
@@ -1556,8 +1642,15 @@ class DeviceManager:
             unregistered,
         )
 
+        leased_control_ids = {
+            lease.control_id for lease in self._binding_leases.values()
+        }
+        actions_needing_lease = [
+            None if binding.control_id in leased_control_ids else action
+            for binding, action in zip(result.bindings, result.actions, strict=True)
+        ]
         prepared_actions, provider_session_snapshots = (
-            await self._prepare_provider_sessions_for_actions(result.actions)
+            await self._prepare_provider_sessions_for_actions(actions_needing_lease)
         )
         if any(not lease.attached for lease in self._binding_leases.values()):
             await self._reconcile_binding_sessions()

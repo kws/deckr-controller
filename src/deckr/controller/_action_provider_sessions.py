@@ -11,6 +11,7 @@ from deckr.concord import (
     ConcordAgreementSpec,
     ConcordService,
     ContractHandle,
+    ContractValidity,
     ContractValidityStatus,
     ParticipantHandle,
 )
@@ -42,6 +43,7 @@ class ProviderSessionSnapshot:
     ready: bool
     terminal: bool
     status: ContractValidityStatus | None
+    reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -78,6 +80,7 @@ class ActionProviderSessionManager:
         self._controller_session_id = controller_session_id
         self._concord = concord
         self._sessions: dict[ProviderSessionKey, ProviderSessionLease] = {}
+        self._retired_provider_session_ids: set[str] = set()
         self._start_soon = start_soon
         self._acceptance_timeout_seconds = acceptance_timeout_seconds
         self._lock = anyio.Lock()
@@ -113,11 +116,11 @@ class ActionProviderSessionManager:
         *,
         key: ProviderSessionKey,
     ) -> ProviderSessionSnapshot:
+        if key.provider_session_id in self._retired_provider_session_ids:
+            return _retired_snapshot(key)
         existing = self._sessions.get(key)
         if existing is not None:
-            snapshot = await self._refresh_unlocked(key)
-            if not snapshot.terminal:
-                return snapshot
+            return await self._refresh_unlocked(key)
 
         provider_endpoint = action_provider_address(action.provider_instance_id)
         controller_endpoint = controller_address(self._controller_id)
@@ -177,6 +180,8 @@ class ActionProviderSessionManager:
     ) -> ProviderSessionSnapshot:
         session = self._sessions.get(key)
         if session is None:
+            if key.provider_session_id in self._retired_provider_session_ids:
+                return _retired_snapshot(key)
             return _missing_snapshot(key)
         validity = await session.agreement.refresh()
         session.controller_token = session.agreement.local_token
@@ -184,26 +189,32 @@ class ActionProviderSessionManager:
             validity.status == ContractValidityStatus.NOT_YET_FULFILLED
             and anyio.current_time() >= session.acceptance_deadline
         ):
+            reason = "provider_session_acceptance_timeout"
             await self._cancel_key_unlocked(
                 key,
-                reason="provider_session_acceptance_timeout",
+                reason=reason,
             )
+            self._retired_provider_session_ids.add(key.provider_session_id)
             return ProviderSessionSnapshot(
                 key=key,
                 ready=False,
                 terminal=True,
                 status=validity.status,
+                reason=reason,
             )
         if _terminal_session_status(validity.status):
+            reason = _terminal_session_reason(validity)
             await self._cancel_key_unlocked(
                 key,
-                reason=f"provider_session_{validity.status.value}",
+                reason=reason,
             )
+            self._retired_provider_session_ids.add(key.provider_session_id)
             return ProviderSessionSnapshot(
                 key=key,
                 ready=False,
                 terminal=True,
                 status=validity.status,
+                reason=reason,
             )
         return _snapshot(session)
 
@@ -294,6 +305,17 @@ def _snapshot(session: ProviderSessionLease) -> ProviderSessionSnapshot:
         ready=status == ContractValidityStatus.VALID,
         terminal=terminal,
         status=status,
+        reason=session.agreement.validity.reason,
+    )
+
+
+def _retired_snapshot(key: ProviderSessionKey) -> ProviderSessionSnapshot:
+    return ProviderSessionSnapshot(
+        key=key,
+        ready=False,
+        terminal=True,
+        status=None,
+        reason="provider_session_retired",
     )
 
 
@@ -317,3 +339,15 @@ def _terminal_session_status(status: ContractValidityStatus) -> bool:
         ContractValidityStatus.SESSION_MISMATCH,
         ContractValidityStatus.TERMS_HASH_MISMATCH,
     }
+
+
+def _terminal_session_reason(validity: ContractValidity) -> str:
+    if (
+        validity.status == ContractValidityStatus.CANCELLED
+        and validity.contract is not None
+        and validity.contract.cancel_reason
+    ):
+        return validity.contract.cancel_reason
+    if validity.reason:
+        return validity.reason
+    return f"provider_session_{validity.status.value}"
