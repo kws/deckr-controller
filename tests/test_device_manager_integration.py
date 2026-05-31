@@ -1157,9 +1157,9 @@ async def test_pending_binding_drops_after_provider_session_acceptance_timeout(
             registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
             unregistered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
         )
-        assert next(iter(provider_sessions._sessions.values())).contract == (
-            old_session.contract
-        )
+        new_pending_session = next(iter(provider_sessions._sessions.values()))
+        assert new_pending_session.provider_session_id == "new-provider-session"
+        assert new_pending_session.contract != old_session.contract
         assert len(provider_sessions._sessions) == 1
 
         await anyio.sleep(0.06)
@@ -1174,13 +1174,13 @@ async def test_pending_binding_drops_after_provider_session_acceptance_timeout(
         assert provider_sessions._sessions == {}
         assert manager._binding_leases == {}
 
-        registry.provider_session_id.return_value = "new-provider-session"
+        registry.provider_session_id.return_value = "replacement-provider-session"
         await manager.on_actions_changed(
             registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
             unregistered=[],
         )
         new_session = next(iter(provider_sessions._sessions.values()))
-        assert new_session.provider_session_id == "new-provider-session"
+        assert new_session.provider_session_id == "replacement-provider-session"
         assert new_session.contract != old_session.contract
 
         tg.cancel_scope.cancel()
@@ -2616,7 +2616,7 @@ async def test_on_actions_changed_unregistered_preserves_attached_context(
 
 
 @pytest.mark.asyncio
-async def test_on_actions_changed_session_refresh_does_not_remove_context(
+async def test_on_actions_changed_same_session_change_does_not_remove_context(
     persistence_tmp_dir,
 ):
     device = _make_mock_device()
@@ -2674,4 +2674,82 @@ async def test_on_actions_changed_session_refresh_does_not_remove_context(
         )
 
         assert await manager.action_contexts.get("0,0") is ctx_before
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_on_actions_changed_session_change_rebinds_context(
+    persistence_tmp_dir,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = ConfigurableActionRegistry()
+    registry.add_action(
+        ACTION_X_UUID,
+        _metadata(
+            ACTION_X_UUID,
+            provider_instance_id="test-provider",
+            provider_id="test",
+            provider_session_id="old-session",
+        ),
+    )
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx_before = await manager.action_contexts.get("0,0")
+        assert ctx_before is not None
+
+        registry.add_action(
+            ACTION_X_UUID,
+            _metadata(
+                ACTION_X_UUID,
+                provider_instance_id="test-provider",
+                provider_id="test",
+                provider_session_id="new-session",
+            ),
+        )
+        qualified = f"test-provider::{ACTION_X_UUID}"
+        await manager.on_actions_changed(
+            registered=[qualified],
+            unregistered=[qualified],
+        )
+
+        ctx_after = await manager.action_contexts.get("0,0")
+        assert ctx_after is not None
+        assert ctx_after is not ctx_before
+        lease = next(iter(manager._binding_leases.values()))
+        assert lease.provider_session_id == "new-session"
+        assert lease.context is ctx_after
+        assert len(manager._binding_leases) == 1
         tg.cancel_scope.cancel()

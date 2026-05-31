@@ -227,6 +227,19 @@ class BindingLease:
     handler: str | None = None
 
 
+def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
+    return f"{provider_instance_id}::{action_uuid}"
+
+
+def _lease_matches_action(lease: BindingLease, action_meta: ActionMetadata) -> bool:
+    return (
+        lease.action_uuid == action_meta.uuid
+        and lease.provider_instance_id == action_meta.provider_instance_id
+        and lease.provider_id == action_meta.provider_id
+        and lease.provider_session_id == action_meta.provider_session_id
+    )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AuthorizedCommandTarget:
     sender_provider_instance_id: str
@@ -526,6 +539,52 @@ class DeviceManager:
         if provider_session_id == action_meta.provider_session_id:
             return action_meta
         return replace(action_meta, provider_session_id=provider_session_id)
+
+    def _binding_lease_for_control(self, control_id: str) -> BindingLease | None:
+        active_binding_id = self._active_binding_by_control.get(control_id)
+        if active_binding_id is not None:
+            lease = self._binding_leases.get(active_binding_id)
+            if lease is not None:
+                return lease
+        for lease in self._binding_leases.values():
+            if lease.control_id == control_id:
+                return lease
+        return None
+
+    async def _revoke_binding_for_action_session_change(
+        self,
+        lease: BindingLease,
+        *,
+        action_meta: ActionMetadata,
+    ) -> None:
+        logger.info(
+            "Rebinding control after action provider session changed "
+            "config=%s control=%s action=%s provider=%s oldSession=%s newSession=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.provider_session_id,
+            action_meta.provider_session_id,
+        )
+        old_session_key = lease.provider_session_key
+        await self._revoke_binding(
+            lease.binding_id,
+            clear_output=False,
+            notify_provider=False,
+            reason="provider_session_changed",
+            clear_held_input=True,
+        )
+        await self._destroy_action_instance(
+            lease.action_instance_id,
+            reason="provider_session_changed",
+            notify_provider=False,
+        )
+        if self._provider_sessions is None or old_session_key is None:
+            return
+        retire = getattr(self._provider_sessions, "retire", None)
+        if retire is not None:
+            await retire(old_session_key, reason="provider_session_changed")
 
     async def _prepare_provider_sessions_for_actions(
         self,
@@ -1642,12 +1701,38 @@ class DeviceManager:
             unregistered,
         )
 
+        changed_action_ids = set(registered) & set(unregistered)
+        current_actions = [
+            None if action is None else self._action_metadata_with_current_session(action)
+            for action in result.actions
+        ]
+        rebind_control_ids: set[str] = set()
+        for binding, action_meta in zip(
+            result.bindings,
+            current_actions,
+            strict=True,
+        ):
+            lease = self._binding_lease_for_control(binding.control_id)
+            if lease is None:
+                continue
+            if (
+                _qualified_action_id(lease.provider_instance_id, lease.action_uuid)
+                not in changed_action_ids
+            ):
+                continue
+            if action_meta is None or _lease_matches_action(lease, action_meta):
+                continue
+            rebind_control_ids.add(binding.control_id)
+
         leased_control_ids = {
             lease.control_id for lease in self._binding_leases.values()
         }
         actions_needing_lease = [
-            None if binding.control_id in leased_control_ids else action
-            for binding, action in zip(result.bindings, result.actions, strict=True)
+            action
+            if binding.control_id in rebind_control_ids
+            or binding.control_id not in leased_control_ids
+            else None
+            for binding, action in zip(result.bindings, current_actions, strict=True)
         ]
         prepared_actions, provider_session_snapshots = (
             await self._prepare_provider_sessions_for_actions(actions_needing_lease)
@@ -1666,6 +1751,13 @@ class DeviceManager:
             prepared_actions,
             strict=True,
         ):
+            if binding.control_id in rebind_control_ids:
+                lease = self._binding_lease_for_control(binding.control_id)
+                if lease is not None and action_meta is not None:
+                    await self._revoke_binding_for_action_session_change(
+                        lease,
+                        action_meta=action_meta,
+                    )
             if await self.action_contexts.has_key(binding.control_id):
                 continue  # Already has context
             if any(

@@ -297,6 +297,63 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
 
 
 @pytest.mark.asyncio
+async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
+    caplog,
+):
+    hardware_bus = LaneHarness(
+        "hardware_messages",
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    actions_bus = LaneHarness(
+        "actions",
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    beacon = _beacon(hardware_bus)
+    concord = _concord(hardware_bus)
+    registry = MagicMock()
+    registry.get_action = AsyncMock(return_value=None)
+    registry.provider_session_id.return_value = None
+    registry.provider_instance_provides_provider.return_value = False
+    controller = ControllerService(
+        hardware_endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)),
+        beacon=beacon,
+        concord=concord,
+        config_service=MemoryConfigService(_config()),
+        settings_service=MagicMock(),
+        controller_id=CONTROLLER_ID,
+        action_registry=registry,
+        actions_endpoint=actions_bus.endpoint(controller_address(CONTROLLER_ID)),
+    )
+    caplog.set_level("INFO", logger="deckr.controller._controller_service")
+
+    await _advertise_hardware(
+        beacon,
+        manager_id="room-a",
+        session_id="stale-session",
+        advertisement_id="hardware_manager_test",
+    )
+    await _advertise_hardware(
+        beacon,
+        manager_id="room-a",
+        session_id="live-session",
+        advertisement_id="hardware_manager_mirabox-rust-001",
+    )
+
+    await controller._reconcile_hardware_current_state(reason="test duplicate beacon")
+
+    assert len(controller._owned_claims) == 1
+    owned = next(iter(controller._owned_claims.values()))
+    assert owned.current_sessions[str(hardware_manager_address("room-a"))] == (
+        "live-session"
+    )
+    assert "Multiple hardware Beacon advertisements describe device room-a/deck" in (
+        caplog.text
+    )
+    assert "hardware_manager_mirabox-rust-001" in caplog.text
+    assert "hardware_manager_test" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_hardware_claim_stays_pending_until_manager_token_attaches():
     async with _running_controller(
         config_service=MemoryConfigService(_config())

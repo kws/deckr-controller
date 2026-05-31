@@ -28,6 +28,7 @@ from deckr.concord import (
 )
 from deckr.contracts.messages import (
     DeckrMessage,
+    EndpointAddress,
     controller_address,
 )
 from deckr.core.util.anyio import AsyncMap
@@ -72,6 +73,10 @@ _WATCH_RETRY_SECONDS = 1.0
 class HardwareCandidate:
     advertisement_key: str
     advertisement_id: str
+    advertisement_endpoint: EndpointAddress
+    advertisement_session_id: str
+    advertisement_revision: int
+    advertisement_refresh_seq: int
     payload: HardwareBeaconPayload
     ref: DeviceRef
     device: DeviceDescriptor
@@ -361,12 +366,25 @@ class ControllerService(BaseComponent):
                 hardware_candidate = HardwareCandidate(
                     advertisement_key=candidate.key,
                     advertisement_id=candidate.advertisement.advertisement_id,
+                    advertisement_endpoint=candidate.advertisement.endpoint,
+                    advertisement_session_id=candidate.advertisement.session_id,
+                    advertisement_revision=candidate.revision,
+                    advertisement_refresh_seq=candidate.advertisement.refresh_seq,
                     payload=payload,
                     ref=item.device_ref,
                     device=item.descriptor,
                     labels=payload.labels,
                 )
-                candidates[_ref_key(item.device_ref)] = hardware_candidate
+                key = _ref_key(item.device_ref)
+                selected = candidates.get(key)
+                if selected is not None:
+                    _log_duplicate_hardware_candidate(
+                        item.device_ref,
+                        selected=selected,
+                        skipped=hardware_candidate,
+                    )
+                    continue
+                candidates[key] = hardware_candidate
         return candidates
 
     async def _try_claim_hardware_candidate(
@@ -744,6 +762,31 @@ def _valid_hardware_payload(candidate: Candidate) -> HardwareBeaconPayload | Non
             candidate.key,
         )
         return None
+
+
+def _log_duplicate_hardware_candidate(
+    ref: DeviceRef,
+    *,
+    selected: HardwareCandidate,
+    skipped: HardwareCandidate,
+) -> None:
+    logger.info(
+        "Multiple hardware Beacon advertisements describe device %s/%s; "
+        "selected key=%s endpoint=%s session=%s revision=%s refreshSeq=%s; "
+        "skipped key=%s endpoint=%s session=%s revision=%s refreshSeq=%s",
+        ref.manager_id,
+        ref.device_id,
+        selected.advertisement_key,
+        selected.advertisement_endpoint,
+        selected.advertisement_session_id,
+        selected.advertisement_revision,
+        selected.advertisement_refresh_seq,
+        skipped.advertisement_key,
+        skipped.advertisement_endpoint,
+        skipped.advertisement_session_id,
+        skipped.advertisement_revision,
+        skipped.advertisement_refresh_seq,
+    )
 
 
 def _ref_key(ref: DeviceRef) -> tuple[str, str]:

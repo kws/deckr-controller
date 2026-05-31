@@ -258,6 +258,11 @@ class ActionProviderSessionManager:
         async with self._lock:
             await self._cancel_unlocked(provider_instance_id, reason=reason)
 
+    async def retire(self, key: ProviderSessionKey, *, reason: str) -> None:
+        async with self._lock:
+            await self._cancel_key_unlocked(key, reason=reason)
+            self._retired_provider_session_ids.add(key.provider_session_id)
+
     async def _cancel_unlocked(self, provider_instance_id: str, *, reason: str) -> None:
         for key in tuple(self._sessions):
             if key.provider_instance_id == provider_instance_id:
