@@ -320,7 +320,7 @@ async def test_hardware_claim_becomes_live_after_concord_manager_token():
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
 
-        await concord.attach(
+        await concord._attach(
             owned.contract,
             hardware_manager_address("room-a"),
             "manager-session",
@@ -350,7 +350,7 @@ async def test_hardware_claim_is_cancelled_when_config_is_removed():
             while not controller._owned_claims:
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
-        await concord.attach(
+        await concord._attach(
             owned.contract,
             hardware_manager_address("room-a"),
             "manager-session",
@@ -368,7 +368,7 @@ async def test_hardware_claim_is_cancelled_when_config_is_removed():
                 await anyio.sleep(0.01)
 
         assert controller._device_registry.get("config-room-a") is None
-        assert (await concord.validate(owned.contract)).status == (
+        assert (await concord._validate(owned.contract)).status == (
             ContractValidityStatus.CANCELLED
         )
 
@@ -384,7 +384,7 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
             while not controller._owned_claims:
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
-        await concord.attach(
+        await concord._attach(
             owned.contract,
             hardware_manager_address("room-a"),
             "manager-session",
@@ -407,7 +407,7 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
 
 
 @pytest.mark.asyncio
-async def test_live_hardware_claim_survives_beacon_churn_until_contract_invalid():
+async def test_live_hardware_claim_session_mismatch_supersedes_claim():
     async with _running_controller(
         config_service=MemoryConfigService(_config())
     ) as (controller, beacon, concord):
@@ -417,7 +417,7 @@ async def test_live_hardware_claim_survives_beacon_churn_until_contract_invalid(
             while not controller._owned_claims:
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
-        await concord.attach(
+        await concord._attach(
             owned.contract,
             hardware_manager_address("room-a"),
             "old-session",
@@ -438,18 +438,24 @@ async def test_live_hardware_claim_survives_beacon_churn_until_contract_invalid(
         )
         await controller._reconcile_hardware_current_state(reason="test session change")
 
-        assert controller._device_registry.get("config-room-a") is not None
-        assert next(iter(controller._owned_claims.values())).claim_id == owned.claim_id
-
-        await concord.cancel(
-            owned.contract,
-            hardware_manager_address("room-a"),
-            reason="manager restart",
+        assert controller._device_registry.get("config-room-a") is None
+        assert (await concord._validate(owned.contract)).status == (
+            ContractValidityStatus.CANCELLED
         )
-        await controller._reconcile_hardware_current_state(reason="test contract cancel")
+        replacement = next(iter(controller._owned_claims.values()))
+        assert replacement.claim_id != owned.claim_id
+
+        await concord._attach(
+            replacement.contract,
+            hardware_manager_address("room-a"),
+            "new-session",
+        )
+        await controller._reconcile_hardware_current_state(
+            reason="test replacement manager token"
+        )
 
         with anyio.fail_after(1):
-            while controller._device_registry.get("config-room-a") is not None:
+            while controller._device_registry.get("config-room-a") is None:
                 await anyio.sleep(0.01)
 
 

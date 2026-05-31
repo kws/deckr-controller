@@ -6,15 +6,14 @@ from dataclasses import dataclass
 import anyio
 from deckr.actions.endpoints import action_provider_address
 from deckr.concord import (
-    ConcordParticipantManager,
+    ConcordAgreement,
+    ConcordAgreementSpec,
     ConcordService,
     ContractHandle,
-    ContractRecord,
     ContractValidityStatus,
     ParticipantHandle,
 )
 from deckr.contracts.messages import controller_address
-from deckr.contracts.models import thaw_json
 from deckr.profiles import (
     ACTION_PROVIDER_SESSION_PROFILE_ID,
     ActionProviderSessionTerms,
@@ -33,8 +32,13 @@ class ProviderSessionLease:
     provider_instance_id: str
     provider_id: str
     provider_session_id: str
-    contract: ContractHandle
+    agreement: ConcordAgreement
+    current_sessions: dict[str, str]
     controller_token: ParticipantHandle | None = None
+
+    @property
+    def contract(self) -> ContractHandle:
+        return self.agreement.contract
 
 
 class ActionProviderSessionManager:
@@ -52,17 +56,7 @@ class ActionProviderSessionManager:
         self._controller_session_id = controller_session_id
         self._concord = concord
         self._sessions: dict[str, ProviderSessionLease] = {}
-        self._participant_manager = ConcordParticipantManager(
-            concord=concord,
-            participant=controller_address(controller_id),
-            session_id=controller_session_id,
-            profile=ACTION_PROVIDER_SESSION_PROFILE_ID,
-            refresh_interval=PROVIDER_SESSION_HEARTBEAT_SECONDS,
-            log_label="ActionProviderSession",
-            accept_contract=self._accept_session_contract,
-            current_sessions=self._session_current_sessions,
-        )
-        self._participant_manager.start_soon(start_soon)
+        self._start_soon = start_soon
         self._lock = anyio.Lock()
 
     async def ensure(self, action: ActionMetadata) -> bool:
@@ -80,43 +74,49 @@ class ActionProviderSessionManager:
                 existing.provider_id == action.provider_id
                 and existing.provider_session_id == provider_session_id
             ):
-                return True
+                validity = await existing.agreement.refresh()
+                existing.controller_token = existing.agreement.local_token
+                if not _terminal_session_status(validity.status):
+                    return True
             await self._cancel_unlocked(
                 action.provider_instance_id,
                 reason="provider_session_changed",
             )
 
-        contract = await self._concord.create_contract(
-            (
-                controller_address(self._controller_id),
-                action_provider_address(action.provider_instance_id),
+        provider_endpoint = action_provider_address(action.provider_instance_id)
+        controller_endpoint = controller_address(self._controller_id)
+        current_sessions = {
+            str(controller_endpoint): self._controller_session_id,
+            str(provider_endpoint): provider_session_id,
+        }
+        agreement = await self._concord.ensure_agreement(
+            ConcordAgreementSpec(
+                profile=ACTION_PROVIDER_SESSION_PROFILE_ID,
+                participants=(controller_endpoint, provider_endpoint),
+                local_participant=controller_endpoint,
+                local_session_id=self._controller_session_id,
+                terms=ActionProviderSessionTerms(
+                    sessionId=provider_session_id,
+                    controllerEndpoint=controller_endpoint,
+                    providerEndpoint=provider_endpoint,
+                    providerInstanceId=action.provider_instance_id,
+                    providerId=action.provider_id,
+                ),
+                current_sessions=current_sessions,
+                refresh_interval=PROVIDER_SESSION_HEARTBEAT_SECONDS,
+                log_label="ActionProviderSession",
             ),
-            profile=ACTION_PROVIDER_SESSION_PROFILE_ID,
-            terms=ActionProviderSessionTerms(
-                sessionId=provider_session_id,
-                controllerEndpoint=controller_address(self._controller_id),
-                providerEndpoint=action_provider_address(action.provider_instance_id),
-                providerInstanceId=action.provider_instance_id,
-                providerId=action.provider_id,
-            ),
-            created_by=controller_address(self._controller_id),
-            log_label="ActionProviderSession",
+            start_soon=self._start_soon,
         )
         session = ProviderSessionLease(
             provider_instance_id=action.provider_instance_id,
             provider_id=action.provider_id,
             provider_session_id=provider_session_id,
-            contract=contract,
+            agreement=agreement,
+            current_sessions=current_sessions,
+            controller_token=agreement.local_token,
         )
         self._sessions[action.provider_instance_id] = session
-        managed = {
-            item.contract.key: item
-            for item in await self._participant_manager.reconcile(
-                reason="new action provider session"
-            )
-        }.get(contract.key)
-        if managed is not None:
-            session.controller_token = managed.token
         return True
 
     async def valid(
@@ -150,24 +150,17 @@ class ActionProviderSessionManager:
             or session.provider_session_id != provider_session_id
         ):
             return False
-        managed = self._participant_manager.managed_contract(session.contract)
-        if managed is None:
-            managed = {
-                item.contract.key: item
-                for item in await self._participant_manager.reconcile(
-                    reason="action provider session validity"
-                )
-            }.get(session.contract.key)
-        if managed is not None:
-            session.controller_token = managed.token
-        validity = await self._concord.validate(
-            session.contract,
-            current_sessions={
-                str(controller_address(self._controller_id)): self._controller_session_id,
-                str(action_provider_address(provider_instance_id)): provider_session_id,
-            },
-            log_label="ActionProviderSession",
-        )
+        session.current_sessions[
+            str(action_provider_address(provider_instance_id))
+        ] = provider_session_id
+        validity = await session.agreement.refresh()
+        session.controller_token = session.agreement.local_token
+        if _terminal_session_status(validity.status):
+            await self._cancel_unlocked(
+                provider_instance_id,
+                reason=f"provider_session_{validity.status.value}",
+            )
+            return False
         return validity.status == ContractValidityStatus.VALID
 
     async def cancel(self, provider_instance_id: str, *, reason: str) -> None:
@@ -179,52 +172,12 @@ class ActionProviderSessionManager:
         if session is None:
             return
         try:
-            await self._concord.cancel(
-                session.contract,
-                controller_address(self._controller_id),
-                reason=reason,
-                log_label="ActionProviderSession",
-            )
+            await session.agreement.cancel(reason=reason)
         except (StateConflict, StateUnavailable, ValueError):
             logger.warning(
                 "Could not cancel action provider session contract for %s",
                 provider_instance_id,
             )
-        await self._participant_manager.release(session.contract, reason=reason)
-
-    async def _accept_session_contract(
-        self,
-        contract: ContractHandle,
-        record: ContractRecord,
-    ) -> bool:
-        session = next(
-            (
-                item
-                for item in self._sessions.values()
-                if item.contract.key == contract.key
-            ),
-            None,
-        )
-        if session is None:
-            return False
-        try:
-            terms = ActionProviderSessionTerms.model_validate(
-                thaw_json(record.terms or {})
-            )
-        except ValueError:
-            return False
-        return (
-            terms.controller_endpoint == controller_address(self._controller_id)
-            and terms.provider_endpoint
-            == action_provider_address(session.provider_instance_id)
-            and terms.provider_instance_id == session.provider_instance_id
-            and terms.provider_id == session.provider_id
-            and terms.session_id == session.provider_session_id
-            and terms.provider_endpoint in contract.participants
-        )
-
-    def _session_current_sessions(self, _contract: ContractHandle) -> dict[str, str]:
-        return {str(controller_address(self._controller_id)): self._controller_session_id}
 
     async def aclose(self) -> None:
         async with self._lock:
@@ -233,4 +186,16 @@ class ActionProviderSessionManager:
                     provider_instance_id,
                     reason="controller_stop",
                 )
-            await self._participant_manager.aclose()
+
+
+def _terminal_session_status(status: ContractValidityStatus) -> bool:
+    return status in {
+        ContractValidityStatus.CANCELLED,
+        ContractValidityStatus.MISSING_CONTRACT,
+        ContractValidityStatus.INVALID_CONTRACT,
+        ContractValidityStatus.INVALID_TOKEN,
+        ContractValidityStatus.MISSING_TOKEN,
+        ContractValidityStatus.GENERATION_MISMATCH,
+        ContractValidityStatus.SESSION_MISMATCH,
+        ContractValidityStatus.TERMS_HASH_MISMATCH,
+    }

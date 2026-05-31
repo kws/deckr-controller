@@ -995,7 +995,7 @@ async def test_binding_waits_for_provider_session_token(
                 await stream.receive()
             assert scope.cancel_called
 
-            await concord.attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+            await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
             await manager._reconcile_binding_sessions()
 
             with anyio.fail_after(1):
@@ -1043,7 +1043,7 @@ async def test_binding_revokes_when_provider_session_changes(
         )
         await manager.set_page(profile="default", page=0)
         session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
-        await concord.attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
         await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
 
@@ -1089,7 +1089,7 @@ async def test_binding_revokes_when_provider_session_disappears(
         )
         await manager.set_page(profile="default", page=0)
         session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
-        await concord.attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
         await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
 
