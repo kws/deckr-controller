@@ -1,8 +1,11 @@
 """Tests for the controller raster render pipeline."""
 
+import httpx
+import pytest
 from invariant import Node, dump_graph_data_uri
 from invariant.params import ref
 
+import deckr.controller.invariant.ops.fetch_url as fetch_url_module
 from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import (
     RenderModel,
@@ -94,3 +97,30 @@ def test_graph_uri_query_context_is_literal_when_bound_to_render_graph():
     result = get_executor().execute({"src": render_node.node}, ["src"], context=context)
 
     assert result["src"] == "${canvas.width}"
+
+
+def test_fetch_image_url_http_uses_bounded_timeout(monkeypatch):
+    class TimeoutClient:
+        kwargs = None
+
+        def __init__(self, **kwargs):
+            type(self).kwargs = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        def get(self, url):
+            raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(fetch_url_module.httpx, "Client", TimeoutClient)
+
+    with pytest.raises(httpx.ReadTimeout):
+        fetch_url_module.fetch_image_url("https://example.test/image.png")
+
+    assert TimeoutClient.kwargs == {
+        "timeout": fetch_url_module.HTTP_IMAGE_TIMEOUT,
+        "follow_redirects": True,
+    }

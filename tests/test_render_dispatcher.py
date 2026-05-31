@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import signal
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import anyio
+import httpx
 import pytest
 from invariant import Node, SubGraphNode, dump_graph_data_uri, dump_graph_to_dict
 from invariant.params import ref
@@ -31,6 +33,7 @@ from deckr.controller._render import (
 from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderDispatcher,
+    ThreadRenderBackend,
 )
 
 
@@ -309,6 +312,53 @@ def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
 
     assert isinstance(frame, bytes)
     assert len(frame) > 100
+
+
+@pytest.mark.asyncio
+async def test_thread_render_backend_skips_http_image_fetch_failures(
+    monkeypatch,
+    caplog,
+):
+    def fail_render(request):
+        del request
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(
+        "deckr.controller._render_dispatcher.render_request_to_jpeg",
+        fail_render,
+    )
+    caplog.set_level(logging.WARNING, logger="deckr.controller._render_dispatcher")
+    backend = ThreadRenderBackend()
+
+    result = await backend.render(_solid_request())
+
+    assert result.frame is None
+    assert result.error == "timed out"
+    assert "image fetch failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_process_pool_render_backend_skips_http_image_fetch_failures(
+    monkeypatch,
+    caplog,
+):
+    async def fail_render(executor, request):
+        del executor, request
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(
+        "deckr.controller._render_dispatcher._run_in_process_pool",
+        fail_render,
+    )
+    caplog.set_level(logging.WARNING, logger="deckr.controller._render_dispatcher")
+    backend = object.__new__(ProcessPoolRenderBackend)
+    backend._executor = object()
+
+    result = await backend.render(_solid_request())
+
+    assert result.frame is None
+    assert result.error == "timed out"
+    assert "image fetch failed" in caplog.text
 
 
 @pytest.mark.asyncio

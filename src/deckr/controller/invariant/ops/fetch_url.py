@@ -6,6 +6,8 @@ import urllib.parse
 import httpx
 from invariant_gfx.artifacts import BlobArtifact
 
+HTTP_IMAGE_TIMEOUT = httpx.Timeout(2.0, connect=1.0)
+
 
 def fetch_image_url(url: str) -> BlobArtifact:
     """Fetch image bytes from a URL or data URI.
@@ -43,7 +45,7 @@ def _parse_data_uri(url: str) -> BlobArtifact:
 
 
 def _fetch_http(url: str) -> BlobArtifact:
-    with httpx.Client() as client:
+    with httpx.Client(timeout=HTTP_IMAGE_TIMEOUT, follow_redirects=True) as client:
         response = client.get(url)
         response.raise_for_status()
         content_type = response.headers.get("content-type", "application/octet-stream")

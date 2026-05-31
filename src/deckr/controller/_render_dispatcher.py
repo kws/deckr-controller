@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
 
 import anyio
+import httpx
 
 from deckr.controller._render import RenderRequest, RenderResult, render_request_to_jpeg
 
@@ -66,6 +67,22 @@ class ThreadRenderBackend:
                 generation=request.generation,
                 frame=frame,
             )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Thread render skipped after image fetch failed for %s:%s gen=%s: %s",
+                request.context_id,
+                request.control_id,
+                request.generation,
+                exc,
+            )
+            return RenderResult(
+                context_id=request.context_id,
+                binding_id=request.binding_id,
+                control_id=request.control_id,
+                generation=request.generation,
+                frame=None,
+                error=str(exc),
+            )
         except Exception as exc:
             logger.exception(
                 "Thread render failed for %s:%s gen=%s",
@@ -104,6 +121,22 @@ class ProcessPoolRenderBackend:
                 control_id=request.control_id,
                 generation=request.generation,
                 frame=frame,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Process render skipped after image fetch failed for %s:%s gen=%s: %s",
+                request.context_id,
+                request.control_id,
+                request.generation,
+                exc,
+            )
+            return RenderResult(
+                context_id=request.context_id,
+                binding_id=request.binding_id,
+                control_id=request.control_id,
+                generation=request.generation,
+                frame=None,
+                error=str(exc),
             )
         except Exception as exc:
             logger.exception(
