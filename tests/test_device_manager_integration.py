@@ -29,6 +29,7 @@ from deckr.concord import (
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
     ConcordService,
+    ContractValidityStatus,
 )
 from deckr.contracts.messages import DeckrMessage, controller_address
 from deckr.hardware import messages as hw_messages
@@ -46,7 +47,12 @@ from deckr.hardware.descriptors import (
 from invariant import Node, SubGraphNode, dump_graph_data_uri
 from invariant.params import ref
 
-from deckr.controller._action_provider_sessions import ActionProviderSessionManager
+from deckr.controller._action_provider_sessions import (
+    ActionProviderSessionManager,
+    ProviderSessionKey,
+    ProviderSessionSnapshot,
+    provider_session_key,
+)
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
 from deckr.controller.action_provider.provider import ActionMetadata
@@ -85,6 +91,45 @@ def _provider_session_manager(
         concord=concord,
         start_soon=start_soon,
     )
+
+
+class ReadyProviderSessions:
+    def __init__(self) -> None:
+        self.prepare_calls: list[tuple[ActionMetadata, ...]] = []
+        self.refresh_calls: list[tuple[ProviderSessionKey, ...]] = []
+
+    async def prepare_many(self, actions) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
+        prepared = tuple(actions)
+        self.prepare_calls.append(prepared)
+        return {
+            key: ProviderSessionSnapshot(
+                key=key,
+                ready=True,
+                terminal=False,
+                status=ContractValidityStatus.VALID,
+            )
+            for action in prepared
+            if (key := provider_session_key(action)) is not None
+        }
+
+    async def refresh_many(self, keys) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
+        prepared = tuple(keys)
+        self.refresh_calls.append(prepared)
+        return {
+            key: ProviderSessionSnapshot(
+                key=key,
+                ready=True,
+                terminal=False,
+                status=ContractValidityStatus.VALID,
+            )
+            for key in prepared
+        }
+
+    def cached_ready(self, key: ProviderSessionKey) -> bool:
+        return True
+
+    async def valid(self, **kwargs) -> bool:
+        raise AssertionError(f"unexpected provider-session valid call: {kwargs}")
 
 
 def _action_command(
@@ -961,7 +1006,7 @@ async def test_binding_waits_for_provider_session_token(
 
             assert await manager.action_contexts.get("0,0") is None
             lease = next(iter(manager._binding_leases.values()))
-            session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
+            session = next(iter(provider_sessions._sessions.values()))
             assert not lease.attached
             assert session.provider_session_id == PROVIDER_SESSION_ID
             assert await manager._authorize_action_command(
@@ -1042,7 +1087,7 @@ async def test_binding_revokes_when_provider_session_changes(
             provider_sessions=provider_sessions,
         )
         await manager.set_page(profile="default", page=0)
-        session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
+        session = next(iter(provider_sessions._sessions.values()))
         await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
         await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
@@ -1088,7 +1133,7 @@ async def test_binding_revokes_when_provider_session_disappears(
             provider_sessions=provider_sessions,
         )
         await manager.set_page(profile="default", page=0)
-        session = provider_sessions._sessions[PROVIDER_INSTANCE_ID]
+        session = next(iter(provider_sessions._sessions.values()))
         await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
         await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
@@ -1100,6 +1145,150 @@ async def test_binding_revokes_when_provider_session_disappears(
         assert manager._binding_leases == {}
 
         tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_static_page_batches_provider_session_preparation():
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    provider_sessions = ReadyProviderSessions()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=SetRasterImageOnAppearAction.uuid,
+                                settings={},
+                            ),
+                            Control(
+                                selector={"control_id": "1,0"},
+                                action=SetRasterImageOnAppearAction.uuid,
+                                settings={},
+                            ),
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=config,
+        manager=registry,
+        actions_bus=action_bus,
+        start_soon=lambda fn, *a, **k: None,
+        provider_sessions=provider_sessions,
+    )
+
+    await manager.set_page(profile="default", page=0)
+
+    assert len(provider_sessions.prepare_calls) == 1
+    prepared = provider_sessions.prepare_calls[0]
+    assert len(prepared) == 2
+    assert {provider_session_key(action) for action in prepared} == {
+        ProviderSessionKey(PROVIDER_INSTANCE_ID, PROVIDER_ID, PROVIDER_SESSION_ID)
+    }
+    assert await manager.action_contexts.get("0,0") is not None
+    assert await manager.action_contexts.get("1,0") is not None
+
+    await manager._reconcile_binding_sessions()
+
+    assert provider_sessions.refresh_calls == [
+        (ProviderSessionKey(PROVIDER_INSTANCE_ID, PROVIDER_ID, PROVIDER_SESSION_ID),)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_action_command_authorization_uses_cached_provider_session():
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    provider_sessions = ReadyProviderSessions()
+
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=DeviceConfig(
+            id="test-device",
+            name="Test Device",
+            match={"fingerprint": "fingerprint:test-device"},
+            profiles=[
+                Profile(
+                    name="default",
+                    pages=[
+                        Page(
+                            controls=[
+                                Control(
+                                    selector={"control_id": "0,0"},
+                                    action=SetRasterImageOnAppearAction.uuid,
+                                    settings={},
+                                )
+                            ]
+                        )
+                    ],
+                )
+            ],
+        ),
+        manager=registry,
+        actions_bus=action_bus,
+        start_soon=lambda fn, *a, **k: None,
+        provider_sessions=provider_sessions,
+    )
+    await manager.set_page(profile="default", page=0)
+    ctx = await manager.action_contexts.get("0,0")
+    assert ctx is not None
+
+    authorization = await manager._authorize_action_command(
+        _action_command(
+            BINDING_OUTPUT,
+            {
+                "binding": ctx.metadata.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": "test-device",
+                    },
+                    "controlId": "0,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "clear",
+                "generation": 0,
+            },
+            context_id=ctx.id,
+            action_instance_id=ctx.action_instance_id,
+            binding_id=ctx.binding_id,
+        ),
+        context_id=ctx.id,
+    )
+
+    assert authorization is not None
+    assert provider_sessions.refresh_calls == []
 
 
 @pytest.mark.asyncio

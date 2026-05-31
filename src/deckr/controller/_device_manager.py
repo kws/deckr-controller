@@ -1,7 +1,7 @@
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import anyio
@@ -74,7 +74,12 @@ from deckr.hardware.descriptors import (
 )
 from pydantic import ValidationError
 
-from deckr.controller._action_provider_sessions import ActionProviderSessionManager
+from deckr.controller._action_provider_sessions import (
+    ActionProviderSessionManager,
+    ProviderSessionKey,
+    ProviderSessionSnapshot,
+    provider_session_key,
+)
 from deckr.controller._binding_resolution import ResolvedControlBinding
 from deckr.controller._binding_validator import (
     BLOCKING_ERROR_CODES,
@@ -207,6 +212,7 @@ class BindingLease:
     provider_instance_id: str
     provider_id: str
     provider_session_id: str | None
+    provider_session_key: ProviderSessionKey | None
     attached: bool
     control_id: str
     control: ControlSurface
@@ -493,12 +499,72 @@ class DeviceManager:
                 )
         return tuple(matches)
 
-    async def _binding_session_valid(self, lease: BindingLease) -> bool:
+    def _action_metadata_with_current_session(
+        self,
+        action_meta: ActionMetadata,
+    ) -> ActionMetadata:
+        registry_session = self.manager.provider_session_id(
+            action_meta.provider_instance_id
+        )
+        if not isinstance(registry_session, str):
+            registry_session = None
+        provider_session_id = registry_session or action_meta.provider_session_id
+        if provider_session_id == action_meta.provider_session_id:
+            return action_meta
+        return replace(action_meta, provider_session_id=provider_session_id)
+
+    async def _prepare_provider_sessions_for_actions(
+        self,
+        actions: list[ActionMetadata | None],
+    ) -> tuple[
+        list[ActionMetadata | None],
+        dict[ProviderSessionKey, ProviderSessionSnapshot],
+    ]:
+        prepared_actions = [
+            None if action is None else self._action_metadata_with_current_session(action)
+            for action in actions
+        ]
+        if self._provider_sessions is None:
+            return prepared_actions, {}
+        snapshots = await self._provider_sessions.prepare_many(
+            action
+            for action in prepared_actions
+            if action is not None
+            and action.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
+        )
+        return prepared_actions, snapshots
+
+    def _provider_session_snapshot_for_action(
+        self,
+        action_meta: ActionMetadata | None,
+        snapshots: Mapping[ProviderSessionKey, ProviderSessionSnapshot],
+    ) -> ProviderSessionSnapshot | None:
+        if action_meta is None:
+            return None
+        key = provider_session_key(action_meta)
+        return snapshots.get(key) if key is not None else None
+
+    def _binding_session_ready(
+        self,
+        lease: BindingLease,
+        *,
+        snapshot: ProviderSessionSnapshot | None = None,
+    ) -> bool:
         if (
             self._provider_sessions is None
             or lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
         ):
             return True
+        if not self._lease_current_provider_session_matches(lease):
+            return False
+        key = lease.provider_session_key
+        if key is None:
+            return False
+        if snapshot is not None and snapshot.key == key:
+            return snapshot.ready
+        return self._provider_sessions.cached_ready(key)
+
+    def _lease_current_provider_session_matches(self, lease: BindingLease) -> bool:
         current_provider_session = self.manager.provider_session_id(
             lease.provider_instance_id
         )
@@ -506,29 +572,22 @@ class DeviceManager:
             return False
         if not isinstance(current_provider_session, str):
             current_provider_session = lease.provider_session_id
-        if (
+        return not (
             current_provider_session is None
             or current_provider_session != lease.provider_session_id
-        ):
-            return False
-        return await self._provider_sessions.valid(
-            provider_instance_id=lease.provider_instance_id,
-            provider_id=lease.provider_id,
-            provider_session_id=current_provider_session,
         )
 
     async def _activate_binding(
         self,
         lease: BindingLease,
         *,
-        provider_session_valid: bool | None = None,
+        provider_session_snapshot: ProviderSessionSnapshot | None = None,
     ) -> bool:
         if lease.attached:
             return True
-        if provider_session_valid is False:
-            return False
-        if provider_session_valid is None and not await self._binding_session_valid(
-            lease
+        if not self._binding_session_ready(
+            lease,
+            snapshot=provider_session_snapshot,
         ):
             return False
         await self._ensure_action_instance(
@@ -555,10 +614,29 @@ class DeviceManager:
             await self._reconcile_binding_sessions()
 
     async def _reconcile_binding_sessions(self) -> None:
-        for lease in tuple(self._binding_leases.values()):
-            valid = await self._binding_session_valid(lease)
+        leases = tuple(self._binding_leases.values())
+        snapshots: dict[ProviderSessionKey, ProviderSessionSnapshot] = {}
+        if self._provider_sessions is not None:
+            keys = {
+                lease.provider_session_key
+                for lease in leases
+                if lease.provider_session_key is not None
+                and self._lease_current_provider_session_matches(lease)
+            }
+            snapshots = await self._provider_sessions.refresh_many(keys)
+
+        for lease in leases:
+            snapshot = (
+                snapshots.get(lease.provider_session_key)
+                if lease.provider_session_key is not None
+                else None
+            )
+            valid = self._binding_session_ready(lease, snapshot=snapshot)
             if valid:
-                await self._activate_binding(lease)
+                await self._activate_binding(
+                    lease,
+                    provider_session_snapshot=snapshot,
+                )
                 continue
             if lease.attached:
                 await self._revoke_binding(lease.binding_id)
@@ -655,8 +733,7 @@ class DeviceManager:
         item_key: str | None = None,
         handler: str | None = None,
         action_meta: ActionMetadata | None = _ACTION_METADATA_UNSET,
-        provider_session_prepared: bool = False,
-        provider_session_valid: bool | None = None,
+        provider_session_snapshot: ProviderSessionSnapshot | None = None,
     ) -> bool:
         """Resolve a binding: create ControlContext and announce the binding lease.
         Returns True if context was created, False if action not found (caller should render unavailable).
@@ -689,12 +766,13 @@ class DeviceManager:
                 binding.action_uuid,
             )
             return False
-        registry_session = self.manager.provider_session_id(
-            action_meta.provider_instance_id
+        action_meta = self._action_metadata_with_current_session(action_meta)
+        provider_session_id = action_meta.provider_session_id
+        session_key = (
+            None
+            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+            else provider_session_key(action_meta)
         )
-        if not isinstance(registry_session, str):
-            registry_session = None
-        provider_session_id = registry_session or action_meta.provider_session_id
         settings_target = (
             self._build_settings_target_for_binding(
                 action_instance_id=action_instance_id,
@@ -721,23 +799,6 @@ class DeviceManager:
         binding_id = make_binding_id()
         context_id = make_context_id()
         matched_capabilities = self._matched_capabilities(binding)
-        if (
-            self._provider_sessions is not None
-            and action_meta.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
-            and not provider_session_prepared
-        ):
-            await self._provider_sessions.ensure(
-                ActionMetadata(
-                    uuid=action_meta.uuid,
-                    provider_instance_id=action_meta.provider_instance_id,
-                    provider_id=action_meta.provider_id,
-                    name=action_meta.name,
-                    provider_session_id=provider_session_id,
-                    provider_labels=action_meta.provider_labels,
-                    settings_schema=action_meta.settings_schema,
-                    provider_settings_schema=action_meta.provider_settings_schema,
-                )
-            )
         binding_metadata = BindingMetadata(
             providerInstanceId=action_meta.provider_instance_id,
             providerId=action_meta.provider_id,
@@ -785,6 +846,7 @@ class DeviceManager:
             provider_instance_id=action_meta.provider_instance_id,
             provider_id=action_meta.provider_id,
             provider_session_id=provider_session_id,
+            provider_session_key=session_key,
             attached=False,
             control_id=control.id,
             control=control,
@@ -801,7 +863,7 @@ class DeviceManager:
         self._binding_leases[binding_id] = lease
         attached = await self._activate_binding(
             lease,
-            provider_session_valid=provider_session_valid,
+            provider_session_snapshot=provider_session_snapshot,
         )
         if attached:
             logger.debug(
@@ -1033,6 +1095,10 @@ class DeviceManager:
                         err.action_uuid,
                     )
 
+        prepared_actions, provider_session_snapshots = (
+            await self._prepare_provider_sessions_for_actions(result.actions)
+        )
+
         preserve_output_control_ids = (
             frozenset(binding.control_id for binding in result.bindings)
             if preserve_rebound_outputs
@@ -1051,7 +1117,7 @@ class DeviceManager:
         if isinstance(arriving, StaticPageRef):
             for binding, action_meta in zip(
                 result.bindings,
-                result.actions,
+                prepared_actions,
                 strict=True,
             ):
                 action_instance_id = derive_action_instance_id(
@@ -1069,6 +1135,10 @@ class DeviceManager:
                     page_id=str(arriving.page_index),
                     action_instance_id=action_instance_id,
                     action_meta=action_meta,
+                    provider_session_snapshot=self._provider_session_snapshot_for_action(
+                        action_meta,
+                        provider_session_snapshots,
+                    ),
                 ):
                     control = _find_control_surface(
                         self.device,
@@ -1083,76 +1153,6 @@ class DeviceManager:
                 return False
             resolved_count = 0
             unavailable_count = 0
-            provider_session_valid_by_key: dict[
-                tuple[str, str, str | None],
-                bool,
-            ] = {}
-
-            def dynamic_provider_session_id(
-                action_meta: ActionMetadata,
-            ) -> str | None:
-                registry_session = self.manager.provider_session_id(
-                    action_meta.provider_instance_id
-                )
-                if not isinstance(registry_session, str):
-                    registry_session = None
-                return registry_session or action_meta.provider_session_id
-
-            def dynamic_provider_session_key(
-                action_meta: ActionMetadata,
-            ) -> tuple[str, str, str | None]:
-                return (
-                    action_meta.provider_instance_id,
-                    action_meta.provider_id,
-                    dynamic_provider_session_id(action_meta),
-                )
-
-            async def prepare_dynamic_provider_session(
-                action_meta: ActionMetadata,
-            ) -> bool:
-                if (
-                    self._provider_sessions is None
-                    or action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-                ):
-                    return True
-                provider_session_id = dynamic_provider_session_id(action_meta)
-                if provider_session_id is None:
-                    return False
-                await self._provider_sessions.ensure(
-                    ActionMetadata(
-                        uuid=action_meta.uuid,
-                        provider_instance_id=action_meta.provider_instance_id,
-                        provider_id=action_meta.provider_id,
-                        name=action_meta.name,
-                        provider_session_id=provider_session_id,
-                        provider_labels=action_meta.provider_labels,
-                        settings_schema=action_meta.settings_schema,
-                        provider_settings_schema=action_meta.provider_settings_schema,
-                    )
-                )
-                current_provider_session = self.manager.provider_session_id(
-                    action_meta.provider_instance_id
-                )
-                if current_provider_session is None:
-                    return False
-                if not isinstance(current_provider_session, str):
-                    current_provider_session = provider_session_id
-                if current_provider_session != provider_session_id:
-                    return False
-                return await self._provider_sessions.valid(
-                    provider_instance_id=action_meta.provider_instance_id,
-                    provider_id=action_meta.provider_id,
-                    provider_session_id=provider_session_id,
-                )
-
-            for action_meta in result.actions:
-                if action_meta is None:
-                    continue
-                session_key = dynamic_provider_session_key(action_meta)
-                if session_key not in provider_session_valid_by_key:
-                    provider_session_valid_by_key[session_key] = (
-                        await prepare_dynamic_provider_session(action_meta)
-                    )
 
             async def resolve_dynamic_child(
                 child: PageChildBindingDescriptor,
@@ -1160,16 +1160,6 @@ class DeviceManager:
                 action_meta: ActionMetadata | None,
             ) -> None:
                 nonlocal resolved_count, unavailable_count
-                provider_session_prepared = False
-                provider_session_valid = None
-                if action_meta is not None:
-                    session_key = dynamic_provider_session_key(action_meta)
-                    provider_session_prepared = (
-                        session_key in provider_session_valid_by_key
-                    )
-                    provider_session_valid = provider_session_valid_by_key.get(
-                        session_key
-                    )
                 if not await self._try_resolve_binding(
                     binding,
                     profile_id="_dynamic",
@@ -1184,8 +1174,10 @@ class DeviceManager:
                     item_key=child.item_key,
                     handler=child.handler,
                     action_meta=action_meta,
-                    provider_session_prepared=provider_session_prepared,
-                    provider_session_valid=provider_session_valid,
+                    provider_session_snapshot=self._provider_session_snapshot_for_action(
+                        action_meta,
+                        provider_session_snapshots,
+                    ),
                 ):
                     unavailable_count += 1
                     control = _find_control_surface(
@@ -1202,7 +1194,7 @@ class DeviceManager:
                 for child, binding, action_meta in zip(
                     arriving.bindings,
                     result.bindings,
-                    result.actions,
+                    prepared_actions,
                     strict=True,
                 ):
                     task_group.start_soon(
@@ -1609,6 +1601,12 @@ class DeviceManager:
             unregistered,
         )
 
+        prepared_actions, provider_session_snapshots = (
+            await self._prepare_provider_sessions_for_actions(result.actions)
+        )
+        if any(not lease.attached for lease in self._binding_leases.values()):
+            await self._reconcile_binding_sessions()
+
         child_bindings = (
             current_page.bindings
             if isinstance(current_page, DynamicPageCommand)
@@ -1617,7 +1615,7 @@ class DeviceManager:
         for child, binding, action_meta in zip(
             child_bindings,
             result.bindings,
-            result.actions,
+            prepared_actions,
             strict=True,
         ):
             if await self.action_contexts.has_key(binding.control_id):
@@ -1626,7 +1624,6 @@ class DeviceManager:
                 lease.control_id == binding.control_id
                 for lease in self._binding_leases.values()
             ):
-                await self._reconcile_binding_sessions()
                 continue
             if child is not None and dynamic_page_session is not None:
                 resolved_action_instance_id = self._dynamic_child_action_instance_id(
@@ -1654,6 +1651,10 @@ class DeviceManager:
                 item_key=child.item_key if child is not None else None,
                 handler=child.handler if child is not None else None,
                 action_meta=action_meta,
+                provider_session_snapshot=self._provider_session_snapshot_for_action(
+                    action_meta,
+                    provider_session_snapshots,
+                ),
             )
 
     async def _config_listener(self) -> None:
@@ -1784,14 +1785,6 @@ class DeviceManager:
                     msg.message_type,
                     msg.sender_session_id,
                 )
-                return None
-            if not await self._binding_session_valid(lease):
-                logger.warning(
-                    "Ignoring action command %s for invalid provider session on binding %s",
-                    msg.message_type,
-                    binding_id,
-                )
-                await self._revoke_binding(binding_id)
                 return None
             if (
                 action_instance_id is not None
