@@ -9,6 +9,7 @@ import pytest
 from conftest import LaneHarness
 from deckr.beacon import (
     DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+    BeaconAdvertisementSpec,
     BeaconDiscovery,
     BeaconService,
 )
@@ -192,14 +193,18 @@ async def _advertise_hardware(
             }
         },
     )
-    return await beacon.advertise(
-        HARDWARE_FEATURE_ID,
-        hardware_manager_address(manager_id),
-        session_id,
-        advertisement_id=advertisement_id,
-        payload=payload.to_dict(),
-        labels=payload.labels,
+    advertisement = await beacon.ensure_advertisement(
+        BeaconAdvertisementSpec(
+            feature_id=HARDWARE_FEATURE_ID,
+            endpoint=hardware_manager_address(manager_id),
+            session_id=session_id,
+            advertisement_id=advertisement_id,
+            payload=payload.to_dict(),
+            labels=payload.labels,
+        )
     )
+    await advertisement.publish()
+    return advertisement
 
 
 @asynccontextmanager
@@ -394,7 +399,7 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
             while controller._device_registry.get("config-room-a") is None:
                 await anyio.sleep(0.01)
 
-        await beacon.withdraw(handle)
+        await handle.aclose()
         await _advertise_hardware(beacon, advertisement_id="hardware-ad-2")
         await controller._reconcile_hardware_current_state(
             reason="test advertisement id change"
@@ -427,7 +432,7 @@ async def test_live_hardware_claim_session_mismatch_supersedes_claim():
             while controller._device_registry.get("config-room-a") is None:
                 await anyio.sleep(0.01)
 
-        await beacon.withdraw(handle)
+        await handle.aclose()
         await controller._reconcile_hardware_current_state(reason="test missing beacon")
         assert controller._device_registry.get("config-room-a") is not None
 

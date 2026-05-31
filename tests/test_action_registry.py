@@ -8,7 +8,8 @@ from conftest import LaneHarness
 from deckr.actions.endpoints import action_provider_address
 from deckr.beacon import (
     DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
-    AdvertisementHandle,
+    BeaconAdvertisement,
+    BeaconAdvertisementSpec,
     BeaconDiscovery,
     BeaconService,
     beacon_advertisement_key,
@@ -66,16 +67,20 @@ async def _advertise_actions(
     *,
     advertisement_id: str = "ad-1",
     session_id: str = "session-1",
-) -> AdvertisementHandle:
+) -> BeaconAdvertisement:
     payload = payload or _actions_payload(session_id=session_id)
-    return await beacon.advertise(
-        ACTIONS_FEATURE_ID,
-        payload.provider_endpoint,
-        payload.session_id,
-        advertisement_id=advertisement_id,
-        payload=payload.to_dict(),
-        labels=payload.labels,
+    advertisement = await beacon.ensure_advertisement(
+        BeaconAdvertisementSpec(
+            feature_id=ACTIONS_FEATURE_ID,
+            endpoint=payload.provider_endpoint,
+            session_id=payload.session_id,
+            advertisement_id=advertisement_id,
+            payload=payload.to_dict(),
+            labels=payload.labels,
+        )
     )
+    await advertisement.publish()
+    return advertisement
 
 
 async def _run_registry(registry: ActionRegistry, callback):
@@ -160,7 +165,7 @@ async def test_action_registry_provider_settings_authority_uses_beacon_session()
             PROVIDER_INSTANCE_ID, PROVIDER_ID
         )
 
-        await beacon.withdraw(old)
+        await old.aclose()
         await _advertise_actions(beacon, session_id="new")
         with anyio.fail_after(1):
             while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
@@ -217,7 +222,7 @@ async def test_action_registry_beacon_session_change_refreshes_action_metadata()
             while await registry.get_action(ACTION_UUID) is None:
                 await anyio.sleep(0.01)
 
-        await beacon.withdraw(old)
+        await old.aclose()
         await _advertise_actions(beacon, session_id="new")
         with anyio.fail_after(1):
             while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
@@ -242,7 +247,7 @@ async def test_action_registry_removes_actions_when_beacon_advertisement_is_with
             while await registry.get_action(ACTION_UUID) is None:
                 await anyio.sleep(0.01)
 
-        await beacon.withdraw(handle)
+        await handle.aclose()
         with anyio.fail_after(1):
             while await registry.get_action(ACTION_UUID) is not None:
                 await anyio.sleep(0.01)
