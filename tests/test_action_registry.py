@@ -236,6 +236,35 @@ async def test_action_registry_beacon_session_change_refreshes_action_metadata()
 
 
 @pytest.mark.asyncio
+async def test_action_registry_prefers_latest_duplicate_provider_advertisement():
+    bus = _state_bus()
+    beacon = _beacon(bus)
+    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+
+    async def scenario(events):
+        await _advertise_actions(
+            beacon,
+            advertisement_id="z-old",
+            session_id="old",
+        )
+        await _advertise_actions(
+            beacon,
+            advertisement_id="a-new",
+            session_id="new",
+        )
+        with anyio.fail_after(1):
+            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
+                await anyio.sleep(0.01)
+
+        meta = await registry.get_action(ACTION_UUID)
+        assert meta is not None
+        assert meta.provider_session_id == "new"
+        assert events[-1].registered == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
+
+    await _run_registry(registry, scenario)
+
+
+@pytest.mark.asyncio
 async def test_action_registry_removes_actions_when_beacon_advertisement_is_withdrawn():
     bus = _state_bus()
     beacon = _beacon(bus)

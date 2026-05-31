@@ -528,6 +528,7 @@ def _provider_settings_device_manager(
     config_service: MemoryConfigService,
     actions_bus: LaneHarness,
     registry: MagicMock,
+    provider_sessions: ActionProviderSessionManager | None = None,
 ) -> DeviceManager:
     device = _make_mock_device()
     return DeviceManager(
@@ -543,7 +544,22 @@ def _provider_settings_device_manager(
             controller_id=CONTROLLER_ID,
             config_service=config_service,
         ),
+        provider_sessions=provider_sessions,
     )
+
+
+async def _prepare_provider_settings_session(
+    provider_sessions: ActionProviderSessionManager,
+    concord: ConcordService,
+    *,
+    provider_id: str = "dev.deckr.clock",
+) -> None:
+    snapshot = await provider_sessions.prepare(
+        _metadata("provider-settings", provider_id=provider_id)
+    )
+    assert snapshot is not None
+    session = next(iter(provider_sessions._sessions.values()))
+    await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
 
 
 async def _next_action_message(
@@ -586,20 +602,24 @@ async def _next_capability_input(
 
 
 @pytest.mark.asyncio
-async def test_provider_settings_patch_from_owning_provider_writes_and_replies():
+async def test_provider_settings_patch_with_valid_provider_session_after_beacon_loss():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
-    registry = MagicMock()
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.side_effect = (
-        lambda provider_instance_id, provider_id: provider_instance_id
-        == PROVIDER_INSTANCE_ID
-        and provider_id == "dev.deckr.clock"
+    concord = _concord(action_bus)
+    provider_sessions = _provider_session_manager(
+        concord,
+        action_bus,
+        lambda fn, *a, **k: None,
     )
+    await _prepare_provider_settings_session(provider_sessions, concord)
+    registry = MagicMock()
+    registry.provider_session_id.return_value = None
+    registry.provider_instance_provides_provider.return_value = False
     manager = _provider_settings_device_manager(
         config_service=config_service,
         actions_bus=action_bus,
         registry=registry,
+        provider_sessions=provider_sessions,
     )
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
@@ -619,10 +639,8 @@ async def test_provider_settings_patch_from_owning_provider_writes_and_replies()
     snapshot = SettingsSnapshot.model_validate(reply.body)
     assert snapshot.settings == {"timezone": "Europe/Amsterdam"}
     assert snapshot.target.key() == _provider_settings_target().key()
-    registry.provider_instance_provides_provider.assert_called_once_with(
-        PROVIDER_INSTANCE_ID,
-        "dev.deckr.clock",
-    )
+    registry.provider_session_id.assert_not_called()
+    registry.provider_instance_provides_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -659,17 +677,21 @@ async def test_provider_settings_patch_from_non_owning_provider_is_ignored():
 async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
+    concord = _concord(action_bus)
+    provider_sessions = _provider_session_manager(
+        concord,
+        action_bus,
+        lambda fn, *a, **k: None,
+    )
+    await _prepare_provider_settings_session(provider_sessions, concord)
     registry = MagicMock()
     registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.side_effect = (
-        lambda provider_instance_id, provider_id: provider_instance_id
-        == PROVIDER_INSTANCE_ID
-        and provider_id == "dev.deckr.clock"
-    )
+    registry.provider_instance_provides_provider.return_value = True
     manager = _provider_settings_device_manager(
         config_service=config_service,
         actions_bus=action_bus,
         registry=registry,
+        provider_sessions=provider_sessions,
     )
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
@@ -684,10 +706,48 @@ async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
     assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
         "timezone": "UTC"
     }
-    registry.provider_instance_provides_provider.assert_called_once_with(
-        PROVIDER_INSTANCE_ID,
-        "other",
+    registry.provider_session_id.assert_not_called()
+    registry.provider_instance_provides_provider.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_provider_settings_command_rejected_when_concord_session_invalid():
+    config_service = MemoryConfigService(_provider_settings_config())
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+    provider_sessions = _provider_session_manager(
+        concord,
+        action_bus,
+        lambda fn, *a, **k: None,
     )
+    await _prepare_provider_settings_session(provider_sessions, concord)
+    session = next(iter(provider_sessions._sessions.values()))
+    await concord._cancel(session.contract, CONTROLLER_ADDR, reason="test invalid")
+    registry = MagicMock()
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    manager = _provider_settings_device_manager(
+        config_service=config_service,
+        actions_bus=action_bus,
+        registry=registry,
+        provider_sessions=provider_sessions,
+    )
+
+    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+        await manager.handle_command(
+            _provider_settings_command(
+                SETTINGS_PATCH,
+                _provider_settings_target(),
+                settings={"timezone": "Europe/Amsterdam"},
+            )
+        )
+        await _assert_no_action_message(stream)
+
+    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
+        "timezone": "UTC"
+    }
+    registry.provider_session_id.assert_not_called()
+    registry.provider_instance_provides_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1056,7 +1116,68 @@ async def test_binding_waits_for_provider_session_token(
 
 
 @pytest.mark.asyncio
-async def test_binding_revokes_when_provider_session_changes(
+async def test_pending_binding_drops_after_provider_session_acceptance_timeout(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+
+    async with anyio.create_task_group() as tg:
+        provider_sessions = ActionProviderSessionManager(
+            controller_id=CONTROLLER_ID,
+            controller_session_id=action_bus.session_id,
+            concord=concord,
+            start_soon=tg.start_soon,
+            acceptance_timeout_seconds=0.05,
+        )
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            provider_sessions=provider_sessions,
+        )
+        await manager.set_page(profile="default", page=0)
+        old_session = next(iter(provider_sessions._sessions.values()))
+        assert not next(iter(manager._binding_leases.values())).attached
+
+        registry.provider_session_id.return_value = "new-provider-session"
+        await manager.on_actions_changed(
+            registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
+            unregistered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
+        )
+        assert next(iter(provider_sessions._sessions.values())).contract == (
+            old_session.contract
+        )
+
+        await anyio.sleep(0.06)
+        await manager._reconcile_binding_sessions()
+        assert manager._binding_leases == {}
+
+        await manager.on_actions_changed(
+            registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
+            unregistered=[],
+        )
+        new_session = next(iter(provider_sessions._sessions.values()))
+        assert new_session.provider_session_id == "new-provider-session"
+        assert new_session.contract != old_session.contract
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_binding_stays_attached_when_beacon_session_changes(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1095,14 +1216,14 @@ async def test_binding_revokes_when_provider_session_changes(
         registry.provider_session_id.return_value = "new-provider-session"
         await manager._reconcile_binding_sessions()
 
-        assert await manager.action_contexts.get("0,0") is None
-        assert manager._binding_leases == {}
+        assert await manager.action_contexts.get("0,0") is not None
+        assert manager._binding_leases
 
         tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio
-async def test_binding_revokes_when_provider_session_disappears(
+async def test_binding_stays_attached_when_beacon_session_disappears(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1141,8 +1262,118 @@ async def test_binding_revokes_when_provider_session_disappears(
         registry.provider_session_id.return_value = None
         await manager._reconcile_binding_sessions()
 
+        assert await manager.action_contexts.get("0,0") is not None
+        assert manager._binding_leases
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_binding_revokes_when_provider_session_contract_is_invalid(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = None
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+
+    async with anyio.create_task_group() as tg:
+        provider_sessions = _provider_session_manager(
+            concord,
+            action_bus,
+            tg.start_soon,
+        )
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            provider_sessions=provider_sessions,
+        )
+        await manager.set_page(profile="default", page=0)
+        session = next(iter(provider_sessions._sessions.values()))
+        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await manager._reconcile_binding_sessions()
+        assert await manager.action_contexts.get("0,0") is not None
+
+        await concord._cancel(session.contract, CONTROLLER_ADDR, reason="test invalid")
+        await manager._reconcile_binding_sessions()
+
         assert await manager.action_contexts.get("0,0") is None
-        assert manager._binding_leases == {}
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_page_survives_action_beacon_withdrawal_with_valid_session(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+
+    async with anyio.create_task_group() as tg:
+        provider_sessions = _provider_session_manager(
+            concord,
+            action_bus,
+            tg.start_soon,
+        )
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            provider_sessions=provider_sessions,
+        )
+        await manager.set_page(profile="default", page=0)
+        session_contract = next(iter(provider_sessions._sessions.values()))
+        await concord._attach(
+            session_contract.contract,
+            PROVIDER_ADDR,
+            PROVIDER_SESSION_ID,
+        )
+        await manager._reconcile_binding_sessions()
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+
+        await manager.open_page(
+            descriptor=_dynamic_page("dynamic-page", "1,0"),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        registry.get_action.return_value = None
+        await manager.on_actions_changed(
+            registered=[],
+            unregistered=[
+                f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
+            ],
+        )
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
 
         tg.cancel_scope.cancel()
 
@@ -2087,8 +2318,9 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
 
 
 @pytest.mark.asyncio
-async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_dir):
-    """When action becomes unavailable, on_actions_changed removes context and renders unavailable."""
+async def test_on_actions_changed_unregistered_preserves_attached_context(
+    persistence_tmp_dir,
+):
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()
@@ -2137,24 +2369,77 @@ async def test_on_actions_changed_unregistered_removes_context(persistence_tmp_d
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
 
-        # Control should have context
         ctx_before = await manager.action_contexts.get("0,0")
         assert ctx_before is not None
 
-        # Clear mock to isolate on_actions_changed effects
-        command_service.set_raster_frame.reset_mock()
-
-        # Remove action from registry to simulate unregister (otherwise the
-        # "registered" handling would re-resolve and recreate the context)
         registry.remove_action(ACTION_X_UUID, "test-provider")
-
-        # Notify that action was unregistered (qualified ID)
         await manager.on_actions_changed(
             registered=[], unregistered=[f"test-provider::{ACTION_X_UUID}"]
         )
 
-        # Control should no longer have context
-        ctx_after = await manager.action_contexts.get("0,0")
-        assert ctx_after is None
+        assert await manager.action_contexts.get("0,0") is ctx_before
+        assert manager._binding_leases
 
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_on_actions_changed_session_refresh_does_not_remove_context(
+    persistence_tmp_dir,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = ConfigurableActionRegistry()
+    registry.add_action(
+        ACTION_X_UUID,
+        _metadata(
+            ACTION_X_UUID,
+            provider_instance_id="test-provider",
+            provider_id="test",
+        ),
+    )
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx_before = await manager.action_contexts.get("0,0")
+        assert ctx_before is not None
+
+        qualified = f"test-provider::{ACTION_X_UUID}"
+        await manager.on_actions_changed(
+            registered=[qualified],
+            unregistered=[qualified],
+        )
+
+        assert await manager.action_contexts.get("0,0") is ctx_before
         tg.cancel_scope.cancel()

@@ -229,7 +229,7 @@ class ActionRegistry(BaseComponent):
 
     async def _reconcile_current_state_locked(self, *, reason: str) -> None:
         candidates = await self._beacon.find(ACTIONS_FEATURE_ID)
-        next_advertisements: dict[str, ActionsBeaconPayload] = {}
+        next_candidates: dict[str, tuple[Candidate, ActionsBeaconPayload]] = {}
 
         for candidate in candidates:
             payload = _valid_actions_payload(candidate)
@@ -238,7 +238,14 @@ class ActionRegistry(BaseComponent):
             provider_instance_id = payload.provider_instance_id
             if not _is_allowed_provider_instance_id(provider_instance_id):
                 continue
-            next_advertisements[provider_instance_id] = payload
+            current = next_candidates.get(provider_instance_id)
+            if current is None or candidate.revision > current[0].revision:
+                next_candidates[provider_instance_id] = (candidate, payload)
+
+        next_advertisements = {
+            provider_instance_id: payload
+            for provider_instance_id, (_candidate, payload) in next_candidates.items()
+        }
 
         affected_providers = set(self._advertisements) | set(next_advertisements)
         self._advertisements = next_advertisements

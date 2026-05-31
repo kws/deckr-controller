@@ -26,6 +26,7 @@ from deckr.controller.action_provider.provider import ActionMetadata
 logger = logging.getLogger(__name__)
 
 PROVIDER_SESSION_HEARTBEAT_SECONDS = 5.0
+DEFAULT_PROVIDER_SESSION_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +52,7 @@ class ProviderSessionLease:
     provider_session_id: str
     agreement: ConcordAgreement
     current_sessions: dict[str, str]
+    acceptance_deadline: float
     controller_token: ParticipantHandle | None = None
 
     @property
@@ -68,12 +70,16 @@ class ActionProviderSessionManager:
         controller_session_id: str,
         concord: ConcordService,
         start_soon,
+        acceptance_timeout_seconds: float = (
+            DEFAULT_PROVIDER_SESSION_ACCEPTANCE_TIMEOUT_SECONDS
+        ),
     ) -> None:
         self._controller_id = controller_id
         self._controller_session_id = controller_session_id
         self._concord = concord
         self._sessions: dict[ProviderSessionKey, ProviderSessionLease] = {}
         self._start_soon = start_soon
+        self._acceptance_timeout_seconds = acceptance_timeout_seconds
         self._lock = anyio.Lock()
 
     async def ensure(self, action: ActionMetadata) -> bool:
@@ -109,17 +115,9 @@ class ActionProviderSessionManager:
     ) -> ProviderSessionSnapshot:
         existing = self._sessions.get(key)
         if existing is not None:
-            return _snapshot(existing)
-
-        for existing_key in tuple(self._sessions):
-            if (
-                existing_key.provider_instance_id == key.provider_instance_id
-                and existing_key.provider_session_id != key.provider_session_id
-            ):
-                await self._cancel_key_unlocked(
-                    existing_key,
-                    reason="provider_session_changed",
-                )
+            snapshot = await self._refresh_unlocked(key)
+            if not snapshot.terminal:
+                return snapshot
 
         provider_endpoint = action_provider_address(action.provider_instance_id)
         controller_endpoint = controller_address(self._controller_id)
@@ -153,6 +151,9 @@ class ActionProviderSessionManager:
             provider_session_id=key.provider_session_id,
             agreement=agreement,
             current_sessions=current_sessions,
+            acceptance_deadline=(
+                anyio.current_time() + self._acceptance_timeout_seconds
+            ),
             controller_token=agreement.local_token,
         )
         self._sessions[key] = session
@@ -177,11 +178,22 @@ class ActionProviderSessionManager:
         session = self._sessions.get(key)
         if session is None:
             return _missing_snapshot(key)
-        session.current_sessions[
-            str(action_provider_address(key.provider_instance_id))
-        ] = key.provider_session_id
         validity = await session.agreement.refresh()
         session.controller_token = session.agreement.local_token
+        if (
+            validity.status == ContractValidityStatus.NOT_YET_FULFILLED
+            and anyio.current_time() >= session.acceptance_deadline
+        ):
+            await self._cancel_key_unlocked(
+                key,
+                reason="provider_session_acceptance_timeout",
+            )
+            return ProviderSessionSnapshot(
+                key=key,
+                ready=False,
+                terminal=True,
+                status=validity.status,
+            )
         if _terminal_session_status(validity.status):
             await self._cancel_key_unlocked(
                 key,

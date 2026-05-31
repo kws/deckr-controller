@@ -555,27 +555,12 @@ class DeviceManager:
             or lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
         ):
             return True
-        if not self._lease_current_provider_session_matches(lease):
-            return False
         key = lease.provider_session_key
         if key is None:
             return False
         if snapshot is not None and snapshot.key == key:
             return snapshot.ready
         return self._provider_sessions.cached_ready(key)
-
-    def _lease_current_provider_session_matches(self, lease: BindingLease) -> bool:
-        current_provider_session = self.manager.provider_session_id(
-            lease.provider_instance_id
-        )
-        if current_provider_session is None:
-            return False
-        if not isinstance(current_provider_session, str):
-            current_provider_session = lease.provider_session_id
-        return not (
-            current_provider_session is None
-            or current_provider_session != lease.provider_session_id
-        )
 
     async def _activate_binding(
         self,
@@ -621,7 +606,6 @@ class DeviceManager:
                 lease.provider_session_key
                 for lease in leases
                 if lease.provider_session_key is not None
-                and self._lease_current_provider_session_matches(lease)
             }
             snapshots = await self._provider_sessions.refresh_many(keys)
 
@@ -638,7 +622,7 @@ class DeviceManager:
                     provider_session_snapshot=snapshot,
                 )
                 continue
-            if lease.attached:
+            if lease.attached or (snapshot is not None and snapshot.terminal):
                 await self._revoke_binding(lease.binding_id)
 
     async def _ensure_action_instance(
@@ -1506,44 +1490,15 @@ class DeviceManager:
 
         registered/unregistered carry qualified provider-instance action IDs.
         """
-        unregistered_set = frozenset(unregistered)
         registered_set = frozenset(registered)
+        reattached_set = frozenset(registered_set - set(unregistered))
 
-        # Handle unregistered first (order matters for re-register scenario)
-        session = self._dynamic_page_session
-        if (
-            session is not None
-            and (
-                f"{session.owner_provider_instance_id}::{session.owner_action_uuid}"
-            )
-            in unregistered_set
-        ):
-            await self.close_page(
-                context_id=session.context_id,
-                reason="action_unregistered",
-            )
-
-        to_remove: list[BindingLease] = []
         to_reappear: list[ControlContext] = []
         for lease in list(self._binding_leases.values()):
             ctx = lease.context
             ctx_qualified = f"{lease.provider_instance_id}::{lease.action_uuid}"
-            if ctx_qualified in unregistered_set:
-                to_remove.append(lease)
-                continue
-            if ctx_qualified in registered_set:
+            if ctx_qualified in reattached_set:
                 to_reappear.append(ctx)
-        for lease in to_remove:
-            await self._revoke_binding(lease.binding_id)
-            if not any(
-                other.action_instance_id == lease.action_instance_id
-                for other in self._binding_leases.values()
-            ):
-                await self._destroy_action_instance(
-                    lease.action_instance_id,
-                    reason="action_unregistered",
-                )
-            await self._render_unavailable_to_control(lease.control)
         for ctx in to_reappear:
             await ctx.on_binding_attached()
 
@@ -1757,33 +1712,18 @@ class DeviceManager:
                     lease.provider_instance_id,
                 )
                 return None
-            current_provider_session = self.manager.provider_session_id(
-                sender_provider_instance_id
-            )
-            if current_provider_session is None:
-                logger.warning(
-                    "Ignoring action command %s from provider without live Beacon session %s",
-                    msg.message_type,
-                    sender_provider_instance_id,
-                )
-                return None
-            if not isinstance(current_provider_session, str):
-                current_provider_session = lease.provider_session_id
-            if current_provider_session is None:
-                logger.warning(
-                    "Ignoring action command %s from provider without live Beacon session %s",
-                    msg.message_type,
-                    sender_provider_instance_id,
-                )
-                return None
-            if (
-                msg.sender_session_id != lease.provider_session_id
-                or msg.sender_session_id != current_provider_session
-            ):
+            if msg.sender_session_id != lease.provider_session_id:
                 logger.warning(
                     "Ignoring action command %s from stale provider session %s",
                     msg.message_type,
                     msg.sender_session_id,
+                )
+                return None
+            if not self._binding_session_ready(lease):
+                logger.warning(
+                    "Ignoring action command %s for invalid provider session %s",
+                    msg.message_type,
+                    lease.provider_session_id,
                 )
                 return None
             if (
@@ -1830,35 +1770,35 @@ class DeviceManager:
                     session.owner_provider_instance_id,
                 )
                 return None
-            current_provider_session = self.manager.provider_session_id(
-                sender_provider_instance_id
-            )
-            if current_provider_session is None:
-                logger.warning(
-                    "Ignoring page action command %s from provider without live Beacon session %s",
-                    msg.message_type,
-                    sender_provider_instance_id,
-                )
-                return None
-            if not isinstance(current_provider_session, str):
-                current_provider_session = session.owner_provider_session_id
-            if current_provider_session is None:
-                logger.warning(
-                    "Ignoring page action command %s from provider without live Beacon session %s",
-                    msg.message_type,
-                    sender_provider_instance_id,
-                )
-                return None
-            if (
-                msg.sender_session_id != session.owner_provider_session_id
-                or msg.sender_session_id != current_provider_session
-            ):
+            if msg.sender_session_id != session.owner_provider_session_id:
                 logger.warning(
                     "Ignoring page action command %s from stale provider session %s",
                     msg.message_type,
                     msg.sender_session_id,
                 )
                 return None
+            if (
+                self._provider_sessions is not None
+                and session.owner_provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
+            ):
+                if session.owner_provider_session_id is None:
+                    logger.warning(
+                        "Ignoring page action command %s without provider session",
+                        msg.message_type,
+                    )
+                    return None
+                owner_key = ProviderSessionKey(
+                    session.owner_provider_instance_id,
+                    session.owner_provider_id,
+                    session.owner_provider_session_id,
+                )
+                if not self._provider_sessions.cached_ready(owner_key):
+                    logger.warning(
+                        "Ignoring page action command %s for invalid provider session %s",
+                        msg.message_type,
+                        session.owner_provider_session_id,
+                    )
+                    return None
             if (
                 action_instance_id is not None
                 and action_instance_id != session.action_instance_id
@@ -1908,7 +1848,7 @@ class DeviceManager:
             )
             return None
 
-    def _provider_settings_authorized(
+    async def _provider_settings_authorized(
         self,
         *,
         sender_provider_instance_id: str,
@@ -1922,30 +1862,27 @@ class DeviceManager:
                 target.provider_instance_id,
             )
             return False
-        expected_session = self.manager.provider_session_id(sender_provider_instance_id)
-        if not isinstance(expected_session, str):
-            expected_session = None
-        if expected_session is None:
+        if self._provider_sessions is None:
             logger.warning(
-                "Ignoring provider settings command from %s without live Beacon session",
+                "Ignoring provider settings command from %s without provider session manager",
                 sender_provider_instance_id,
             )
             return False
-        if sender_session_id != expected_session:
+        if sender_session_id is None:
             logger.warning(
-                "Ignoring provider settings command from %s with stale session %s",
+                "Ignoring provider settings command from %s without sender session",
                 sender_provider_instance_id,
-                sender_session_id,
             )
             return False
-        if not self.manager.provider_instance_provides_provider(
-            sender_provider_instance_id,
-            target.provider_id,
+        if not await self._provider_sessions.valid(
+            provider_instance_id=sender_provider_instance_id,
+            provider_id=target.provider_id,
+            provider_session_id=sender_session_id,
         ):
             logger.warning(
-                "Ignoring provider settings command from %s for provider %s",
+                "Ignoring provider settings command from %s with invalid provider session %s",
                 sender_provider_instance_id,
-                target.provider_id,
+                sender_session_id,
             )
             return False
         return True
@@ -2022,7 +1959,7 @@ class DeviceManager:
                 )
                 return
             if settings_target.scope == "action_provider_instance":
-                if not self._provider_settings_authorized(
+                if not await self._provider_settings_authorized(
                     sender_provider_instance_id=sender_provider_instance_id,
                     sender_session_id=msg.sender_session_id,
                     target=settings_target,

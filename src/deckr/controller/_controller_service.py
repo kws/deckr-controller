@@ -63,6 +63,7 @@ from deckr.controller.settings import SettingsService
 logger = logging.getLogger(__name__)
 
 CLAIM_HEARTBEAT_SECONDS = 5.0
+DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 
@@ -85,6 +86,7 @@ class OwnedHardwareClaim:
     device: DeviceDescriptor
     agreement: ConcordAgreement
     current_sessions: dict[str, str]
+    acceptance_deadline: float
     controller_token: ParticipantHandle | None = None
     live: bool = False
 
@@ -290,12 +292,9 @@ class ControllerService(BaseComponent):
         candidates = await self._hardware_candidates_from_beacon()
         self._hardware_candidates = candidates
 
+        now = anyio.current_time()
         for owned in tuple(self._owned_claims.values()):
             candidate = candidates.get(_ref_key(owned.ref))
-            if candidate is not None:
-                owned.current_sessions[
-                    str(candidate.payload.manager_endpoint)
-                ] = candidate.payload.session_id
             validity = await self._hardware_claim_contract_validity(owned)
             owned.controller_token = owned.agreement.local_token
 
@@ -306,8 +305,11 @@ class ControllerService(BaseComponent):
                         ContractValidityStatus.UNAVAILABLE,
                     }:
                         continue
-                else:
-                    validity = ContractValidity(ContractValidityStatus.MISSING_CONTRACT)
+                elif (
+                    _pending_hardware_claim_status(validity.status)
+                    and now < owned.acceptance_deadline
+                ):
+                    continue
                 await self._revoke_owned_claim(
                     owned,
                     cancel_contract=True,
@@ -329,10 +331,17 @@ class ControllerService(BaseComponent):
                 }:
                     continue
 
-            if not owned.live and validity.status in {
-                ContractValidityStatus.MISSING_TOKEN,
-                ContractValidityStatus.NOT_YET_FULFILLED,
-            }:
+            if not owned.live and _pending_hardware_claim_status(validity.status):
+                if now < owned.acceptance_deadline:
+                    continue
+                await self._revoke_owned_claim(
+                    owned,
+                    cancel_contract=True,
+                    reason=(
+                        f"hardware claim acceptance timeout during {reason}: "
+                        f"{validity.status}"
+                    ),
+                )
                 continue
 
             await self._revoke_owned_claim(
@@ -453,6 +462,10 @@ class ControllerService(BaseComponent):
             device=device,
             agreement=agreement,
             current_sessions=current_sessions,
+            acceptance_deadline=(
+                anyio.current_time()
+                + DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS
+            ),
         )
         self._owned_claims[key] = owned
         validity = await self._hardware_claim_contract_validity(owned)
@@ -758,3 +771,10 @@ def _unmatched_hardware_signature(
     labels: Mapping[str, str],
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
     return device.fingerprint, tuple(sorted(labels.items()))
+
+
+def _pending_hardware_claim_status(status: ContractValidityStatus) -> bool:
+    return status in {
+        ContractValidityStatus.NOT_YET_FULFILLED,
+        ContractValidityStatus.UNAVAILABLE,
+    }
