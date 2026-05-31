@@ -68,8 +68,11 @@ class TestEventTranslator:
         assert out.action_event.view == "native"
 
     def test_non_interaction_events_return_none(self, translator):
-        event = hw_messages.DeviceUnavailableMessage(
-            deviceRef={"managerId": "manager-main", "deviceId": "d1"}
+        event = hw_messages.CommandRejectedMessage(
+            deviceRef={"managerId": "manager-main", "deviceId": "d1"},
+            capabilityId="raster.bitmap",
+            commandType="clear",
+            reason="stale",
         )
         assert translator.translate(event, "d1") is None
 

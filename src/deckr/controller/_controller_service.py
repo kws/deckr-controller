@@ -217,21 +217,6 @@ class ControllerService(BaseComponent):
                 if ref is None:
                     continue
                 live = self._device_registry.get_by_ref(ref)
-                if isinstance(event, hw_messages.DeviceAvailableMessage):
-                    await self._reconcile_hardware_current_state(
-                        reason="deviceAvailable message"
-                    )
-                    continue
-                if isinstance(event, hw_messages.DeviceDescriptorChangedMessage):
-                    await self._reconcile_hardware_current_state(
-                        reason="deviceDescriptorChanged message"
-                    )
-                    continue
-                if isinstance(event, hw_messages.DeviceUnavailableMessage):
-                    await self._reconcile_hardware_current_state(
-                        reason="deviceUnavailable message"
-                    )
-                    continue
                 if live is None:
                     continue
                 ctrl_ctx = await self._controller_contexts.get(live.config_id)
@@ -463,8 +448,7 @@ class ControllerService(BaseComponent):
             agreement=agreement,
             current_sessions=current_sessions,
             acceptance_deadline=(
-                anyio.current_time()
-                + DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS
+                anyio.current_time() + DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS
             ),
         )
         self._owned_claims[key] = owned
