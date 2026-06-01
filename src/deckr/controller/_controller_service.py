@@ -269,13 +269,13 @@ class ControllerService(BaseComponent):
     async def _hardware_claim_event_loop(self) -> None:
         while True:
             try:
-                async with self._concord.watch_contracts(
+                async with self._concord.watch_contract_notifications(
                     HARDWARE_CLAIM_PROFILE_ID,
-                    log_events=False,
                 ) as stream:
-                    async for event in stream:
+                    async for notification in stream:
                         await self._hardware_reconcile_notifications.request(
-                            f"hardware claim {event.event_type.value}"
+                            f"hardware claim {notification.source} "
+                            f"{notification.operation}"
                         )
             except StateUnavailable:
                 await anyio.sleep(_WATCH_RETRY_SECONDS)
