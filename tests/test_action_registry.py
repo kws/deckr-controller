@@ -25,6 +25,7 @@ CONTROLLER_ID = "controller-main"
 ACTION_UUID = "test.stub.action"
 PROVIDER_INSTANCE_ID = "python-dev.deckr.clock"
 PROVIDER_ID = "dev.deckr.clock"
+TEST_NOTIFICATION_BATCH_SECONDS = 0.01
 
 
 def _state_bus() -> LaneHarness:
@@ -34,6 +35,14 @@ def _state_bus() -> LaneHarness:
 def _beacon(bus: LaneHarness) -> BeaconService:
     return BeaconService(
         BeaconDiscovery(bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
+    )
+
+
+def _registry(beacon: BeaconService) -> ActionRegistry:
+    return ActionRegistry(
+        beacon,
+        controller_id=CONTROLLER_ID,
+        notification_batch_interval=TEST_NOTIFICATION_BATCH_SECONDS,
     )
 
 
@@ -101,7 +110,7 @@ async def _run_registry(registry: ActionRegistry, callback):
 async def test_action_registry_uses_beacon_actions_as_availability_source():
     bus = _state_bus()
     beacon = _beacon(bus)
-    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+    registry = _registry(beacon)
 
     async def scenario(events):
         await _advertise_actions(beacon)
@@ -124,7 +133,7 @@ async def test_action_registry_uses_beacon_actions_as_availability_source():
 async def test_action_registry_filters_by_provider_instance_and_labels():
     bus = _state_bus()
     beacon = _beacon(bus)
-    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+    registry = _registry(beacon)
 
     async def scenario(events):
         del events
@@ -153,7 +162,7 @@ async def test_action_registry_filters_by_provider_instance_and_labels():
 async def test_action_registry_provider_settings_authority_uses_beacon_session():
     bus = _state_bus()
     beacon = _beacon(bus)
-    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+    registry = _registry(beacon)
 
     async def scenario(events):
         del events
@@ -181,7 +190,7 @@ async def test_action_registry_provider_settings_authority_uses_beacon_session()
 async def test_action_registry_rejects_mismatched_beacon_payload_identity():
     bus = _state_bus()
     beacon = _beacon(bus)
-    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+    registry = _registry(beacon)
     state = bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME)
 
     async def scenario(events):
@@ -214,7 +223,7 @@ async def test_action_registry_rejects_mismatched_beacon_payload_identity():
 async def test_action_registry_beacon_session_change_refreshes_action_metadata():
     bus = _state_bus()
     beacon = _beacon(bus)
-    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+    registry = _registry(beacon)
 
     async def scenario(events):
         old = await _advertise_actions(beacon, session_id="old")
@@ -239,7 +248,7 @@ async def test_action_registry_beacon_session_change_refreshes_action_metadata()
 async def test_action_registry_prefers_latest_duplicate_provider_advertisement():
     bus = _state_bus()
     beacon = _beacon(bus)
-    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+    registry = _registry(beacon)
 
     async def scenario(events):
         await _advertise_actions(
@@ -268,7 +277,7 @@ async def test_action_registry_prefers_latest_duplicate_provider_advertisement()
 async def test_action_registry_removes_actions_when_beacon_advertisement_is_withdrawn():
     bus = _state_bus()
     beacon = _beacon(bus)
-    registry = ActionRegistry(beacon, controller_id=CONTROLLER_ID)
+    registry = _registry(beacon)
 
     async def scenario(events):
         handle = await _advertise_actions(beacon)
@@ -290,7 +299,7 @@ async def test_action_registry_removes_actions_when_beacon_advertisement_is_with
 @pytest.mark.asyncio
 async def test_action_registry_loads_builtin_actions_without_provider_beacon_ads():
     bus = _state_bus()
-    registry = ActionRegistry(_beacon(bus), controller_id=CONTROLLER_ID)
+    registry = _registry(_beacon(bus))
     stopping = anyio.Event()
     mock_tg = MagicMock()
     mock_tg.start_soon = lambda fn, *a, **k: None

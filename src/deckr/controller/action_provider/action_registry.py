@@ -15,12 +15,17 @@ from deckr.actions.messages import ActionDescriptor
 from deckr.beacon import BeaconService, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.models import thaw_json
+from deckr.core.util.anyio import CoalescedTrigger
 from deckr.profiles import (
     ACTIONS_FEATURE_ID,
     ActionsBeaconPayload,
     actions_payload_from_advertisement,
 )
-from deckr.state import StateUnavailable
+from deckr.state import (
+    DEFAULT_STATE_NOTIFICATION_BATCH_SECONDS,
+    DEFAULT_STATE_RECONCILE_SECONDS,
+    StateUnavailable,
+)
 
 from deckr.controller.action_provider.builtin import (
     BuiltinAction,
@@ -31,7 +36,8 @@ from deckr.controller.action_provider.provider import ActionMetadata
 
 logger = logging.getLogger(__name__)
 
-_STATE_RECONCILE_SECONDS = 1.0
+_STATE_RECONCILE_SECONDS = DEFAULT_STATE_RECONCILE_SECONDS
+_STATE_NOTIFICATION_BATCH_SECONDS = DEFAULT_STATE_NOTIFICATION_BATCH_SECONDS
 _WATCH_RETRY_SECONDS = 1.0
 
 
@@ -57,6 +63,7 @@ class ActionRegistry(BaseComponent):
         *,
         controller_id: str,
         on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]] | None = None,
+        notification_batch_interval: float = _STATE_NOTIFICATION_BATCH_SECONDS,
     ):
         super().__init__(name="ActionRegistry")
         del controller_id
@@ -67,6 +74,9 @@ class ActionRegistry(BaseComponent):
         self._action_registry: dict[str, _BeaconAction] = {}
         self._advertisements: dict[str, ActionsBeaconPayload] = {}
         self._reconcile_lock = anyio.Lock()
+        self._reconcile_notifications = CoalescedTrigger(
+            batch_interval=notification_batch_interval
+        )
 
     async def get_action(
         self,
@@ -188,22 +198,22 @@ class ActionRegistry(BaseComponent):
                 self._builtin_action_registry[action_uuid] = descriptor
 
         start_soon(self._advertisement_loop)
+        start_soon(self._notification_reconciliation_loop)
         start_soon(self._reconciliation_loop)
 
     async def stop(self) -> None:
         self._action_registry.clear()
         self._builtin_action_registry.clear()
         self._advertisements.clear()
+        await self._reconcile_notifications.aclose()
 
     async def _advertisement_loop(self) -> None:
         while True:
             try:
                 async with self._beacon.watch_feature(ACTIONS_FEATURE_ID) as stream:
                     async for event in stream:
-                        await self._reconcile_current_state(
-                            reason=(
-                                f"actions beacon {event.event_type.value} {event.key}"
-                            )
+                        await self._reconcile_notifications.request(
+                            f"actions beacon {event.event_type.value} {event.key}"
                         )
             except StateUnavailable:
                 logger.warning(
@@ -222,6 +232,21 @@ class ActionRegistry(BaseComponent):
                     exc_info=True,
                 )
             await anyio.sleep(_STATE_RECONCILE_SECONDS)
+
+    async def _notification_reconciliation_loop(self) -> None:
+        await self._reconcile_notifications.run(
+            self._reconcile_notification,
+            reason_prefix="action beacon notifications",
+        )
+
+    async def _reconcile_notification(self, reason: str) -> None:
+        try:
+            await self._reconcile_current_state(reason=reason)
+        except StateUnavailable:
+            logger.warning(
+                "Action Beacon advertisements unavailable; notification will retry",
+                exc_info=True,
+            )
 
     async def _reconcile_current_state(self, *, reason: str) -> None:
         async with self._reconcile_lock:
