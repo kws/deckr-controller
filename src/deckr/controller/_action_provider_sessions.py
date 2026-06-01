@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import anyio
 from deckr.actions.endpoints import action_provider_address
 from deckr.concord import (
+    DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS,
     ConcordAgreement,
     ConcordAgreementSpec,
     ConcordService,
@@ -27,7 +28,7 @@ from deckr.controller.action_provider.provider import ActionMetadata
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_SESSION_HEARTBEAT_SECONDS = 5.0
+PROVIDER_SESSION_HEARTBEAT_SECONDS = DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS
 DEFAULT_PROVIDER_SESSION_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
 
 

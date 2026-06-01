@@ -18,6 +18,7 @@ from deckr.actions.messages import (
 from deckr.beacon import BeaconService, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.concord import (
+    DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS,
     ConcordAgreement,
     ConcordAgreementSpec,
     ConcordService,
@@ -68,7 +69,7 @@ from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)
 
-CLAIM_HEARTBEAT_SECONDS = 5.0
+CLAIM_HEARTBEAT_SECONDS = DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS
 DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
 _STATE_RECONCILE_SECONDS = DEFAULT_STATE_RECONCILE_SECONDS
 _STATE_NOTIFICATION_BATCH_SECONDS = DEFAULT_STATE_NOTIFICATION_BATCH_SECONDS
