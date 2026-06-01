@@ -19,6 +19,7 @@ from deckr.contracts.messages import controller_address
 from deckr.profiles import (
     ACTION_PROVIDER_SESSION_PROFILE_ID,
     ActionProviderSessionTerms,
+    action_provider_session_contract_id,
 )
 from deckr.state import StateConflict, StateUnavailable
 
@@ -134,6 +135,10 @@ class ActionProviderSessionManager:
                 participants=(controller_endpoint, provider_endpoint),
                 local_participant=controller_endpoint,
                 local_session_id=self._controller_session_id,
+                stable_contract_id=action_provider_session_contract_id(
+                    controller_endpoint,
+                    provider_endpoint,
+                ),
                 terms=ActionProviderSessionTerms(
                     sessionId=key.provider_session_id,
                     controllerEndpoint=controller_endpoint,
@@ -189,18 +194,12 @@ class ActionProviderSessionManager:
             validity.status == ContractValidityStatus.NOT_YET_FULFILLED
             and anyio.current_time() >= session.acceptance_deadline
         ):
-            reason = "provider_session_acceptance_timeout"
-            await self._cancel_key_unlocked(
-                key,
-                reason=reason,
-            )
-            self._retired_provider_session_ids.add(key.provider_session_id)
             return ProviderSessionSnapshot(
                 key=key,
                 ready=False,
-                terminal=True,
+                terminal=False,
                 status=validity.status,
-                reason=reason,
+                reason="provider_session_acceptance_timeout",
             )
         if _terminal_session_status(validity.status):
             reason = _terminal_session_reason(validity)

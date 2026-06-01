@@ -1116,7 +1116,61 @@ async def test_binding_waits_for_provider_session_token(
 
 
 @pytest.mark.asyncio
-async def test_pending_binding_drops_after_provider_session_acceptance_timeout(
+async def test_pending_binding_activates_when_provider_attaches_after_acceptance_timeout(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    concord = _concord(action_bus)
+
+    async with anyio.create_task_group() as tg:
+        provider_sessions = ActionProviderSessionManager(
+            controller_id=CONTROLLER_ID,
+            controller_session_id=action_bus.session_id,
+            concord=concord,
+            start_soon=tg.start_soon,
+            acceptance_timeout_seconds=0.05,
+        )
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=action_bus,
+            start_soon=tg.start_soon,
+            provider_sessions=provider_sessions,
+        )
+        await manager.set_page(profile="default", page=0)
+        session = next(iter(provider_sessions._sessions.values()))
+        lease = next(iter(manager._binding_leases.values()))
+        assert not lease.attached
+
+        await anyio.sleep(0.06)
+        await manager._reconcile_binding_sessions()
+
+        assert manager._binding_leases
+        assert provider_sessions._sessions == {session.key: session}
+        assert not lease.attached
+
+        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await manager._reconcile_binding_sessions()
+
+        assert await manager.action_contexts.get("0,0") is not None
+        assert lease.attached
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_provider_session_restart_rebinds_to_successor_contract(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1157,31 +1211,20 @@ async def test_pending_binding_drops_after_provider_session_acceptance_timeout(
             registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
             unregistered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
         )
-        new_pending_session = next(iter(provider_sessions._sessions.values()))
-        assert new_pending_session.provider_session_id == "new-provider-session"
-        assert new_pending_session.contract != old_session.contract
-        assert len(provider_sessions._sessions) == 1
-
-        await anyio.sleep(0.06)
-        await manager._reconcile_binding_sessions()
-        assert manager._binding_leases == {}
-
-        registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-        await manager.on_actions_changed(
-            registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
-            unregistered=[],
-        )
-        assert provider_sessions._sessions == {}
-        assert manager._binding_leases == {}
-
-        registry.provider_session_id.return_value = "replacement-provider-session"
-        await manager.on_actions_changed(
-            registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
-            unregistered=[],
-        )
         new_session = next(iter(provider_sessions._sessions.values()))
-        assert new_session.provider_session_id == "replacement-provider-session"
-        assert new_session.contract != old_session.contract
+        assert new_session.provider_session_id == "new-provider-session"
+        assert new_session.contract.contract_id == old_session.contract.contract_id
+        assert new_session.contract.generation == old_session.contract.generation + 1
+        assert len(provider_sessions._sessions) == 1
+        assert (await concord._validate(old_session.contract)).status == (
+            ContractValidityStatus.CANCELLED
+        )
+
+        await concord._attach(new_session.contract, PROVIDER_ADDR, "new-provider-session")
+        await manager._reconcile_binding_sessions()
+
+        assert await manager.action_contexts.get("0,0") is not None
+        assert next(iter(manager._binding_leases.values())).attached
 
         tg.cancel_scope.cancel()
 
