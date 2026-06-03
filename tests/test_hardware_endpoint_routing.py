@@ -33,6 +33,7 @@ from deckr.hardware.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
 
 from deckr.controller import _controller_service as controller_service_module
 from deckr.controller._controller_service import ControllerService
+from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
     HardwareCommandService,
@@ -486,6 +487,62 @@ async def test_hardware_claim_is_cancelled_when_config_is_removed():
         assert (await concord.validate(owned.contract)).status == (
             ContractValidityStatus.CANCELLED
         )
+
+
+@pytest.mark.asyncio
+async def test_device_manager_background_work_is_scoped_to_device_lifecycle(
+    monkeypatch,
+):
+    original_start = DeviceManager.start
+    background_started = anyio.Event()
+    background_stopped = anyio.Event()
+
+    async def start_with_sentinel(self, tg, stopping) -> None:
+        await original_start(self, tg, stopping)
+
+        async def sentinel() -> None:
+            background_started.set()
+            try:
+                await anyio.sleep_forever()
+            finally:
+                background_stopped.set()
+
+        tg.start_soon(sentinel)
+
+    monkeypatch.setattr(DeviceManager, "start", start_with_sentinel)
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
+        await _advertise_hardware(beacon)
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        owned = next(iter(controller._owned_claims.values()))
+        await concord.attach(
+            owned.contract,
+            participant=hardware_manager_address("room-a"),
+            session_id="manager-session",
+        )
+        await controller._reconcile_hardware_current_state(reason="test manager token")
+
+        with anyio.fail_after(1):
+            await background_started.wait()
+
+        live = controller._device_registry.get("config-room-a")
+        assert live is not None
+        await controller._disconnect_live(
+            live,
+            release_claim=False,
+            reason="test device disconnect",
+        )
+
+        with anyio.fail_after(1):
+            await background_stopped.wait()
+
+        assert controller._device_registry.get("config-room-a") is None
 
 
 @pytest.mark.asyncio

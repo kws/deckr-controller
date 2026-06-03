@@ -609,6 +609,48 @@ async def _next_capability_input(
 
 
 @pytest.mark.asyncio
+async def test_device_manager_starts_background_loops_explicitly():
+    started: list[tuple[object, tuple[object, ...]]] = []
+    device = _make_mock_device()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[Profile(name="default", pages=[Page(controls=[])])],
+    )
+
+    class RecordingTaskGroup:
+        def start_soon(self, fn, *args, **kwargs) -> None:
+            started.append((fn, args))
+
+    constructor_tg = RecordingTaskGroup()
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=config,
+        manager=MagicMock(),
+        actions_bus=_actions_bus(),
+        start_soon=constructor_tg.start_soon,
+        provider_sessions=ReadyProviderSessions(),
+    )
+    assert started == []
+
+    stopping = anyio.Event()
+    stopping.set()
+    await manager.start(RecordingTaskGroup(), stopping)
+
+    assert [fn.__name__ for fn, _ in started] == [
+        "_page_timeout_loop",
+        "_binding_session_loop",
+    ]
+    assert all(args == (stopping,) for _, args in started)
+    for fn, args in started:
+        await fn(*args)
+
+
+@pytest.mark.asyncio
 async def test_provider_settings_patch_with_valid_provider_session_after_beacon_loss():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()

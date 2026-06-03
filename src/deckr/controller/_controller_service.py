@@ -712,6 +712,7 @@ class ControllerService(BaseComponent):
             )
             await self._controller_contexts.set(live.config_id, ctrl_ctx)
             async with anyio.create_task_group() as device_tg:
+                await ctrl_ctx.start(device_tg, disconnect_event)
                 page_ready = anyio.Event()
 
                 async def set_initial_page() -> None:

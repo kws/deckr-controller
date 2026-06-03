@@ -317,9 +317,15 @@ class DeviceManager:
         self._clock = clock or time.monotonic
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
-        self._start_soon(self._page_timeout_loop)
+
+    async def start(
+        self,
+        tg: anyio.abc.TaskGroup,
+        stopping: anyio.Event,
+    ) -> None:
+        tg.start_soon(self._page_timeout_loop, stopping)
         if self._provider_sessions is not None:
-            self._start_soon(self._binding_session_loop)
+            tg.start_soon(self._binding_session_loop, stopping)
 
     async def _render_unavailable_to_control(self, control: ControlSurface) -> None:
         """Render a not-available overlay to an output-capable control."""
@@ -671,9 +677,11 @@ class DeviceManager:
         await lease.context.on_binding_attached()
         return True
 
-    async def _binding_session_loop(self) -> None:
-        while True:
+    async def _binding_session_loop(self, stopping: anyio.Event) -> None:
+        while not stopping.is_set():
             await anyio.sleep(BINDING_SESSION_RECONCILE_SECONDS)
+            if stopping.is_set():
+                return
             await self._reconcile_binding_sessions()
 
     async def _reconcile_binding_sessions(self) -> None:
@@ -1065,9 +1073,11 @@ class DeviceManager:
         if session is not None:
             session.last_activity = self._clock()
 
-    async def _page_timeout_loop(self) -> None:
-        while True:
+    async def _page_timeout_loop(self, stopping: anyio.Event) -> None:
+        while not stopping.is_set():
             await anyio.sleep(self._page_timeout_check_interval)
+            if stopping.is_set():
+                return
             session = self._dynamic_page_session
             if session is None:
                 continue
