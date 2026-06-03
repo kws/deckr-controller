@@ -18,6 +18,7 @@ from ._materialized import (
     MaterializedConfigPublisher,
     MaterializedConfigResult,
     MaterializedDeviceConfigService,
+    materialized_config_bucket_policy,
     materialized_config_key,
     materialized_config_result_key,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "NullDeviceConfigService",
     "Page",
     "Profile",
+    "materialized_config_bucket_policy",
     "materialized_config_key",
     "materialized_config_result_key",
 ]

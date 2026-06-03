@@ -6,12 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import anyio
-from deckr.beacon import (
-    BEACON_ADVERTISEMENT_STORE_POLICY,
-    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
-    BeaconDiscovery,
-    BeaconService,
-)
+from deckr.beacon import Beacon
 from deckr.components import (
     BaseComponent,
     Component,
@@ -21,21 +16,9 @@ from deckr.components import (
     ComponentManifest,
     RunContext,
 )
-from deckr.concord import (
-    CONCORD_CONTRACT_STORE_POLICY,
-    CONCORD_TOKEN_STORE_POLICY,
-    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
-    DEFAULT_CONCORD_TOKEN_STORE_NAME,
-    ConcordCoordinator,
-    ConcordService,
-)
-from deckr.contracts.messages import (
-    ACTIONS_LANE,
-    HARDWARE_MESSAGES_LANE,
-    controller_address,
-)
-from deckr.lanes import Lane, RegisteredEndpointLane
-from deckr.state import PERSISTENT_STATE_STORE_POLICY, StateStore
+from deckr.concord import Concord
+from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE
+from deckr.lanes import EndpointSession
 
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
@@ -47,6 +30,7 @@ from deckr.controller._runtime_support import (
     build_settings_service,
 )
 from deckr.controller.action_provider.action_registry import ActionRegistry
+from deckr.controller.config import materialized_config_bucket_policy
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,44 +46,29 @@ class ControllerRuntimeService(BaseComponent):
         *,
         runtime_name: str,
         runtime: ControllerRuntime,
-        hardware_messages: Lane,
-        actions: Lane,
-        beacon: BeaconService,
-        concord: ConcordService,
-        materialized_config_state: StateStore | None = None,
+        context: ComponentContext,
+        beacon: Beacon,
+        concord: Concord,
+        materialized_config_bucket=None,
     ) -> None:
         super().__init__(name=runtime_name)
         self._runtime = runtime
-        self._hardware_messages = hardware_messages
-        self._actions = actions
+        self._context = context
         self._beacon = beacon
         self._concord = concord
-        self._materialized_config_state = materialized_config_state
+        self._materialized_config_bucket = materialized_config_bucket
         self._component_manager = ComponentManager()
-        self._hardware_endpoint_cm: (
-            AbstractAsyncContextManager[RegisteredEndpointLane] | None
-        ) = None
-        self._actions_endpoint_cm: (
-            AbstractAsyncContextManager[RegisteredEndpointLane] | None
-        ) = None
-        self._hardware_endpoint: RegisteredEndpointLane | None = None
-        self._actions_endpoint: RegisteredEndpointLane | None = None
+        self._endpoint_cm: AbstractAsyncContextManager[EndpointSession] | None = None
+        self._endpoint: EndpointSession | None = None
 
     async def start(self, ctx: RunContext) -> None:
         manager_started = False
         try:
-            self._hardware_endpoint_cm = self._hardware_messages.register_endpoint(
-                controller_address(self._runtime.controller_id),
+            self._endpoint_cm = self._context.open_endpoint(
+                "controller",
                 metadata={"runtime": self.name, "role": "controller"},
-                task_group=ctx.tg,
             )
-            self._hardware_endpoint = await self._hardware_endpoint_cm.__aenter__()
-            self._actions_endpoint_cm = self._actions.register_endpoint(
-                controller_address(self._runtime.controller_id),
-                metadata={"runtime": self.name, "role": "controller"},
-                task_group=ctx.tg,
-            )
-            self._actions_endpoint = await self._actions_endpoint_cm.__aenter__()
+            self._endpoint = await self._endpoint_cm.__aenter__()
 
             await ctx.tg.start(self._component_manager.run)
             manager_started = True
@@ -107,7 +76,7 @@ class ControllerRuntimeService(BaseComponent):
             config_service = build_config_service(
                 self._runtime.config,
                 controller_id=self._runtime.controller_id,
-                materialized_state=self._materialized_config_state,
+                materialized_bucket=self._materialized_config_bucket,
             )
             if isinstance(config_service, Component):
                 await self._component_manager.add_component(config_service)
@@ -132,39 +101,33 @@ class ControllerRuntimeService(BaseComponent):
             )
 
             controller_service = ControllerService(
-                hardware_endpoint=self._hardware_endpoint,
+                endpoint=self._endpoint,
                 beacon=self._beacon,
                 concord=self._concord,
                 config_service=config_service,
                 settings_service=settings_service,
                 controller_id=self._runtime.controller_id,
                 action_registry=action_registry,
-                actions_endpoint=self._actions_endpoint,
             )
             await self._component_manager.add_component(controller_service)
         except BaseException:
             with anyio.CancelScope(shield=True):
                 if manager_started:
                     await self._component_manager.stop()
-                await self._close_endpoint_contexts()
+                await self._close_endpoint_context()
             raise
 
     async def stop(self) -> None:
         with anyio.CancelScope(shield=True):
             await self._component_manager.stop()
-            await self._close_endpoint_contexts()
+            await self._close_endpoint_context()
 
-    async def _close_endpoint_contexts(self) -> None:
-        actions_cm = self._actions_endpoint_cm
-        self._actions_endpoint_cm = None
-        self._actions_endpoint = None
-        if actions_cm is not None:
-            await actions_cm.__aexit__(None, None, None)
-        hardware_cm = self._hardware_endpoint_cm
-        self._hardware_endpoint_cm = None
-        self._hardware_endpoint = None
-        if hardware_cm is not None:
-            await hardware_cm.__aexit__(None, None, None)
+    async def _close_endpoint_context(self) -> None:
+        endpoint_cm = self._endpoint_cm
+        self._endpoint_cm = None
+        self._endpoint = None
+        if endpoint_cm is not None:
+            await endpoint_cm.__aexit__(None, None, None)
 
 
 def build_controller_runtime(
@@ -188,37 +151,25 @@ def component_factory(context: ComponentContext):
         base_dir=context.base_dir,
         controller_id=context.require_endpoint_id("controller"),
     )
-    materialized_config_state = None
+    context.require_lane(HARDWARE_MESSAGES_LANE)
+    context.require_lane(ACTIONS_LANE)
+
+    materialized_config_bucket = None
     device_config = runtime.config.device_config
     if device_config is not None and device_config.materialized is not None:
-        materialized_config_state = context.state(
-            device_config.materialized.bucket,
-            policy=PERSISTENT_STATE_STORE_POLICY,
+        materialized_config_bucket = context.kv_bucket(
+            materialized_config_bucket_policy(device_config.materialized.bucket)
         )
 
     return ControllerRuntimeService(
         runtime_name=context.runtime_name,
         runtime=runtime,
-        hardware_messages=context.require_lane(HARDWARE_MESSAGES_LANE),
-        actions=context.require_lane(ACTIONS_LANE),
-        beacon=BeaconService(BeaconDiscovery(
-            context.state(
-                DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
-                policy=BEACON_ADVERTISEMENT_STORE_POLICY,
-            )
-        )),
-        concord=ConcordService(ConcordCoordinator(
-            context.state(
-                DEFAULT_CONCORD_CONTRACT_STORE_NAME,
-                policy=CONCORD_CONTRACT_STORE_POLICY,
-            ),
-            context.state(
-                DEFAULT_CONCORD_TOKEN_STORE_NAME,
-                policy=CONCORD_TOKEN_STORE_POLICY,
-            ),
-        )),
-        materialized_config_state=materialized_config_state,
+        context=context,
+        beacon=context.require_beacon(),
+        concord=context.require_concord(),
+        materialized_config_bucket=materialized_config_bucket,
     )
+
 
 component = ComponentDefinition(
     manifest=ComponentManifest(

@@ -116,7 +116,10 @@ def test_raster_controls_order_by_geometry_without_kind_classification():
         "encoder-display",
         "plain-button-with-display",
     ]
-    assert all(control.image_format == RasterImageFormat(width=72, height=72) for control in controls)
+    assert all(
+        control.image_format == RasterImageFormat(width=72, height=72)
+        for control in controls
+    )
     assert {control.capability_id for control in controls} == {"raster.bitmap"}
 
 

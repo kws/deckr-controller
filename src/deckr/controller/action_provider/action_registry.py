@@ -12,7 +12,7 @@ from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
 from deckr.actions.messages import ActionDescriptor
-from deckr.beacon import BeaconService, Candidate
+from deckr.beacon import Beacon, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.models import thaw_json
 from deckr.core.util.anyio import CoalescedTrigger
@@ -21,11 +21,7 @@ from deckr.profiles import (
     ActionsBeaconPayload,
     actions_payload_from_advertisement,
 )
-from deckr.state import (
-    DEFAULT_STATE_NOTIFICATION_BATCH_SECONDS,
-    DEFAULT_STATE_RECONCILE_SECONDS,
-    StateUnavailable,
-)
+from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller.action_provider.builtin import (
     BuiltinAction,
@@ -36,8 +32,8 @@ from deckr.controller.action_provider.provider import ActionMetadata
 
 logger = logging.getLogger(__name__)
 
-_STATE_RECONCILE_SECONDS = DEFAULT_STATE_RECONCILE_SECONDS
-_STATE_NOTIFICATION_BATCH_SECONDS = DEFAULT_STATE_NOTIFICATION_BATCH_SECONDS
+_STATE_RECONCILE_SECONDS = 15.0
+_STATE_NOTIFICATION_BATCH_SECONDS = 0.05
 _WATCH_RETRY_SECONDS = 1.0
 
 
@@ -59,10 +55,11 @@ class ActionRegistry(BaseComponent):
 
     def __init__(
         self,
-        beacon: BeaconService,
+        beacon: Beacon,
         *,
         controller_id: str,
-        on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]] | None = None,
+        on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]]
+        | None = None,
         notification_batch_interval: float = _STATE_NOTIFICATION_BATCH_SECONDS,
     ):
         super().__init__(name="ActionRegistry")
@@ -102,11 +99,7 @@ class ActionRegistry(BaseComponent):
             return _metadata(entry)
 
         if provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS:
-            return (
-                None
-                if provider_labels
-                else self._builtin_action_metadata(address)
-            )
+            return None if provider_labels else self._builtin_action_metadata(address)
         if provider_instance_id is None and not provider_labels:
             builtin = self._builtin_action_metadata(address)
             if builtin is not None:
@@ -210,12 +203,12 @@ class ActionRegistry(BaseComponent):
     async def _advertisement_loop(self) -> None:
         while True:
             try:
-                async with self._beacon.watch_feature(ACTIONS_FEATURE_ID) as stream:
+                async with self._beacon.watch(ACTIONS_FEATURE_ID) as stream:
                     async for event in stream:
                         await self._reconcile_notifications.request(
                             f"actions beacon {event.event_type.value} {event.key}"
                         )
-            except StateUnavailable:
+            except KvUnavailable:
                 logger.warning(
                     "Action Beacon advertisements unavailable; retrying",
                     exc_info=True,
@@ -226,7 +219,7 @@ class ActionRegistry(BaseComponent):
         while True:
             try:
                 await self._reconcile_current_state(reason="broker snapshot")
-            except StateUnavailable:
+            except KvUnavailable:
                 logger.warning(
                     "Action Beacon advertisements unavailable; reconciliation will retry",
                     exc_info=True,
@@ -242,7 +235,7 @@ class ActionRegistry(BaseComponent):
     async def _reconcile_notification(self, reason: str) -> None:
         try:
             await self._reconcile_current_state(reason=reason)
-        except StateUnavailable:
+        except KvUnavailable:
             logger.warning(
                 "Action Beacon advertisements unavailable; notification will retry",
                 exc_info=True,
@@ -253,7 +246,7 @@ class ActionRegistry(BaseComponent):
             await self._reconcile_current_state_locked(reason=reason)
 
     async def _reconcile_current_state_locked(self, *, reason: str) -> None:
-        candidates = await self._beacon.find(ACTIONS_FEATURE_ID)
+        candidates = self._beacon.candidates(ACTIONS_FEATURE_ID)
         next_candidates: dict[str, tuple[Candidate, ActionsBeaconPayload]] = {}
 
         for candidate in candidates:
@@ -385,5 +378,7 @@ def _valid_actions_payload(candidate: Candidate) -> ActionsBeaconPayload | None:
     try:
         return actions_payload_from_advertisement(candidate.advertisement)
     except ValueError:
-        logger.warning("Ignoring invalid actions Beacon advertisement %s", candidate.key)
+        logger.warning(
+            "Ignoring invalid actions Beacon advertisement %s", candidate.key
+        )
         return None

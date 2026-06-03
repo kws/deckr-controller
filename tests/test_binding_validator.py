@@ -210,9 +210,7 @@ async def test_validate_page_bindings_missing_control():
         del kwargs
         return action
 
-    bindings = [
-        _page_child("99,99", settings={})
-    ]
+    bindings = [_page_child("99,99", settings={})]
     result = await validate_dynamic_page_bindings(
         bindings,
         device,
@@ -236,9 +234,7 @@ async def test_validate_page_bindings_missing_action():
         del kwargs
         return None
 
-    bindings = [
-        _page_child("0,0", settings={})
-    ]
+    bindings = [_page_child("0,0", settings={})]
     result = await validate_dynamic_page_bindings(
         bindings,
         device,

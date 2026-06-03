@@ -1,21 +1,13 @@
-"""In-process lane substrate for controller unit tests (no NATS server).
-
-Deckr defaults to ``NatsSubstrate``; controller tests need deterministic,
-connected-free messaging and KV behavior. This module vendors the former
-``LocalSubstrate`` / ``LocalStateStore`` pair from Deckr with local expiry
-helpers that were removed from ``deckr.state`` when NATS became the only
-product substrate.
-"""
+"""In-process Deckr message bus and KV buckets for controller tests."""
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import anyio
-from deckr.contracts.lanes import LaneContractRegistry
+from deckr.contracts.lanes import MessageContract, MessageContractRegistry
 from deckr.contracts.messages import DeckrMessage, EndpointAddress
 from deckr.contracts.models import DeckrModel
 from deckr.lanes import (
@@ -24,82 +16,45 @@ from deckr.lanes import (
     reply_is_accepted,
     validate_message_for_contract,
 )
-from deckr.state import (
-    DEFAULT_STATE_STORE_NAME,
-    StateChange,
-    StateConflict,
-    StateEntry,
-    StateStore,
-    StateStorePolicy,
-    state_value,
+from deckr.substrates.nats_kv import (
+    KvBucketPolicy,
+    KvChange,
+    KvConflict,
+    KvEntry,
+    kv_value,
 )
-
-
-def _parse_timestamp(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        timestamp = value
-    elif isinstance(value, str):
-        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    else:
-        raise ValueError("timestamp must be an ISO-8601 string or datetime")
-    if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=UTC)
-    return timestamp.astimezone(UTC)
-
-
-def _state_expires_at(
-    value: Mapping[str, Any],
-    *,
-    ttl: float | None = None,
-    now: datetime | None = None,
-) -> datetime | None:
-    timestamp = value.get("timestamp")
-    ttl_seconds = value.get("ttlSeconds", value.get("ttl_seconds"))
-    payload_deadline: datetime | None = None
-    if timestamp is not None and ttl_seconds is not None:
-        parsed = _parse_timestamp(timestamp)
-        try:
-            seconds = float(ttl_seconds)
-        except (TypeError, ValueError):
-            seconds = 0
-        if seconds > 0:
-            payload_deadline = parsed + timedelta(seconds=seconds)
-
-    ttl_deadline = None
-    if ttl is not None and ttl > 0:
-        ttl_deadline = (now or datetime.now(UTC)) + timedelta(seconds=ttl)
-
-    deadlines = [deadline for deadline in (payload_deadline, ttl_deadline) if deadline]
-    if not deadlines:
-        return None
-    return min(deadlines)
 
 
 class MemoryLaneSubstrate:
     def __init__(
         self,
         *,
-        lane_contracts: LaneContractRegistry,
+        lane_contracts: MessageContractRegistry,
         buffer_size: int = 100,
-        sweep_interval: float = 0.05,
-        default_state_name: str = DEFAULT_STATE_STORE_NAME,
     ) -> None:
         self._lane_contracts = lane_contracts
-        self.default_state_name = default_state_name
         self._buffer_size = buffer_size
-        self._sweep_interval = sweep_interval
         self._lock = anyio.Lock()
         self._subscribers: dict[
             tuple[str, EndpointAddress, str],
             set[anyio.abc.ObjectSendStream[DeckrMessage]],
         ] = {}
-        self._states: dict[str, MemoryStateStore] = {}
+        self.kv_buckets: dict[str, MemoryJsonKvBucket] = {}
 
-    def start(self, tg: anyio.abc.TaskGroup) -> None:
-        tg.start_soon(self._sweep_state, name="deckr_memory_state_sweeper")
+    def contract_for(self, lane: str) -> MessageContract:
+        return self._lane_contracts.contract_for(lane)
+
+    async def connect(self) -> None:
+        return
+
+    def start(self, _tg: anyio.abc.TaskGroup) -> None:
+        return
+
+    async def aclose(self) -> None:
+        return
 
     async def publish(self, message: DeckrMessage) -> None:
-        contract = self._lane_contracts.contract_for(message.lane)
+        contract = self.contract_for(message.lane)
         validate_message_for_contract(message, contract)
         async with self._lock:
             subscribers = [
@@ -176,47 +131,34 @@ class MemoryLaneSubstrate:
             await send.aclose()
             await receive.aclose()
 
-    def state(
-        self,
-        name: str,
-        *,
-        policy: StateStorePolicy | None = None,
-    ) -> StateStore:
-        del policy
-        store = self._states.get(name)
-        if store is None:
-            store = MemoryStateStore(name=name, buffer_size=self._buffer_size)
-            self._states[name] = store
-        return store
-
-    async def _sweep_state(self) -> None:
-        while True:
-            await anyio.sleep(self._sweep_interval)
-            for store in tuple(self._states.values()):
-                await store.expire()
+    def kv_bucket(self, policy: KvBucketPolicy) -> MemoryJsonKvBucket:
+        bucket = self.kv_buckets.get(policy.bucket)
+        if bucket is None:
+            bucket = MemoryJsonKvBucket(
+                bucket=policy.bucket, buffer_size=self._buffer_size
+            )
+            self.kv_buckets[policy.bucket] = bucket
+        return bucket
 
 
-class MemoryStateStore:
-    def __init__(self, *, name: str, buffer_size: int = 100) -> None:
-        self.name = name
+class MemoryJsonKvBucket:
+    def __init__(self, *, bucket: str, buffer_size: int = 100) -> None:
+        self.bucket = bucket
         self._buffer_size = buffer_size
-        self._lock = anyio.Lock()
         self._revision = 0
-        self._entries: dict[str, tuple[StateEntry, datetime | None]] = {}
-        self._watchers: dict[
-            anyio.abc.ObjectSendStream[StateChange], str
-        ] = {}
+        self._entries: dict[str, KvEntry] = {}
+        self._watchers: dict[anyio.abc.ObjectSendStream[KvChange | None], str] = {}
+        self._lock = anyio.Lock()
 
-    async def get(self, key: str) -> StateEntry | None:
+    async def get(self, key: str) -> KvEntry | None:
         async with self._lock:
-            item = self._entries.get(key)
-            return item[0] if item is not None else None
+            return self._entries.get(key)
 
-    async def items(self, prefix: str = "") -> tuple[StateEntry, ...]:
+    async def items(self, prefix: str = "") -> tuple[KvEntry, ...]:
         async with self._lock:
             return tuple(
                 entry
-                for key, (entry, _expires_at) in sorted(self._entries.items())
+                for key, entry in sorted(self._entries.items())
                 if key.startswith(prefix)
             )
 
@@ -226,13 +168,12 @@ class MemoryStateStore:
         value: Mapping[str, Any] | DeckrModel,
         *,
         ttl: float | None = None,
-    ) -> StateEntry:
-        normalized = state_value(value)
-        async with self._lock:
-            entry = self._next_entry(key, normalized)
-            self._entries[key] = (entry, _state_expires_at(normalized, ttl=ttl))
-            watchers = self._watchers_for(key)
-        await self._publish(watchers, StateChange("put", key, entry))
+    ) -> KvEntry:
+        del ttl
+        entry, watchers = await self._write(key, value)
+        await self._publish(
+            watchers, KvChange(self.bucket, key, entry.revision, "put", entry)
+        )
         return entry
 
     async def create(
@@ -241,16 +182,12 @@ class MemoryStateStore:
         value: Mapping[str, Any] | DeckrModel,
         *,
         ttl: float | None = None,
-    ) -> StateEntry:
-        normalized = state_value(value)
+    ) -> KvEntry:
+        del ttl
         async with self._lock:
             if key in self._entries:
-                raise StateConflict(f"State key {key!r} already exists")
-            entry = self._next_entry(key, normalized)
-            self._entries[key] = (entry, _state_expires_at(normalized, ttl=ttl))
-            watchers = self._watchers_for(key)
-        await self._publish(watchers, StateChange("put", key, entry))
-        return entry
+                raise KvConflict(f"KV key {key!r} already exists")
+        return await self.put(key, value)
 
     async def update(
         self,
@@ -259,81 +196,98 @@ class MemoryStateStore:
         *,
         revision: int,
         ttl: float | None = None,
-    ) -> StateEntry:
-        normalized = state_value(value)
+    ) -> KvEntry:
+        del ttl
         async with self._lock:
             current = self._entries.get(key)
-            if current is None or current[0].revision != revision:
-                raise StateConflict(f"State key {key!r} revision changed")
-            entry = self._next_entry(key, normalized)
-            self._entries[key] = (entry, _state_expires_at(normalized, ttl=ttl))
-            watchers = self._watchers_for(key)
-        await self._publish(watchers, StateChange("put", key, entry))
-        return entry
+            if current is None or current.revision != revision:
+                raise KvConflict(f"KV key {key!r} revision changed")
+        return await self.put(key, value)
 
-    async def delete(self, key: str, *, revision: int | None = None) -> None:
+    async def delete(self, key: str, *, revision: int | None = None) -> int | None:
         async with self._lock:
             current = self._entries.get(key)
             if current is None:
-                return
-            if revision is not None and current[0].revision != revision:
-                raise StateConflict(f"State key {key!r} revision changed")
+                return None
+            if revision is not None and current.revision != revision:
+                raise KvConflict(f"KV key {key!r} revision changed")
+            self._revision += 1
             self._entries.pop(key, None)
+            delete_revision = self._revision
             watchers = self._watchers_for(key)
-        await self._publish(watchers, StateChange("delete", key, None))
+        await self._publish(
+            watchers,
+            KvChange(self.bucket, key, delete_revision, "delete"),
+        )
+        return delete_revision
+
+    async def expire(self, key: str) -> None:
+        async with self._lock:
+            current = self._entries.pop(key, None)
+            if current is None:
+                return
+            self._revision += 1
+            expire_revision = self._revision
+            watchers = self._watchers_for(key)
+        await self._publish(
+            watchers,
+            KvChange(self.bucket, key, expire_revision, "expire"),
+        )
 
     @asynccontextmanager
     async def watch(
         self,
         prefix: str = "",
-    ) -> AsyncIterator[anyio.abc.ObjectReceiveStream[StateChange]]:
-        send, receive = anyio.create_memory_object_stream[StateChange](
+    ) -> AsyncIterator[anyio.abc.ObjectReceiveStream[KvChange | None]]:
+        send, receive = anyio.create_memory_object_stream[KvChange | None](
             max_buffer_size=self._buffer_size
         )
         async with self._lock:
             self._watchers[send] = prefix
             snapshot = tuple(
                 entry
-                for key, (entry, _expires_at) in sorted(self._entries.items())
+                for key, entry in sorted(self._entries.items())
                 if key.startswith(prefix)
             )
         for entry in snapshot:
-            await send.send(StateChange("put", entry.key, entry))
+            await send.send(
+                KvChange(self.bucket, entry.key, entry.revision, "put", entry)
+            )
+        await send.send(None)
         try:
-            yield receive
+            async with send, receive:
+                yield receive
         finally:
             async with self._lock:
                 self._watchers.pop(send, None)
-            await send.aclose()
-            await receive.aclose()
 
-    async def expire(self) -> None:
-        now = datetime.now(UTC)
-        expired: list[tuple[str, tuple[anyio.abc.ObjectSendStream[StateChange], ...]]] = []
+    async def _write(
+        self,
+        key: str,
+        value: Mapping[str, Any] | DeckrModel,
+    ) -> tuple[KvEntry, tuple[anyio.abc.ObjectSendStream[KvChange | None], ...]]:
+        normalized = kv_value(value)
         async with self._lock:
-            for key, (_entry, expires_at) in tuple(self._entries.items()):
-                if expires_at is None or expires_at > now:
-                    continue
-                self._entries.pop(key, None)
-                expired.append((key, self._watchers_for(key)))
-        for key, watchers in expired:
-            await self._publish(watchers, StateChange("expire", key, None))
-
-    def _next_entry(self, key: str, value: Mapping[str, Any]) -> StateEntry:
-        self._revision += 1
-        return StateEntry(key=key, value=value, revision=self._revision)
+            self._revision += 1
+            entry = KvEntry(self.bucket, key, normalized, self._revision)
+            self._entries[key] = entry
+            watchers = self._watchers_for(key)
+        return entry, watchers
 
     def _watchers_for(
-        self, key: str
-    ) -> tuple[anyio.abc.ObjectSendStream[StateChange], ...]:
+        self,
+        key: str,
+    ) -> tuple[anyio.abc.ObjectSendStream[KvChange | None], ...]:
         return tuple(
-            stream for stream, prefix in self._watchers.items() if key.startswith(prefix)
+            stream
+            for stream, prefix in self._watchers.items()
+            if key.startswith(prefix)
         )
 
     async def _publish(
         self,
-        watchers: tuple[anyio.abc.ObjectSendStream[StateChange], ...],
-        change: StateChange,
+        watchers: tuple[anyio.abc.ObjectSendStream[KvChange | None], ...],
+        change: KvChange,
     ) -> None:
         for watcher in watchers:
             await watcher.send(change)

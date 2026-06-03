@@ -120,7 +120,9 @@ def parse_controller_config(
     return _resolve_controller_paths(controller, base_dir=base_dir)
 
 
-def controller_config_from_document(document: ConfigDocument) -> ControllerRuntimeConfig:
+def controller_config_from_document(
+    document: ConfigDocument,
+) -> ControllerRuntimeConfig:
     return parse_controller_config(
         controller_payload_from_document(document),
         base_dir=document.base_dir,

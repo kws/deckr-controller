@@ -7,11 +7,10 @@ import pytest
 from conftest import LaneHarness
 from deckr.actions.endpoints import action_provider_address
 from deckr.beacon import (
-    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
-    BeaconAdvertisement,
+    BEACON_ADVERTISEMENT_STORE_POLICY,
+    Beacon,
+    BeaconAdvertisementLease,
     BeaconAdvertisementSpec,
-    BeaconDiscovery,
-    BeaconService,
     beacon_advertisement_key,
 )
 from deckr.components import RunContext
@@ -32,13 +31,11 @@ def _state_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint="controller:controller-main")
 
 
-def _beacon(bus: LaneHarness) -> BeaconService:
-    return BeaconService(
-        BeaconDiscovery(bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
-    )
+def _beacon(bus: LaneHarness) -> Beacon:
+    return Beacon(bus.substrate.kv_bucket(BEACON_ADVERTISEMENT_STORE_POLICY))
 
 
-def _registry(beacon: BeaconService) -> ActionRegistry:
+def _registry(beacon: Beacon) -> ActionRegistry:
     return ActionRegistry(
         beacon,
         controller_id=CONTROLLER_ID,
@@ -71,14 +68,14 @@ def _actions_payload(
 
 
 async def _advertise_actions(
-    beacon: BeaconService,
+    beacon: Beacon,
     payload: ActionsBeaconPayload | None = None,
     *,
     advertisement_id: str = "ad-1",
     session_id: str = "session-1",
-) -> BeaconAdvertisement:
+) -> BeaconAdvertisementLease:
     payload = payload or _actions_payload(session_id=session_id)
-    advertisement = await beacon.ensure_advertisement(
+    return await beacon.advertise(
         BeaconAdvertisementSpec(
             feature_id=ACTIONS_FEATURE_ID,
             endpoint=payload.provider_endpoint,
@@ -88,8 +85,6 @@ async def _advertise_actions(
             labels=payload.labels,
         )
     )
-    await advertisement.publish()
-    return advertisement
 
 
 async def _run_registry(registry: ActionRegistry, callback):
@@ -101,6 +96,7 @@ async def _run_registry(registry: ActionRegistry, callback):
     registry._on_actions_changed = on_changed
     stopping = anyio.Event()
     async with anyio.create_task_group() as tg:
+        registry._beacon.start(tg)
         await registry.start(RunContext(tg=tg, stopping=stopping))
         await callback(events)
         tg.cancel_scope.cancel()
@@ -150,10 +146,13 @@ async def test_action_registry_filters_by_provider_instance_and_labels():
             ACTION_UUID,
             provider_labels={"room": "office"},
         )
-        assert await registry.get_action(
-            ACTION_UUID,
-            provider_labels={"room": "kitchen"},
-        ) is None
+        assert (
+            await registry.get_action(
+                ACTION_UUID,
+                provider_labels={"room": "kitchen"},
+            )
+            is None
+        )
 
     await _run_registry(registry, scenario)
 
@@ -191,10 +190,10 @@ async def test_action_registry_rejects_mismatched_beacon_payload_identity():
     bus = _state_bus()
     beacon = _beacon(bus)
     registry = _registry(beacon)
-    state = bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME)
+    bucket = bus.substrate.kv_bucket(BEACON_ADVERTISEMENT_STORE_POLICY)
 
     async def scenario(events):
-        await state.put(
+        await bucket.put(
             beacon_advertisement_key(
                 feature_id=ACTIONS_FEATURE_ID,
                 advertisement_id="bad-ad",
@@ -306,7 +305,9 @@ async def test_action_registry_loads_builtin_actions_without_provider_beacon_ads
 
     await registry.start(RunContext(tg=mock_tg, stopping=stopping))
 
-    goto_page = await registry.get_action("dev.deckr.controller.builtin.action.go_to_page")
+    goto_page = await registry.get_action(
+        "dev.deckr.controller.builtin.action.go_to_page"
+    )
     assert goto_page is not None
     assert goto_page.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
     descriptor = await registry.get_action_descriptor(

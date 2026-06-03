@@ -25,10 +25,10 @@ from deckr.actions.messages import (
     context_subject,
 )
 from deckr.concord import (
-    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
-    DEFAULT_CONCORD_TOKEN_STORE_NAME,
-    ConcordCoordinator,
-    ConcordService,
+    CONCORD_CONTRACT_BUCKET_POLICY,
+    CONCORD_MAINTENANCE_BUCKET_POLICY,
+    CONCORD_TOKEN_BUCKET_POLICY,
+    Concord,
     ContractValidityStatus,
 )
 from deckr.contracts.messages import DeckrMessage, controller_address
@@ -71,17 +71,16 @@ def _actions_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint=CONTROLLER_ADDR)
 
 
-def _concord(bus: LaneHarness) -> ConcordService:
-    return ConcordService(
-        ConcordCoordinator(
-            bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
-            bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
-        )
+def _concord(bus: LaneHarness) -> Concord:
+    return Concord(
+        bus.substrate.kv_bucket(CONCORD_CONTRACT_BUCKET_POLICY),
+        bus.substrate.kv_bucket(CONCORD_TOKEN_BUCKET_POLICY),
+        bus.substrate.kv_bucket(CONCORD_MAINTENANCE_BUCKET_POLICY),
     )
 
 
 def _provider_session_manager(
-    concord: ConcordService,
+    concord: Concord,
     action_bus: LaneHarness,
     start_soon,
 ) -> ActionProviderSessionManager:
@@ -98,7 +97,9 @@ class ReadyProviderSessions:
         self.prepare_calls: list[tuple[ActionMetadata, ...]] = []
         self.refresh_calls: list[tuple[ProviderSessionKey, ...]] = []
 
-    async def prepare_many(self, actions) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
+    async def prepare_many(
+        self, actions
+    ) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
         prepared = tuple(actions)
         self.prepare_calls.append(prepared)
         return {
@@ -112,7 +113,9 @@ class ReadyProviderSessions:
             if (key := provider_session_key(action)) is not None
         }
 
-    async def refresh_many(self, keys) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
+    async def refresh_many(
+        self, keys
+    ) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
         prepared = tuple(keys)
         self.refresh_calls.append(prepared)
         return {
@@ -550,7 +553,7 @@ def _provider_settings_device_manager(
 
 async def _prepare_provider_settings_session(
     provider_sessions: ActionProviderSessionManager,
-    concord: ConcordService,
+    concord: Concord,
     *,
     provider_id: str = "dev.deckr.clock",
 ) -> None:
@@ -559,7 +562,11 @@ async def _prepare_provider_settings_session(
     )
     assert snapshot is not None
     session = next(iter(provider_sessions._sessions.values()))
-    await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+    await concord.attach(
+        session.contract,
+        participant=PROVIDER_ADDR,
+        session_id=PROVIDER_SESSION_ID,
+    )
 
 
 async def _next_action_message(
@@ -722,7 +729,9 @@ async def test_provider_settings_command_rejected_when_concord_session_invalid()
     )
     await _prepare_provider_settings_session(provider_sessions, concord)
     session = next(iter(provider_sessions._sessions.values()))
-    await concord._cancel(session.contract, CONTROLLER_ADDR, reason="test invalid")
+    await concord.cancel(
+        session.contract, participant=CONTROLLER_ADDR, reason="test invalid"
+    )
     registry = MagicMock()
     registry.provider_session_id.return_value = PROVIDER_SESSION_ID
     registry.provider_instance_provides_provider.return_value = True
@@ -1069,38 +1078,45 @@ async def test_binding_waits_for_provider_session_token(
             session = next(iter(provider_sessions._sessions.values()))
             assert not lease.attached
             assert session.provider_session_id == PROVIDER_SESSION_ID
-            assert await manager._authorize_action_command(
-                _action_command(
-                    BINDING_OUTPUT,
-                    {
-                        "binding": lease.context.metadata.model_dump(
-                            by_alias=True,
-                            exclude_none=True,
-                            mode="json",
-                        ),
-                        "capability": {
-                            "deviceRef": {
-                                "managerId": "manager-main",
-                                "deviceId": "test-device",
+            assert (
+                await manager._authorize_action_command(
+                    _action_command(
+                        BINDING_OUTPUT,
+                        {
+                            "binding": lease.context.metadata.model_dump(
+                                by_alias=True,
+                                exclude_none=True,
+                                mode="json",
+                            ),
+                            "capability": {
+                                "deviceRef": {
+                                    "managerId": "manager-main",
+                                    "deviceId": "test-device",
+                                },
+                                "controlId": "0,0",
+                                "capabilityId": "raster.bitmap",
                             },
-                            "controlId": "0,0",
-                            "capabilityId": "raster.bitmap",
+                            "commandType": "clear",
+                            "generation": 1,
                         },
-                        "commandType": "clear",
-                        "generation": 1,
-                    },
+                        context_id=lease.context_id,
+                        action_instance_id=lease.action_instance_id,
+                        binding_id=lease.binding_id,
+                    ),
                     context_id=lease.context_id,
-                    action_instance_id=lease.action_instance_id,
-                    binding_id=lease.binding_id,
-                ),
-                context_id=lease.context_id,
-            ) is None
+                )
+                is None
+            )
 
             with anyio.move_on_after(0.05) as scope:
                 await stream.receive()
             assert scope.cancel_called
 
-            await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+            await concord.attach(
+                session.contract,
+                participant=PROVIDER_ADDR,
+                session_id=PROVIDER_SESSION_ID,
+            )
             await manager._reconcile_binding_sessions()
 
             with anyio.fail_after(1):
@@ -1160,7 +1176,11 @@ async def test_pending_binding_activates_when_provider_attaches_after_acceptance
         assert provider_sessions._sessions == {session.key: session}
         assert not lease.attached
 
-        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await concord.attach(
+            session.contract,
+            participant=PROVIDER_ADDR,
+            session_id=PROVIDER_SESSION_ID,
+        )
         await manager._reconcile_binding_sessions()
 
         assert await manager.action_contexts.get("0,0") is not None
@@ -1209,18 +1229,24 @@ async def test_provider_session_restart_rebinds_to_successor_contract(
         registry.provider_session_id.return_value = "new-provider-session"
         await manager.on_actions_changed(
             registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
-            unregistered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
+            unregistered=[
+                f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
+            ],
         )
         new_session = next(iter(provider_sessions._sessions.values()))
         assert new_session.provider_session_id == "new-provider-session"
         assert new_session.contract.contract_id == old_session.contract.contract_id
         assert new_session.contract.generation == old_session.contract.generation + 1
         assert len(provider_sessions._sessions) == 1
-        assert (await concord._validate(old_session.contract)).status == (
+        assert (await concord.validate(old_session.contract)).status == (
             ContractValidityStatus.CANCELLED
         )
 
-        await concord._attach(new_session.contract, PROVIDER_ADDR, "new-provider-session")
+        await concord.attach(
+            new_session.contract,
+            participant=PROVIDER_ADDR,
+            session_id="new-provider-session",
+        )
         await manager._reconcile_binding_sessions()
 
         assert await manager.action_contexts.get("0,0") is not None
@@ -1262,7 +1288,11 @@ async def test_binding_stays_attached_when_beacon_session_changes(
         )
         await manager.set_page(profile="default", page=0)
         session = next(iter(provider_sessions._sessions.values()))
-        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await concord.attach(
+            session.contract,
+            participant=PROVIDER_ADDR,
+            session_id=PROVIDER_SESSION_ID,
+        )
         await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
 
@@ -1308,7 +1338,11 @@ async def test_binding_stays_attached_when_beacon_session_disappears(
         )
         await manager.set_page(profile="default", page=0)
         session = next(iter(provider_sessions._sessions.values()))
-        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await concord.attach(
+            session.contract,
+            participant=PROVIDER_ADDR,
+            session_id=PROVIDER_SESSION_ID,
+        )
         await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
 
@@ -1355,7 +1389,11 @@ async def test_beacon_session_reappearance_does_not_resend_binding_attached(
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             await manager.set_page(profile="default", page=0)
             session = next(iter(provider_sessions._sessions.values()))
-            await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+            await concord.attach(
+                session.contract,
+                participant=PROVIDER_ADDR,
+                session_id=PROVIDER_SESSION_ID,
+            )
             await manager._reconcile_binding_sessions()
             assert await manager.action_contexts.get("0,0") is not None
             await _drain_action_messages(stream)
@@ -1435,7 +1473,11 @@ async def test_binding_and_page_navigation_reuses_provider_session_contract():
 
         await manager.set_page(profile="default", page=0)
         session = next(iter(provider_sessions._sessions.values()))
-        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await concord.attach(
+            session.contract,
+            participant=PROVIDER_ADDR,
+            session_id=PROVIDER_SESSION_ID,
+        )
         await manager._reconcile_binding_sessions()
         contract = session.contract
         owner_ctx = await manager.action_contexts.get("0,0")
@@ -1500,11 +1542,17 @@ async def test_binding_revokes_when_provider_session_contract_is_invalid(
         )
         await manager.set_page(profile="default", page=0)
         session = next(iter(provider_sessions._sessions.values()))
-        await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+        await concord.attach(
+            session.contract,
+            participant=PROVIDER_ADDR,
+            session_id=PROVIDER_SESSION_ID,
+        )
         await manager._reconcile_binding_sessions()
         assert await manager.action_contexts.get("0,0") is not None
 
-        await concord._cancel(session.contract, CONTROLLER_ADDR, reason="test invalid")
+        await concord.cancel(
+            session.contract, participant=CONTROLLER_ADDR, reason="test invalid"
+        )
         await manager._reconcile_binding_sessions()
 
         assert await manager.action_contexts.get("0,0") is None
@@ -1546,7 +1594,11 @@ async def test_provider_session_terminal_cleanup_is_local_only(
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             await manager.set_page(profile="default", page=0)
             session = next(iter(provider_sessions._sessions.values()))
-            await concord._attach(session.contract, PROVIDER_ADDR, PROVIDER_SESSION_ID)
+            await concord.attach(
+                session.contract,
+                participant=PROVIDER_ADDR,
+                session_id=PROVIDER_SESSION_ID,
+            )
             await manager._reconcile_binding_sessions()
             owner_ctx = await manager.action_contexts.get("0,0")
             assert owner_ctx is not None
@@ -1566,9 +1618,9 @@ async def test_provider_session_terminal_cleanup_is_local_only(
             assert manager._held_input_bindings
             await _drain_action_messages(stream)
 
-            await concord._cancel(
+            await concord.cancel(
                 session.contract,
-                PROVIDER_ADDR,
+                participant=PROVIDER_ADDR,
                 reason="action_provider_stop",
             )
             await manager._reconcile_binding_sessions()
@@ -1621,10 +1673,10 @@ async def test_dynamic_page_survives_action_beacon_withdrawal_with_valid_session
         )
         await manager.set_page(profile="default", page=0)
         session_contract = next(iter(provider_sessions._sessions.values()))
-        await concord._attach(
+        await concord.attach(
             session_contract.contract,
-            PROVIDER_ADDR,
-            PROVIDER_SESSION_ID,
+            participant=PROVIDER_ADDR,
+            session_id=PROVIDER_SESSION_ID,
         )
         await manager._reconcile_binding_sessions()
         owner_ctx = await manager.action_contexts.get("0,0")
@@ -2168,9 +2220,7 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
     """Same control on different pages keeps separate settings."""
     device = _make_mock_device()
     registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(NoopAction.uuid)
-    )
+    registry.get_action = AsyncMock(return_value=_metadata(NoopAction.uuid))
     action_bus = _actions_bus()
 
     config = DeviceConfig(
@@ -2250,9 +2300,7 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
     """Same action on different controls keeps separate settings."""
     device = _make_mock_device()
     registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(NoopAction.uuid)
-    )
+    registry.get_action = AsyncMock(return_value=_metadata(NoopAction.uuid))
     action_bus = _actions_bus()
 
     config = DeviceConfig(
@@ -2323,9 +2371,7 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
 async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir):
     device = _make_mock_device()
     registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(NoopAction.uuid)
-    )
+    registry.get_action = AsyncMock(return_value=_metadata(NoopAction.uuid))
     action_bus = _actions_bus()
     config = DeviceConfig(
         id="test-device",
@@ -2411,9 +2457,7 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
 async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tmp_dir):
     device = _make_mock_device()
     registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(NoopAction.uuid)
-    )
+    registry.get_action = AsyncMock(return_value=_metadata(NoopAction.uuid))
     command_service = FakeHardwareCommandService()
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,

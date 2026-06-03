@@ -143,17 +143,25 @@ class CommandRouter:
             return
         self._store.content.title = text
         self._store.content.image = None
-        if generation is None or self._store.base_output_generation > previous_generation:
+        if (
+            generation is None
+            or self._store.base_output_generation > previous_generation
+        ):
             self._store.overlay = None
         await self._render()
 
-    async def set_raster_image(self, image: str, *, generation: int | None = None) -> None:
+    async def set_raster_image(
+        self, image: str, *, generation: int | None = None
+    ) -> None:
         previous_generation = self._store.base_output_generation
         if not self._accept_base_generation(generation):
             return
         self._store.content.image = image
         self._store.content.title = None
-        if generation is None or self._store.base_output_generation > previous_generation:
+        if (
+            generation is None
+            or self._store.base_output_generation > previous_generation
+        ):
             self._store.overlay = None
         await self._render()
 
@@ -163,7 +171,10 @@ class CommandRouter:
             return
         self._store.content.image = None
         self._store.content.title = None
-        if generation is None or self._store.base_output_generation > previous_generation:
+        if (
+            generation is None
+            or self._store.base_output_generation > previous_generation
+        ):
             self._store.overlay = None
         if self._output is None:
             return

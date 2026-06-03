@@ -22,6 +22,7 @@ from deckr.hardware.descriptors import DeviceDescriptor
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
+from deckr.controller._endpoint_messages import send_message
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
@@ -56,6 +57,7 @@ class ControlContext:
         render_dispatcher: RenderDispatcher,
         settings_service: SettingsService | None,
         context_settings_target: SettingsTargetRef | None,
+        provider_session_id: str | None,
         *,
         profile_id: str,
         page_id: str,
@@ -68,6 +70,7 @@ class ControlContext:
         self._command_service = command_service
         self.provider_instance_id = provider_instance_id
         self.provider_id = provider_id
+        self.provider_session_id = provider_session_id
         self.action_uuid = action_uuid
         self.action_instance_id = metadata.action_instance_id
         self.binding_id = metadata.binding_id
@@ -129,6 +132,7 @@ class ControlContext:
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
             recipient=action_provider_address(self.provider_instance_id),
+            recipient_session_id=self.provider_session_id,
             message_type=message_type,
             body=body,
             subject=context_subject(
@@ -141,7 +145,7 @@ class ControlContext:
                 page_session_id=self.page_session_id,
             ),
         )
-        await self._actions_bus.publish(msg)
+        await send_message(self._actions_bus, msg)
 
     async def on_binding_attached(self) -> None:
         await self._router.hydrate_settings()
@@ -174,7 +178,9 @@ class ControlContext:
             CapabilityInputBody(binding=self.metadata, event=event),
         )
 
-    async def set_raster_image(self, image: str, *, generation: int | None = None) -> None:
+    async def set_raster_image(
+        self, image: str, *, generation: int | None = None
+    ) -> None:
         await self._router.set_raster_image(image, generation=generation)
 
     async def clear_raster(self, *, generation: int | None = None) -> None:

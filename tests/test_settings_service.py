@@ -287,7 +287,9 @@ async def test_action_target_metadata_mismatch_is_unknown(
 
 
 @pytest.mark.asyncio
-async def test_rejected_subscription_does_not_register_subscriber(tmp_path: Path) -> None:
+async def test_rejected_subscription_does_not_register_subscriber(
+    tmp_path: Path,
+) -> None:
     service, _ = await _service(tmp_path)
     bad_target = _target_with(actionId="action.other")
 

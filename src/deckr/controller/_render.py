@@ -141,7 +141,9 @@ def _bind_document_context(
     bound_context: dict[str, Any] = {}
     for index, key in enumerate(sorted(context)):
         if not isinstance(key, str) or not key:
-            raise ValueError("Invariant graph render context keys must be non-empty strings")
+            raise ValueError(
+                "Invariant graph render context keys must be non-empty strings"
+            )
         if key == "canvas":
             raise ValueError("Invariant graph render context must not include 'canvas'")
         dep = f"__deckr_graph_context_{index}"

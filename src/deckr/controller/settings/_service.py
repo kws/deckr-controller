@@ -54,7 +54,9 @@ class SettingsService(Protocol):
     async def replace(
         self, target: SettingsTargetRef, settings: Mapping[str, Any]
     ) -> SettingsSnapshot: ...
-    def subscribe(self, target: SettingsTargetRef) -> AsyncIterator[SettingsSnapshot]: ...
+    def subscribe(
+        self, target: SettingsTargetRef
+    ) -> AsyncIterator[SettingsSnapshot]: ...
     async def ensure_service_managed_id(
         self, target: SettingsTargetRef
     ) -> SettingsTargetRef: ...
@@ -370,7 +372,9 @@ class ConfigBackedSettingsService:
             provider_labels=control.provider_labels,
         )
 
-    async def _action_for_target(self, target: SettingsTargetRef) -> ActionMetadata | None:
+    async def _action_for_target(
+        self, target: SettingsTargetRef
+    ) -> ActionMetadata | None:
         if target.scope == "action_provider_instance":
             config = await self._require_config(target.config_id)
             for location in self._control_locations(config):
@@ -485,9 +489,7 @@ class ConfigBackedSettingsService:
             if candidate not in existing:
                 return candidate
 
-    def _action_provenance(
-        self, control: Control
-    ) -> tuple[SettingsProvenance, ...]:
+    def _action_provenance(self, control: Control) -> tuple[SettingsProvenance, ...]:
         provenance: list[SettingsProvenance] = ["config_default"]
         if control.template_overrides:
             provenance.append("template_override")
@@ -517,7 +519,9 @@ class ConfigBackedSettingsService:
                         self._subscribers.pop(key, None)
             await send.aclose()
 
-    async def _notify(self, target: SettingsTargetRef, snapshot: SettingsSnapshot) -> None:
+    async def _notify(
+        self, target: SettingsTargetRef, snapshot: SettingsSnapshot
+    ) -> None:
         async with self._lock:
             subscribers = set(self._subscribers.get(target.key(), set()))
         for send in subscribers:

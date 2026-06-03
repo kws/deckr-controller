@@ -16,6 +16,7 @@ from deckr.controller.config import (
     NullDeviceConfigService,
 )
 from deckr.controller.settings import ConfigBackedSettingsService
+from test_support.memory_lane_substrate import MemoryJsonKvBucket
 
 
 def test_build_services_disable_when_sections_are_absent(tmp_path: Path) -> None:
@@ -90,15 +91,12 @@ bucket = "dev_deckr_controller_config_v1"
     )
     config = controller_config_from_document(load_config_document(config_path))
 
-    class State:
-        pass
-
-    state = State()
+    bucket = MemoryJsonKvBucket(bucket="dev_deckr_controller_config_v1")
     config_service = build_config_service(
         config,
         controller_id="controller-main",
-        materialized_state=state,
+        materialized_bucket=bucket,
     )
 
     assert isinstance(config_service, MaterializedDeviceConfigService)
-    assert config_service._state is state
+    assert config_service._bucket is bucket

@@ -33,7 +33,9 @@ class BuiltinAction(Protocol):
     uuid: str
 
     async def on_bind(self, context: ControllerActionContext) -> None: ...
-    async def on_unbind(self, context: ControllerActionContext, reason: str) -> None: ...
+    async def on_unbind(
+        self, context: ControllerActionContext, reason: str
+    ) -> None: ...
     async def on_input(
         self,
         context: ControllerActionContext,

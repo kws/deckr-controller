@@ -8,17 +8,16 @@ import anyio
 import pytest
 from conftest import LaneHarness
 from deckr.beacon import (
-    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+    BEACON_ADVERTISEMENT_STORE_POLICY,
+    Beacon,
     BeaconAdvertisementSpec,
-    BeaconDiscovery,
-    BeaconService,
 )
 from deckr.components import RunContext
 from deckr.concord import (
-    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
-    DEFAULT_CONCORD_TOKEN_STORE_NAME,
-    ConcordCoordinator,
-    ConcordService,
+    CONCORD_CONTRACT_BUCKET_POLICY,
+    CONCORD_MAINTENANCE_BUCKET_POLICY,
+    CONCORD_TOKEN_BUCKET_POLICY,
+    Concord,
     ContractValidityStatus,
 )
 from deckr.contracts.messages import controller_address, hardware_manager_address
@@ -96,7 +95,9 @@ class MemoryConfigService:
             for config in self._configs.values()
             if config.enabled
             and config.match.fingerprint == fingerprint
-            and all(labels.get(key) == value for key, value in config.match.labels.items())
+            and all(
+                labels.get(key) == value for key, value in config.match.labels.items()
+            )
         ]
         if len(matches) > 1:
             raise ValueError("ambiguous config")
@@ -152,23 +153,20 @@ def _config(
     )
 
 
-def _beacon(bus: LaneHarness) -> BeaconService:
-    return BeaconService(
-        BeaconDiscovery(bus.deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
-    )
+def _beacon(bus: LaneHarness) -> Beacon:
+    return Beacon(bus.substrate.kv_bucket(BEACON_ADVERTISEMENT_STORE_POLICY))
 
 
-def _concord(bus: LaneHarness) -> ConcordService:
-    return ConcordService(
-        ConcordCoordinator(
-            bus.deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
-            bus.deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
-        )
+def _concord(bus: LaneHarness) -> Concord:
+    return Concord(
+        bus.substrate.kv_bucket(CONCORD_CONTRACT_BUCKET_POLICY),
+        bus.substrate.kv_bucket(CONCORD_TOKEN_BUCKET_POLICY),
+        bus.substrate.kv_bucket(CONCORD_MAINTENANCE_BUCKET_POLICY),
     )
 
 
 async def _advertise_hardware(
-    beacon: BeaconService,
+    beacon: Beacon,
     *,
     manager_id: str = "room-a",
     session_id: str = "manager-session",
@@ -194,7 +192,7 @@ async def _advertise_hardware(
             }
         },
     )
-    advertisement = await beacon.ensure_advertisement(
+    return await beacon.advertise(
         BeaconAdvertisementSpec(
             feature_id=HARDWARE_FEATURE_ID,
             endpoint=hardware_manager_address(manager_id),
@@ -204,8 +202,6 @@ async def _advertise_hardware(
             labels=payload.labels,
         )
     )
-    await advertisement.publish()
-    return advertisement
 
 
 @asynccontextmanager
@@ -217,7 +213,6 @@ async def _running_controller(
         "hardware_messages",
         default_endpoint=controller_address(CONTROLLER_ID),
     )
-    actions_bus = LaneHarness("actions", default_endpoint=controller_address(CONTROLLER_ID))
     beacon = _beacon(hardware_bus)
     concord = _concord(hardware_bus)
     registry = MagicMock()
@@ -225,16 +220,17 @@ async def _running_controller(
     registry.provider_session_id.return_value = None
     registry.provider_instance_provides_provider.return_value = False
     controller = ControllerService(
-        hardware_endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)),
+        endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)),
         beacon=beacon,
         concord=concord,
         config_service=config_service,
         settings_service=MagicMock(),
         controller_id=CONTROLLER_ID,
         action_registry=registry,
-        actions_endpoint=actions_bus.endpoint(controller_address(CONTROLLER_ID)),
     )
     async with anyio.create_task_group() as tg:
+        beacon.start(tg)
+        concord.start(tg)
         await controller.start(RunContext(tg=tg, stopping=anyio.Event()))
         try:
             yield controller, beacon, concord
@@ -245,7 +241,9 @@ async def _running_controller(
 
 @pytest.mark.asyncio
 async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands():
-    bus = LaneHarness("hardware_messages", default_endpoint="controller:controller-main")
+    bus = LaneHarness(
+        "hardware_messages", default_endpoint="controller:controller-main"
+    )
     command_service = HardwareCommandService(
         bus.endpoint("controller:controller-main"),
         controller_id="controller-main",
@@ -271,7 +269,9 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
         bus.subscribe(hardware_manager_address("room-a")) as stream_a,
         bus.subscribe(hardware_manager_address("room-b")) as stream_b,
     ):
-        await command_service.set_raster_frame("config-room-a", "0,0", "raster.bitmap", b"a")
+        await command_service.set_raster_frame(
+            "config-room-a", "0,0", "raster.bitmap", b"a"
+        )
         await command_service.clear_raster("config-room-b", "0,0", "raster.bitmap")
         msg_a = await stream_a.receive()
         msg_b = await stream_b.receive()
@@ -304,10 +304,6 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
         "hardware_messages",
         default_endpoint=controller_address(CONTROLLER_ID),
     )
-    actions_bus = LaneHarness(
-        "actions",
-        default_endpoint=controller_address(CONTROLLER_ID),
-    )
     beacon = _beacon(hardware_bus)
     concord = _concord(hardware_bus)
     registry = MagicMock()
@@ -315,31 +311,36 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
     registry.provider_session_id.return_value = None
     registry.provider_instance_provides_provider.return_value = False
     controller = ControllerService(
-        hardware_endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)),
+        endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)),
         beacon=beacon,
         concord=concord,
         config_service=MemoryConfigService(_config()),
         settings_service=MagicMock(),
         controller_id=CONTROLLER_ID,
         action_registry=registry,
-        actions_endpoint=actions_bus.endpoint(controller_address(CONTROLLER_ID)),
     )
     caplog.set_level("INFO", logger="deckr.controller._controller_service")
 
-    await _advertise_hardware(
-        beacon,
-        manager_id="room-a",
-        session_id="stale-session",
-        advertisement_id="hardware_manager_test",
-    )
-    await _advertise_hardware(
-        beacon,
-        manager_id="room-a",
-        session_id="live-session",
-        advertisement_id="hardware_manager_mirabox-rust-001",
-    )
+    async with anyio.create_task_group() as tg:
+        beacon.start(tg)
+        concord.start(tg)
+        await _advertise_hardware(
+            beacon,
+            manager_id="room-a",
+            session_id="live-session",
+            advertisement_id="hardware_manager_test",
+        )
+        await _advertise_hardware(
+            beacon,
+            manager_id="room-a",
+            session_id="live-session",
+            advertisement_id="hardware_manager_mirabox-rust-001",
+        )
 
-    await controller._reconcile_hardware_current_state(reason="test duplicate beacon")
+        await controller._reconcile_hardware_current_state(
+            reason="test duplicate beacon"
+        )
+        tg.cancel_scope.cancel()
 
     assert len(controller._owned_claims) == 1
     owned = next(iter(controller._owned_claims.values()))
@@ -355,9 +356,11 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
 
 @pytest.mark.asyncio
 async def test_hardware_claim_stays_pending_until_manager_token_attaches():
-    async with _running_controller(
-        config_service=MemoryConfigService(_config())
-    ) as (controller, beacon, _concord):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        _concord,
+    ):
         await _advertise_hardware(beacon)
 
         with anyio.fail_after(1):
@@ -380,9 +383,11 @@ async def test_pending_hardware_claim_waits_for_acceptance_timeout_before_redisc
         "DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS",
         0.05,
     )
-    async with _running_controller(
-        config_service=MemoryConfigService(_config())
-    ) as (controller, beacon, concord):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
         handle = await _advertise_hardware(beacon, session_id="old-session")
 
         with anyio.fail_after(1):
@@ -406,21 +411,23 @@ async def test_pending_hardware_claim_waits_for_acceptance_timeout_before_redisc
             reason="test replacement after timeout"
         )
 
-        assert (await concord._validate(owned.contract)).status == (
+        assert (await concord.validate(owned.contract)).status == (
             ContractValidityStatus.CANCELLED
         )
         replacement = next(iter(controller._owned_claims.values()))
         assert replacement.claim_id != owned.claim_id
-        assert replacement.current_sessions[str(hardware_manager_address("room-a"))] == (
-            "new-session"
-        )
+        assert replacement.current_sessions[
+            str(hardware_manager_address("room-a"))
+        ] == ("new-session")
 
 
 @pytest.mark.asyncio
 async def test_hardware_claim_becomes_live_after_concord_manager_token():
-    async with _running_controller(
-        config_service=MemoryConfigService(_config())
-    ) as (controller, beacon, concord):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
         await _advertise_hardware(beacon)
 
         with anyio.fail_after(1):
@@ -428,10 +435,10 @@ async def test_hardware_claim_becomes_live_after_concord_manager_token():
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
 
-        await concord._attach(
+        await concord.attach(
             owned.contract,
-            hardware_manager_address("room-a"),
-            "manager-session",
+            participant=hardware_manager_address("room-a"),
+            session_id="manager-session",
         )
         await controller._reconcile_hardware_current_state(reason="test manager token")
 
@@ -458,10 +465,10 @@ async def test_hardware_claim_is_cancelled_when_config_is_removed():
             while not controller._owned_claims:
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
-        await concord._attach(
+        await concord.attach(
             owned.contract,
-            hardware_manager_address("room-a"),
-            "manager-session",
+            participant=hardware_manager_address("room-a"),
+            session_id="manager-session",
         )
         await controller._reconcile_hardware_current_state(reason="test manager token")
 
@@ -476,26 +483,28 @@ async def test_hardware_claim_is_cancelled_when_config_is_removed():
                 await anyio.sleep(0.01)
 
         assert controller._device_registry.get("config-room-a") is None
-        assert (await concord._validate(owned.contract)).status == (
+        assert (await concord.validate(owned.contract)).status == (
             ContractValidityStatus.CANCELLED
         )
 
 
 @pytest.mark.asyncio
 async def test_live_hardware_claim_ignores_advertisement_id_change():
-    async with _running_controller(
-        config_service=MemoryConfigService(_config())
-    ) as (controller, beacon, concord):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
         handle = await _advertise_hardware(beacon, advertisement_id="hardware-ad-1")
 
         with anyio.fail_after(1):
             while not controller._owned_claims:
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
-        await concord._attach(
+        await concord.attach(
             owned.contract,
-            hardware_manager_address("room-a"),
-            "manager-session",
+            participant=hardware_manager_address("room-a"),
+            session_id="manager-session",
         )
         await controller._reconcile_hardware_current_state(reason="test manager token")
         with anyio.fail_after(1):
@@ -516,19 +525,21 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
 
 @pytest.mark.asyncio
 async def test_live_hardware_claim_survives_session_changing_beacon_replacement():
-    async with _running_controller(
-        config_service=MemoryConfigService(_config())
-    ) as (controller, beacon, concord):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
         handle = await _advertise_hardware(beacon, session_id="old-session")
 
         with anyio.fail_after(1):
             while not controller._owned_claims:
                 await anyio.sleep(0.01)
         owned = next(iter(controller._owned_claims.values()))
-        await concord._attach(
+        await concord.attach(
             owned.contract,
-            hardware_manager_address("room-a"),
-            "old-session",
+            participant=hardware_manager_address("room-a"),
+            session_id="old-session",
         )
         await controller._reconcile_hardware_current_state(reason="test manager token")
         with anyio.fail_after(1):
@@ -549,7 +560,7 @@ async def test_live_hardware_claim_survives_session_changing_beacon_replacement(
         assert controller._device_registry.get("config-room-a") is not None
         current_owned = next(iter(controller._owned_claims.values()))
         assert current_owned.claim_id == owned.claim_id
-        assert (await concord._validate(owned.contract)).status == (
+        assert (await concord.validate(owned.contract)).status == (
             ContractValidityStatus.VALID
         )
 

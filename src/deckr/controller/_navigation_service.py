@@ -65,7 +65,9 @@ class NavigationService:
                 return p
         return self._config.profiles[0]
 
-    def resolve_static_bindings(self, ref: StaticPageRef) -> list[ConfiguredControlBinding]:
+    def resolve_static_bindings(
+        self, ref: StaticPageRef
+    ) -> list[ConfiguredControlBinding]:
         """Return unresolved descriptor selector bindings for a static page."""
         profile = self._find_profile(ref.profile_name)
         page = profile.pages[ref.page_index]

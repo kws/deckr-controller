@@ -9,7 +9,7 @@ import anyio
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.keys import encode_key_token
 from deckr.contracts.models import DeckrModel
-from deckr.state import StateEntry, StateStore, StateUnavailable
+from deckr.substrates.nats_kv import KvBucketPolicy, KvEntry, KvUnavailable
 from pydantic import Field, field_serializer, field_validator
 
 from deckr.controller.config._data import DeviceConfig
@@ -48,6 +48,16 @@ def materialized_config_result_key(controller_id: str) -> str:
             encode_key_token(controller_id),
             "materialized",
         )
+    )
+
+
+def materialized_config_bucket_policy(
+    bucket: str = CONFIG_STATE_BUCKET,
+) -> KvBucketPolicy:
+    return KvBucketPolicy(
+        bucket=bucket,
+        ttl_seconds=None,
+        description="Deckr controller materialized config KV",
     )
 
 
@@ -136,25 +146,25 @@ class MaterializedConfigPublisher:
         self,
         *,
         controller_id: str,
-        state: StateStore,
+        bucket,
         producer: MaterializedConfigProducer | None = None,
     ) -> None:
         self.controller_id = controller_id
-        self.state = state
+        self.bucket = bucket
         self.key = materialized_config_key(controller_id)
         self.producer = producer
 
     async def publish_configs(
         self,
         configs: Sequence[DeviceConfig],
-    ) -> StateEntry:
+    ) -> KvEntry:
         projection = MaterializedConfigProjection(
             controllerId=self.controller_id,
             timestamp=datetime.now(UTC),
             deviceConfigs=tuple(sorted(configs, key=lambda item: item.id)),
             producer=self.producer,
         )
-        return await self.state.put(self.key, projection)
+        return await self.bucket.put(self.key, projection)
 
 
 class MaterializedDeviceConfigService(BaseComponent):
@@ -162,11 +172,11 @@ class MaterializedDeviceConfigService(BaseComponent):
         self,
         *,
         controller_id: str,
-        state: StateStore,
+        bucket,
     ) -> None:
         super().__init__(name="MaterializedDeviceConfigService")
         self._controller_id = controller_id
-        self._state = state
+        self._bucket = bucket
         self._config_key = materialized_config_key(controller_id)
         self._result_key = materialized_config_result_key(controller_id)
         self._config_by_id: dict[str, DeviceConfig] = {}
@@ -229,7 +239,7 @@ class MaterializedDeviceConfigService(BaseComponent):
             configs[config.id] = config
         publisher = MaterializedConfigPublisher(
             controller_id=self._controller_id,
-            state=self._state,
+            bucket=self._bucket,
             producer=MaterializedConfigProducer(
                 id=f"controller:{self._controller_id}",
                 kind="controller_runtime",
@@ -271,21 +281,23 @@ class MaterializedDeviceConfigService(BaseComponent):
     async def _watch_loop(self) -> None:
         while self._stopping is None or not self._stopping.is_set():
             try:
-                async with self._state.watch(self._config_key) as stream:
+                async with self._bucket.watch(self._config_key) as stream:
                     async for change in stream:
+                        if change is None:
+                            continue
                         if change.key != self._config_key:
                             continue
                         await self._reconcile(
                             reason=f"watch {change.operation} {change.key}"
                         )
-            except StateUnavailable:
+            except KvUnavailable:
                 logger.warning("Materialized config state unavailable; retrying")
                 await anyio.sleep(CONFIG_WATCH_RETRY_SECONDS)
 
     async def _reconcile(self, *, reason: str) -> None:
         try:
-            entry = await self._state.get(self._config_key)
-        except StateUnavailable:
+            entry = await self._bucket.get(self._config_key)
+        except KvUnavailable:
             logger.warning("Could not read materialized config during %s", reason)
             raise
         if entry is None:
@@ -360,7 +372,10 @@ class MaterializedDeviceConfigService(BaseComponent):
             affected_ids = set(old_configs) | set(configs)
             self._config_by_id = dict(configs)
             to_send = [
-                (self._config_by_id.get(config_id), set(self._subscribers.get(config_id, set())))
+                (
+                    self._config_by_id.get(config_id),
+                    set(self._subscribers.get(config_id, set())),
+                )
                 for config_id in affected_ids
                 if old_configs.get(config_id) != self._config_by_id.get(config_id)
             ]
@@ -388,6 +403,6 @@ class MaterializedDeviceConfigService(BaseComponent):
             diagnostics=diagnostics,
         )
         try:
-            await self._state.put(self._result_key, result)
-        except StateUnavailable:
+            await self._bucket.put(self._result_key, result)
+        except KvUnavailable:
             logger.warning("Could not write materialized config result")

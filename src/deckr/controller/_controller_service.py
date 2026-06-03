@@ -15,19 +15,23 @@ from deckr.actions.messages import (
     action_message_for_controller,
     subject_config_id,
 )
-from deckr.beacon import BeaconService, Candidate
+from deckr.beacon import Beacon, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.concord import (
     DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS,
-    ConcordAgreement,
+    Concord,
+    ConcordAgreementLease,
     ConcordAgreementSpec,
-    ConcordService,
+    ConcordConflict,
+    ConcordUnavailable,
     ContractHandle,
     ContractValidity,
     ContractValidityStatus,
     ParticipantHandle,
 )
 from deckr.contracts.messages import (
+    ACTIONS_LANE,
+    HARDWARE_MESSAGES_LANE,
     DeckrMessage,
     EndpointAddress,
     controller_address,
@@ -43,13 +47,8 @@ from deckr.hardware.profiles import (
     HardwareClaimTerms,
     hardware_payload_from_advertisement,
 )
-from deckr.lanes import RegisteredEndpointLane
-from deckr.state import (
-    DEFAULT_STATE_NOTIFICATION_BATCH_SECONDS,
-    DEFAULT_STATE_RECONCILE_SECONDS,
-    StateConflict,
-    StateUnavailable,
-)
+from deckr.lanes import EndpointSession
+from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._device_manager import DeviceManager
@@ -71,8 +70,8 @@ logger = logging.getLogger(__name__)
 
 CLAIM_HEARTBEAT_SECONDS = DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS
 DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
-_STATE_RECONCILE_SECONDS = DEFAULT_STATE_RECONCILE_SECONDS
-_STATE_NOTIFICATION_BATCH_SECONDS = DEFAULT_STATE_NOTIFICATION_BATCH_SECONDS
+_STATE_RECONCILE_SECONDS = 15.0
+_STATE_NOTIFICATION_BATCH_SECONDS = 0.05
 _WATCH_RETRY_SECONDS = 1.0
 
 
@@ -96,7 +95,7 @@ class OwnedHardwareClaim:
     config_id: str
     ref: DeviceRef
     device: DeviceDescriptor
-    agreement: ConcordAgreement
+    agreement: ConcordAgreementLease
     current_sessions: dict[str, str]
     acceptance_deadline: float
     controller_token: ParticipantHandle | None = None
@@ -110,19 +109,18 @@ class OwnedHardwareClaim:
 class ControllerService(BaseComponent):
     def __init__(
         self,
-        hardware_endpoint: RegisteredEndpointLane,
-        beacon: BeaconService,
-        concord: ConcordService,
+        endpoint: EndpointSession,
+        beacon: Beacon,
+        concord: Concord,
         config_service: DeviceConfigService,
         settings_service: SettingsService,
         *,
         controller_id: str,
         action_registry: ActionRegistry | None = None,
-        actions_endpoint: RegisteredEndpointLane | None = None,
         render_backend: RenderBackend | None = None,
     ):
         super().__init__()
-        self._hardware_endpoint = hardware_endpoint
+        self._endpoint = endpoint
         self._beacon = beacon
         self._concord = concord
         self._device_registry = DeviceRouteRegistry()
@@ -130,16 +128,15 @@ class ControllerService(BaseComponent):
         self._settings_service = settings_service
         self._controller_id = controller_id
         self._command_service = HardwareCommandService(
-            hardware_endpoint,
+            endpoint,
             controller_id=controller_id,
         )
         self._controller_contexts = AsyncMap[str, DeviceManager]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
-        self._actions_endpoint = actions_endpoint
         self._start_soon: Callable | None = None
         self._render_backend = render_backend
-        self._session_id = hardware_endpoint.session_id
+        self._session_id = endpoint.session_id
         self._owned_claims: dict[tuple[str, str], OwnedHardwareClaim] = {}
         self._unmatched_hardware_signatures: dict[
             tuple[str, str],
@@ -203,9 +200,7 @@ class ControllerService(BaseComponent):
 
     async def _actions_subscription_loop(self) -> None:
         """Subscribe to action lane and route command messages to DeviceManagers."""
-        if self._actions_endpoint is None:
-            return
-        async with self._actions_endpoint.subscribe() as stream:
+        async with self._endpoint.subscribe(ACTIONS_LANE) as stream:
             async for event in stream:
                 try:
                     if not isinstance(event, DeckrMessage):
@@ -225,7 +220,7 @@ class ControllerService(BaseComponent):
                         logger.exception("Error handling action lane event")
 
     async def _hardware_input_loop(self) -> None:
-        async with self._hardware_endpoint.subscribe() as subscribe:
+        async with self._endpoint.subscribe(HARDWARE_MESSAGES_LANE) as subscribe:
             async for message in subscribe:
                 event = hw_messages.hardware_body_from_message(message)
                 ref = hw_messages.hardware_device_ref_from_message(message)
@@ -247,12 +242,12 @@ class ControllerService(BaseComponent):
     async def _hardware_beacon_loop(self) -> None:
         while True:
             try:
-                async with self._beacon.watch_feature(HARDWARE_FEATURE_ID) as stream:
+                async with self._beacon.watch(HARDWARE_FEATURE_ID) as stream:
                     async for event in stream:
                         await self._hardware_reconcile_notifications.request(
                             f"hardware Beacon {event.event_type.value} {event.key}"
                         )
-            except StateUnavailable:
+            except KvUnavailable:
                 logger.warning("Hardware Beacon advertisements unavailable; retrying")
                 await anyio.sleep(_WATCH_RETRY_SECONDS)
 
@@ -260,7 +255,7 @@ class ControllerService(BaseComponent):
         while True:
             try:
                 await self._reconcile_hardware_current_state(reason="broker snapshot")
-            except StateUnavailable:
+            except (ConcordUnavailable, KvUnavailable):
                 logger.warning(
                     "Hardware current state unavailable; reconciliation will retry",
                     exc_info=True,
@@ -270,15 +265,12 @@ class ControllerService(BaseComponent):
     async def _hardware_claim_event_loop(self) -> None:
         while True:
             try:
-                async with self._concord.watch_contract_notifications(
-                    HARDWARE_CLAIM_PROFILE_ID,
-                ) as stream:
-                    async for notification in stream:
+                async with self._concord.watch(HARDWARE_CLAIM_PROFILE_ID) as stream:
+                    async for event in stream:
                         await self._hardware_reconcile_notifications.request(
-                            f"hardware claim {notification.source} "
-                            f"{notification.operation}"
+                            f"hardware claim {event.event_type.value}"
                         )
-            except StateUnavailable:
+            except ConcordUnavailable:
                 await anyio.sleep(_WATCH_RETRY_SECONDS)
 
     async def _hardware_notification_reconciliation_loop(self) -> None:
@@ -290,7 +282,7 @@ class ControllerService(BaseComponent):
     async def _reconcile_hardware_notification(self, reason: str) -> None:
         try:
             await self._reconcile_hardware_current_state(reason=reason)
-        except StateUnavailable:
+        except (ConcordUnavailable, KvUnavailable):
             logger.warning(
                 "Hardware current state unavailable; notification will retry",
                 exc_info=True,
@@ -379,7 +371,7 @@ class ControllerService(BaseComponent):
         self,
     ) -> dict[tuple[str, str], HardwareCandidate]:
         candidates: dict[tuple[str, str], HardwareCandidate] = {}
-        for candidate in await self._beacon.find(HARDWARE_FEATURE_ID):
+        for candidate in self._beacon.candidates(HARDWARE_FEATURE_ID):
             payload = _valid_hardware_payload(candidate)
             if payload is None:
                 continue
@@ -461,7 +453,7 @@ class ControllerService(BaseComponent):
             str(candidate.payload.manager_endpoint): candidate.payload.session_id,
         }
         try:
-            agreement = await self._concord.ensure_agreement(
+            agreement = await self._concord.propose(
                 ConcordAgreementSpec(
                     profile=HARDWARE_CLAIM_PROFILE_ID,
                     participants=(
@@ -477,7 +469,7 @@ class ControllerService(BaseComponent):
                 ),
                 start_soon=self._start_soon,
             )
-        except (StateConflict, StateUnavailable):
+        except (ConcordConflict, ConcordUnavailable):
             logger.warning("Could not create hardware claim for %s", candidate.ref)
             return
 
@@ -513,6 +505,7 @@ class ControllerService(BaseComponent):
             config_id=owned.config_id,
             ref=owned.ref,
             device=candidate.device,
+            manager_session_id=candidate.payload.session_id,
         )
         owned.device = candidate.device
         owned.live = True
@@ -520,6 +513,7 @@ class ControllerService(BaseComponent):
             config_id=owned.config_id,
             ref=owned.ref,
             device=candidate.device,
+            manager_session_id=candidate.payload.session_id,
         )
         config = await self._config_service.get_config(owned.config_id)
         if config is None:
@@ -539,11 +533,15 @@ class ControllerService(BaseComponent):
         live = self._device_registry.get_by_ref(owned.ref)
         if live is None:
             return
-        if candidate.device == live.device:
+        if (
+            candidate.device == live.device
+            and candidate.payload.session_id == live.manager_session_id
+        ):
             return
         updated = self._device_registry.update_descriptor(
             ref=owned.ref,
             device=candidate.device,
+            manager_session_id=candidate.payload.session_id,
         )
         if updated is None:
             return
@@ -552,6 +550,7 @@ class ControllerService(BaseComponent):
             config_id=updated.config_id,
             ref=updated.ref,
             device=updated.device,
+            manager_session_id=updated.manager_session_id,
         )
         ctrl_ctx = await self._controller_contexts.get(updated.config_id)
         if ctrl_ctx is not None:
@@ -585,7 +584,7 @@ class ControllerService(BaseComponent):
         with anyio.CancelScope(shield=True):
             try:
                 await owned.agreement.cancel(reason=reason)
-            except (StateConflict, StateUnavailable, ValueError):
+            except (ConcordConflict, ConcordUnavailable, ValueError):
                 logger.info("Could not cancel hardware claim %s", owned.claim_id)
 
     async def _disconnect_live(
@@ -626,17 +625,15 @@ class ControllerService(BaseComponent):
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
         self._start_soon = ctx.tg.start_soon
-        if self._actions_endpoint is not None:
-            self._provider_sessions = ActionProviderSessionManager(
-                controller_id=self._controller_id,
-                controller_session_id=self._actions_endpoint.session_id,
-                concord=self._concord,
-                start_soon=ctx.tg.start_soon,
-            )
+        self._provider_sessions = ActionProviderSessionManager(
+            controller_id=self._controller_id,
+            controller_session_id=self._endpoint.session_id,
+            concord=self._concord,
+            start_soon=ctx.tg.start_soon,
+        )
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
-        if self._actions_endpoint is not None:
-            ctx.tg.start_soon(self._actions_subscription_loop)
+        ctx.tg.start_soon(self._actions_subscription_loop)
         ctx.tg.start_soon(self._hardware_input_loop)
         ctx.tg.start_soon(self._hardware_beacon_loop)
         ctx.tg.start_soon(self._hardware_claim_event_loop)
@@ -705,7 +702,7 @@ class ControllerService(BaseComponent):
                 command_service=self._command_service,
                 config=first,
                 manager=self._action_registry,
-                actions_bus=self._actions_endpoint,
+                actions_bus=self._endpoint,
                 start_soon=self._start_soon,
                 render_backend=self._render_backend,
                 settings_service=self._settings_service,

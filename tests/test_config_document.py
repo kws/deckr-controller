@@ -119,7 +119,9 @@ bucket = "dev_deckr_controller_config_v1"
 
     assert controller.device_config is not None
     assert controller.device_config.materialized is not None
-    assert controller.device_config.materialized.bucket == "dev_deckr_controller_config_v1"
+    assert (
+        controller.device_config.materialized.bucket == "dev_deckr_controller_config_v1"
+    )
 
 
 def test_load_config_document_rejects_multiple_device_config_sources(
@@ -193,4 +195,6 @@ controller = "controller-main"
 
 
 def test_default_config_document_text_contains_controller_table() -> None:
-    assert "[deckr.components.instances.controller_main]" in default_config_document_text()
+    assert (
+        "[deckr.components.instances.controller_main]" in default_config_document_text()
+    )

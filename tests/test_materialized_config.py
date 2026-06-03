@@ -27,10 +27,11 @@ from deckr.controller.config import (
     MaterializedDeviceConfigService,
     Page,
     Profile,
+    materialized_config_bucket_policy,
     materialized_config_key,
     materialized_config_result_key,
 )
-from test_support.memory_lane_substrate import MemoryLaneSubstrate, MemoryStateStore
+from test_support.memory_lane_substrate import MemoryJsonKvBucket, MemoryLaneSubstrate
 
 CONTROLLER_ID = "controller-main"
 
@@ -76,11 +77,11 @@ async def _next_with_timeout(stream) -> Any:
         return await anext(stream)
 
 
-async def _wait_for_result(state: MemoryStateStore, status: str):
+async def _wait_for_result(bucket: MemoryJsonKvBucket, status: str):
     key = materialized_config_result_key(CONTROLLER_ID)
     with anyio.fail_after(1):
         while True:
-            entry = await state.get(key)
+            entry = await bucket.get(key)
             if entry is not None and entry.value.get("status") == status:
                 return entry
             await anyio.sleep(0.01)
@@ -88,8 +89,8 @@ async def _wait_for_result(state: MemoryStateStore, status: str):
 
 @pytest.mark.asyncio
 async def test_materialized_service_activates_valid_projection() -> None:
-    state = MemoryStateStore(name="config")
-    await state.put(
+    bucket = MemoryJsonKvBucket(bucket="config")
+    await bucket.put(
         materialized_config_key(CONTROLLER_ID),
         MaterializedConfigProjection(
             controllerId=CONTROLLER_ID,
@@ -99,7 +100,7 @@ async def test_materialized_service_activates_valid_projection() -> None:
     )
     service = MaterializedDeviceConfigService(
         controller_id=CONTROLLER_ID,
-        state=state,
+        bucket=bucket,
     )
 
     async with anyio.create_task_group() as tg:
@@ -115,7 +116,7 @@ async def test_materialized_service_activates_valid_projection() -> None:
             )
             assert match is not None
             assert match.id == "config-1"
-            result = await _wait_for_result(state, "active")
+            result = await _wait_for_result(bucket, "active")
             assert result.value["activeConfigIds"] == ("config-1",)
         finally:
             stopping.set()
@@ -125,12 +126,12 @@ async def test_materialized_service_activates_valid_projection() -> None:
 
 @pytest.mark.asyncio
 async def test_materialized_service_watches_projection_updates() -> None:
-    state = MemoryStateStore(name="config")
+    bucket = MemoryJsonKvBucket(bucket="config")
     service = MaterializedDeviceConfigService(
         controller_id=CONTROLLER_ID,
-        state=state,
+        bucket=bucket,
     )
-    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, state=state)
+    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, bucket=bucket)
 
     async with anyio.create_task_group() as tg:
         stopping = anyio.Event()
@@ -142,7 +143,7 @@ async def test_materialized_service_watches_projection_updates() -> None:
             emitted = await _next_with_timeout(stream)
             assert emitted is not None
             assert emitted.name == "Updated"
-            result = await _wait_for_result(state, "active")
+            result = await _wait_for_result(bucket, "active")
             assert result.value["sourceRevision"] is not None
         finally:
             stopping.set()
@@ -151,21 +152,22 @@ async def test_materialized_service_watches_projection_updates() -> None:
 
 
 @pytest.mark.asyncio
-async def test_materialized_service_rejects_invalid_projection_without_deactivating(
-) -> None:
-    state = MemoryStateStore(name="config")
-    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, state=state)
+async def test_materialized_service_rejects_invalid_projection_without_deactivating() -> (
+    None
+):
+    bucket = MemoryJsonKvBucket(bucket="config")
+    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, bucket=bucket)
     await publisher.publish_configs((_config(name="Good"),))
     service = MaterializedDeviceConfigService(
         controller_id=CONTROLLER_ID,
-        state=state,
+        bucket=bucket,
     )
 
     async with anyio.create_task_group() as tg:
         stopping = anyio.Event()
         await service.start(RunContext(tg=tg, stopping=stopping))
         try:
-            await state.put(
+            await bucket.put(
                 materialized_config_key(CONTROLLER_ID),
                 {
                     "schema": "dev.deckr.controller.config.materialized.v1",
@@ -174,7 +176,7 @@ async def test_materialized_service_rejects_invalid_projection_without_deactivat
                     "deviceConfigs": [{"id": "broken"}],
                 },
             )
-            result = await _wait_for_result(state, "rejected")
+            result = await _wait_for_result(bucket, "rejected")
             assert result.value["diagnostics"][0]["code"] == "invalid_projection"
             config = await service.get_config("config-1")
             assert config is not None
@@ -187,12 +189,12 @@ async def test_materialized_service_rejects_invalid_projection_without_deactivat
 
 @pytest.mark.asyncio
 async def test_materialized_service_delete_means_no_projection() -> None:
-    state = MemoryStateStore(name="config")
-    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, state=state)
+    bucket = MemoryJsonKvBucket(bucket="config")
+    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, bucket=bucket)
     await publisher.publish_configs((_config(),))
     service = MaterializedDeviceConfigService(
         controller_id=CONTROLLER_ID,
-        state=state,
+        bucket=bucket,
     )
 
     async with anyio.create_task_group() as tg:
@@ -201,9 +203,9 @@ async def test_materialized_service_delete_means_no_projection() -> None:
         stream = service.subscribe("config-1")
         try:
             assert await _next_with_timeout(stream) is not None
-            await state.delete(materialized_config_key(CONTROLLER_ID))
+            await bucket.delete(materialized_config_key(CONTROLLER_ID))
             assert await _next_with_timeout(stream) is None
-            await _wait_for_result(state, "missing")
+            await _wait_for_result(bucket, "missing")
         finally:
             stopping.set()
             await service.stop()
@@ -212,19 +214,19 @@ async def test_materialized_service_delete_means_no_projection() -> None:
 
 @pytest.mark.asyncio
 async def test_materialized_service_write_config_updates_projection() -> None:
-    state = MemoryStateStore(name="config")
+    bucket = MemoryJsonKvBucket(bucket="config")
     service = MaterializedDeviceConfigService(
         controller_id=CONTROLLER_ID,
-        state=state,
+        bucket=bucket,
     )
 
     written = await service.write_config(_config(name="Written"))
 
     assert written.name == "Written"
-    entry = await state.get(materialized_config_key(CONTROLLER_ID))
+    entry = await bucket.get(materialized_config_key(CONTROLLER_ID))
     assert entry is not None
     assert entry.value["deviceConfigs"][0]["name"] == "Written"
-    result = await _wait_for_result(state, "active")
+    result = await _wait_for_result(bucket, "active")
     assert result.value["activeConfigIds"] == ("config-1",)
 
 
@@ -232,8 +234,8 @@ async def test_materialized_service_write_config_updates_projection() -> None:
 async def test_file_backed_service_publishes_materialized_snapshots(
     tmp_path: Path,
 ) -> None:
-    state = MemoryStateStore(name="config")
-    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, state=state)
+    bucket = MemoryJsonKvBucket(bucket="config")
+    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, bucket=bucket)
     service = FileBackedDeviceConfigService(
         config_dir=tmp_path,
         materialized_publisher=publisher,
@@ -243,14 +245,14 @@ async def test_file_backed_service_publishes_materialized_snapshots(
 
     await service.refresh()
 
-    entry = await state.get(materialized_config_key(CONTROLLER_ID))
+    entry = await bucket.get(materialized_config_key(CONTROLLER_ID))
     assert entry is not None
     assert entry.value["deviceConfigs"][0]["name"] == "From File"
 
     path.unlink()
     await service.refresh()
 
-    entry = await state.get(materialized_config_key(CONTROLLER_ID))
+    entry = await bucket.get(materialized_config_key(CONTROLLER_ID))
     assert entry is not None
     assert entry.value["deviceConfigs"] == ()
 
@@ -261,7 +263,9 @@ async def test_config_watcher_component_publishes_materialized_snapshot(
 ) -> None:
     settings_dir = tmp_path / "settings"
     settings_dir.mkdir()
-    (settings_dir / "config-1.yml").write_text(_config_to_yaml(_config(name="Component")))
+    (settings_dir / "config-1.yml").write_text(
+        _config_to_yaml(_config(name="Component"))
+    )
     document = ConfigDocument(
         raw={
             "deckr": {
@@ -288,16 +292,19 @@ async def test_config_watcher_component_publishes_materialized_snapshot(
     )
     substrate = MemoryLaneSubstrate(lane_contracts=plan.lane_contracts)
 
-    async with Deckr(
-        lane_contracts=plan.lane_contracts,
-        lanes=plan.lane_names,
-        substrate=substrate,
-    ) as deckr, start_components(deckr, plan):
+    async with (
+        Deckr(
+            lane_contracts=plan.lane_contracts,
+            lanes=plan.lane_names,
+            message_bus=substrate,
+        ) as deckr,
+        start_components(deckr, plan),
+    ):
         key = materialized_config_key(CONTROLLER_ID)
-        state = deckr.state("dev_deckr_controller_config_v1")
+        bucket = deckr.kv_bucket(materialized_config_bucket_policy())
         with anyio.fail_after(1):
             while True:
-                entry = await state.get(key)
+                entry = await bucket.get(key)
                 if entry is not None:
                     break
                 await anyio.sleep(0.01)

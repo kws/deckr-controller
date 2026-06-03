@@ -8,9 +8,11 @@ import anyio
 from deckr.actions.endpoints import action_provider_address
 from deckr.concord import (
     DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS,
-    ConcordAgreement,
+    Concord,
+    ConcordAgreementLease,
     ConcordAgreementSpec,
-    ConcordService,
+    ConcordConflict,
+    ConcordUnavailable,
     ContractHandle,
     ContractValidity,
     ContractValidityStatus,
@@ -22,7 +24,6 @@ from deckr.profiles import (
     ActionProviderSessionTerms,
     action_provider_session_contract_id,
 )
-from deckr.state import StateConflict, StateUnavailable
 
 from deckr.controller.action_provider.provider import ActionMetadata
 
@@ -54,7 +55,7 @@ class ProviderSessionLease:
     provider_instance_id: str
     provider_id: str
     provider_session_id: str
-    agreement: ConcordAgreement
+    agreement: ConcordAgreementLease
     current_sessions: dict[str, str]
     acceptance_deadline: float
     controller_token: ParticipantHandle | None = None
@@ -72,7 +73,7 @@ class ActionProviderSessionManager:
         *,
         controller_id: str,
         controller_session_id: str,
-        concord: ConcordService,
+        concord: Concord,
         start_soon,
         acceptance_timeout_seconds: float = (
             DEFAULT_PROVIDER_SESSION_ACCEPTANCE_TIMEOUT_SECONDS
@@ -130,7 +131,7 @@ class ActionProviderSessionManager:
             str(controller_endpoint): self._controller_session_id,
             str(provider_endpoint): key.provider_session_id,
         }
-        agreement = await self._concord.ensure_agreement(
+        agreement = await self._concord.propose(
             ConcordAgreementSpec(
                 profile=ACTION_PROVIDER_SESSION_PROFILE_ID,
                 participants=(controller_endpoint, provider_endpoint),
@@ -279,7 +280,7 @@ class ActionProviderSessionManager:
             return
         try:
             await session.agreement.cancel(reason=reason)
-        except (StateConflict, StateUnavailable, ValueError):
+        except (ConcordConflict, ConcordUnavailable, ValueError):
             logger.warning(
                 "Could not cancel action provider session contract for %s",
                 key.provider_instance_id,

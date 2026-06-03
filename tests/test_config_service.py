@@ -37,7 +37,11 @@ def _make_config(
                 pages=[
                     Page(
                         controls=[
-                            Control(selector={"control_id": "0,0"}, action="action.a", settings={}),
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action="action.a",
+                                settings={},
+                            ),
                         ]
                     ),
                 ],

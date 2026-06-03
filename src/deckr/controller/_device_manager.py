@@ -93,6 +93,7 @@ from deckr.controller._device_layout import (
     control_surface_for_raster_capability,
     raster_controls,
 )
+from deckr.controller._endpoint_messages import send_message
 from deckr.controller._event_translator import EventTranslator
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._navigation_service import (
@@ -143,7 +144,9 @@ def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
     try:
         return DynamicPageCommand.model_validate(data)
     except ValidationError:
-        logger.warning("Ignoring invalid dynamic page descriptor payload", exc_info=True)
+        logger.warning(
+            "Ignoring invalid dynamic page descriptor payload", exc_info=True
+        )
         return None
 
 
@@ -594,7 +597,9 @@ class DeviceManager:
         dict[ProviderSessionKey, ProviderSessionSnapshot],
     ]:
         prepared_actions = [
-            None if action is None else self._action_metadata_with_current_session(action)
+            None
+            if action is None
+            else self._action_metadata_with_current_session(action)
             for action in actions
         ]
         if self._provider_sessions is None:
@@ -794,10 +799,13 @@ class DeviceManager:
         self._action_instance_providers[action_instance_id] = (
             action_meta.provider_instance_id
         )
-        self._action_instance_provider_sessions[action_instance_id] = (
+        provider_session_key_for_action = (
             None
             if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
             else provider_session_key(action_meta)
+        )
+        self._action_instance_provider_sessions[action_instance_id] = (
+            provider_session_key_for_action
         )
         if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
@@ -805,6 +813,11 @@ class DeviceManager:
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
             recipient=action_provider_address(action_meta.provider_instance_id),
+            recipient_session_id=(
+                provider_session_key_for_action.provider_session_id
+                if provider_session_key_for_action is not None
+                else None
+            ),
             message_type=ACTION_INSTANCE_CREATED,
             body=ActionInstanceLifecycleBody(
                 metadata=metadata,
@@ -818,7 +831,7 @@ class DeviceManager:
                 action_instance_id=action_instance_id,
             ),
         )
-        await self._actions_bus.publish(msg)
+        await send_message(self._actions_bus, msg)
 
     async def _destroy_action_instance(
         self,
@@ -832,7 +845,10 @@ class DeviceManager:
             action_instance_id,
             None,
         )
-        self._action_instance_provider_sessions.pop(action_instance_id, None)
+        provider_session_key_for_action = self._action_instance_provider_sessions.pop(
+            action_instance_id,
+            None,
+        )
         if (
             metadata is None
             or provider_instance_id is None
@@ -844,6 +860,11 @@ class DeviceManager:
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
             recipient=action_provider_address(provider_instance_id),
+            recipient_session_id=(
+                provider_session_key_for_action.provider_session_id
+                if provider_session_key_for_action is not None
+                else None
+            ),
             message_type=ACTION_INSTANCE_DESTROYED,
             body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
             subject=context_subject(
@@ -854,7 +875,7 @@ class DeviceManager:
                 action_instance_id=metadata.action_instance_id,
             ),
         )
-        await self._actions_bus.publish(msg)
+        await send_message(self._actions_bus, msg)
 
     async def _destroy_all_action_instances(self, *, reason: str) -> None:
         for action_instance_id in list(self._action_instances):
@@ -932,9 +953,8 @@ class DeviceManager:
             except KeyError:
                 initial_settings = dict(binding.settings)
         builtin_action = None
-        if (
-            action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-            and hasattr(self.manager, "get_builtin_action")
+        if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
+            self.manager, "get_builtin_action"
         ):
             builtin_action = self.manager.get_builtin_action(action_meta.uuid)
         binding_id = make_binding_id()
@@ -974,6 +994,7 @@ class DeviceManager:
             render_dispatcher=self._render_dispatcher,
             settings_service=self._settings_service,
             context_settings_target=settings_target,
+            provider_session_id=provider_session_id,
             profile_id=profile_id,
             page_id=page_id,
             builtin_action=builtin_action,
@@ -1054,9 +1075,7 @@ class DeviceManager:
                 continue
             elapsed_ms = int((self._clock() - session.last_activity) * 1000)
             if elapsed_ms >= session.timeout_ms:
-                await self.close_page(
-                    context_id=session.context_id, reason="timeout"
-                )
+                await self.close_page(context_id=session.context_id, reason="timeout")
 
     def _page_session_metadata(
         self,
@@ -1091,6 +1110,7 @@ class DeviceManager:
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
             recipient=action_provider_address(session.owner_provider_instance_id),
+            recipient_session_id=session.owner_provider_session_id,
             message_type=PAGE_SESSION_OPENED,
             body=PageSessionLifecycleBody(
                 pageSession=self._page_session_metadata(session)
@@ -1105,7 +1125,7 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await self._actions_bus.publish(msg)
+        await send_message(self._actions_bus, msg)
 
     async def _emit_page_closed(
         self,
@@ -1120,6 +1140,7 @@ class DeviceManager:
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
             recipient=action_provider_address(session.owner_provider_instance_id),
+            recipient_session_id=session.owner_provider_session_id,
             message_type=PAGE_SESSION_CLOSED,
             body=PageSessionLifecycleBody(
                 pageSession=self._page_session_metadata(session),
@@ -1135,7 +1156,7 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await self._actions_bus.publish(msg)
+        await send_message(self._actions_bus, msg)
 
     async def _finalize_dynamic_page(
         self,
@@ -1236,9 +1257,10 @@ class DeviceManager:
                         err.action_uuid,
                     )
 
-        prepared_actions, provider_session_snapshots = (
-            await self._prepare_provider_sessions_for_actions(result.actions)
-        )
+        (
+            prepared_actions,
+            provider_session_snapshots,
+        ) = await self._prepare_provider_sessions_for_actions(result.actions)
 
         preserve_output_control_ids = (
             frozenset(binding.control_id for binding in result.bindings)
@@ -1427,7 +1449,9 @@ class DeviceManager:
                 self._binding_leases.get(binding_id) if binding_id is not None else None
             )
             if owner_lease is None and current is None:
-                logger.warning("open_page ignored: no active context for %s", context_id)
+                logger.warning(
+                    "open_page ignored: no active context for %s", context_id
+                )
                 return
 
             if owner_lease is not None:
@@ -1464,7 +1488,9 @@ class DeviceManager:
                 action_instance_id = current.action_instance_id
                 settings_target = current.settings_target
             else:
-                logger.warning("open_page ignored: no active context for %s", context_id)
+                logger.warning(
+                    "open_page ignored: no active context for %s", context_id
+                )
                 return
 
             page_id = descriptor.page_id or make_dynamic_page_id()
@@ -1543,7 +1569,9 @@ class DeviceManager:
         async with self._nav_lock:
             current = self._page_control_session(context_id)
             if current is None:
-                logger.warning("replace_page ignored: no active page for %s", context_id)
+                logger.warning(
+                    "replace_page ignored: no active page for %s", context_id
+                )
                 return
             if descriptor.page_id != current.page_id:
                 logger.warning(
@@ -1703,7 +1731,9 @@ class DeviceManager:
 
         changed_action_ids = set(registered) & set(unregistered)
         current_actions = [
-            None if action is None else self._action_metadata_with_current_session(action)
+            None
+            if action is None
+            else self._action_metadata_with_current_session(action)
             for action in result.actions
         ]
         rebind_control_ids: set[str] = set()
@@ -1734,9 +1764,10 @@ class DeviceManager:
             else None
             for binding, action in zip(result.bindings, current_actions, strict=True)
         ]
-        prepared_actions, provider_session_snapshots = (
-            await self._prepare_provider_sessions_for_actions(actions_needing_lease)
-        )
+        (
+            prepared_actions,
+            provider_session_snapshots,
+        ) = await self._prepare_provider_sessions_for_actions(actions_needing_lease)
         if any(not lease.attached for lease in self._binding_leases.values()):
             await self._reconcile_binding_sessions()
 
@@ -1772,14 +1803,17 @@ class DeviceManager:
                     binding=binding,
                 )
             else:
-                resolved_action_instance_id = action_instance_id or derive_action_instance_id(
-                    controller_id=self._controller_id,
-                    config_id=self.config_id,
-                    action_id=binding.action_uuid,
-                    stable_id=binding.stable_id,
-                    profile_id=profile_id,
-                    page_id=page_id,
-                    control_id=binding.control_id,
+                resolved_action_instance_id = (
+                    action_instance_id
+                    or derive_action_instance_id(
+                        controller_id=self._controller_id,
+                        config_id=self.config_id,
+                        action_id=binding.action_uuid,
+                        stable_id=binding.stable_id,
+                        profile_id=profile_id,
+                        page_id=page_id,
+                        control_id=binding.control_id,
+                    )
                 )
             await self._try_resolve_binding(
                 binding,
@@ -2223,13 +2257,18 @@ class DeviceManager:
         page_session = authorization.page_session
         if page_session is not None:
             if msg_type in _SETTINGS_COMMAND_TYPES:
-                if self._settings_service is None or page_session.settings_target is None:
+                if (
+                    self._settings_service is None
+                    or page_session.settings_target is None
+                ):
                     return
                 target = settings_target
                 if target is None:
                     return
                 if target.key() != page_session.settings_target.key():
-                    logger.warning("Ignoring settings command for mismatched page target")
+                    logger.warning(
+                        "Ignoring settings command for mismatched page target"
+                    )
                     return
                 snapshot_body = await self._settings_snapshot_for_command(
                     msg_type=msg_type,
@@ -2251,7 +2290,9 @@ class DeviceManager:
             if target is None:
                 return
             if target.key() != lease.settings_target.key():
-                logger.warning("Ignoring settings command for mismatched binding target")
+                logger.warning(
+                    "Ignoring settings command for mismatched binding target"
+                )
                 return
             snapshot_body = await self._settings_snapshot_for_command(
                 msg_type=msg_type,
@@ -2262,6 +2303,7 @@ class DeviceManager:
                 return
             lease.context._store.settings = dict(thaw_json(snapshot_body.settings))
             await send_settings_response(snapshot_body)
+
     async def _handle_binding_output(
         self,
         lease: BindingLease,
@@ -2421,9 +2463,9 @@ class DeviceManager:
     def _record_held_input_binding(self, translated, binding_id: str) -> None:
         if translated.action_event.event_type != "down":
             return
-        self._held_input_bindings[
-            (translated.control_id, translated.capability_id)
-        ] = binding_id
+        self._held_input_bindings[(translated.control_id, translated.capability_id)] = (
+            binding_id
+        )
 
     def _consume_release_for_rebound_control(
         self,

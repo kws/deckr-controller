@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
+from deckr.contracts.messages import HARDWARE_MESSAGES_LANE, hardware_manager_address
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.capabilities import (
     RasterBitmapEncoding,
@@ -16,7 +19,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from deckr.lanes import RegisteredEndpointLane
+from deckr.lanes import EndpointSession
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,7 @@ class LiveDeviceRoute:
     config_id: str
     ref: DeviceRef
     device: DeviceDescriptor
+    manager_session_id: str | None = None
 
 
 class DeviceRouteRegistry:
@@ -45,9 +49,15 @@ class DeviceRouteRegistry:
         config_id: str,
         ref: DeviceRef,
         device: DeviceDescriptor,
+        manager_session_id: str | None = None,
     ) -> LiveDeviceRoute:
         self.disconnect_config(config_id)
-        live = LiveDeviceRoute(config_id=config_id, ref=ref, device=device)
+        live = LiveDeviceRoute(
+            config_id=config_id,
+            ref=ref,
+            device=device,
+            manager_session_id=manager_session_id,
+        )
         self._devices_by_config[config_id] = live
         self._config_by_ref[_ref_key(ref)] = config_id
         return live
@@ -57,11 +67,20 @@ class DeviceRouteRegistry:
         *,
         ref: DeviceRef,
         device: DeviceDescriptor,
+        manager_session_id: str | None = None,
     ) -> LiveDeviceRoute | None:
         config_id = self._config_by_ref.get(_ref_key(ref))
         if config_id is None:
             return None
-        live = LiveDeviceRoute(config_id=config_id, ref=ref, device=device)
+        current = self._devices_by_config.get(config_id)
+        live = LiveDeviceRoute(
+            config_id=config_id,
+            ref=ref,
+            device=device,
+            manager_session_id=manager_session_id
+            if manager_session_id is not None
+            else (current.manager_session_id if current is not None else None),
+        )
         self._devices_by_config[config_id] = live
         return live
 
@@ -100,7 +119,7 @@ class DeviceRouteRegistry:
 class HardwareCommandService:
     """Publishes hardware output commands onto the hardware lane."""
 
-    def __init__(self, endpoint: RegisteredEndpointLane, *, controller_id: str) -> None:
+    def __init__(self, endpoint: EndpointSession, *, controller_id: str) -> None:
         self._endpoint = endpoint
         self._controller_id = controller_id
         self._devices_by_config_id: dict[str, LiveDeviceRoute] = {}
@@ -111,11 +130,13 @@ class HardwareCommandService:
         config_id: str,
         ref: DeviceRef,
         device: DeviceDescriptor,
+        manager_session_id: str | None = None,
     ) -> None:
         self._devices_by_config_id[config_id] = LiveDeviceRoute(
             config_id=config_id,
             ref=ref,
             device=device,
+            manager_session_id=manager_session_id,
         )
 
     def unregister_config(self, config_id: str) -> None:
@@ -148,18 +169,15 @@ class HardwareCommandService:
                 "encoding": encoding,
             },
         ).model_dump(by_alias=True, exclude_none=True)
-        await self._endpoint.publish(
-            hw_messages.control_command_for_capability(
-                controller_id=self._controller_id,
-                sender_session_id=self._endpoint.session_id,
-                ref=CapabilityRef(
-                    deviceRef=live.ref,
-                    controlId=control_id,
-                    capabilityId=capability_id,
-                ),
-                command_type="set_frame",
-                params=params,
-            )
+        await self._send_control_command(
+            live=live,
+            ref=CapabilityRef(
+                deviceRef=live.ref,
+                controlId=control_id,
+                capabilityId=capability_id,
+            ),
+            command_type="set_frame",
+            params=params,
         )
 
     async def clear_raster(
@@ -175,18 +193,15 @@ class HardwareCommandService:
             by_alias=True,
             exclude_none=True,
         )
-        await self._endpoint.publish(
-            hw_messages.control_command_for_capability(
-                controller_id=self._controller_id,
-                sender_session_id=self._endpoint.session_id,
-                ref=CapabilityRef(
-                    deviceRef=live.ref,
-                    controlId=control_id,
-                    capabilityId=capability_id,
-                ),
-                command_type="clear",
-                params=params,
-            )
+        await self._send_control_command(
+            live=live,
+            ref=CapabilityRef(
+                deviceRef=live.ref,
+                controlId=control_id,
+                capabilityId=capability_id,
+            ),
+            command_type="clear",
+            params=params,
         )
 
     async def sleep_device(self, config_id: str) -> None:
@@ -207,20 +222,44 @@ class HardwareCommandService:
                 config_id,
             )
             return
-        await self._endpoint.publish(
-            hw_messages.control_command_for_capability(
-                controller_id=self._controller_id,
-                sender_session_id=self._endpoint.session_id,
-                ref=CapabilityRef(
-                    deviceRef=live.ref,
-                    capabilityId=capability_id,
-                ),
-                command_type=command_type,
-                params=device_power_command_params({}).model_dump(
-                    by_alias=True,
-                    exclude_none=True,
-                ),
-            )
+        await self._send_control_command(
+            live=live,
+            ref=CapabilityRef(
+                deviceRef=live.ref,
+                capabilityId=capability_id,
+            ),
+            command_type=command_type,
+            params=device_power_command_params({}).model_dump(
+                by_alias=True,
+                exclude_none=True,
+            ),
+        )
+
+    async def _send_control_command(
+        self,
+        *,
+        live: LiveDeviceRoute,
+        ref: CapabilityRef,
+        command_type: str,
+        params: Mapping[str, Any],
+    ) -> None:
+        device = ref.device_ref
+        if device is None:
+            raise ValueError("hardware control commands require deviceRef")
+        body = hw_messages.ControlCommandMessage(
+            deviceRef=device,
+            controlId=ref.control_id,
+            capabilityId=ref.capability_id,
+            commandType=command_type,
+            params=dict(params),
+        )
+        await self._endpoint.send(
+            lane=HARDWARE_MESSAGES_LANE,
+            recipient=hardware_manager_address(device.manager_id),
+            recipient_session_id=live.manager_session_id,
+            message_type=hw_messages.CONTROL_COMMAND,
+            body=hw_messages.hardware_body_to_dict(body),
+            subject=hw_messages.hardware_subject_for_capability(ref),
         )
 
 

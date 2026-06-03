@@ -12,7 +12,6 @@ from deckr.components import (
     ComponentManifest,
     RunContext,
 )
-from deckr.state import PERSISTENT_STATE_STORE_POLICY
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from deckr.controller.config import (
@@ -20,6 +19,7 @@ from deckr.controller.config import (
     FileBackedDeviceConfigService,
     MaterializedConfigProducer,
     MaterializedConfigPublisher,
+    materialized_config_bucket_policy,
 )
 
 CONFIG_WATCHER_COMPONENT_ID = "dev.deckr.controller.config_watcher"
@@ -79,15 +79,13 @@ class MaterializedConfigWatcherComponent(BaseComponent):
 def component_factory(context: ComponentContext):
     config = _parse_config(context.config)
     config_dir = (
-        context.base_dir / config.path
-        if not config.path.is_absolute()
-        else config.path
+        context.base_dir / config.path if not config.path.is_absolute() else config.path
     )
     config_dir = config_dir.resolve()
-    state = context.state(config.bucket, policy=PERSISTENT_STATE_STORE_POLICY)
+    bucket = context.kv_bucket(materialized_config_bucket_policy(config.bucket))
     publisher = MaterializedConfigPublisher(
         controller_id=config.target_controller_id,
-        state=state,
+        bucket=bucket,
         producer=MaterializedConfigProducer(
             id=config.producer_id or context.runtime_name,
             kind="file_watcher",

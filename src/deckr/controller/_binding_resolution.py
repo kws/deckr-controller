@@ -80,7 +80,8 @@ def resolve_binding(
     """Resolve one configured binding against a descriptor's controls."""
 
     matches = [
-        control for control in _candidate_controls(binding.selector, controls)
+        control
+        for control in _candidate_controls(binding.selector, controls)
         if _control_matches(binding.selector, control)
     ]
     if not matches:
@@ -95,8 +96,7 @@ def resolve_binding(
         return SelectorResolution(
             code="control_selector_ambiguous",
             message=(
-                "control selector matched multiple controls: "
-                + ", ".join(sorted(ids))
+                "control selector matched multiple controls: " + ", ".join(sorted(ids))
             ),
             details=tuple(sorted(ids)),
         )
@@ -108,8 +108,7 @@ def resolve_binding(
             code="capability_not_found",
             message=(
                 f"control {control.control_id!r} does not advertise required "
-                "capability: "
-                + capability_check[0]
+                "capability: " + capability_check[0]
             ),
             details=capability_check,
         )
@@ -185,7 +184,9 @@ def _candidate_controls(
 ) -> tuple[ControlDescriptor, ...]:
     if selector.control_id is None:
         return controls
-    return tuple(control for control in controls if control.control_id == selector.control_id)
+    return tuple(
+        control for control in controls if control.control_id == selector.control_id
+    )
 
 
 def _control_matches(selector: ControlSelector, control: ControlDescriptor) -> bool:
@@ -261,14 +262,18 @@ def _selected_capability_ids(
     requirements.extend(
         requirement
         for requirement in generic_requirements
-        if any(_capability_matches(requirement, capability) for capability in capabilities)
+        if any(
+            _capability_matches(requirement, capability) for capability in capabilities
+        )
     )
     if not requirements:
         return frozenset(capability.capability_id for capability in capabilities)
     return frozenset(
         capability.capability_id
         for capability in capabilities
-        if any(_capability_matches(requirement, capability) for requirement in requirements)
+        if any(
+            _capability_matches(requirement, capability) for requirement in requirements
+        )
     )
 
 
