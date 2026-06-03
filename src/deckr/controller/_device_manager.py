@@ -13,6 +13,7 @@ from deckr.actions.endpoints import (
 from deckr.actions.messages import (
     ACTION_INSTANCE_CREATED,
     ACTION_INSTANCE_DESTROYED,
+    ACTION_LIFECYCLE_REJECTED,
     BINDING_OUTPUT,
     BINDING_OVERLAY,
     BINDING_OVERLAY_CLEAR,
@@ -27,6 +28,7 @@ from deckr.actions.messages import (
     SETTINGS_SNAPSHOT,
     ActionInstanceLifecycleBody,
     ActionInstanceMetadata,
+    ActionLifecycleRejectedBody,
     BindingMetadata,
     BindingOutputBody,
     BindingOverlayBody,
@@ -110,6 +112,7 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.action_provider.context import ControlContext
+from deckr.controller.action_provider.events import ActionCatalogChangedEvent
 from deckr.controller.action_provider.provider import (
     ActionMetadata,
     ActionProviderManager,
@@ -254,9 +257,41 @@ class AuthorizedCommandTarget:
 
 def _binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
     return (
-        binding.context_id == lease.context_id
+        binding.provider_instance_id == lease.provider_instance_id
+        and binding.provider_id == lease.provider_id
+        and binding.action_id == lease.action_uuid
+        and binding.context_id == lease.context_id
         and binding.binding_id == lease.binding_id
         and binding.action_instance_id == lease.action_instance_id
+    )
+
+
+def _action_instance_matches_metadata(
+    stored: ActionInstanceMetadata,
+    metadata: ActionInstanceMetadata,
+) -> bool:
+    return (
+        stored.provider_instance_id == metadata.provider_instance_id
+        and stored.provider_id == metadata.provider_id
+        and stored.action_id == metadata.action_id
+        and stored.action_instance_id == metadata.action_instance_id
+        and stored.config_id == metadata.config_id
+        and stored.context_id == metadata.context_id
+    )
+
+
+def _page_session_matches_metadata(
+    session: DynamicPageSession,
+    metadata: PageSessionMetadata,
+) -> bool:
+    return (
+        metadata.provider_instance_id == session.owner_provider_instance_id
+        and metadata.provider_id == session.owner_provider_id
+        and metadata.action_instance_id == session.action_instance_id
+        and metadata.page_id == session.page_id
+        and metadata.page_session_id == session.page_session_id
+        and metadata.context_id == session.context_id
+        and metadata.owner_binding_id == session.owner_binding_id
     )
 
 
@@ -1679,14 +1714,11 @@ class DeviceManager:
             event.message,
         )
 
-    async def on_actions_changed(
-        self, registered: list[str], unregistered: list[str]
+    async def on_action_catalog_changed(
+        self,
+        event: ActionCatalogChangedEvent,
     ) -> None:
-        """Re-resolve bindings when actions become available or unavailable.
-
-        registered/unregistered carry qualified provider-instance action IDs.
-        """
-        # Handle registered: try to resolve bindings that were previously unavailable
+        """Resolve newly available catalog actions and handle provider-session succession."""
         current_page = self._nav.current_page
         if current_page is None:
             return
@@ -1733,14 +1765,20 @@ class DeviceManager:
             return
 
         logger.info(
-            "Re-evaluating page bindings for config=%s page=%s after actions change +%s -%s",
+            "Re-evaluating page bindings for config=%s page=%s after action catalog change +%s -%s ~%s successor=%s",
             self.config_id,
             page_id,
-            registered,
-            unregistered,
+            event.catalog_added,
+            event.catalog_removed,
+            event.catalog_updated,
+            event.provider_session_successions,
         )
 
-        changed_action_ids = set(registered) & set(unregistered)
+        successor_action_ids = {
+            action
+            for succession in event.provider_session_successions
+            for action in succession.actions
+        }
         current_actions = [
             None
             if action is None
@@ -1758,7 +1796,7 @@ class DeviceManager:
                 continue
             if (
                 _qualified_action_id(lease.provider_instance_id, lease.action_uuid)
-                not in changed_action_ids
+                not in successor_action_ids
             ):
                 continue
             if action_meta is None or _lease_matches_action(lease, action_meta):
@@ -2117,6 +2155,39 @@ class DeviceManager:
             return False
         return True
 
+    def _provider_session_key_ready(self, key: ProviderSessionKey | None) -> bool:
+        if key is None:
+            return False
+        if self._provider_sessions is None:
+            return True
+        return self._provider_sessions.cached_ready(key)
+
+    def _action_instance_rejection_authorized(
+        self,
+        msg: DeckrMessage,
+        *,
+        sender_provider_instance_id: str,
+        metadata: ActionInstanceMetadata,
+        context_id: str,
+    ) -> bool:
+        if metadata.config_id != self.config_id or metadata.context_id != context_id:
+            return False
+        if metadata.provider_instance_id != sender_provider_instance_id:
+            return False
+        action_instance_id = subject_action_instance_id(msg.subject)
+        if (
+            action_instance_id is not None
+            and action_instance_id != metadata.action_instance_id
+        ):
+            return False
+        stored = self._action_instances.get(metadata.action_instance_id)
+        if stored is None or not _action_instance_matches_metadata(stored, metadata):
+            return False
+        key = self._action_instance_provider_sessions.get(metadata.action_instance_id)
+        if key is None or msg.sender_session_id != key.provider_session_id:
+            return False
+        return self._provider_session_key_ready(key)
+
     async def _settings_snapshot_for_command(
         self,
         *,
@@ -2144,6 +2215,127 @@ class DeviceManager:
             )
             return None
         return SettingsSnapshot.from_snapshot(snapshot)
+
+    async def _handle_action_lifecycle_rejected(
+        self,
+        msg: DeckrMessage,
+        body: ActionLifecycleRejectedBody,
+        *,
+        context_id: str,
+    ) -> None:
+        sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
+        if sender_provider_instance_id is None:
+            return
+
+        if body.target_kind == "action_instance":
+            metadata = body.action_instance
+            if metadata is None:
+                return
+            if not self._action_instance_rejection_authorized(
+                msg,
+                sender_provider_instance_id=sender_provider_instance_id,
+                metadata=metadata,
+                context_id=context_id,
+            ):
+                logger.warning(
+                    "Ignoring unauthorized action lifecycle rejection for action instance %s",
+                    metadata.action_instance_id,
+                )
+                return
+            await self._reject_action_instance(metadata, reason=body.reason)
+            return
+
+        authorization = await self._authorize_action_command(
+            msg,
+            context_id=context_id,
+        )
+        if authorization is None:
+            return
+
+        if body.target_kind == "binding":
+            lease = authorization.binding
+            metadata = body.binding
+            if (
+                lease is None
+                or metadata is None
+                or metadata.config_id != self.config_id
+                or not _binding_body_matches_lease(lease, metadata)
+            ):
+                logger.warning("Ignoring action lifecycle rejection for mismatched binding")
+                return
+            await self._revoke_binding(
+                lease.binding_id,
+                notify_provider=False,
+                reason=body.reason,
+                clear_held_input=True,
+            )
+            return
+
+        if body.target_kind == "page_session":
+            session = authorization.page_session
+            metadata = body.page_session
+            if (
+                session is None
+                or metadata is None
+                or metadata.config_id != self.config_id
+                or not _page_session_matches_metadata(session, metadata)
+            ):
+                logger.warning(
+                    "Ignoring action lifecycle rejection for mismatched page session"
+                )
+                return
+            await self._close_rejected_page_session(session, reason=body.reason)
+
+    async def _reject_action_instance(
+        self,
+        metadata: ActionInstanceMetadata,
+        *,
+        reason: str,
+    ) -> None:
+        page_session = self._dynamic_page_session
+        if (
+            page_session is not None
+            and page_session.action_instance_id == metadata.action_instance_id
+        ):
+            await self._close_rejected_page_session(page_session, reason=reason)
+
+        for binding_id, lease in tuple(self._binding_leases.items()):
+            if lease.action_instance_id == metadata.action_instance_id:
+                await self._revoke_binding(
+                    binding_id,
+                    notify_provider=False,
+                    reason=reason,
+                    clear_held_input=True,
+                )
+        await self._destroy_action_instance(
+            metadata.action_instance_id,
+            reason=reason,
+            notify_provider=False,
+        )
+
+    async def _close_rejected_page_session(
+        self,
+        session: DynamicPageSession,
+        *,
+        reason: str,
+    ) -> None:
+        if self._dynamic_page_session is session:
+            self._dynamic_page_session = None
+            if isinstance(self._nav.current_page, DynamicPageCommand):
+                self._nav.set_page(
+                    StaticPageRef(
+                        profile_name=session.owner_profile,
+                        page_index=session.owner_page,
+                    )
+                )
+        for binding_id, lease in tuple(self._binding_leases.items()):
+            if lease.page_session_id == session.page_session_id:
+                await self._revoke_binding(
+                    binding_id,
+                    notify_provider=False,
+                    reason=reason,
+                    clear_held_input=True,
+                )
 
     async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from an action provider."""
@@ -2209,6 +2401,14 @@ class DeviceManager:
             return
         config_id = subject_config_id(msg.subject)
         if config_id != self.config_id:
+            return
+        if msg_type == ACTION_LIFECYCLE_REJECTED:
+            body = ActionLifecycleRejectedBody.model_validate(payload)
+            await self._handle_action_lifecycle_rejected(
+                msg,
+                body,
+                context_id=context_id,
+            )
             return
         authorization = await self._authorize_action_command(
             msg,

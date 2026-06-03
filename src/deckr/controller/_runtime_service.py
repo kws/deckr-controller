@@ -83,14 +83,14 @@ class ControllerRuntimeService(BaseComponent):
 
             controller_service: ControllerService | None = None
 
-            async def on_actions_changed(event) -> None:
+            async def on_catalog_changed(event) -> None:
                 if controller_service is not None:
-                    await controller_service.handle_actions_changed_event(event)
+                    await controller_service.handle_action_catalog_changed_event(event)
 
             action_registry = ActionRegistry(
                 self._beacon,
                 controller_id=self._runtime.controller_id,
-                on_actions_changed=on_actions_changed,
+                on_catalog_changed=on_catalog_changed,
             )
             await self._component_manager.add_component(action_registry)
             settings_service = build_settings_service(

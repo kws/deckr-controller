@@ -28,7 +28,10 @@ from deckr.controller.action_provider.builtin import (
     BuiltinAction,
     BuiltinRegistry,
 )
-from deckr.controller.action_provider.events import ActionsChangedEvent
+from deckr.controller.action_provider.events import (
+    ActionCatalogChangedEvent,
+    ProviderSessionSuccession,
+)
 from deckr.controller.action_provider.provider import ActionMetadata
 
 logger = logging.getLogger(__name__)
@@ -59,14 +62,14 @@ class ActionRegistry(BaseComponent):
         beacon: Beacon,
         *,
         controller_id: str,
-        on_actions_changed: Callable[[ActionsChangedEvent], Awaitable[None]]
+        on_catalog_changed: Callable[[ActionCatalogChangedEvent], Awaitable[None]]
         | None = None,
         notification_batch_interval: float = _STATE_NOTIFICATION_BATCH_SECONDS,
     ):
         super().__init__(name="ActionRegistry")
         del controller_id
         self._beacon = beacon
-        self._on_actions_changed = on_actions_changed
+        self._on_catalog_changed = on_catalog_changed
         self._builtin_registry = BuiltinRegistry()
         self._builtin_action_registry: dict[str, ActionDescriptor] = {}
         self._action_registry: dict[str, _BeaconAction] = {}
@@ -295,30 +298,44 @@ class ActionRegistry(BaseComponent):
             for qualified, entry in self._action_registry.items()
             if entry.provider_instance_id == provider_instance_id
         }
-        changed = {
+        updated_or_succeeded = {
             qualified
             for qualified, entry in desired.items()
             if existing.get(qualified) != entry
         }
-        registered = sorted(changed)
-        unregistered = sorted((set(existing) - set(desired)) | changed)
+        added = sorted(set(desired) - set(existing))
+        removed = sorted(set(existing) - set(desired))
+        successions = _provider_session_successions(
+            provider_instance_id,
+            existing,
+            desired,
+            updated_or_succeeded,
+        )
+        succeeded_actions = {
+            action for succession in successions for action in succession.actions
+        }
+        updated = sorted(updated_or_succeeded - succeeded_actions)
 
-        for qualified in unregistered:
+        for qualified in set(existing) - set(desired):
             self._action_registry.pop(qualified, None)
         self._action_registry.update(desired)
 
-        if registered or unregistered:
+        if added or removed or updated or successions:
             logger.debug(
-                "Action provider %s Beacon advertisement changed via %s: +%s -%s",
+                "Action provider %s Beacon catalog changed via %s: +%s -%s ~%s successor=%s",
                 provider_instance_id,
                 reason,
-                registered,
-                unregistered,
+                added,
+                removed,
+                updated,
+                successions,
             )
-            await self._publish_actions_changed(
-                ActionsChangedEvent(
-                    registered=registered,
-                    unregistered=unregistered,
+            await self._publish_catalog_changed(
+                ActionCatalogChangedEvent(
+                    catalog_added=added,
+                    catalog_removed=removed,
+                    catalog_updated=updated,
+                    provider_session_successions=successions,
                 )
             )
 
@@ -341,9 +358,44 @@ class ActionRegistry(BaseComponent):
             if descriptor.action_id
         }
 
-    async def _publish_actions_changed(self, event: ActionsChangedEvent) -> None:
-        if self._on_actions_changed is not None:
-            await self._on_actions_changed(event)
+    async def _publish_catalog_changed(
+        self,
+        event: ActionCatalogChangedEvent,
+    ) -> None:
+        if self._on_catalog_changed is not None:
+            await self._on_catalog_changed(event)
+
+
+def _provider_session_successions(
+    provider_instance_id: str,
+    existing: Mapping[str, _BeaconAction],
+    desired: Mapping[str, _BeaconAction],
+    changed: set[str],
+) -> list[ProviderSessionSuccession]:
+    by_session: dict[tuple[str, str, str], list[str]] = {}
+    for qualified in changed:
+        old = existing.get(qualified)
+        new = desired.get(qualified)
+        if old is None or new is None:
+            continue
+        if old.session_id == new.session_id:
+            continue
+        key = (old.provider_id, old.session_id, new.session_id)
+        by_session.setdefault(key, []).append(qualified)
+    return [
+        ProviderSessionSuccession(
+            provider_instance_id=provider_instance_id,
+            provider_id=provider_id,
+            previous_session_id=previous_session_id,
+            successor_session_id=successor_session_id,
+            actions=sorted(actions),
+        )
+        for (
+            provider_id,
+            previous_session_id,
+            successor_session_id,
+        ), actions in sorted(by_session.items())
+    ]
 
 
 def _metadata(entry: _BeaconAction) -> ActionMetadata:

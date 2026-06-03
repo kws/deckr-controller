@@ -9,6 +9,7 @@ import pytest_asyncio
 from conftest import LaneHarness
 from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import (
+    ACTION_LIFECYCLE_REJECTED,
     BINDING_OUTPUT,
     CAPABILITY_INPUT,
     SETTINGS_PATCH,
@@ -56,6 +57,10 @@ from deckr.controller._action_provider_sessions import (
 )
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
+from deckr.controller.action_provider.events import (
+    ActionCatalogChangedEvent,
+    ProviderSessionSuccession,
+)
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.settings import ConfigBackedSettingsService
@@ -220,6 +225,38 @@ def _metadata(
     )
 
 
+def _catalog_event(
+    *,
+    added: list[str] | None = None,
+    removed: list[str] | None = None,
+    updated: list[str] | None = None,
+    successions: list[ProviderSessionSuccession] | None = None,
+) -> ActionCatalogChangedEvent:
+    return ActionCatalogChangedEvent(
+        catalog_added=added or [],
+        catalog_removed=removed or [],
+        catalog_updated=updated or [],
+        provider_session_successions=successions or [],
+    )
+
+
+def _provider_session_succession(
+    *,
+    provider_instance_id: str = PROVIDER_INSTANCE_ID,
+    provider_id: str = PROVIDER_ID,
+    previous_session_id: str = PROVIDER_SESSION_ID,
+    successor_session_id: str = "new-provider-session",
+    actions: list[str],
+) -> ProviderSessionSuccession:
+    return ProviderSessionSuccession(
+        provider_instance_id=provider_instance_id,
+        provider_id=provider_id,
+        previous_session_id=previous_session_id,
+        successor_session_id=successor_session_id,
+        actions=actions,
+    )
+
+
 async def _action_command_for_active_binding(
     manager: DeviceManager,
     message_type: str,
@@ -236,6 +273,58 @@ async def _action_command_for_active_binding(
         action_instance_id=ctx.action_instance_id,
         binding_id=ctx.binding_id,
         page_session_id=ctx.page_session_id,
+    )
+
+
+def _action_instance_command(
+    message_type: str,
+    payload: dict,
+    *,
+    context_id: str,
+    action_instance_id: str,
+    config_id: str = "test-device",
+    sender_session_id: str = PROVIDER_SESSION_ID,
+) -> DeckrMessage:
+    return action_message(
+        sender=PROVIDER_ADDR,
+        sender_session_id=sender_session_id,
+        recipient=CONTROLLER_ADDR,
+        message_type=message_type,
+        body=payload,
+        subject=context_subject(
+            context_id,
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+            config_id=config_id,
+            action_instance_id=action_instance_id,
+        ),
+    )
+
+
+def _page_session_command(
+    message_type: str,
+    payload: dict,
+    *,
+    session_id: str,
+    context_id: str,
+    action_instance_id: str,
+    config_id: str = "test-device",
+    sender_session_id: str = PROVIDER_SESSION_ID,
+) -> DeckrMessage:
+    return action_message(
+        sender=PROVIDER_ADDR,
+        sender_session_id=sender_session_id,
+        recipient=CONTROLLER_ADDR,
+        message_type=message_type,
+        body=payload,
+        subject=context_subject(
+            context_id,
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+            config_id=config_id,
+            action_instance_id=action_instance_id,
+            page_session_id=session_id,
+        ),
     )
 
 
@@ -1274,11 +1363,16 @@ async def test_provider_session_restart_rebinds_to_successor_contract(
         assert not next(iter(manager._binding_leases.values())).attached
 
         registry.provider_session_id.return_value = "new-provider-session"
-        await manager.on_actions_changed(
-            registered=[f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"],
-            unregistered=[
-                f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
-            ],
+        qualified = f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
+        await manager.on_action_catalog_changed(
+            _catalog_event(
+                successions=[
+                    _provider_session_succession(
+                        successor_session_id="new-provider-session",
+                        actions=[qualified],
+                    )
+                ],
+            )
         )
         new_session = next(iter(provider_sessions._sessions.values()))
         assert new_session.provider_session_id == "new-provider-session"
@@ -1445,11 +1539,12 @@ async def test_beacon_session_reappearance_does_not_resend_binding_attached(
             assert await manager.action_contexts.get("0,0") is not None
             await _drain_action_messages(stream)
 
-            await manager.on_actions_changed(
-                registered=[
-                    f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
-                ],
-                unregistered=[],
+            await manager.on_action_catalog_changed(
+                _catalog_event(
+                    added=[
+                        f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
+                    ]
+                )
             )
 
             assert await manager.action_contexts.get("0,0") is not None
@@ -1739,11 +1834,12 @@ async def test_dynamic_page_survives_action_beacon_withdrawal_with_valid_session
         assert child_ctx is not None
 
         registry.get_action.return_value = None
-        await manager.on_actions_changed(
-            registered=[],
-            unregistered=[
-                f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
-            ],
+        await manager.on_action_catalog_changed(
+            _catalog_event(
+                removed=[
+                    f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
+                ]
+            )
         )
 
         assert manager._dynamic_page_session is session
@@ -2204,6 +2300,208 @@ async def test_close_page_from_non_owner_is_noop(
 
 
 @pytest.mark.asyncio
+async def test_action_lifecycle_rejected_binding_detaches_only_that_binding(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=command_service,
+        config=device_config_set_raster_image,
+        manager=registry,
+        actions_bus=_actions_session(action_bus),
+        start_soon=lambda fn, *a, **k: None,
+    )
+    await manager.set_page(profile="default", page=0)
+    ctx = await manager.action_contexts.get("0,0")
+    assert ctx is not None
+
+    msg = await _action_command_for_active_binding(
+        manager,
+        ACTION_LIFECYCLE_REJECTED,
+        {
+            "targetKind": "binding",
+            "binding": ctx.metadata.model_dump(
+                by_alias=True,
+                exclude_none=True,
+                mode="json",
+            ),
+            "reason": "invalid_settings",
+        },
+    )
+    await manager.handle_command(msg)
+
+    assert await manager.action_contexts.get("0,0") is None
+    assert manager._binding_leases == {}
+    assert ctx.action_instance_id in manager._action_instances
+
+
+@pytest.mark.asyncio
+async def test_action_lifecycle_rejected_action_instance_destroys_affected_bindings(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=device_config_set_raster_image,
+        manager=registry,
+        actions_bus=_actions_session(action_bus),
+        start_soon=lambda fn, *a, **k: None,
+    )
+    await manager.set_page(profile="default", page=0)
+    ctx = await manager.action_contexts.get("0,0")
+    assert ctx is not None
+    metadata = manager._action_instances[ctx.action_instance_id]
+
+    await manager.handle_command(
+        _action_instance_command(
+            ACTION_LIFECYCLE_REJECTED,
+            {
+                "targetKind": "action_instance",
+                "actionInstance": metadata.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "reason": "action_not_available",
+            },
+            context_id=metadata.context_id,
+            action_instance_id=metadata.action_instance_id,
+        )
+    )
+
+    assert await manager.action_contexts.get("0,0") is None
+    assert manager._binding_leases == {}
+    assert ctx.action_instance_id not in manager._action_instances
+    assert ctx.action_instance_id not in manager._action_instance_provider_sessions
+
+
+@pytest.mark.asyncio
+async def test_action_lifecycle_rejected_page_session_closes_child_bindings(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+        await manager.open_page(
+            descriptor=_dynamic_page("dynamic-page", "1,0"),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        await manager.handle_command(
+            _page_session_command(
+                ACTION_LIFECYCLE_REJECTED,
+                {
+                    "targetKind": "page_session",
+                    "pageSession": manager._page_session_metadata(
+                        session
+                    ).model_dump(
+                        by_alias=True,
+                        exclude_none=True,
+                        mode="json",
+                    ),
+                    "reason": "resource_unavailable",
+                },
+                session_id=session.page_session_id,
+                context_id=session.context_id,
+                action_instance_id=session.action_instance_id,
+            )
+        )
+
+        assert manager._dynamic_page_session is None
+        assert await manager.action_contexts.get("1,0") is None
+        assert all(
+            lease.page_session_id != session.page_session_id
+            for lease in manager._binding_leases.values()
+        )
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_action_lifecycle_rejected_from_stale_provider_session_is_ignored(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=device_config_set_raster_image,
+        manager=registry,
+        actions_bus=_actions_session(action_bus),
+        start_soon=lambda fn, *a, **k: None,
+    )
+    await manager.set_page(profile="default", page=0)
+    ctx = await manager.action_contexts.get("0,0")
+    assert ctx is not None
+
+    msg = await _action_command_for_active_binding(
+        manager,
+        ACTION_LIFECYCLE_REJECTED,
+        {
+            "targetKind": "binding",
+            "binding": ctx.metadata.model_dump(
+                by_alias=True,
+                exclude_none=True,
+                mode="json",
+            ),
+            "reason": "stale_lifecycle",
+        },
+    )
+    await manager.handle_command(msg.model_copy(update={"sender_session_id": "stale"}))
+
+    assert await manager.action_contexts.get("0,0") is ctx
+    assert manager._binding_leases
+
+
+@pytest.mark.asyncio
 async def test_set_raster_image_last_write_wins_same_control(
     device_config_set_raster_image, persistence_tmp_dir
 ):
@@ -2549,7 +2847,7 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
 
 
 class ConfigurableActionRegistry:
-    """Registry that can add/remove actions for testing on_actions_changed.
+    """Registry that can add/remove actions for testing catalog-change handling.
 
     Uses qualified IDs (provider_instance_id::action_uuid) internally to match ActionRegistry.
     """
@@ -2611,10 +2909,10 @@ ACTION_X_UUID = "test.action.x"
 
 
 @pytest.mark.asyncio
-async def test_on_actions_changed_registered_resolves_unavailable_control(
+async def test_on_action_catalog_changed_added_resolves_unavailable_control(
     persistence_tmp_dir,
 ):
-    """When action becomes available, on_actions_changed creates context for unavailable control."""
+    """When action becomes available, catalog change creates context for unavailable control."""
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()
@@ -2672,9 +2970,8 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
                 provider_id="test",
             ),
         )
-        await manager.on_actions_changed(
-            registered=[f"test-provider::{ACTION_X_UUID}"],
-            unregistered=[],
+        await manager.on_action_catalog_changed(
+            _catalog_event(added=[f"test-provider::{ACTION_X_UUID}"])
         )
 
         # Control should now have context
@@ -2684,7 +2981,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
 
 
 @pytest.mark.asyncio
-async def test_on_actions_changed_unregistered_preserves_attached_context(
+async def test_on_action_catalog_changed_removed_preserves_attached_context(
     persistence_tmp_dir,
 ):
     device = _make_mock_device()
@@ -2739,8 +3036,8 @@ async def test_on_actions_changed_unregistered_preserves_attached_context(
         assert ctx_before is not None
 
         registry.remove_action(ACTION_X_UUID, "test-provider")
-        await manager.on_actions_changed(
-            registered=[], unregistered=[f"test-provider::{ACTION_X_UUID}"]
+        await manager.on_action_catalog_changed(
+            _catalog_event(removed=[f"test-provider::{ACTION_X_UUID}"])
         )
 
         assert await manager.action_contexts.get("0,0") is ctx_before
@@ -2750,7 +3047,7 @@ async def test_on_actions_changed_unregistered_preserves_attached_context(
 
 
 @pytest.mark.asyncio
-async def test_on_actions_changed_same_session_change_does_not_remove_context(
+async def test_on_action_catalog_changed_same_session_update_does_not_remove_context(
     persistence_tmp_dir,
 ):
     device = _make_mock_device()
@@ -2802,17 +3099,14 @@ async def test_on_actions_changed_same_session_change_does_not_remove_context(
         assert ctx_before is not None
 
         qualified = f"test-provider::{ACTION_X_UUID}"
-        await manager.on_actions_changed(
-            registered=[qualified],
-            unregistered=[qualified],
-        )
+        await manager.on_action_catalog_changed(_catalog_event(updated=[qualified]))
 
         assert await manager.action_contexts.get("0,0") is ctx_before
         tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio
-async def test_on_actions_changed_session_change_rebinds_context(
+async def test_on_action_catalog_changed_session_succession_rebinds_context(
     persistence_tmp_dir,
 ):
     device = _make_mock_device()
@@ -2874,9 +3168,18 @@ async def test_on_actions_changed_session_change_rebinds_context(
             ),
         )
         qualified = f"test-provider::{ACTION_X_UUID}"
-        await manager.on_actions_changed(
-            registered=[qualified],
-            unregistered=[qualified],
+        await manager.on_action_catalog_changed(
+            _catalog_event(
+                successions=[
+                    _provider_session_succession(
+                        provider_instance_id="test-provider",
+                        provider_id="test",
+                        previous_session_id="old-session",
+                        successor_session_id="new-session",
+                        actions=[qualified],
+                    )
+                ],
+            )
         )
 
         ctx_after = await manager.action_contexts.get("0,0")

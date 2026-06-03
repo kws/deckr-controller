@@ -63,7 +63,7 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
 from deckr.controller.action_provider.action_registry import ActionRegistry
-from deckr.controller.action_provider.events import ActionsChangedEvent
+from deckr.controller.action_provider.events import ActionCatalogChangedEvent
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.settings import SettingsService
 
@@ -187,17 +187,22 @@ class ControllerService(BaseComponent):
         if ctrl_ctx is not None:
             await ctrl_ctx.handle_command(msg)
 
-    async def handle_actions_changed_event(self, event: ActionsChangedEvent) -> None:
+    async def handle_action_catalog_changed_event(
+        self,
+        event: ActionCatalogChangedEvent,
+    ) -> None:
         controller_contexts = await self._controller_contexts.values()
         logger.log(
             logging.INFO if controller_contexts else logging.DEBUG,
-            "Applying ActionsChangedEvent to %d device(s): +%s -%s",
+            "Applying ActionCatalogChangedEvent to %d device(s): +%s -%s ~%s successor=%s",
             len(controller_contexts),
-            event.registered,
-            event.unregistered,
+            event.catalog_added,
+            event.catalog_removed,
+            event.catalog_updated,
+            event.provider_session_successions,
         )
         for ctrl_ctx in controller_contexts:
-            await ctrl_ctx.on_actions_changed(event.registered, event.unregistered)
+            await ctrl_ctx.on_action_catalog_changed(event)
 
     async def _actions_subscription_loop(self, stopping: anyio.Event) -> None:
         """Subscribe to action lane and route command messages to DeviceManagers."""

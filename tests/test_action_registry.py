@@ -18,7 +18,7 @@ from deckr.profiles import ACTIONS_FEATURE_ID, ActionsBeaconPayload
 
 from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
-from deckr.controller.action_provider.events import ActionsChangedEvent
+from deckr.controller.action_provider.events import ActionCatalogChangedEvent
 
 CONTROLLER_ID = "controller-main"
 ACTION_UUID = "test.stub.action"
@@ -88,12 +88,12 @@ async def _advertise_actions(
 
 
 async def _run_registry(registry: ActionRegistry, callback):
-    events: list[ActionsChangedEvent] = []
+    events: list[ActionCatalogChangedEvent] = []
 
-    async def on_changed(event: ActionsChangedEvent) -> None:
+    async def on_changed(event: ActionCatalogChangedEvent) -> None:
         events.append(event)
 
-    registry._on_actions_changed = on_changed
+    registry._on_catalog_changed = on_changed
     stopping = anyio.Event()
     async with anyio.create_task_group() as tg:
         registry._beacon.start(tg)
@@ -120,7 +120,7 @@ async def test_action_registry_uses_beacon_actions_as_availability_source():
         assert meta.provider_id == PROVIDER_ID
         assert meta.provider_labels == {"room": "office"}
         assert meta.provider_session_id == "session-1"
-        assert events[-1].registered == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
+        assert events[-1].catalog_added == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
 
     await _run_registry(registry, scenario)
 
@@ -237,8 +237,8 @@ async def test_action_registry_beacon_session_change_refreshes_action_metadata()
                 await anyio.sleep(0.01)
 
         qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
-        assert events[-1].registered == [qualified]
-        assert events[-1].unregistered == [qualified]
+        assert events[-2].catalog_removed == [qualified]
+        assert events[-1].catalog_added == [qualified]
 
     await _run_registry(registry, scenario)
 
@@ -267,7 +267,13 @@ async def test_action_registry_prefers_latest_duplicate_provider_advertisement()
         meta = await registry.get_action(ACTION_UUID)
         assert meta is not None
         assert meta.provider_session_id == "new"
-        assert events[-1].registered == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
+        qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
+        assert events[-1].catalog_added == []
+        assert events[-1].catalog_removed == []
+        assert events[-1].catalog_updated == []
+        assert events[-1].provider_session_successions[0].actions == [qualified]
+        assert events[-1].provider_session_successions[0].previous_session_id == "old"
+        assert events[-1].provider_session_successions[0].successor_session_id == "new"
 
     await _run_registry(registry, scenario)
 
@@ -289,7 +295,7 @@ async def test_action_registry_removes_actions_when_beacon_advertisement_is_with
             while await registry.get_action(ACTION_UUID) is not None:
                 await anyio.sleep(0.01)
 
-        assert events[-1].unregistered == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
+        assert events[-1].catalog_removed == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
         assert registry.provider_session_id(PROVIDER_INSTANCE_ID) is None
 
     await _run_registry(registry, scenario)
