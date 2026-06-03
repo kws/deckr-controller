@@ -23,6 +23,7 @@ from deckr.profiles import (
 )
 from deckr.substrates.nats_kv import KvUnavailable
 
+from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
 from deckr.controller.action_provider.builtin import (
     BuiltinAction,
     BuiltinRegistry,
@@ -190,9 +191,9 @@ class ActionRegistry(BaseComponent):
             if descriptor:
                 self._builtin_action_registry[action_uuid] = descriptor
 
-        start_soon(self._advertisement_loop)
-        start_soon(self._notification_reconciliation_loop)
-        start_soon(self._reconciliation_loop)
+        start_soon(self._advertisement_loop, ctx.stopping)
+        start_soon(self._notification_reconciliation_loop, ctx.stopping)
+        start_soon(self._reconciliation_loop, ctx.stopping)
 
     async def stop(self) -> None:
         self._action_registry.clear()
@@ -200,10 +201,13 @@ class ActionRegistry(BaseComponent):
         self._advertisements.clear()
         await self._reconcile_notifications.aclose()
 
-    async def _advertisement_loop(self) -> None:
-        while True:
+    async def _advertisement_loop(self, stopping: anyio.Event) -> None:
+        while not stopping.is_set():
             try:
-                async with self._beacon.watch(ACTIONS_FEATURE_ID) as stream:
+                async with (
+                    self._beacon.watch(ACTIONS_FEATURE_ID) as stream,
+                    cancel_on_stopping(stopping),
+                ):
                     async for event in stream:
                         await self._reconcile_notifications.request(
                             f"actions beacon {event.event_type.value} {event.key}"
@@ -213,10 +217,10 @@ class ActionRegistry(BaseComponent):
                     "Action Beacon advertisements unavailable; retrying",
                     exc_info=True,
                 )
-                await anyio.sleep(_WATCH_RETRY_SECONDS)
+                await sleep_until_stopping(stopping, _WATCH_RETRY_SECONDS)
 
-    async def _reconciliation_loop(self) -> None:
-        while True:
+    async def _reconciliation_loop(self, stopping: anyio.Event) -> None:
+        while not stopping.is_set():
             try:
                 await self._reconcile_current_state(reason="broker snapshot")
             except KvUnavailable:
@@ -224,13 +228,22 @@ class ActionRegistry(BaseComponent):
                     "Action Beacon advertisements unavailable; reconciliation will retry",
                     exc_info=True,
                 )
-            await anyio.sleep(_STATE_RECONCILE_SECONDS)
+            await sleep_until_stopping(stopping, _STATE_RECONCILE_SECONDS)
 
-    async def _notification_reconciliation_loop(self) -> None:
-        await self._reconcile_notifications.run(
-            self._reconcile_notification,
-            reason_prefix="action beacon notifications",
-        )
+    async def _notification_reconciliation_loop(self, stopping: anyio.Event) -> None:
+        async def close_on_stopping() -> None:
+            await stopping.wait()
+            await self._reconcile_notifications.aclose()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(close_on_stopping)
+            try:
+                await self._reconcile_notifications.run(
+                    self._reconcile_notification,
+                    reason_prefix="action beacon notifications",
+                )
+            finally:
+                tg.cancel_scope.cancel()
 
     async def _reconcile_notification(self, reason: str) -> None:
         try:

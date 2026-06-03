@@ -20,7 +20,11 @@ from deckr.concord import (
     Concord,
     ContractValidityStatus,
 )
-from deckr.contracts.messages import controller_address, hardware_manager_address
+from deckr.contracts.messages import (
+    TraceContext,
+    controller_address,
+    hardware_manager_address,
+)
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import (
     CapabilityDescriptor,
@@ -34,6 +38,7 @@ from deckr.hardware.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
 from deckr.controller import _controller_service as controller_service_module
 from deckr.controller._controller_service import ControllerService
 from deckr.controller._device_manager import DeviceManager
+from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
     HardwareCommandService,
@@ -41,6 +46,54 @@ from deckr.controller._hardware_service import (
 from deckr.controller.config import DeviceConfig, DeviceConfigMatch, Page, Profile
 
 CONTROLLER_ID = "controller-main"
+
+
+@pytest.mark.asyncio
+async def test_send_with_endpoint_identity_restamps_sender_and_preserves_metadata():
+    bus = LaneHarness(
+        "hardware_messages",
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    endpoint = bus.endpoint(controller_address(CONTROLLER_ID)).session
+    manager_endpoint = bus.endpoint(hardware_manager_address("room-a"))
+    original = hw_messages.control_command_message(
+        controller_id="stale-controller",
+        sender_session_id="stale-session",
+        manager_id="room-a",
+        device_id="deck",
+        capability_id="raster.bitmap",
+        command_type="clear",
+        control_id="0,0",
+        params={},
+        recipient_session_id=manager_endpoint.session_id,
+    ).model_copy(
+        update={
+            "ttl_ms": 1234,
+            "causation_id": "cause-1",
+            "trace": TraceContext(
+                traceParent=(
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+                )
+            ),
+        }
+    )
+
+    async with manager_endpoint.subscribe() as stream:
+        sent = await send_with_endpoint_identity(endpoint, original)
+        with anyio.fail_after(1):
+            received = await stream.receive()
+
+    assert received == sent
+    assert received.sender == controller_address(CONTROLLER_ID)
+    assert received.sender_session_id == endpoint.session_id
+    assert received.recipient == original.recipient
+    assert received.recipient_session_id == original.recipient_session_id
+    assert received.subject == original.subject
+    assert received.message_type == original.message_type
+    assert received.body == original.body
+    assert received.ttl_ms == original.ttl_ms
+    assert received.causation_id == original.causation_id
+    assert received.trace == original.trace
 
 
 def _device(device_id: str = "deck", fingerprint: str = "serial-a") -> DeviceDescriptor:
@@ -221,7 +274,7 @@ async def _running_controller(
     registry.provider_session_id.return_value = None
     registry.provider_instance_provides_provider.return_value = False
     controller = ControllerService(
-        endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)),
+        endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)).session,
         beacon=beacon,
         concord=concord,
         config_service=config_service,
@@ -241,12 +294,46 @@ async def _running_controller(
 
 
 @pytest.mark.asyncio
+async def test_controller_service_background_loops_exit_when_stopping_is_set():
+    hardware_bus = LaneHarness(
+        "hardware_messages",
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    beacon = _beacon(hardware_bus)
+    concord = _concord(hardware_bus)
+    registry = MagicMock()
+    registry.get_action = AsyncMock(return_value=None)
+    render_backend = MagicMock()
+    render_backend.aclose = AsyncMock()
+    controller = ControllerService(
+        endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)).session,
+        beacon=beacon,
+        concord=concord,
+        config_service=MemoryConfigService(_config()),
+        settings_service=MagicMock(),
+        controller_id=CONTROLLER_ID,
+        action_registry=registry,
+        render_backend=render_backend,
+    )
+    stopping = anyio.Event()
+
+    with anyio.fail_after(1):
+        async with anyio.create_task_group() as tg:
+            await controller.start(RunContext(tg=tg, stopping=stopping))
+            await anyio.sleep(0.05)
+            stopping.set()
+
+    await controller.stop()
+    render_backend.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands():
     bus = LaneHarness(
         "hardware_messages", default_endpoint="controller:controller-main"
     )
     command_service = HardwareCommandService(
-        bus.endpoint("controller:controller-main"),
+        bus.endpoint("controller:controller-main").session,
         controller_id="controller-main",
     )
     registry = DeviceRouteRegistry()
@@ -312,7 +399,7 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
     registry.provider_session_id.return_value = None
     registry.provider_instance_provides_provider.return_value = False
     controller = ControllerService(
-        endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)),
+        endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)).session,
         beacon=beacon,
         concord=concord,
         config_service=MemoryConfigService(_config()),

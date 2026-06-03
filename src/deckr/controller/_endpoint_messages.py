@@ -5,10 +5,10 @@ from deckr.contracts.models import thaw_json
 from deckr.lanes import EndpointSession
 
 
-async def send_message(
+async def send_with_endpoint_identity(
     endpoint: EndpointSession, message: DeckrMessage
 ) -> DeckrMessage:
-    """Send a prebuilt message body through an endpoint session."""
+    """Send a prebuilt message restamped with the endpoint's local identity."""
 
     return await endpoint.send(
         lane=message.lane,

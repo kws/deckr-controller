@@ -13,7 +13,7 @@ from deckr.contracts.messages import (
 from deckr.lanes import EndpointSession, endpoint_session
 from deckr.runtime import Deckr
 
-from deckr.controller._endpoint_messages import send_message
+from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from test_support.memory_lane_substrate import MemoryLaneSubstrate
 
 pytest_plugins = ("pytest_asyncio",)
@@ -125,7 +125,7 @@ class EndpointHarness:
         return await self._session.send(**kwargs)
 
     async def publish(self, message: DeckrMessage) -> DeckrMessage:
-        return await send_message(self._session, message)
+        return await send_with_endpoint_identity(self._session, message)
 
     async def reply_to(self, request: DeckrMessage, **kwargs) -> DeckrMessage:
         return await self._session.reply_to(request, **kwargs)

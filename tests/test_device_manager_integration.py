@@ -44,6 +44,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
+from deckr.lanes import EndpointSession
 from invariant import Node, SubGraphNode, dump_graph_data_uri
 from invariant.params import ref
 
@@ -69,6 +70,10 @@ PROVIDER_SESSION_ID = "action-provider-session"
 
 def _actions_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint=CONTROLLER_ADDR)
+
+
+def _actions_session(action_bus: LaneHarness) -> EndpointSession:
+    return action_bus.endpoint(CONTROLLER_ADDR).session
 
 
 def _concord(bus: LaneHarness) -> Concord:
@@ -541,7 +546,7 @@ def _provider_settings_device_manager(
         command_service=FakeHardwareCommandService(),
         config=config_service.config,
         manager=registry,
-        actions_bus=actions_bus,
+        actions_bus=_actions_session(actions_bus),
         start_soon=lambda fn, *a, **k: None,
         settings_service=ConfigBackedSettingsService(
             controller_id=CONTROLLER_ID,
@@ -631,7 +636,7 @@ async def test_device_manager_starts_background_loops_explicitly():
         command_service=FakeHardwareCommandService(),
         config=config,
         manager=MagicMock(),
-        actions_bus=_actions_bus(),
+        actions_bus=_actions_session(_actions_bus()),
         start_soon=constructor_tg.start_soon,
         provider_sessions=ReadyProviderSessions(),
     )
@@ -887,7 +892,7 @@ async def test_key_press_renders_to_device(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             render_backend=render_backend,
         )
@@ -962,7 +967,7 @@ async def test_binding_output_accepts_graph_data_uri(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             render_backend=render_backend,
         )
@@ -1035,7 +1040,7 @@ async def test_binding_overlay_renders_and_expires(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             render_backend=render_backend,
         )
@@ -1108,7 +1113,7 @@ async def test_binding_waits_for_provider_session_token(
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1202,7 +1207,7 @@ async def test_pending_binding_activates_when_provider_attaches_after_acceptance
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1260,7 +1265,7 @@ async def test_provider_session_restart_rebinds_to_successor_contract(
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1324,7 +1329,7 @@ async def test_binding_stays_attached_when_beacon_session_changes(
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1374,7 +1379,7 @@ async def test_binding_stays_attached_when_beacon_session_disappears(
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1424,7 +1429,7 @@ async def test_beacon_session_reappearance_does_not_resend_binding_attached(
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1508,7 +1513,7 @@ async def test_binding_and_page_navigation_reuses_provider_session_contract():
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1578,7 +1583,7 @@ async def test_binding_revokes_when_provider_session_contract_is_invalid(
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1629,7 +1634,7 @@ async def test_provider_session_terminal_cleanup_is_local_only(
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1709,7 +1714,7 @@ async def test_dynamic_page_survives_action_beacon_withdrawal_with_valid_session
             command_service=FakeHardwareCommandService(),
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
             provider_sessions=provider_sessions,
         )
@@ -1791,7 +1796,7 @@ async def test_static_page_batches_provider_session_preparation():
         command_service=FakeHardwareCommandService(),
         config=config,
         manager=registry,
-        actions_bus=action_bus,
+        actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
         provider_sessions=provider_sessions,
     )
@@ -1852,7 +1857,7 @@ async def test_action_command_authorization_uses_cached_provider_session():
             ],
         ),
         manager=registry,
-        actions_bus=action_bus,
+        actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
         provider_sessions=provider_sessions,
     )
@@ -1912,7 +1917,7 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -1957,7 +1962,7 @@ async def test_release_after_dynamic_page_rebind_is_consumed(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
@@ -2015,7 +2020,7 @@ async def test_release_on_same_binding_is_delivered(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
@@ -2059,7 +2064,7 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2116,7 +2121,7 @@ async def test_replace_page_from_non_owner_is_noop(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2170,7 +2175,7 @@ async def test_close_page_from_non_owner_is_noop(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2221,7 +2226,7 @@ async def test_set_raster_image_last_write_wins_same_control(
             command_service=command_service,
             config=device_config_set_raster_image,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2313,7 +2318,7 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=start_soon,
             settings_service=settings_service,
         )
@@ -2389,7 +2394,7 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=start_soon,
             settings_service=settings_service,
         )
@@ -2473,7 +2478,7 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2528,7 +2533,7 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
             ],
         ),
         manager=registry,
-        actions_bus=_actions_bus(),
+        actions_bus=_actions_session(_actions_bus()),
         start_soon=lambda fn, *a, **k: None,
     )
 
@@ -2648,7 +2653,7 @@ async def test_on_actions_changed_registered_resolves_unavailable_control(
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2724,7 +2729,7 @@ async def test_on_actions_changed_unregistered_preserves_attached_context(
             command_service=command_service,
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2789,7 +2794,7 @@ async def test_on_actions_changed_same_session_change_does_not_remove_context(
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)
@@ -2852,7 +2857,7 @@ async def test_on_actions_changed_session_change_rebinds_context(
             command_service=FakeHardwareCommandService(),
             config=config,
             manager=registry,
-            actions_bus=action_bus,
+            actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
         await manager.set_page(profile="default", page=0)

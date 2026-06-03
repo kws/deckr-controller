@@ -61,6 +61,7 @@ from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderBackend,
 )
+from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
 from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.events import ActionsChangedEvent
 from deckr.controller.config import DeviceConfigService
@@ -198,9 +199,12 @@ class ControllerService(BaseComponent):
         for ctrl_ctx in controller_contexts:
             await ctrl_ctx.on_actions_changed(event.registered, event.unregistered)
 
-    async def _actions_subscription_loop(self) -> None:
+    async def _actions_subscription_loop(self, stopping: anyio.Event) -> None:
         """Subscribe to action lane and route command messages to DeviceManagers."""
-        async with self._endpoint.subscribe(ACTIONS_LANE) as stream:
+        async with (
+            self._endpoint.subscribe(ACTIONS_LANE) as stream,
+            cancel_on_stopping(stopping),
+        ):
             async for event in stream:
                 try:
                     if not isinstance(event, DeckrMessage):
@@ -219,8 +223,11 @@ class ControllerService(BaseComponent):
                     else:
                         logger.exception("Error handling action lane event")
 
-    async def _hardware_input_loop(self) -> None:
-        async with self._endpoint.subscribe(HARDWARE_MESSAGES_LANE) as subscribe:
+    async def _hardware_input_loop(self, stopping: anyio.Event) -> None:
+        async with (
+            self._endpoint.subscribe(HARDWARE_MESSAGES_LANE) as subscribe,
+            cancel_on_stopping(stopping),
+        ):
             async for message in subscribe:
                 event = hw_messages.hardware_body_from_message(message)
                 ref = hw_messages.hardware_device_ref_from_message(message)
@@ -239,20 +246,23 @@ class ControllerService(BaseComponent):
                 elif isinstance(event, hw_messages.CommandRejectedMessage):
                     await ctrl_ctx.on_command_rejected(event)
 
-    async def _hardware_beacon_loop(self) -> None:
-        while True:
+    async def _hardware_beacon_loop(self, stopping: anyio.Event) -> None:
+        while not stopping.is_set():
             try:
-                async with self._beacon.watch(HARDWARE_FEATURE_ID) as stream:
+                async with (
+                    self._beacon.watch(HARDWARE_FEATURE_ID) as stream,
+                    cancel_on_stopping(stopping),
+                ):
                     async for event in stream:
                         await self._hardware_reconcile_notifications.request(
                             f"hardware Beacon {event.event_type.value} {event.key}"
                         )
             except KvUnavailable:
                 logger.warning("Hardware Beacon advertisements unavailable; retrying")
-                await anyio.sleep(_WATCH_RETRY_SECONDS)
+                await sleep_until_stopping(stopping, _WATCH_RETRY_SECONDS)
 
-    async def _hardware_reconciliation_loop(self) -> None:
-        while True:
+    async def _hardware_reconciliation_loop(self, stopping: anyio.Event) -> None:
+        while not stopping.is_set():
             try:
                 await self._reconcile_hardware_current_state(reason="broker snapshot")
             except (ConcordUnavailable, KvUnavailable):
@@ -260,24 +270,39 @@ class ControllerService(BaseComponent):
                     "Hardware current state unavailable; reconciliation will retry",
                     exc_info=True,
                 )
-            await anyio.sleep(_STATE_RECONCILE_SECONDS)
+            await sleep_until_stopping(stopping, _STATE_RECONCILE_SECONDS)
 
-    async def _hardware_claim_event_loop(self) -> None:
-        while True:
+    async def _hardware_claim_event_loop(self, stopping: anyio.Event) -> None:
+        while not stopping.is_set():
             try:
-                async with self._concord.watch(HARDWARE_CLAIM_PROFILE_ID) as stream:
+                async with (
+                    self._concord.watch(HARDWARE_CLAIM_PROFILE_ID) as stream,
+                    cancel_on_stopping(stopping),
+                ):
                     async for event in stream:
                         await self._hardware_reconcile_notifications.request(
                             f"hardware claim {event.event_type.value}"
                         )
             except ConcordUnavailable:
-                await anyio.sleep(_WATCH_RETRY_SECONDS)
+                await sleep_until_stopping(stopping, _WATCH_RETRY_SECONDS)
 
-    async def _hardware_notification_reconciliation_loop(self) -> None:
-        await self._hardware_reconcile_notifications.run(
-            self._reconcile_hardware_notification,
-            reason_prefix="hardware notifications",
-        )
+    async def _hardware_notification_reconciliation_loop(
+        self,
+        stopping: anyio.Event,
+    ) -> None:
+        async def close_on_stopping() -> None:
+            await stopping.wait()
+            await self._hardware_reconcile_notifications.aclose()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(close_on_stopping)
+            try:
+                await self._hardware_reconcile_notifications.run(
+                    self._reconcile_hardware_notification,
+                    reason_prefix="hardware notifications",
+                )
+            finally:
+                tg.cancel_scope.cancel()
 
     async def _reconcile_hardware_notification(self, reason: str) -> None:
         try:
@@ -633,12 +658,15 @@ class ControllerService(BaseComponent):
         )
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
-        ctx.tg.start_soon(self._actions_subscription_loop)
-        ctx.tg.start_soon(self._hardware_input_loop)
-        ctx.tg.start_soon(self._hardware_beacon_loop)
-        ctx.tg.start_soon(self._hardware_claim_event_loop)
-        ctx.tg.start_soon(self._hardware_notification_reconciliation_loop)
-        ctx.tg.start_soon(self._hardware_reconciliation_loop)
+        ctx.tg.start_soon(self._actions_subscription_loop, ctx.stopping)
+        ctx.tg.start_soon(self._hardware_input_loop, ctx.stopping)
+        ctx.tg.start_soon(self._hardware_beacon_loop, ctx.stopping)
+        ctx.tg.start_soon(self._hardware_claim_event_loop, ctx.stopping)
+        ctx.tg.start_soon(
+            self._hardware_notification_reconciliation_loop,
+            ctx.stopping,
+        )
+        ctx.tg.start_soon(self._hardware_reconciliation_loop, ctx.stopping)
 
     async def stop(self):
         if self._stopping is not None:

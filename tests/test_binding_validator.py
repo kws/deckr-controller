@@ -407,7 +407,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
         command_service=command_service,
         config=config,
         manager=registry,
-        actions_bus=actions_bus,
+        actions_bus=actions_bus.endpoint(controller_address(CONTROLLER_ID)).session,
         start_soon=start_soon,
     )
     await manager.set_page(profile="default", page=0)
@@ -484,7 +484,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
             command_service=command_service,
             config=config,
             manager=registry,
-            actions_bus=actions_bus,
+            actions_bus=actions_bus.endpoint(controller_address(CONTROLLER_ID)).session,
             start_soon=tg.start_soon,
             render_backend=_ImmediateRenderBackend(),
         )

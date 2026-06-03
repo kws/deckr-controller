@@ -19,10 +19,11 @@ from deckr.actions.messages import (
 from deckr.contracts.messages import controller_address
 from deckr.contracts.models import thaw_json
 from deckr.hardware.descriptors import DeviceDescriptor
+from deckr.lanes import EndpointSession
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
-from deckr.controller._endpoint_messages import send_message
+from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
@@ -52,7 +53,7 @@ class ControlContext:
         control: ControlSurface,
         settings: Mapping[str, Any],
         manager: "DeviceManager",
-        actions_bus: Any,
+        actions_bus: EndpointSession,
         start_soon: Callable[..., None],
         render_dispatcher: RenderDispatcher,
         settings_service: SettingsService | None,
@@ -145,7 +146,7 @@ class ControlContext:
                 page_session_id=self.page_session_id,
             ),
         )
-        await send_message(self._actions_bus, msg)
+        await send_with_endpoint_identity(self._actions_bus, msg)
 
     async def on_binding_attached(self) -> None:
         await self._router.hydrate_settings()

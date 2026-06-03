@@ -72,6 +72,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
+from deckr.lanes import EndpointSession
 from pydantic import ValidationError
 
 from deckr.controller._action_provider_sessions import (
@@ -93,7 +94,7 @@ from deckr.controller._device_layout import (
     control_surface_for_raster_capability,
     raster_controls,
 )
-from deckr.controller._endpoint_messages import send_message
+from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._event_translator import EventTranslator
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._navigation_service import (
@@ -269,7 +270,7 @@ class DeviceManager:
         command_service: HardwareCommandService,
         config: DeviceConfig,
         manager: ActionProviderManager,
-        actions_bus: Any,
+        actions_bus: EndpointSession,
         start_soon: Callable,
         render_backend: RenderBackend | None = None,
         settings_service: SettingsService | None = None,
@@ -839,7 +840,7 @@ class DeviceManager:
                 action_instance_id=action_instance_id,
             ),
         )
-        await send_message(self._actions_bus, msg)
+        await send_with_endpoint_identity(self._actions_bus, msg)
 
     async def _destroy_action_instance(
         self,
@@ -883,7 +884,7 @@ class DeviceManager:
                 action_instance_id=metadata.action_instance_id,
             ),
         )
-        await send_message(self._actions_bus, msg)
+        await send_with_endpoint_identity(self._actions_bus, msg)
 
     async def _destroy_all_action_instances(self, *, reason: str) -> None:
         for action_instance_id in list(self._action_instances):
@@ -1135,7 +1136,7 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await send_message(self._actions_bus, msg)
+        await send_with_endpoint_identity(self._actions_bus, msg)
 
     async def _emit_page_closed(
         self,
@@ -1166,7 +1167,7 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await send_message(self._actions_bus, msg)
+        await send_with_endpoint_identity(self._actions_bus, msg)
 
     async def _finalize_dynamic_page(
         self,

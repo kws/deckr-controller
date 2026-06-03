@@ -296,6 +296,21 @@ async def test_action_registry_removes_actions_when_beacon_advertisement_is_with
 
 
 @pytest.mark.asyncio
+async def test_action_registry_background_loops_exit_when_stopping_is_set():
+    bus = _state_bus()
+    registry = _registry(_beacon(bus))
+    stopping = anyio.Event()
+
+    with anyio.fail_after(1):
+        async with anyio.create_task_group() as tg:
+            await registry.start(RunContext(tg=tg, stopping=stopping))
+            await anyio.sleep(0.05)
+            stopping.set()
+
+    await registry.stop()
+
+
+@pytest.mark.asyncio
 async def test_action_registry_loads_builtin_actions_without_provider_beacon_ads():
     bus = _state_bus()
     registry = _registry(_beacon(bus))
