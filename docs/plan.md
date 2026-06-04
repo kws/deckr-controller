@@ -47,96 +47,92 @@ availability as independent state domains:
 
 ## Recommended Next Slice
 
-### 2. Extract Local Page Planner Models
+### 3. Introduce Action Availability Cache Skeleton
 
 Recommended commit title:
 
 ```text
-Extract controller page planning decisions
+Introduce controller action availability cache
 ```
 
-Focus this slice on making the transitional planner state explicit and
-testable outside of `DeviceManager`, without changing the runtime availability
-architecture yet.
+Focus this slice on creating the local availability data model and cache that
+will eventually replace Beacon-backed binding-time `manager.get_action()` calls.
+Keep runtime behavior compatible by bridging the current action registry lookup
+into the new cache as a transitional source.
 
 Why this first:
 
-- The stabilization slice introduced page frames and committed plans inside
-  `DeviceManager`; extracting those decisions now reduces mutation-heavy code
-  before more availability states are added.
-- A pure planner gives the availability service a concrete consumer contract
-  later: provider selection and freshness policy can feed planner inputs instead
-  of reaching into device runtime internals.
-- Planner unit tests can cover invalid controls, unavailable actions, retained
-  static frames, dynamic page children, and output preservation without spinning
-  up action buses or hardware fakes.
-- This is lower risk than starting provider-direct availability protocol work
-  while planning, commit ordering, and rollback behavior are still embedded in
-  one large runtime class.
+- The planner now consumes local metadata snapshots, so an availability service
+  can be introduced behind that snapshot boundary without touching commit-time
+  mutation.
+- A small cache/data-model slice gives later provider-direct protocol work a
+  stable internal contract before adding new wire messages.
+- Tests can lock down the important distinction between discovery candidates,
+  authoritative availability, stale records, and unavailable records before
+  provider selection and action interest add more states.
+- This is lower risk than replacing Beacon lookup in one step because the
+  transitional bridge can preserve current `DeviceManager` behavior.
 
 Scope for this slice:
 
-- Introduce an internal planner module under `src/deckr/controller`, for
-  example `_binding_planner.py`.
-- Move planner-only data shapes out of `DeviceManager` where possible:
-  `ActionIntentKey`, `PlannedBinding`, `PagePlan`, and page-frame inputs or
-  outputs.
-- Add explicit planner outcomes for each configured control:
-  `bound`, `unavailable`, and `invalid_device_control` are enough for this
-  slice. Leave `pending`, stale states, and multi-provider ranking for later.
-- Keep using transitional Beacon-backed action metadata as planner input.
-  `DeviceManager` may still call `manager.get_action()` before invoking the
-  planner, but the planner itself should not perform remote I/O.
-- Keep commit behavior in `DeviceManager`: binding attach/detach, action
-  instance lifecycle, rendering, held-input cancellation, and frame mutation
-  remain runtime responsibilities.
-- Add focused planner unit tests and keep the existing integration tests as
-  safety coverage.
+- Add an internal action-availability module under `src/deckr/controller`, for
+  example `_action_availability.py`.
+- Define `ProviderActionKey`, `ActionAvailabilityState`, availability records,
+  cache snapshots, freshness timestamps, stale-grace policy inputs, and source
+  labels such as `beacon_candidate` and `provider_direct`.
+- Add a small service/cache API that can answer planner `ActionIntentKey`
+  requests from a local snapshot and update records from transitional
+  `ActionMetadata` values.
+- Keep `DeviceManager` responsible for the temporary `manager.get_action()`
+  orchestration, but move `_action_metadata_cache` semantics behind the new
+  availability cache where possible.
+- Preserve the current metadata snapshot behavior for static pages, dynamic
+  pages, catalog changes, retained-plan restore, and unavailable rendering.
+- Add focused unit tests for record freshness, explicit provider filtering,
+  provider-label matching, stale-grace behavior, and snapshot conversion for the
+  planner.
 
 Acceptance criteria:
 
-- Planner build functions perform no provider, settings, bus, or hardware I/O.
-- Static page planning returns a complete outcome for every structurally valid
-  configured control.
-- Dynamic page planning resolves `self` and explicit child targets without
-  action lookup inside validation.
-- Missing action metadata produces an unavailable outcome instead of a rejected
-  page.
-- Invalid selectors/capabilities are represented as structural planner failures
-  or invalid-control outcomes according to the current validator behavior.
-- Closing a dynamic page can restore from a retained static frame through
-  planner inputs, without consulting Beacon/action lookup.
-- `DeviceManager` still owns the commit phase and all existing runtime
-  invariants remain covered.
+- Availability cache APIs perform no bus, hardware, settings, or provider I/O.
+- Beacon/action-registry metadata can populate cache records without making
+  those records authoritative provider-direct availability.
+- Planner metadata snapshots can be built from the cache for all currently
+  visible page intents.
+- Missing or expired records produce unavailable planner metadata without
+  rejecting the page.
+- Retained-plan restoration still works when the current cache snapshot is
+  empty.
+- Existing integration behavior remains unchanged while the transitional
+  `manager.get_action()` bridge is still present.
 
 Explicit non-goals:
 
-- Do not introduce `ActionAvailabilityService`.
-- Do not add provider-direct availability messages.
-- Do not implement action interest tracking.
-- Do not implement deterministic multi-provider selection.
-- Do not remove Beacon-backed `manager.get_action()` from transitional planning
-  orchestration yet.
-- Do not move action instance creation, attach/detach notification, or rendering
-  into the planner.
+- Do not add provider-direct availability request/snapshot/change messages yet.
+- Do not implement provider-side availability support.
+- Do not implement action interest tracking or warm interest retention.
+- Do not implement deterministic multi-provider ranking beyond explicit
+  provider/label filtering needed by the cache.
+- Do not remove the transitional `manager.get_action()` bridge from
+  `DeviceManager` yet.
+- Do not change provider wire protocol or public package API.
 
 Suggested tests:
 
 ```bash
 uv run ruff check .
-uv run pytest tests/test_binding_planner.py tests/test_binding_validator.py tests/test_device_manager_integration.py
+uv run pytest tests/test_action_availability.py tests/test_binding_planner.py tests/test_device_manager_integration.py
 git diff --check
 ```
 
-Add `tests/test_binding_planner.py` with coverage for:
+Add `tests/test_action_availability.py` with coverage for:
 
-- static page plans with bound and unavailable controls
-- structural validation errors
-- dynamic child `self` target planning
-- explicit dynamic child provider/action target planning
-- retained static plan restore after action metadata disappears
-- planner purity by using plain metadata snapshots rather than mocks that can
-  be awaited
+- cache record keys for explicit provider/action pairs
+- provider-label constrained intent matching
+- Beacon-backed candidate metadata converted into planner snapshots
+- unavailable outcome for missing or expired records
+- stale-grace retention of previously available metadata
+- no awaitable provider lookup or bus mock used by the cache
 
 ## Milestones
 
@@ -263,10 +259,11 @@ Goal: make the architecture difficult to regress.
    Landed in the first slice. Keep follow-up cleanup scoped to the same
    invariants until the planner is extracted.
 2. Extract planner models and tests.
-   Recommended next. Move page-planning decisions out of `DeviceManager` while
-   leaving commit-time mutation in the runtime.
+   Landed as `f698bdb`. Planner decisions now live in `_binding_planner.py`;
+   `DeviceManager` still owns metadata refresh and commit-time mutation.
 3. Add availability data models and a service skeleton.
-   Introduce the cache and event API before provider-direct protocol work.
+   Recommended next. Introduce the local cache and snapshot API before
+   provider-direct protocol work.
 4. Connect Beacon as candidate input.
    Preserve existing discovery behavior but downgrade it from availability truth
    to candidate hints.

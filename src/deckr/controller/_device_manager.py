@@ -76,6 +76,10 @@ from deckr.hardware.descriptors import (
 from deckr.lanes import EndpointSession
 from pydantic import ValidationError
 
+from deckr.controller._action_availability import (
+    ActionAvailabilityCache,
+    ActionAvailabilityPolicy,
+)
 from deckr.controller._action_provider_sessions import (
     ProviderSessionKey,
     provider_session_key,
@@ -342,6 +346,7 @@ class DeviceManager:
         self._config_stream = config_stream
         self._config_listener_task = None
         self._render_backend = render_backend or ThreadRenderBackend()
+        self._clock = clock or time.monotonic
         self._render_dispatcher = RenderDispatcher(
             command_service=command_service,
             config_id=self.config_id,
@@ -361,7 +366,13 @@ class DeviceManager:
         self._page_frames: list[PageFrame] = []
         self._current_plan: PagePlan | None = None
         self._planned_bindings_by_control: dict[str, PlannedBinding] = {}
-        self._action_metadata_cache: dict[ActionIntentKey, ActionMetadata] = {}
+        self._action_availability = ActionAvailabilityCache(
+            policy=ActionAvailabilityPolicy(
+                fresh_ttl_seconds=None,
+                stale_grace_seconds=None,
+            ),
+            clock=self._clock,
+        )
         self._binding_leases: dict[str, BindingLease] = {}
         self._binding_by_context: dict[str, str] = {}
         self._active_binding_by_control: dict[str, str] = {}
@@ -373,7 +384,6 @@ class DeviceManager:
             str,
             ProviderSessionKey | None,
         ] = {}
-        self._clock = clock or time.monotonic
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
 
@@ -658,19 +668,12 @@ class DeviceManager:
             dynamic_sessions[-1] if dynamic_sessions else None
         )
 
-    def _action_intent_key(
-        self,
-        binding: ResolvedControlBinding,
-    ) -> ActionIntentKey:
-        return self._binding_planner.resolved_action_intent_key(binding)
-
     async def _action_metadata_snapshot_for_plan(
         self,
         intents: tuple[ActionIntentKey, ...],
         *,
         refresh_actions: bool,
     ) -> dict[ActionIntentKey, ActionMetadata]:
-        action_metadata: dict[ActionIntentKey, ActionMetadata] = {}
         for intent in intents:
             if refresh_actions:
                 action_meta = await self.manager.get_action(
@@ -682,13 +685,15 @@ class DeviceManager:
                     action_meta = self._action_metadata_with_current_session(
                         action_meta
                     )
-                    self._action_metadata_cache[intent] = action_meta
-                    action_metadata[intent] = action_meta
-                    continue
-            cached = self._action_metadata_cache.get(intent)
-            if cached is not None:
-                action_metadata[intent] = cached
-        return action_metadata
+                    self._action_availability.record_metadata(
+                        action_meta,
+                        now=self._clock(),
+                        intent=intent,
+                    )
+        return self._action_availability.snapshot_for_intents(
+            intents,
+            now=self._clock(),
+        )
 
     def _log_static_page_plan_rejection(
         self,
@@ -1078,7 +1083,11 @@ class DeviceManager:
             )
             return False
         action_meta = self._action_metadata_with_current_session(action_meta)
-        self._action_metadata_cache[self._action_intent_key(binding)] = action_meta
+        self._action_availability.record_metadata(
+            action_meta,
+            now=self._clock(),
+            intent=self._binding_planner.resolved_action_intent_key(binding),
+        )
         provider_session_id = action_meta.provider_session_id
         session_key = (
             None
