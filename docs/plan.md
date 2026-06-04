@@ -35,15 +35,108 @@ availability as independent state domains:
 | Area | Status | Notes |
 | --- | --- | --- |
 | Config matching and config subscriptions | Partial | File-backed config service already supports matching, updates, and `None` removal events. |
-| Validator separation from action lookup | In progress | Binding validation should only resolve selectors/capabilities. Availability must be handled after planning. |
+| Validator separation from action lookup | Done | Binding validation resolves selectors/capabilities only; planner handles missing metadata as unavailable. |
 | Provider-session gating removal | In progress | Binding/page transitions should not require Concord provider-session readiness. |
 | Page frame model | In progress | Device runtime needs explicit static/dynamic frames with cached committed plans. |
 | Held input cancellation | In progress | Rebinding must cancel old held inputs before releases are ignored. |
 | Action availability service | Not started | Needs provider candidates, direct probes, cache, selection, expiry, and events. |
-| Binding planner extraction | Not started | Current planning is still in `DeviceManager`; extract after behavior stabilizes. |
+| Binding planner extraction | Done | `_binding_planner.py` owns local planning decisions and outcomes; `DeviceManager` still owns metadata refresh and commit-time mutation. |
 | Action interest service | Not started | Needed actions must be tracked separately from button bindings. |
 | Provider availability protocol | Not started | Requires controller/provider messages and provider-side support. |
 | Multiple-provider selection | Not started | Needs deterministic, sticky provider ranking. |
+
+## Recommended Next Slice
+
+### 2. Extract Local Page Planner Models
+
+Recommended commit title:
+
+```text
+Extract controller page planning decisions
+```
+
+Focus this slice on making the transitional planner state explicit and
+testable outside of `DeviceManager`, without changing the runtime availability
+architecture yet.
+
+Why this first:
+
+- The stabilization slice introduced page frames and committed plans inside
+  `DeviceManager`; extracting those decisions now reduces mutation-heavy code
+  before more availability states are added.
+- A pure planner gives the availability service a concrete consumer contract
+  later: provider selection and freshness policy can feed planner inputs instead
+  of reaching into device runtime internals.
+- Planner unit tests can cover invalid controls, unavailable actions, retained
+  static frames, dynamic page children, and output preservation without spinning
+  up action buses or hardware fakes.
+- This is lower risk than starting provider-direct availability protocol work
+  while planning, commit ordering, and rollback behavior are still embedded in
+  one large runtime class.
+
+Scope for this slice:
+
+- Introduce an internal planner module under `src/deckr/controller`, for
+  example `_binding_planner.py`.
+- Move planner-only data shapes out of `DeviceManager` where possible:
+  `ActionIntentKey`, `PlannedBinding`, `PagePlan`, and page-frame inputs or
+  outputs.
+- Add explicit planner outcomes for each configured control:
+  `bound`, `unavailable`, and `invalid_device_control` are enough for this
+  slice. Leave `pending`, stale states, and multi-provider ranking for later.
+- Keep using transitional Beacon-backed action metadata as planner input.
+  `DeviceManager` may still call `manager.get_action()` before invoking the
+  planner, but the planner itself should not perform remote I/O.
+- Keep commit behavior in `DeviceManager`: binding attach/detach, action
+  instance lifecycle, rendering, held-input cancellation, and frame mutation
+  remain runtime responsibilities.
+- Add focused planner unit tests and keep the existing integration tests as
+  safety coverage.
+
+Acceptance criteria:
+
+- Planner build functions perform no provider, settings, bus, or hardware I/O.
+- Static page planning returns a complete outcome for every structurally valid
+  configured control.
+- Dynamic page planning resolves `self` and explicit child targets without
+  action lookup inside validation.
+- Missing action metadata produces an unavailable outcome instead of a rejected
+  page.
+- Invalid selectors/capabilities are represented as structural planner failures
+  or invalid-control outcomes according to the current validator behavior.
+- Closing a dynamic page can restore from a retained static frame through
+  planner inputs, without consulting Beacon/action lookup.
+- `DeviceManager` still owns the commit phase and all existing runtime
+  invariants remain covered.
+
+Explicit non-goals:
+
+- Do not introduce `ActionAvailabilityService`.
+- Do not add provider-direct availability messages.
+- Do not implement action interest tracking.
+- Do not implement deterministic multi-provider selection.
+- Do not remove Beacon-backed `manager.get_action()` from transitional planning
+  orchestration yet.
+- Do not move action instance creation, attach/detach notification, or rendering
+  into the planner.
+
+Suggested tests:
+
+```bash
+uv run ruff check .
+uv run pytest tests/test_binding_planner.py tests/test_binding_validator.py tests/test_device_manager_integration.py
+git diff --check
+```
+
+Add `tests/test_binding_planner.py` with coverage for:
+
+- static page plans with bound and unavailable controls
+- structural validation errors
+- dynamic child `self` target planning
+- explicit dynamic child provider/action target planning
+- retained static plan restore after action metadata disappears
+- planner purity by using plain metadata snapshots rather than mocks that can
+  be awaited
 
 ## Milestones
 
@@ -69,12 +162,12 @@ Goal: move page planning out of mutation-heavy runtime code.
 
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
-| Define planner input/output models | Not started | Current page plan/frame shape | Planner has explicit inputs for device, config snapshot, frame, availability snapshot, and previous binding state. |
-| Model binding outcomes | Not started | Availability state model | Each configured control resolves to `bound`, `unavailable`, `pending`, `invalid_config`, or `invalid_device_control`. |
-| Move structural validation into build phase | Not started | Validator separation | Build phase performs no network I/O and no runtime mutation. |
+| Define planner input/output models | Done | Current page plan/frame shape | Planner has explicit inputs for device, static/dynamic entries, metadata snapshots, retained plans, and dynamic sessions. |
+| Model binding outcomes | In progress | Availability state model | Current planner models `bound`, `unavailable`, and `invalid_device_control`; pending, invalid-config, stale, and sticky-provider states remain future work. |
+| Move structural validation into build phase | Done | Validator separation | Planner build phase performs no network I/O and no runtime mutation. |
 | Move binding install/detach/render into commit phase | Not started | Planner output | Commit phase cancels inputs, detaches old bindings, installs new bindings, renders controls, and updates frames in order. |
 | Add rollback/fallback handling for structural failures | Not started | Commit phase | Failed builds preserve the old page or enter a controlled fallback, never a half-cleared page. |
-| Add unit tests for planner decisions | Not started | Planner extraction | Planner tests cover valid, unavailable, pending, invalid config, invalid control, and sticky provider cases. |
+| Add unit tests for planner decisions | In progress | Planner extraction | Planner tests cover bound/unavailable controls, structural failures, dynamic children, retained metadata restore, and pure metadata snapshots. Pending, invalid-config, and sticky-provider cases remain future work. |
 
 ### 3. Introduce Action Availability Service
 
@@ -167,12 +260,11 @@ Goal: make the architecture difficult to regress.
 ## Suggested PR Sequence
 
 1. Land the device-runtime stabilization slice.
-   Keep the scope to validator separation, provider-session gating removal, page
-   frame state, dynamic close restore, bounded blocking calls, and held-input
-   cancellation.
+   Landed in the first slice. Keep follow-up cleanup scoped to the same
+   invariants until the planner is extracted.
 2. Extract planner models and tests.
-   Move the build/commit boundary out of `DeviceManager` after the transitional
-   behavior is covered.
+   Recommended next. Move page-planning decisions out of `DeviceManager` while
+   leaving commit-time mutation in the runtime.
 3. Add availability data models and a service skeleton.
    Introduce the cache and event API before provider-direct protocol work.
 4. Connect Beacon as candidate input.

@@ -35,7 +35,6 @@ from deckr.actions.messages import (
     BindingOverlayClearBody,
     DynamicPageCommand,
     MatchedCapability,
-    PageChildBindingDescriptor,
     PageSessionLifecycleBody,
     PageSessionMetadata,
     SettingsPatchBody,
@@ -81,13 +80,17 @@ from deckr.controller._action_provider_sessions import (
     ProviderSessionKey,
     provider_session_key,
 )
-from deckr.controller._binding_resolution import ResolvedControlBinding
-from deckr.controller._binding_validator import (
-    BLOCKING_ERROR_CODES,
-    format_validation_summary,
-    validate_dynamic_page_bindings,
-    validate_page_bindings,
+from deckr.controller._binding_planner import (
+    ActionIntentKey,
+    BindingPlanner,
+    BindingPlanStatus,
+    DynamicPageSession,
+    PageFrame,
+    PagePlan,
+    PlannedBinding,
 )
+from deckr.controller._binding_resolution import ResolvedControlBinding
+from deckr.controller._binding_validator import format_validation_summary
 from deckr.controller._command_router import DeviceOutput
 from deckr.controller._device_layout import (
     ControlSurface,
@@ -117,10 +120,7 @@ from deckr.controller.action_provider.provider import (
     ActionProviderManager,
 )
 from deckr.controller.config._data import DeviceConfig, Profile
-from deckr.controller.settings import (
-    SettingsService,
-    derive_action_instance_id,
-)
+from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)
 
@@ -193,26 +193,6 @@ def _selected_raster_capability_id(binding: ResolvedControlBinding) -> str | Non
 
 
 @dataclass(slots=True)
-class DynamicPageSession:
-    page_id: str
-    page_session_id: str
-    context_id: str
-    action_instance_id: str
-    owner_context_id: str
-    owner_binding_id: str
-    owner_control_id: str
-    owner_action_uuid: str
-    owner_provider_instance_id: str
-    owner_provider_id: str
-    owner_provider_session_id: str | None
-    owner_profile: str
-    owner_page: int
-    timeout_ms: int
-    last_activity: float
-    settings_target: SettingsTargetRef | None
-
-
-@dataclass(slots=True)
 class BindingLease:
     binding_id: str
     context_id: str
@@ -234,45 +214,6 @@ class BindingLease:
     page_session_id: str | None = None
     item_key: str | None = None
     handler: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ActionIntentKey:
-    action_uuid: str
-    provider_instance_id: str | None
-    provider_labels: tuple[tuple[str, str], ...]
-
-
-@dataclass(slots=True)
-class PlannedBinding:
-    binding: ResolvedControlBinding
-    action_instance_id: str
-    action_meta: ActionMetadata | None
-    page_session_id: str | None
-    persist_settings: bool
-    item_key: str | None = None
-    handler: str | None = None
-    child: PageChildBindingDescriptor | None = None
-
-    @property
-    def control_id(self) -> str:
-        return self.binding.control_id
-
-
-@dataclass(slots=True)
-class PagePlan:
-    entry: PageStackEntry
-    profile_id: str
-    page_id: str
-    page_session: DynamicPageSession | None
-    bindings: tuple[PlannedBinding, ...]
-
-
-@dataclass(slots=True)
-class PageFrame:
-    entry: PageStackEntry
-    page_session: DynamicPageSession | None
-    committed_plan: PagePlan
 
 
 @dataclass(slots=True)
@@ -412,6 +353,10 @@ class DeviceManager:
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
         self._nav = NavigationService(config)
+        self._binding_planner = BindingPlanner(
+            controller_id=controller_id,
+            config_id=self.config_id,
+        )
         self._dynamic_page_session: DynamicPageSession | None = None
         self._page_frames: list[PageFrame] = []
         self._current_plan: PagePlan | None = None
@@ -643,43 +588,6 @@ class DeviceManager:
             stableId=binding.stable_id,
         )
 
-    def _dynamic_child_action_instance_id(
-        self,
-        *,
-        page_session: DynamicPageSession,
-        child: PageChildBindingDescriptor,
-        binding: ResolvedControlBinding,
-    ) -> str:
-        if child.target.kind == "self":
-            return page_session.action_instance_id
-
-        provider_key = binding.provider_instance_id or ""
-        if binding.provider_labels:
-            provider_key = "|".join(
-                (
-                    provider_key,
-                    *(
-                        f"{key}={value}"
-                        for key, value in sorted(binding.provider_labels.items())
-                    ),
-                )
-            )
-        target_key = child.target.instance_key or child.control_id
-        stable_id = "\x1f".join(
-            (
-                "dynamic-page",
-                page_session.page_session_id,
-                provider_key,
-                target_key,
-            )
-        )
-        return derive_action_instance_id(
-            controller_id=self._controller_id,
-            config_id=self.config_id,
-            action_id=binding.action_uuid,
-            stable_id=stable_id,
-        )
-
     def _matched_capabilities(
         self,
         binding: ResolvedControlBinding,
@@ -754,57 +662,69 @@ class DeviceManager:
         self,
         binding: ResolvedControlBinding,
     ) -> ActionIntentKey:
-        return ActionIntentKey(
-            action_uuid=binding.action_uuid,
-            provider_instance_id=binding.provider_instance_id,
-            provider_labels=tuple(sorted(binding.provider_labels.items())),
-        )
+        return self._binding_planner.resolved_action_intent_key(binding)
 
-    def _retained_action_metadata(
+    async def _action_metadata_snapshot_for_plan(
         self,
+        intents: tuple[ActionIntentKey, ...],
         *,
-        retained_plan: PagePlan | None,
-        binding: ResolvedControlBinding,
-        action_instance_id: str,
-    ) -> ActionMetadata | None:
-        if retained_plan is None:
-            return None
-        intent_key = self._action_intent_key(binding)
-        for planned in retained_plan.bindings:
-            if planned.action_instance_id != action_instance_id:
-                continue
-            if self._action_intent_key(planned.binding) != intent_key:
-                continue
-            return planned.action_meta
-        return None
-
-    async def _action_metadata_for_plan(
-        self,
-        binding: ResolvedControlBinding,
-        *,
-        retained_plan: PagePlan | None,
-        action_instance_id: str,
         refresh_actions: bool,
-    ) -> ActionMetadata | None:
-        intent_key = self._action_intent_key(binding)
-        retained = self._retained_action_metadata(
-            retained_plan=retained_plan,
-            binding=binding,
-            action_instance_id=action_instance_id,
+    ) -> dict[ActionIntentKey, ActionMetadata]:
+        action_metadata: dict[ActionIntentKey, ActionMetadata] = {}
+        for intent in intents:
+            if refresh_actions:
+                action_meta = await self.manager.get_action(
+                    intent.action_uuid,
+                    provider_instance_id=intent.provider_instance_id,
+                    provider_labels=dict(intent.provider_labels),
+                )
+                if action_meta is not None:
+                    action_meta = self._action_metadata_with_current_session(
+                        action_meta
+                    )
+                    self._action_metadata_cache[intent] = action_meta
+                    action_metadata[intent] = action_meta
+                    continue
+            cached = self._action_metadata_cache.get(intent)
+            if cached is not None:
+                action_metadata[intent] = cached
+        return action_metadata
+
+    def _log_static_page_plan_rejection(
+        self,
+        result_errors,
+    ) -> None:
+        logger.error(
+            "Page transition rejected (capability validation): %s",
+            format_validation_summary(list(result_errors)),
         )
-        if refresh_actions:
-            action_meta = await self.manager.get_action(
-                binding.action_uuid,
-                provider_instance_id=binding.provider_instance_id,
-                provider_labels=binding.provider_labels,
+        for err in result_errors:
+            logger.error(
+                "Binding validation failed [%s]: %s (control=%s action=%s) %s",
+                err.code,
+                err.message,
+                err.control_ref,
+                err.action_uuid,
+                err.details,
             )
-            if action_meta is not None:
-                action_meta = self._action_metadata_with_current_session(action_meta)
-                self._action_metadata_cache[intent_key] = action_meta
-                return action_meta
-        if retained is not None:
-            return retained
-        return self._action_metadata_cache.get(intent_key)
+
+    def _log_dynamic_page_plan_rejection(
+        self,
+        result_errors,
+    ) -> None:
+        logger.error(
+            "Dynamic page transition rejected (capability validation): %s",
+            format_validation_summary(list(result_errors)),
+        )
+        for err in result_errors:
+            logger.error(
+                "Dynamic page binding validation failed [%s]: %s (control=%s action=%s) %s",
+                err.code,
+                err.message,
+                err.control_ref,
+                err.action_uuid,
+                err.details,
+            )
 
     async def _build_static_page_plan(
         self,
@@ -813,61 +733,21 @@ class DeviceManager:
         retained_plan: PagePlan | None = None,
         refresh_actions: bool = True,
     ) -> PagePlan | None:
-        result = await validate_page_bindings(
-            self._nav.resolve_static_bindings(entry),
-            self.device,
-            profile_id=entry.profile_name,
-            page_id=str(entry.page_index),
+        bindings = self._nav.resolve_static_bindings(entry)
+        action_metadata = await self._action_metadata_snapshot_for_plan(
+            self._binding_planner.static_action_intents(bindings),
+            refresh_actions=refresh_actions,
         )
-        if result.has_blocking_errors:
-            logger.error(
-                "Page transition rejected (capability validation): %s",
-                format_validation_summary(result),
-            )
-            for err in result.errors:
-                if err.code in BLOCKING_ERROR_CODES:
-                    logger.error(
-                        "Binding validation failed [%s]: %s (control=%s action=%s) %s",
-                        err.code,
-                        err.message,
-                        err.control_ref,
-                        err.action_uuid,
-                        err.details,
-                    )
-            return None
-
-        planned: list[PlannedBinding] = []
-        for binding in result.bindings:
-            action_instance_id = derive_action_instance_id(
-                controller_id=self._controller_id,
-                config_id=self.config_id,
-                action_id=binding.action_uuid,
-                stable_id=binding.stable_id,
-                profile_id=entry.profile_name,
-                page_id=str(entry.page_index),
-                control_id=binding.control_id,
-            )
-            planned.append(
-                PlannedBinding(
-                    binding=binding,
-                    action_instance_id=action_instance_id,
-                    action_meta=await self._action_metadata_for_plan(
-                        binding,
-                        retained_plan=retained_plan,
-                        action_instance_id=action_instance_id,
-                        refresh_actions=refresh_actions,
-                    ),
-                    page_session_id=None,
-                    persist_settings=True,
-                )
-            )
-        return PagePlan(
-            entry=entry,
-            profile_id=entry.profile_name,
-            page_id=str(entry.page_index),
-            page_session=None,
-            bindings=tuple(planned),
+        result = self._binding_planner.build_static_page_plan(
+            entry,
+            bindings=bindings,
+            device=self.device,
+            action_metadata=action_metadata,
+            retained_plan=retained_plan,
         )
+        if result.plan is None:
+            self._log_static_page_plan_rejection(result.validation_errors)
+        return result.plan
 
     async def _build_dynamic_page_plan(
         self,
@@ -877,66 +757,24 @@ class DeviceManager:
         retained_plan: PagePlan | None = None,
         refresh_actions: bool = True,
     ) -> PagePlan | None:
-        try:
-            result = await validate_dynamic_page_bindings(
-                list(entry.bindings),
-                self.device,
+        action_metadata = await self._action_metadata_snapshot_for_plan(
+            self._binding_planner.dynamic_action_intents(
+                entry.bindings,
                 owner_action_uuid=page_session.owner_action_uuid,
                 owner_provider_instance_id=page_session.owner_provider_instance_id,
-                profile_id="_dynamic",
-                page_id=entry.page_id,
-            )
-        except ValueError:
-            logger.warning("Dynamic page transition rejected: invalid child target")
-            return None
-        if result.has_blocking_errors:
-            logger.error(
-                "Dynamic page transition rejected (capability validation): %s",
-                format_validation_summary(result),
-            )
-            for err in result.errors:
-                if err.code in BLOCKING_ERROR_CODES:
-                    logger.error(
-                        "Dynamic page binding validation failed [%s]: %s (control=%s action=%s) %s",
-                        err.code,
-                        err.message,
-                        err.control_ref,
-                        err.action_uuid,
-                        err.details,
-                    )
-            return None
-
-        planned: list[PlannedBinding] = []
-        for child, binding in zip(entry.bindings, result.bindings, strict=True):
-            action_instance_id = self._dynamic_child_action_instance_id(
-                page_session=page_session,
-                child=child,
-                binding=binding,
-            )
-            planned.append(
-                PlannedBinding(
-                    binding=binding,
-                    action_instance_id=action_instance_id,
-                    action_meta=await self._action_metadata_for_plan(
-                        binding,
-                        retained_plan=retained_plan,
-                        action_instance_id=action_instance_id,
-                        refresh_actions=refresh_actions,
-                    ),
-                    page_session_id=page_session.page_session_id,
-                    persist_settings=False,
-                    item_key=child.item_key,
-                    handler=child.handler,
-                    child=child,
-                )
-            )
-        return PagePlan(
-            entry=entry,
-            profile_id="_dynamic",
-            page_id=entry.page_id,
-            page_session=page_session,
-            bindings=tuple(planned),
+            ),
+            refresh_actions=refresh_actions,
         )
+        result = self._binding_planner.build_dynamic_page_plan(
+            entry,
+            device=self.device,
+            page_session=page_session,
+            action_metadata=action_metadata,
+            retained_plan=retained_plan,
+        )
+        if result.plan is None:
+            self._log_dynamic_page_plan_rejection(result.validation_errors)
+        return result.plan
 
     async def _build_page_plan(
         self,
@@ -1608,7 +1446,7 @@ class DeviceManager:
         plan: PagePlan,
         planned: PlannedBinding,
     ) -> bool:
-        if planned.action_meta is None:
+        if planned.status == BindingPlanStatus.UNAVAILABLE:
             control = _find_control_surface(
                 self.device,
                 planned.control_id,
@@ -2051,7 +1889,7 @@ class DeviceManager:
 
             for planned in refreshed_plan.bindings:
                 lease = self._binding_lease_for_control(planned.control_id)
-                if planned.action_meta is None:
+                if planned.status == BindingPlanStatus.UNAVAILABLE:
                     if lease is None:
                         control = _find_control_surface(
                             self.device,
