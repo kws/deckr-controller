@@ -50,7 +50,6 @@ from deckr.hardware.profiles import (
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
 
-from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
@@ -144,7 +143,6 @@ class ControllerService(BaseComponent):
             tuple[str, tuple[tuple[str, str], ...]],
         ] = {}
         self._hardware_candidates: dict[tuple[str, str], HardwareCandidate] = {}
-        self._provider_sessions: ActionProviderSessionManager | None = None
         self._hardware_reconcile_lock = anyio.Lock()
         self._hardware_reconcile_notifications = CoalescedTrigger(
             batch_interval=_STATE_NOTIFICATION_BATCH_SECONDS
@@ -655,12 +653,6 @@ class ControllerService(BaseComponent):
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
         self._start_soon = ctx.tg.start_soon
-        self._provider_sessions = ActionProviderSessionManager(
-            controller_id=self._controller_id,
-            controller_session_id=self._endpoint.session_id,
-            concord=self._concord,
-            start_soon=ctx.tg.start_soon,
-        )
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
         ctx.tg.start_soon(self._actions_subscription_loop, ctx.stopping)
@@ -687,9 +679,6 @@ class ControllerService(BaseComponent):
             await ctrl_ctx.clear_page(clear_outputs=False)
         await self._controller_contexts.clear()
         await self._release_owned_claims()
-        if self._provider_sessions is not None:
-            await self._provider_sessions.aclose()
-            self._provider_sessions = None
         if self._render_backend is not None:
             await self._render_backend.aclose()
 
@@ -741,7 +730,6 @@ class ControllerService(BaseComponent):
                 settings_service=self._settings_service,
                 config_stream=stream,
                 on_config_removed=handle_config_removed,
-                provider_sessions=self._provider_sessions,
             )
             await self._controller_contexts.set(live.config_id, ctrl_ctx)
             async with anyio.create_task_group() as device_tg:

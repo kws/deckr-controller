@@ -154,7 +154,7 @@ async def test_validate_page_bindings_all_valid():
     )
     assert result.valid is True
     assert len(result.errors) == 0
-    assert result.actions == [action, action]
+    assert result.actions == []
 
 
 @pytest.mark.asyncio
@@ -193,12 +193,8 @@ async def test_validate_dynamic_page_bindings_resolves_explicit_child_action_tar
     assert result.bindings[0].action_uuid == "action.volume"
     assert result.bindings[0].provider_instance_id == "sonos-bedroom"
     assert result.bindings[0].settings["zoneName"] == "Bedroom"
-    assert result.actions == [action]
-    get_action.assert_awaited_once_with(
-        "action.volume",
-        provider_instance_id="sonos-bedroom",
-        provider_labels={},
-    )
+    assert result.actions == []
+    get_action.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -244,10 +240,9 @@ async def test_validate_page_bindings_missing_action():
     )
     assert result.valid is True  # Page can load (partial activation)
     assert result.has_blocking_errors is False
-    assert result.has_non_blocking_errors is True
-    assert result.actions == [None]
-    assert len(result.errors) == 1
-    assert result.errors[0].code == "action_not_found"
+    assert result.has_non_blocking_errors is False
+    assert result.actions == []
+    assert result.errors == []
 
 
 @pytest.mark.asyncio

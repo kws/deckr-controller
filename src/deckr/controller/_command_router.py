@@ -36,6 +36,7 @@ OVERLAY_TEMPLATES = frozenset(
         "unknown",
     }
 )
+SETTINGS_HYDRATE_TIMEOUT_SECONDS = 0.25
 
 
 class DeviceOutput:
@@ -281,10 +282,30 @@ class CommandRouter:
             return
 
         if self._settings_service is not None and self._settings_target is not None:
-            snapshot = await self._settings_service.get(self._settings_target)
-            merged = dict(thaw_json(self._store.settings))
-            merged.update(snapshot.settings)
-            self._store.settings = merged
+            snapshot = None
+            with anyio.move_on_after(SETTINGS_HYDRATE_TIMEOUT_SECONDS) as scope:
+                try:
+                    snapshot = await self._settings_service.get(self._settings_target)
+                except KeyError:
+                    snapshot = None
+                except Exception:
+                    logger.exception(
+                        "Failed to hydrate runtime settings for context %s target=%s",
+                        self._store.context_id,
+                        self._settings_target.key(),
+                    )
+                    snapshot = None
+            if scope.cancel_called:
+                logger.warning(
+                    "Runtime settings hydrate timed out for context %s target=%s timeout=%ss",
+                    self._store.context_id,
+                    self._settings_target.key(),
+                    SETTINGS_HYDRATE_TIMEOUT_SECONDS,
+                )
+            if snapshot is not None:
+                merged = dict(thaw_json(self._store.settings))
+                merged.update(snapshot.settings)
+                self._store.settings = merged
 
         self._settings_hydrated = True
 

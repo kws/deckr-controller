@@ -78,9 +78,7 @@ from deckr.lanes import EndpointSession
 from pydantic import ValidationError
 
 from deckr.controller._action_provider_sessions import (
-    ActionProviderSessionManager,
     ProviderSessionKey,
-    ProviderSessionSnapshot,
     provider_session_key,
 )
 from deckr.controller._binding_resolution import ResolvedControlBinding
@@ -101,6 +99,7 @@ from deckr.controller._event_translator import EventTranslator
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._navigation_service import (
     NavigationService,
+    PageStackEntry,
     PageTransition,
     StaticPageRef,
 )
@@ -126,7 +125,10 @@ from deckr.controller.settings import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_WIDGET_TIMEOUT_MS = 60_000
-BINDING_SESSION_RECONCILE_SECONDS = 1.0
+ACTION_INSTANCE_CREATE_TIMEOUT_SECONDS = 1.0
+BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS = 1.0
+SETTINGS_SNAPSHOT_TIMEOUT_SECONDS = 1.0
+DETACH_NOTIFY_TIMEOUT_SECONDS = 1.0
 _ACTION_METADATA_UNSET: Any = object()
 _SETTINGS_COMMAND_TYPES = frozenset(
     {
@@ -234,6 +236,54 @@ class BindingLease:
     handler: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ActionIntentKey:
+    action_uuid: str
+    provider_instance_id: str | None
+    provider_labels: tuple[tuple[str, str], ...]
+
+
+@dataclass(slots=True)
+class PlannedBinding:
+    binding: ResolvedControlBinding
+    action_instance_id: str
+    action_meta: ActionMetadata | None
+    page_session_id: str | None
+    persist_settings: bool
+    item_key: str | None = None
+    handler: str | None = None
+    child: PageChildBindingDescriptor | None = None
+
+    @property
+    def control_id(self) -> str:
+        return self.binding.control_id
+
+
+@dataclass(slots=True)
+class PagePlan:
+    entry: PageStackEntry
+    profile_id: str
+    page_id: str
+    page_session: DynamicPageSession | None
+    bindings: tuple[PlannedBinding, ...]
+
+
+@dataclass(slots=True)
+class PageFrame:
+    entry: PageStackEntry
+    page_session: DynamicPageSession | None
+    committed_plan: PagePlan
+
+
+@dataclass(slots=True)
+class HeldInputRecord:
+    binding_id: str
+    control_id: str
+    capability_id: str
+    context_id: str
+    down_event: Any
+
+
 def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
     return f"{provider_instance_id}::{action_uuid}"
 
@@ -244,6 +294,17 @@ def _lease_matches_action(lease: BindingLease, action_meta: ActionMetadata) -> b
         and lease.provider_instance_id == action_meta.provider_instance_id
         and lease.provider_id == action_meta.provider_id
         and lease.provider_session_id == action_meta.provider_session_id
+    )
+
+
+def _lease_matches_action_ignoring_session(
+    lease: BindingLease,
+    action_meta: ActionMetadata,
+) -> bool:
+    return (
+        lease.action_uuid == action_meta.uuid
+        and lease.provider_instance_id == action_meta.provider_instance_id
+        and lease.provider_id == action_meta.provider_id
     )
 
 
@@ -280,6 +341,20 @@ def _action_instance_matches_metadata(
     )
 
 
+def _action_instance_matches_action(
+    stored: ActionInstanceMetadata,
+    action_meta: ActionMetadata,
+    *,
+    config_id: str,
+) -> bool:
+    return (
+        stored.provider_instance_id == action_meta.provider_instance_id
+        and stored.provider_id == action_meta.provider_id
+        and stored.action_id == action_meta.uuid
+        and stored.config_id == config_id
+    )
+
+
 def _page_session_matches_metadata(
     session: DynamicPageSession,
     metadata: PageSessionMetadata,
@@ -311,7 +386,6 @@ class DeviceManager:
         settings_service: SettingsService | None = None,
         config_stream: AsyncIterator[DeviceConfig | None] | None = None,
         on_config_removed: Callable[[str], Awaitable[None]] | None = None,
-        provider_sessions: ActionProviderSessionManager | None = None,
         clock: Callable[[], float] | None = None,
         page_timeout_check_interval: float = 0.25,
     ):
@@ -335,15 +409,19 @@ class DeviceManager:
         )
         self._settings_service = settings_service
         self._on_config_removed = on_config_removed
-        self._provider_sessions = provider_sessions
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
         self._nav = NavigationService(config)
         self._dynamic_page_session: DynamicPageSession | None = None
+        self._page_frames: list[PageFrame] = []
+        self._current_plan: PagePlan | None = None
+        self._planned_bindings_by_control: dict[str, PlannedBinding] = {}
+        self._action_metadata_cache: dict[ActionIntentKey, ActionMetadata] = {}
         self._binding_leases: dict[str, BindingLease] = {}
         self._binding_by_context: dict[str, str] = {}
         self._active_binding_by_control: dict[str, str] = {}
-        self._held_input_bindings: dict[tuple[str, str], str] = {}
+        self._held_input_bindings: dict[tuple[str, str], HeldInputRecord] = {}
+        self._cancelled_input_keys: set[tuple[str, str]] = set()
         self._action_instances: dict[str, ActionInstanceMetadata] = {}
         self._action_instance_providers: dict[str, str] = {}
         self._action_instance_provider_sessions: dict[
@@ -360,8 +438,6 @@ class DeviceManager:
         stopping: anyio.Event,
     ) -> None:
         tg.start_soon(self._page_timeout_loop, stopping)
-        if self._provider_sessions is not None:
-            tg.start_soon(self._binding_session_loop, stopping)
 
     async def _render_unavailable_to_control(self, control: ControlSurface) -> None:
         """Render a not-available overlay to an output-capable control."""
@@ -396,6 +472,13 @@ class DeviceManager:
         logger.error(f"Profile {profile_name} not found. Returning the first profile.")
         return self.config.profiles[0]
 
+    def _describe_page_entry(self, entry: PageStackEntry | None) -> str:
+        if entry is None:
+            return "none"
+        if isinstance(entry, StaticPageRef):
+            return f"static:{entry.profile_name}:{entry.page_index}"
+        return f"dynamic:{entry.page_id}"
+
     async def _revoke_binding(
         self,
         binding_id: str,
@@ -408,15 +491,39 @@ class DeviceManager:
         lease = self._binding_leases.pop(binding_id, None)
         if lease is None:
             return None
+        logger.info(
+            "Revoking binding config=%s control=%s action=%s provider=%s "
+            "binding=%s reason=%s clearOutput=%s notifyProvider=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.binding_id,
+            reason,
+            clear_output,
+            notify_provider,
+        )
         if clear_held_input:
-            self._clear_held_inputs_for_binding(binding_id)
+            await self._cancel_held_inputs_for_binding(lease)
         self._binding_by_context.pop(lease.context_id, None)
         active_binding = self._active_binding_by_control.get(lease.control_id)
         if active_binding == binding_id:
             self._active_binding_by_control.pop(lease.control_id, None)
             await self.action_contexts.delete(lease.control_id)
         if lease.attached and notify_provider:
-            await lease.context.on_binding_detached(reason)
+            with anyio.move_on_after(DETACH_NOTIFY_TIMEOUT_SECONDS) as scope:
+                await lease.context.on_binding_detached(reason)
+            if scope.cancel_called:
+                logger.warning(
+                    "Timed out notifying provider of binding detach config=%s "
+                    "control=%s action=%s provider=%s binding=%s reason=%s",
+                    self.config_id,
+                    lease.control_id,
+                    lease.action_uuid,
+                    lease.provider_instance_id,
+                    lease.binding_id,
+                    reason,
+                )
         output = (
             DeviceOutput(
                 self._command_service,
@@ -436,15 +543,46 @@ class DeviceManager:
         )
         return lease
 
-    def _clear_held_inputs_for_binding(self, binding_id: str) -> None:
-        for key, held_binding_id in tuple(self._held_input_bindings.items()):
-            if held_binding_id == binding_id:
-                self._held_input_bindings.pop(key, None)
+    async def _cancel_held_inputs_for_binding(self, lease: BindingLease) -> None:
+        for key, held in tuple(self._held_input_bindings.items()):
+            if held.binding_id != lease.binding_id:
+                continue
+            self._held_input_bindings.pop(key, None)
+            self._cancelled_input_keys.add(key)
+            if not lease.attached or held.context_id != lease.context_id:
+                continue
+            cancel_event = held.down_event.model_copy(
+                update={"event_type": "cancel"}
+            )
+            try:
+                await lease.context.on_input(cancel_event)
+            except Exception:
+                logger.exception(
+                    "Error delivering cancel to action %s binding=%s",
+                    lease.action_uuid,
+                    lease.binding_id,
+                )
 
-    async def _revoke_active_bindings(self, *, clear_outputs: bool = True) -> None:
+    async def _cancel_all_held_inputs(self) -> None:
+        for held in tuple(self._held_input_bindings.values()):
+            lease = self._binding_leases.get(held.binding_id)
+            if lease is not None:
+                await self._cancel_held_inputs_for_binding(lease)
+            else:
+                key = (held.control_id, held.capability_id)
+                self._held_input_bindings.pop(key, None)
+                self._cancelled_input_keys.add(key)
+
+    async def _revoke_active_bindings(
+        self,
+        *,
+        clear_outputs: bool = True,
+        reason: str = "active_bindings",
+    ) -> None:
         await self._revoke_active_bindings_except(
             clear_outputs=clear_outputs,
             preserve_output_control_ids=frozenset(),
+            reason=reason,
         )
 
     async def _revoke_active_bindings_except(
@@ -452,13 +590,20 @@ class DeviceManager:
         *,
         clear_outputs: bool = True,
         preserve_output_control_ids: frozenset[str],
+        reason: str = "active_bindings",
+        clear_held_input: bool = True,
     ) -> None:
         for binding_id in list(self._binding_leases):
             lease = self._binding_leases.get(binding_id)
             clear_output = clear_outputs
             if lease is not None and lease.control_id in preserve_output_control_ids:
                 clear_output = False
-            await self._revoke_binding(binding_id, clear_output=clear_output)
+            await self._revoke_binding(
+                binding_id,
+                clear_output=clear_output,
+                reason=reason,
+                clear_held_input=clear_held_input,
+            )
 
     async def _clear_all_raster_controls(
         self,
@@ -585,6 +730,238 @@ class DeviceManager:
             return action_meta
         return replace(action_meta, provider_session_id=provider_session_id)
 
+    def _sync_top_frame_state(self) -> None:
+        frame = self._page_frames[-1] if self._page_frames else None
+        self._current_plan = frame.committed_plan if frame is not None else None
+        self._planned_bindings_by_control = (
+            {
+                planned.control_id: planned
+                for planned in frame.committed_plan.bindings
+            }
+            if frame is not None
+            else {}
+        )
+        dynamic_sessions = [
+            page_frame.page_session
+            for page_frame in self._page_frames
+            if page_frame.page_session is not None
+        ]
+        self._dynamic_page_session = (
+            dynamic_sessions[-1] if dynamic_sessions else None
+        )
+
+    def _action_intent_key(
+        self,
+        binding: ResolvedControlBinding,
+    ) -> ActionIntentKey:
+        return ActionIntentKey(
+            action_uuid=binding.action_uuid,
+            provider_instance_id=binding.provider_instance_id,
+            provider_labels=tuple(sorted(binding.provider_labels.items())),
+        )
+
+    def _retained_action_metadata(
+        self,
+        *,
+        retained_plan: PagePlan | None,
+        binding: ResolvedControlBinding,
+        action_instance_id: str,
+    ) -> ActionMetadata | None:
+        if retained_plan is None:
+            return None
+        intent_key = self._action_intent_key(binding)
+        for planned in retained_plan.bindings:
+            if planned.action_instance_id != action_instance_id:
+                continue
+            if self._action_intent_key(planned.binding) != intent_key:
+                continue
+            return planned.action_meta
+        return None
+
+    async def _action_metadata_for_plan(
+        self,
+        binding: ResolvedControlBinding,
+        *,
+        retained_plan: PagePlan | None,
+        action_instance_id: str,
+        refresh_actions: bool,
+    ) -> ActionMetadata | None:
+        intent_key = self._action_intent_key(binding)
+        retained = self._retained_action_metadata(
+            retained_plan=retained_plan,
+            binding=binding,
+            action_instance_id=action_instance_id,
+        )
+        if refresh_actions:
+            action_meta = await self.manager.get_action(
+                binding.action_uuid,
+                provider_instance_id=binding.provider_instance_id,
+                provider_labels=binding.provider_labels,
+            )
+            if action_meta is not None:
+                action_meta = self._action_metadata_with_current_session(action_meta)
+                self._action_metadata_cache[intent_key] = action_meta
+                return action_meta
+        if retained is not None:
+            return retained
+        return self._action_metadata_cache.get(intent_key)
+
+    async def _build_static_page_plan(
+        self,
+        entry: StaticPageRef,
+        *,
+        retained_plan: PagePlan | None = None,
+        refresh_actions: bool = True,
+    ) -> PagePlan | None:
+        result = await validate_page_bindings(
+            self._nav.resolve_static_bindings(entry),
+            self.device,
+            profile_id=entry.profile_name,
+            page_id=str(entry.page_index),
+        )
+        if result.has_blocking_errors:
+            logger.error(
+                "Page transition rejected (capability validation): %s",
+                format_validation_summary(result),
+            )
+            for err in result.errors:
+                if err.code in BLOCKING_ERROR_CODES:
+                    logger.error(
+                        "Binding validation failed [%s]: %s (control=%s action=%s) %s",
+                        err.code,
+                        err.message,
+                        err.control_ref,
+                        err.action_uuid,
+                        err.details,
+                    )
+            return None
+
+        planned: list[PlannedBinding] = []
+        for binding in result.bindings:
+            action_instance_id = derive_action_instance_id(
+                controller_id=self._controller_id,
+                config_id=self.config_id,
+                action_id=binding.action_uuid,
+                stable_id=binding.stable_id,
+                profile_id=entry.profile_name,
+                page_id=str(entry.page_index),
+                control_id=binding.control_id,
+            )
+            planned.append(
+                PlannedBinding(
+                    binding=binding,
+                    action_instance_id=action_instance_id,
+                    action_meta=await self._action_metadata_for_plan(
+                        binding,
+                        retained_plan=retained_plan,
+                        action_instance_id=action_instance_id,
+                        refresh_actions=refresh_actions,
+                    ),
+                    page_session_id=None,
+                    persist_settings=True,
+                )
+            )
+        return PagePlan(
+            entry=entry,
+            profile_id=entry.profile_name,
+            page_id=str(entry.page_index),
+            page_session=None,
+            bindings=tuple(planned),
+        )
+
+    async def _build_dynamic_page_plan(
+        self,
+        entry: DynamicPageCommand,
+        *,
+        page_session: DynamicPageSession,
+        retained_plan: PagePlan | None = None,
+        refresh_actions: bool = True,
+    ) -> PagePlan | None:
+        try:
+            result = await validate_dynamic_page_bindings(
+                list(entry.bindings),
+                self.device,
+                owner_action_uuid=page_session.owner_action_uuid,
+                owner_provider_instance_id=page_session.owner_provider_instance_id,
+                profile_id="_dynamic",
+                page_id=entry.page_id,
+            )
+        except ValueError:
+            logger.warning("Dynamic page transition rejected: invalid child target")
+            return None
+        if result.has_blocking_errors:
+            logger.error(
+                "Dynamic page transition rejected (capability validation): %s",
+                format_validation_summary(result),
+            )
+            for err in result.errors:
+                if err.code in BLOCKING_ERROR_CODES:
+                    logger.error(
+                        "Dynamic page binding validation failed [%s]: %s (control=%s action=%s) %s",
+                        err.code,
+                        err.message,
+                        err.control_ref,
+                        err.action_uuid,
+                        err.details,
+                    )
+            return None
+
+        planned: list[PlannedBinding] = []
+        for child, binding in zip(entry.bindings, result.bindings, strict=True):
+            action_instance_id = self._dynamic_child_action_instance_id(
+                page_session=page_session,
+                child=child,
+                binding=binding,
+            )
+            planned.append(
+                PlannedBinding(
+                    binding=binding,
+                    action_instance_id=action_instance_id,
+                    action_meta=await self._action_metadata_for_plan(
+                        binding,
+                        retained_plan=retained_plan,
+                        action_instance_id=action_instance_id,
+                        refresh_actions=refresh_actions,
+                    ),
+                    page_session_id=page_session.page_session_id,
+                    persist_settings=False,
+                    item_key=child.item_key,
+                    handler=child.handler,
+                    child=child,
+                )
+            )
+        return PagePlan(
+            entry=entry,
+            profile_id="_dynamic",
+            page_id=entry.page_id,
+            page_session=page_session,
+            bindings=tuple(planned),
+        )
+
+    async def _build_page_plan(
+        self,
+        entry: PageStackEntry,
+        *,
+        page_session: DynamicPageSession | None = None,
+        retained_plan: PagePlan | None = None,
+        refresh_actions: bool = True,
+    ) -> PagePlan | None:
+        if isinstance(entry, StaticPageRef):
+            return await self._build_static_page_plan(
+                entry,
+                retained_plan=retained_plan,
+                refresh_actions=refresh_actions,
+            )
+        if page_session is None:
+            logger.error("Dynamic page planning missing page session")
+            return None
+        return await self._build_dynamic_page_plan(
+            entry,
+            page_session=page_session,
+            retained_plan=retained_plan,
+            refresh_actions=refresh_actions,
+        )
+
     def _binding_lease_for_control(self, control_id: str) -> BindingLease | None:
         active_binding_id = self._active_binding_by_control.get(control_id)
         if active_binding_id is not None:
@@ -596,230 +973,113 @@ class DeviceManager:
                 return lease
         return None
 
-    async def _revoke_binding_for_action_session_change(
+    def _restamp_binding_route(
         self,
         lease: BindingLease,
-        *,
         action_meta: ActionMetadata,
     ) -> None:
-        logger.info(
-            "Rebinding control after action provider session changed "
-            "config=%s control=%s action=%s provider=%s oldSession=%s newSession=%s",
-            self.config_id,
-            lease.control_id,
-            lease.action_uuid,
-            lease.provider_instance_id,
-            lease.provider_session_id,
-            action_meta.provider_session_id,
-        )
-        old_session_key = lease.provider_session_key
-        await self._revoke_binding(
-            lease.binding_id,
-            clear_output=False,
-            notify_provider=False,
-            reason="provider_session_changed",
-            clear_held_input=True,
-        )
-        await self._destroy_action_instance(
-            lease.action_instance_id,
-            reason="provider_session_changed",
-            notify_provider=False,
-        )
-        if self._provider_sessions is None or old_session_key is None:
-            return
-        retire = getattr(self._provider_sessions, "retire", None)
-        if retire is not None:
-            await retire(old_session_key, reason="provider_session_changed")
-
-    async def _prepare_provider_sessions_for_actions(
-        self,
-        actions: list[ActionMetadata | None],
-    ) -> tuple[
-        list[ActionMetadata | None],
-        dict[ProviderSessionKey, ProviderSessionSnapshot],
-    ]:
-        prepared_actions = [
+        action_meta = self._action_metadata_with_current_session(action_meta)
+        lease.provider_session_id = action_meta.provider_session_id
+        lease.provider_session_key = (
             None
-            if action is None
-            else self._action_metadata_with_current_session(action)
-            for action in actions
-        ]
-        if self._provider_sessions is None:
-            return prepared_actions, {}
-        snapshots = await self._provider_sessions.prepare_many(
-            action
-            for action in prepared_actions
-            if action is not None
-            and action.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
+            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+            else provider_session_key(action_meta)
         )
-        return prepared_actions, snapshots
-
-    def _provider_session_snapshot_for_action(
-        self,
-        action_meta: ActionMetadata | None,
-        snapshots: Mapping[ProviderSessionKey, ProviderSessionSnapshot],
-    ) -> ProviderSessionSnapshot | None:
-        if action_meta is None:
-            return None
-        key = provider_session_key(action_meta)
-        return snapshots.get(key) if key is not None else None
-
-    def _binding_session_ready(
-        self,
-        lease: BindingLease,
-        *,
-        snapshot: ProviderSessionSnapshot | None = None,
-    ) -> bool:
-        if (
-            self._provider_sessions is None
-            or lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-        ):
-            return True
-        key = lease.provider_session_key
-        if key is None:
-            return False
-        if snapshot is not None and snapshot.key == key:
-            return snapshot.ready
-        return self._provider_sessions.cached_ready(key)
+        lease.context.provider_session_id = lease.provider_session_id
+        self._action_instance_provider_sessions[lease.action_instance_id] = (
+            lease.provider_session_key
+        )
 
     async def _activate_binding(
         self,
         lease: BindingLease,
-        *,
-        provider_session_snapshot: ProviderSessionSnapshot | None = None,
     ) -> bool:
         if lease.attached:
             return True
-        if not self._binding_session_ready(
-            lease,
-            snapshot=provider_session_snapshot,
-        ):
+        action_meta = ActionMetadata(
+            uuid=lease.action_uuid,
+            provider_instance_id=lease.provider_instance_id,
+            provider_id=lease.provider_id,
+            provider_session_id=lease.provider_session_id,
+        )
+        had_action_instance = lease.action_instance_id in self._action_instances
+        logger.info(
+            "Binding activation starting config=%s control=%s action=%s "
+            "provider=%s binding=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.binding_id,
+        )
+        with anyio.move_on_after(ACTION_INSTANCE_CREATE_TIMEOUT_SECONDS) as scope:
+            await self._ensure_action_instance(
+                action_meta=action_meta,
+                action_instance_id=lease.action_instance_id,
+                context_id=lease.context_id,
+                settings=lease.context.settings,
+            )
+        if scope.cancel_called:
+            if not had_action_instance:
+                self._action_instances.pop(lease.action_instance_id, None)
+                self._action_instance_providers.pop(lease.action_instance_id, None)
+                self._action_instance_provider_sessions.pop(
+                    lease.action_instance_id,
+                    None,
+                )
+            logger.warning(
+                "Binding activation timed out config=%s control=%s action=%s "
+                "provider=%s binding=%s stage=actionInstanceCreated timeout=%ss",
+                self.config_id,
+                lease.control_id,
+                lease.action_uuid,
+                lease.provider_instance_id,
+                lease.binding_id,
+                ACTION_INSTANCE_CREATE_TIMEOUT_SECONDS,
+            )
             return False
-        await self._ensure_action_instance(
-            action_meta=ActionMetadata(
-                uuid=lease.action_uuid,
-                provider_instance_id=lease.provider_instance_id,
-                provider_id=lease.provider_id,
-                provider_session_id=lease.provider_session_id,
-            ),
-            action_instance_id=lease.action_instance_id,
-            context_id=lease.context_id,
-            settings=lease.context.settings,
+        logger.info(
+            "Binding activation action instance ready config=%s control=%s "
+            "action=%s provider=%s binding=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.binding_id,
         )
         self._binding_by_context[lease.context_id] = lease.binding_id
         self._active_binding_by_control[lease.control_id] = lease.binding_id
         await self.action_contexts.set(lease.control_id, lease.context)
         lease.attached = True
-        await lease.context.on_binding_attached()
+        with anyio.move_on_after(BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS) as scope:
+            await lease.context.on_binding_attached()
+        if scope.cancel_called:
+            logger.warning(
+                "Binding activation timed out config=%s control=%s action=%s "
+                "provider=%s binding=%s stage=bindingAttached timeout=%ss",
+                self.config_id,
+                lease.control_id,
+                lease.action_uuid,
+                lease.provider_instance_id,
+                lease.binding_id,
+                BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS,
+            )
+        else:
+            logger.info(
+                "Binding activation attached config=%s control=%s action=%s "
+                "provider=%s binding=%s",
+                self.config_id,
+                lease.control_id,
+                lease.action_uuid,
+                lease.provider_instance_id,
+                lease.binding_id,
+            )
         return True
 
-    async def _binding_session_loop(self, stopping: anyio.Event) -> None:
-        while not stopping.is_set():
-            await anyio.sleep(BINDING_SESSION_RECONCILE_SECONDS)
-            if stopping.is_set():
-                return
-            await self._reconcile_binding_sessions()
-
     async def _reconcile_binding_sessions(self) -> None:
-        leases = tuple(self._binding_leases.values())
-        snapshots: dict[ProviderSessionKey, ProviderSessionSnapshot] = {}
-        if self._provider_sessions is not None:
-            keys = {
-                lease.provider_session_key
-                for lease in leases
-                if lease.provider_session_key is not None
-            }
-            snapshots = await self._provider_sessions.refresh_many(keys)
-
-        for lease in leases:
-            snapshot = (
-                snapshots.get(lease.provider_session_key)
-                if lease.provider_session_key is not None
-                else None
-            )
-            if snapshot is not None and snapshot.terminal:
-                await self._cleanup_terminal_provider_session(snapshot)
-
-        leases = tuple(self._binding_leases.values())
-        for lease in leases:
-            snapshot = (
-                snapshots.get(lease.provider_session_key)
-                if lease.provider_session_key is not None
-                else None
-            )
-            valid = self._binding_session_ready(lease, snapshot=snapshot)
-            if valid:
-                await self._activate_binding(
-                    lease,
-                    provider_session_snapshot=snapshot,
-                )
-                continue
-            if lease.attached or (snapshot is not None and snapshot.terminal):
-                await self._revoke_binding(lease.binding_id)
-
-    def _dynamic_page_owned_by_provider_session(
-        self,
-        session: DynamicPageSession,
-        key: ProviderSessionKey,
-    ) -> bool:
-        return (
-            session.owner_provider_instance_id == key.provider_instance_id
-            and session.owner_provider_id == key.provider_id
-            and session.owner_provider_session_id == key.provider_session_id
-        )
-
-    async def _cleanup_terminal_provider_session(
-        self,
-        snapshot: ProviderSessionSnapshot,
-    ) -> None:
-        key = snapshot.key
-        reason = snapshot.reason or "provider_session_terminal"
-        closed_page_session_id: str | None = None
-        page_session = self._dynamic_page_session
-        if page_session is not None and self._dynamic_page_owned_by_provider_session(
-            page_session,
-            key,
-        ):
-            closed_page_session_id = page_session.page_session_id
-            self._dynamic_page_session = None
-            if isinstance(self._nav.current_page, DynamicPageCommand):
-                self._nav.set_page(
-                    StaticPageRef(
-                        profile_name=page_session.owner_profile,
-                        page_index=page_session.owner_page,
-                    )
-                )
-
-        binding_ids: list[str] = []
-        for binding_id, lease in tuple(self._binding_leases.items()):
-            if lease.provider_session_key == key:
-                binding_ids.append(binding_id)
-                continue
-            if (
-                closed_page_session_id is not None
-                and lease.page_session_id == closed_page_session_id
-            ):
-                binding_ids.append(binding_id)
-
-        for binding_id in binding_ids:
-            lease = self._binding_leases.get(binding_id)
-            notify_provider = lease is not None and lease.provider_session_key != key
-            await self._revoke_binding(
-                binding_id,
-                notify_provider=notify_provider,
-                reason=reason,
-                clear_held_input=True,
-            )
-
-        for action_instance_id, owned_session_key in tuple(
-            self._action_instance_provider_sessions.items()
-        ):
-            if owned_session_key == key:
-                await self._destroy_action_instance(
-                    action_instance_id,
-                    reason=reason,
-                    notify_provider=False,
-                )
+        for lease in tuple(self._binding_leases.values()):
+            if not lease.attached:
+                await self._activate_binding(lease)
 
     async def _ensure_action_instance(
         self,
@@ -829,8 +1089,18 @@ class DeviceManager:
         context_id: str,
         settings: Mapping[str, Any],
     ) -> None:
-        if action_instance_id in self._action_instances:
+        existing = self._action_instances.get(action_instance_id)
+        if existing is not None and _action_instance_matches_action(
+            existing,
+            action_meta,
+            config_id=self.config_id,
+        ):
             return
+        if existing is not None:
+            await self._destroy_action_instance(
+                action_instance_id,
+                reason="action_instance_retargeted",
+            )
         metadata = ActionInstanceMetadata(
             providerInstanceId=action_meta.provider_instance_id,
             providerId=action_meta.provider_id,
@@ -937,7 +1207,6 @@ class DeviceManager:
         item_key: str | None = None,
         handler: str | None = None,
         action_meta: ActionMetadata | None = _ACTION_METADATA_UNSET,
-        provider_session_snapshot: ProviderSessionSnapshot | None = None,
     ) -> bool:
         """Resolve a binding: create ControlContext and announce the binding lease.
         Returns True if context was created, False if action not found (caller should render unavailable).
@@ -971,14 +1240,13 @@ class DeviceManager:
             )
             return False
         action_meta = self._action_metadata_with_current_session(action_meta)
+        self._action_metadata_cache[self._action_intent_key(binding)] = action_meta
         provider_session_id = action_meta.provider_session_id
         session_key = (
             None
             if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
             else provider_session_key(action_meta)
         )
-        if provider_session_snapshot is not None and provider_session_snapshot.terminal:
-            return False
         settings_target = (
             self._build_settings_target_for_binding(
                 action_instance_id=action_instance_id,
@@ -991,18 +1259,40 @@ class DeviceManager:
         )
         initial_settings = dict(binding.settings)
         if self._settings_service is not None and settings_target is not None:
-            try:
-                snapshot = await self._settings_service.get(settings_target)
-                initial_settings = dict(thaw_json(snapshot.settings))
-            except KeyError:
-                initial_settings = dict(binding.settings)
+            with anyio.move_on_after(SETTINGS_SNAPSHOT_TIMEOUT_SECONDS) as scope:
+                try:
+                    snapshot = await self._settings_service.get(settings_target)
+                    initial_settings = dict(thaw_json(snapshot.settings))
+                except KeyError:
+                    initial_settings = dict(binding.settings)
+            if scope.cancel_called:
+                logger.warning(
+                    "Binding settings snapshot timed out config=%s control=%s "
+                    "action=%s provider=%s target=%s timeout=%ss",
+                    self.config_id,
+                    binding.control_id,
+                    binding.action_uuid,
+                    action_meta.provider_instance_id,
+                    settings_target.key(),
+                    SETTINGS_SNAPSHOT_TIMEOUT_SECONDS,
+                )
         builtin_action = None
         if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
             self.manager, "get_builtin_action"
         ):
             builtin_action = self.manager.get_builtin_action(action_meta.uuid)
         binding_id = make_binding_id()
-        context_id = make_context_id()
+        existing_action_instance = self._action_instances.get(action_instance_id)
+        context_id = (
+            existing_action_instance.context_id
+            if existing_action_instance is not None
+            and _action_instance_matches_action(
+                existing_action_instance,
+                action_meta,
+                config_id=self.config_id,
+            )
+            else make_context_id()
+        )
         matched_capabilities = self._matched_capabilities(binding)
         binding_metadata = BindingMetadata(
             providerInstanceId=action_meta.provider_instance_id,
@@ -1067,12 +1357,9 @@ class DeviceManager:
             handler=handler,
         )
         self._binding_leases[binding_id] = lease
-        attached = await self._activate_binding(
-            lease,
-            provider_session_snapshot=provider_session_snapshot,
-        )
+        attached = await self._activate_binding(lease)
         if attached:
-            logger.debug(
+            logger.info(
                 "Binding resolved on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
                 profile_id,
                 page_id,
@@ -1082,8 +1369,8 @@ class DeviceManager:
                 binding_id,
             )
             return True
-        logger.debug(
-            "Binding pending provider session on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
+        logger.info(
+            "Binding pending provider availability on profile=%s page=%s control=%s action=%s provider=%s binding=%s",
             profile_id,
             page_id,
             binding.control_id,
@@ -1210,15 +1497,27 @@ class DeviceManager:
         *,
         causation_id: str | None = None,
     ) -> None:
-        session = self._dynamic_page_session
-        if session is None:
+        sessions = [
+            frame.page_session
+            for frame in reversed(self._page_frames)
+            if frame.page_session is not None
+        ]
+        if not sessions:
             return
-        await self._emit_page_closed(
-            session,
-            reason,
-            causation_id=causation_id,
-        )
-        self._dynamic_page_session = None
+        for session in sessions:
+            await self._emit_page_closed(
+                session,
+                reason,
+                causation_id=causation_id,
+            )
+        self._page_frames = [
+            frame for frame in self._page_frames if frame.page_session is None
+        ]
+        if self._page_frames:
+            self._nav.set_page(self._page_frames[-1].entry)
+        else:
+            self._nav._current_page = None
+        self._sync_top_frame_state()
 
     async def _execute_transition(
         self,
@@ -1226,199 +1525,119 @@ class DeviceManager:
         *,
         page_session: DynamicPageSession | None = None,
         preserve_rebound_outputs: bool = False,
+        retained_plan: PagePlan | None = None,
+        refresh_actions: bool = True,
     ) -> bool:
-        arriving = transition.arriving
+        plan = await self._build_page_plan(
+            transition.arriving,
+            page_session=page_session,
+            retained_plan=retained_plan,
+            refresh_actions=refresh_actions,
+        )
+        if plan is None:
+            return False
+        await self._commit_page_plan(
+            plan,
+            departing=transition.departing,
+            preserve_rebound_outputs=preserve_rebound_outputs,
+        )
+        return True
 
-        if isinstance(arriving, StaticPageRef):
-            result = await validate_page_bindings(
-                self._nav.resolve_static_bindings(arriving),
-                self.device,
-                self.manager.get_action,
-                profile_id=arriving.profile_name,
-                page_id=str(arriving.page_index),
-            )
-            if result.has_blocking_errors:
-                logger.error(
-                    "Page transition rejected (capability validation): %s",
-                    format_validation_summary(result),
-                )
-                for err in result.errors:
-                    if err.code in BLOCKING_ERROR_CODES:
-                        logger.error(
-                            "Binding validation failed [%s]: %s (control=%s action=%s) %s",
-                            err.code,
-                            err.message,
-                            err.control_ref,
-                            err.action_uuid,
-                            err.details,
-                        )
-                if transition.departing is not None:
-                    self._nav.set_page(transition.departing)
-                return False
-            for err in result.errors:
-                if err.code not in BLOCKING_ERROR_CODES:
-                    logger.warning(
-                        "Action unavailable (control will show 'not available'): %s (control=%s action=%s)",
-                        err.message,
-                        err.control_ref,
-                        err.action_uuid,
-                    )
-        elif isinstance(arriving, DynamicPageCommand):
-            if page_session is None:
-                logger.error("Dynamic page validation missing page session")
-                return False
-            result = await validate_dynamic_page_bindings(
-                list(arriving.bindings),
-                self.device,
-                self.manager.get_action,
-                owner_action_uuid=page_session.owner_action_uuid,
-                owner_provider_instance_id=page_session.owner_provider_instance_id,
-                profile_id="_dynamic",
-                page_id=arriving.page_id,
-            )
-            if result.has_blocking_errors:
-                logger.error(
-                    "Dynamic page transition rejected (capability validation): %s",
-                    format_validation_summary(result),
-                )
-                for err in result.errors:
-                    if err.code in BLOCKING_ERROR_CODES:
-                        logger.error(
-                            "Dynamic page binding validation failed [%s]: %s (control=%s action=%s) %s",
-                            err.code,
-                            err.message,
-                            err.control_ref,
-                            err.action_uuid,
-                            err.details,
-                        )
-                if transition.departing is not None:
-                    self._nav.set_page(transition.departing)
-                return False
-            for err in result.errors:
-                if err.code not in BLOCKING_ERROR_CODES:
-                    logger.warning(
-                        "Action unavailable (control will show 'not available'): %s (control=%s action=%s)",
-                        err.message,
-                        err.control_ref,
-                        err.action_uuid,
-                    )
-
-        (
-            prepared_actions,
-            provider_session_snapshots,
-        ) = await self._prepare_provider_sessions_for_actions(result.actions)
+    async def _commit_page_plan(
+        self,
+        plan: PagePlan,
+        *,
+        departing: PageStackEntry | None,
+        preserve_rebound_outputs: bool = False,
+    ) -> None:
+        arriving = plan.entry
+        logger.info(
+            "Executing page transition config=%s departing=%s arriving=%s "
+            "pageSession=%s preserveReboundOutputs=%s",
+            self.config_id,
+            self._describe_page_entry(departing),
+            self._describe_page_entry(arriving),
+            plan.page_session.page_session_id
+            if plan.page_session is not None
+            else None,
+            preserve_rebound_outputs,
+        )
 
         preserve_output_control_ids = (
-            frozenset(binding.control_id for binding in result.bindings)
+            frozenset(planned.control_id for planned in plan.bindings)
             if preserve_rebound_outputs
             else frozenset()
         )
 
-        if transition.departing is not None:
+        if departing is not None:
             await self._revoke_active_bindings_except(
                 preserve_output_control_ids=preserve_output_control_ids,
+                reason=(
+                    "page_transition:"
+                    f"{self._describe_page_entry(departing)}->"
+                    f"{self._describe_page_entry(arriving)}"
+                ),
             )
 
         await self._clear_all_raster_controls(
             preserve_control_ids=preserve_output_control_ids,
         )
 
-        if isinstance(arriving, StaticPageRef):
-            for binding, action_meta in zip(
-                result.bindings,
-                prepared_actions,
-                strict=True,
-            ):
-                action_instance_id = derive_action_instance_id(
-                    controller_id=self._controller_id,
-                    config_id=self.config_id,
-                    action_id=binding.action_uuid,
-                    stable_id=binding.stable_id,
-                    profile_id=arriving.profile_name,
-                    page_id=str(arriving.page_index),
-                    control_id=binding.control_id,
-                )
-                if not await self._try_resolve_binding(
-                    binding,
-                    profile_id=arriving.profile_name,
-                    page_id=str(arriving.page_index),
-                    action_instance_id=action_instance_id,
-                    action_meta=action_meta,
-                    provider_session_snapshot=self._provider_session_snapshot_for_action(
-                        action_meta,
-                        provider_session_snapshots,
-                    ),
-                ):
-                    control = _find_control_surface(
-                        self.device,
-                        binding.control_id,
-                        raster_capability_id=_selected_raster_capability_id(binding),
-                    )
-                    if control is not None:
-                        await self._render_unavailable_to_control(control)
-        elif isinstance(arriving, DynamicPageCommand):
-            if page_session is None:
-                logger.error("Dynamic page transition missing page session")
-                return False
-            resolved_count = 0
-            unavailable_count = 0
+        self._current_plan = plan
+        self._planned_bindings_by_control = {
+            planned.control_id: planned for planned in plan.bindings
+        }
 
-            async def resolve_dynamic_child(
-                child: PageChildBindingDescriptor,
-                binding: ResolvedControlBinding,
-                action_meta: ActionMetadata | None,
-            ) -> None:
-                nonlocal resolved_count, unavailable_count
-                if not await self._try_resolve_binding(
-                    binding,
-                    profile_id="_dynamic",
-                    page_id=arriving.page_id,
-                    action_instance_id=self._dynamic_child_action_instance_id(
-                        page_session=page_session,
-                        child=child,
-                        binding=binding,
-                    ),
-                    page_session_id=page_session.page_session_id,
-                    persist_settings=False,
-                    item_key=child.item_key,
-                    handler=child.handler,
-                    action_meta=action_meta,
-                    provider_session_snapshot=self._provider_session_snapshot_for_action(
-                        action_meta,
-                        provider_session_snapshots,
-                    ),
-                ):
-                    unavailable_count += 1
-                    control = _find_control_surface(
-                        self.device,
-                        binding.control_id,
-                        raster_capability_id=_selected_raster_capability_id(binding),
-                    )
-                    if control is not None:
-                        await self._render_unavailable_to_control(control)
-                    return
+        resolved_count = 0
+        unavailable_count = 0
+        for planned in plan.bindings:
+            if await self._install_planned_binding(plan, planned):
                 resolved_count += 1
+            else:
+                unavailable_count += 1
+        logger.info(
+            "Page bindings installed config=%s page=%s resolved=%s unavailable=%s",
+            self.config_id,
+            plan.page_id,
+            resolved_count,
+            unavailable_count,
+        )
 
-            async with anyio.create_task_group() as task_group:
-                for child, binding, action_meta in zip(
-                    arriving.bindings,
-                    result.bindings,
-                    prepared_actions,
-                    strict=True,
-                ):
-                    task_group.start_soon(
-                        resolve_dynamic_child,
-                        child,
-                        binding,
-                        action_meta,
-                    )
-            logger.info(
-                "Dynamic page bindings resolved on page=%s resolved=%s unavailable=%s",
-                arriving.page_id,
-                resolved_count,
-                unavailable_count,
+    async def _install_planned_binding(
+        self,
+        plan: PagePlan,
+        planned: PlannedBinding,
+    ) -> bool:
+        if planned.action_meta is None:
+            control = _find_control_surface(
+                self.device,
+                planned.control_id,
+                raster_capability_id=_selected_raster_capability_id(planned.binding),
             )
-        return True
+            if control is not None:
+                await self._render_unavailable_to_control(control)
+            return False
+        ok = await self._try_resolve_binding(
+            planned.binding,
+            profile_id=plan.profile_id,
+            page_id=plan.page_id,
+            action_instance_id=planned.action_instance_id,
+            page_session_id=planned.page_session_id,
+            persist_settings=planned.persist_settings,
+            item_key=planned.item_key,
+            handler=planned.handler,
+            action_meta=planned.action_meta,
+        )
+        if ok:
+            return True
+        control = _find_control_surface(
+            self.device,
+            planned.control_id,
+            raster_capability_id=_selected_raster_capability_id(planned.binding),
+        )
+        if control is not None:
+            await self._render_unavailable_to_control(control)
+        return False
 
     async def _set_page_locked(
         self,
@@ -1432,31 +1651,71 @@ class DeviceManager:
         causation_id: str | None = None,
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor). Caller must hold _nav_lock."""
-        session_to_close = self._dynamic_page_session if close_dynamic else None
+        dynamic_sessions_to_close = (
+            [
+                frame.page_session
+                for frame in self._page_frames
+                if frame.page_session is not None
+            ]
+            if close_dynamic
+            else []
+        )
+        current_frame = self._page_frames[-1] if self._page_frames else None
+        departing = current_frame.entry if current_frame is not None else None
         if descriptor is not None:
-            transition = self._nav.set_page(descriptor)
+            entry: PageStackEntry = descriptor
         else:
             profile_name = profile or "default"
             page_index = page if page is not None else 0
             profile_obj = self._find_profile(profile_name)
-            transition = self._nav.set_page(
-                StaticPageRef(profile_name=profile_obj.name, page_index=page_index)
-            )
-        ok = await self._execute_transition(
-            transition,
-            page_session=page_session,
-            preserve_rebound_outputs=(
-                page_session is not None
-                and isinstance(transition.departing, DynamicPageCommand)
-                and isinstance(transition.arriving, DynamicPageCommand)
-            ),
+            entry = StaticPageRef(profile_name=profile_obj.name, page_index=page_index)
+
+        retained_plan = (
+            current_frame.committed_plan
+            if current_frame is not None and current_frame.entry == entry
+            else None
         )
-        if ok and session_to_close is not None:
-            await self._finalize_dynamic_page(
-                close_reason,
-                causation_id=causation_id,
-            )
-        return ok
+        plan = await self._build_page_plan(
+            entry,
+            page_session=page_session,
+            retained_plan=retained_plan,
+            refresh_actions=True,
+        )
+        if plan is None:
+            return False
+
+        preserve_rebound_outputs = isinstance(departing, DynamicPageCommand) and (
+            isinstance(entry, StaticPageRef)
+            or (page_session is not None and isinstance(entry, DynamicPageCommand))
+        )
+        await self._commit_page_plan(
+            plan,
+            departing=departing,
+            preserve_rebound_outputs=preserve_rebound_outputs,
+        )
+
+        if isinstance(entry, StaticPageRef):
+            self._page_frames = [PageFrame(entry, None, plan)]
+        elif page_session is not None:
+            next_frame = PageFrame(entry, page_session, plan)
+            if (
+                current_frame is not None
+                and current_frame.page_session is page_session
+            ):
+                self._page_frames[-1] = next_frame
+            else:
+                self._page_frames.append(next_frame)
+        self._nav.set_page(entry)
+        self._sync_top_frame_state()
+
+        for session in reversed(dynamic_sessions_to_close):
+            if session is not None:
+                await self._emit_page_closed(
+                    session,
+                    close_reason,
+                    causation_id=causation_id,
+                )
+        return True
 
     async def set_page(
         self,
@@ -1570,18 +1829,6 @@ class DeviceManager:
                 close_dynamic=False,
             )
             if ok:
-                if current is not None:
-                    reason = (
-                        "replaced"
-                        if current.owner_binding_id == session.owner_binding_id
-                        else "dismissed"
-                    )
-                    await self._emit_page_closed(
-                        current,
-                        reason=reason,
-                        causation_id=causation_id,
-                    )
-                self._dynamic_page_session = session
                 await self._emit_page_opened(session, causation_id=causation_id)
 
     def _page_control_session(self, context_id: str) -> DynamicPageSession | None:
@@ -1651,12 +1898,38 @@ class DeviceManager:
             if session is None:
                 logger.info("No owner for dynamic page")
                 return
-            self._dynamic_page_session = None
-            await self._set_page_locked(
-                profile=session.owner_profile,
-                page=session.owner_page,
-                close_dynamic=False,
+            if (
+                len(self._page_frames) < 2
+                or self._page_frames[-1].page_session is not session
+            ):
+                logger.info("Dynamic page close ignored for non-top session")
+                return
+            departing_frame = self._page_frames[-1]
+            restore_frame = self._page_frames[-2]
+            restored_plan = await self._build_page_plan(
+                restore_frame.entry,
+                page_session=restore_frame.page_session,
+                retained_plan=restore_frame.committed_plan,
+                refresh_actions=False,
             )
+            if restored_plan is None:
+                logger.warning(
+                    "Dynamic page close rejected because restore frame is invalid"
+                )
+                return
+            await self._commit_page_plan(
+                restored_plan,
+                departing=departing_frame.entry,
+                preserve_rebound_outputs=True,
+            )
+            self._page_frames.pop()
+            self._page_frames[-1] = PageFrame(
+                restore_frame.entry,
+                restore_frame.page_session,
+                restored_plan,
+            )
+            self._nav.set_page(restore_frame.entry)
+            self._sync_top_frame_state()
             await self._emit_page_closed(
                 session,
                 reason=reason,
@@ -1665,28 +1938,51 @@ class DeviceManager:
 
     async def clear_page(self, *, clear_outputs: bool = True):
         async with self._nav_lock:
-            self._held_input_bindings.clear()
+            await self._cancel_all_held_inputs()
             await self._finalize_dynamic_page(reason="clear")
-            await self._revoke_active_bindings(clear_outputs=clear_outputs)
+            await self._revoke_active_bindings(
+                clear_outputs=clear_outputs,
+                reason="clear_page",
+            )
             await self._destroy_all_action_instances(reason="clear")
             if clear_outputs:
                 await self._clear_all_raster_controls()
+            self._page_frames.clear()
+            self._nav._current_page = None
+            self._sync_top_frame_state()
 
     async def on_descriptor_changed(self, descriptor: DeviceDescriptor) -> None:
         """Re-resolve the active page against a changed device descriptor."""
 
         async with self._nav_lock:
             self.device = descriptor
-            current_page = self._nav.current_page
-            if current_page is None:
+            current_frame = self._page_frames[-1] if self._page_frames else None
+            if current_frame is None:
                 return
             ok = await self._execute_transition(
-                PageTransition(departing=current_page, arriving=current_page),
-                page_session=self._dynamic_page_session,
+                PageTransition(
+                    departing=current_frame.entry,
+                    arriving=current_frame.entry,
+                ),
+                page_session=current_frame.page_session,
+                preserve_rebound_outputs=True,
+                retained_plan=current_frame.committed_plan,
+                refresh_actions=False,
             )
             if not ok:
                 await self._finalize_dynamic_page(reason="device_descriptor_changed")
-                await self._revoke_active_bindings(clear_outputs=False)
+                await self._revoke_active_bindings(
+                    clear_outputs=False,
+                    reason="device_descriptor_changed_failed",
+                )
+                return
+            if self._page_frames and self._current_plan is not None:
+                self._page_frames[-1] = PageFrame(
+                    current_frame.entry,
+                    current_frame.page_session,
+                    self._current_plan,
+                )
+                self._sync_top_frame_state()
 
     async def on_capability_state_changed(
         self,
@@ -1718,167 +2014,80 @@ class DeviceManager:
         self,
         event: ActionCatalogChangedEvent,
     ) -> None:
-        """Resolve newly available catalog actions and handle provider-session succession."""
-        current_page = self._nav.current_page
-        if current_page is None:
-            return
-
-        if isinstance(current_page, StaticPageRef):
-            result = await validate_page_bindings(
-                self._nav.resolve_static_bindings(current_page),
-                self.device,
-                self.manager.get_action,
-                profile_id=current_page.profile_name,
-                page_id=str(current_page.page_index),
-            )
-            profile_id = current_page.profile_name
-            page_id = str(current_page.page_index)
-            page_session_id = None
-            action_instance_id = None
-            dynamic_page_session = None
-            persist_settings = True
-        else:
-            session = self._dynamic_page_session
-            if session is None:
+        """Refresh the current page availability overlay after Beacon changes."""
+        async with self._nav_lock:
+            current_frame = self._page_frames[-1] if self._page_frames else None
+            if current_frame is None:
                 return
-            result = await validate_dynamic_page_bindings(
-                list(current_page.bindings),
-                self.device,
-                self.manager.get_action,
-                owner_action_uuid=session.owner_action_uuid,
-                owner_provider_instance_id=session.owner_provider_instance_id,
-                profile_id="_dynamic",
-                page_id=current_page.page_id,
+
+            refreshed_plan = await self._build_page_plan(
+                current_frame.entry,
+                page_session=current_frame.page_session,
+                retained_plan=current_frame.committed_plan,
+                refresh_actions=True,
             )
-            profile_id = "_dynamic"
-            page_id = current_page.page_id
-            page_session_id = session.page_session_id
-            action_instance_id = session.action_instance_id
-            dynamic_page_session = session
-            persist_settings = False
-
-        if result.has_blocking_errors:
-            logger.warning(
-                "Skipping action-change rebind for invalid page bindings: %s",
-                format_validation_summary(result),
-            )
-            return
-
-        logger.info(
-            "Re-evaluating page bindings for config=%s page=%s after action catalog change +%s -%s ~%s successor=%s",
-            self.config_id,
-            page_id,
-            event.catalog_added,
-            event.catalog_removed,
-            event.catalog_updated,
-            event.provider_session_successions,
-        )
-
-        successor_action_ids = {
-            action
-            for succession in event.provider_session_successions
-            for action in succession.actions
-        }
-        current_actions = [
-            None
-            if action is None
-            else self._action_metadata_with_current_session(action)
-            for action in result.actions
-        ]
-        rebind_control_ids: set[str] = set()
-        for binding, action_meta in zip(
-            result.bindings,
-            current_actions,
-            strict=True,
-        ):
-            lease = self._binding_lease_for_control(binding.control_id)
-            if lease is None:
-                continue
-            if (
-                _qualified_action_id(lease.provider_instance_id, lease.action_uuid)
-                not in successor_action_ids
-            ):
-                continue
-            if action_meta is None or _lease_matches_action(lease, action_meta):
-                continue
-            rebind_control_ids.add(binding.control_id)
-
-        leased_control_ids = {
-            lease.control_id for lease in self._binding_leases.values()
-        }
-        actions_needing_lease = [
-            action
-            if binding.control_id in rebind_control_ids
-            or binding.control_id not in leased_control_ids
-            else None
-            for binding, action in zip(result.bindings, current_actions, strict=True)
-        ]
-        (
-            prepared_actions,
-            provider_session_snapshots,
-        ) = await self._prepare_provider_sessions_for_actions(actions_needing_lease)
-        if any(not lease.attached for lease in self._binding_leases.values()):
-            await self._reconcile_binding_sessions()
-
-        child_bindings = (
-            current_page.bindings
-            if isinstance(current_page, DynamicPageCommand)
-            else (None,) * len(result.bindings)
-        )
-        for child, binding, action_meta in zip(
-            child_bindings,
-            result.bindings,
-            prepared_actions,
-            strict=True,
-        ):
-            if binding.control_id in rebind_control_ids:
-                lease = self._binding_lease_for_control(binding.control_id)
-                if lease is not None and action_meta is not None:
-                    await self._revoke_binding_for_action_session_change(
-                        lease,
-                        action_meta=action_meta,
-                    )
-            if await self.action_contexts.has_key(binding.control_id):
-                continue  # Already has context
-            if any(
-                lease.control_id == binding.control_id
-                for lease in self._binding_leases.values()
-            ):
-                continue
-            if child is not None and dynamic_page_session is not None:
-                resolved_action_instance_id = self._dynamic_child_action_instance_id(
-                    page_session=dynamic_page_session,
-                    child=child,
-                    binding=binding,
+            if refreshed_plan is None:
+                logger.warning(
+                    "Skipping action-change rebind for invalid page bindings"
                 )
-            else:
-                resolved_action_instance_id = (
-                    action_instance_id
-                    or derive_action_instance_id(
-                        controller_id=self._controller_id,
-                        config_id=self.config_id,
-                        action_id=binding.action_uuid,
-                        stable_id=binding.stable_id,
-                        profile_id=profile_id,
-                        page_id=page_id,
-                        control_id=binding.control_id,
-                    )
-                )
-            await self._try_resolve_binding(
-                binding,
-                profile_id=profile_id,
-                page_id=page_id,
-                action_instance_id=resolved_action_instance_id,
-                page_session_id=page_session_id,
-                persist_settings=persist_settings,
-                item_key=child.item_key if child is not None else None,
-                handler=child.handler if child is not None else None,
-                action_meta=action_meta,
-                provider_session_snapshot=self._provider_session_snapshot_for_action(
-                    action_meta,
-                    provider_session_snapshots,
-                ),
+                return
+
+            logger.info(
+                "Re-evaluating page bindings for config=%s page=%s after action catalog change +%s -%s ~%s successor=%s",
+                self.config_id,
+                refreshed_plan.page_id,
+                event.catalog_added,
+                event.catalog_removed,
+                event.catalog_updated,
+                event.provider_session_successions,
             )
+
+            self._page_frames[-1] = PageFrame(
+                current_frame.entry,
+                current_frame.page_session,
+                refreshed_plan,
+            )
+            self._sync_top_frame_state()
+
+            for planned in refreshed_plan.bindings:
+                lease = self._binding_lease_for_control(planned.control_id)
+                if planned.action_meta is None:
+                    if lease is None:
+                        control = _find_control_surface(
+                            self.device,
+                            planned.control_id,
+                            raster_capability_id=_selected_raster_capability_id(
+                                planned.binding
+                            ),
+                        )
+                        if control is not None:
+                            await self._render_unavailable_to_control(control)
+                    continue
+
+                if lease is None:
+                    await self._install_planned_binding(refreshed_plan, planned)
+                    continue
+
+                if _lease_matches_action(lease, planned.action_meta):
+                    await self._activate_binding(lease)
+                    continue
+
+                if _lease_matches_action_ignoring_session(
+                    lease,
+                    planned.action_meta,
+                ):
+                    self._restamp_binding_route(lease, planned.action_meta)
+                    await self._activate_binding(lease)
+                    continue
+
+                await self._revoke_binding(
+                    lease.binding_id,
+                    clear_output=False,
+                    notify_provider=False,
+                    reason="action_catalog_changed",
+                    clear_held_input=True,
+                )
+                await self._install_planned_binding(refreshed_plan, planned)
 
     async def _config_listener(self) -> None:
         """Consume config stream and apply changes."""
@@ -1894,14 +2103,27 @@ class DeviceManager:
             if self._on_config_removed is not None:
                 await self._on_config_removed(self.config_id)
             return
+        if config == self.config:
+            return
         async with self._nav_lock:
-            self._held_input_bindings.clear()
+            await self._cancel_all_held_inputs()
             self.config = config
-            if self._dynamic_page_session is not None:
-                await self._finalize_dynamic_page(reason="config_change")
+            self._nav.update_config(config)
+            await self._finalize_dynamic_page(reason="config_change")
             await self._destroy_all_action_instances(reason="config_change")
-            transition = self._nav.update_config(config)
-            await self._execute_transition(transition)
+            profile = config.profiles[0]
+            entry = StaticPageRef(profile_name=profile.name, page_index=0)
+            plan = await self._build_page_plan(entry, refresh_actions=True)
+            if plan is None:
+                self._page_frames.clear()
+                self._nav._current_page = None
+                self._sync_top_frame_state()
+                return
+            departing = self._page_frames[-1].entry if self._page_frames else None
+            await self._commit_page_plan(plan, departing=departing)
+            self._page_frames = [PageFrame(entry, None, plan)]
+            self._nav.set_page(entry)
+            self._sync_top_frame_state()
 
     def _command_sender_provider_instance_id(self, msg: DeckrMessage) -> str | None:
         provider_instance_id = parse_action_provider_address(msg.sender)
@@ -1987,13 +2209,6 @@ class DeviceManager:
                     msg.sender_session_id,
                 )
                 return None
-            if not self._binding_session_ready(lease):
-                logger.warning(
-                    "Ignoring action command %s for invalid provider session %s",
-                    msg.message_type,
-                    lease.provider_session_id,
-                )
-                return None
             if (
                 action_instance_id is not None
                 and action_instance_id != lease.action_instance_id
@@ -2045,28 +2260,6 @@ class DeviceManager:
                     msg.sender_session_id,
                 )
                 return None
-            if (
-                self._provider_sessions is not None
-                and session.owner_provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
-            ):
-                if session.owner_provider_session_id is None:
-                    logger.warning(
-                        "Ignoring page action command %s without provider session",
-                        msg.message_type,
-                    )
-                    return None
-                owner_key = ProviderSessionKey(
-                    session.owner_provider_instance_id,
-                    session.owner_provider_id,
-                    session.owner_provider_session_id,
-                )
-                if not self._provider_sessions.cached_ready(owner_key):
-                    logger.warning(
-                        "Ignoring page action command %s for invalid provider session %s",
-                        msg.message_type,
-                        session.owner_provider_session_id,
-                    )
-                    return None
             if (
                 action_instance_id is not None
                 and action_instance_id != session.action_instance_id
@@ -2130,10 +2323,14 @@ class DeviceManager:
                 target.provider_instance_id,
             )
             return False
-        if self._provider_sessions is None:
+        if not self.manager.provider_instance_provides_provider(
+            sender_provider_instance_id,
+            target.provider_id,
+        ):
             logger.warning(
-                "Ignoring provider settings command from %s without provider session manager",
+                "Ignoring provider settings command from %s for unadvertised provider %s",
                 sender_provider_instance_id,
+                target.provider_id,
             )
             return False
         if sender_session_id is None:
@@ -2142,25 +2339,17 @@ class DeviceManager:
                 sender_provider_instance_id,
             )
             return False
-        if not await self._provider_sessions.valid(
-            provider_instance_id=sender_provider_instance_id,
-            provider_id=target.provider_id,
-            provider_session_id=sender_session_id,
-        ):
+        current_session_id = self.manager.provider_session_id(
+            sender_provider_instance_id
+        )
+        if sender_session_id != current_session_id:
             logger.warning(
-                "Ignoring provider settings command from %s with invalid provider session %s",
+                "Ignoring provider settings command from %s with stale provider session %s",
                 sender_provider_instance_id,
                 sender_session_id,
             )
             return False
         return True
-
-    def _provider_session_key_ready(self, key: ProviderSessionKey | None) -> bool:
-        if key is None:
-            return False
-        if self._provider_sessions is None:
-            return True
-        return self._provider_sessions.cached_ready(key)
 
     def _action_instance_rejection_authorized(
         self,
@@ -2184,9 +2373,7 @@ class DeviceManager:
         if stored is None or not _action_instance_matches_metadata(stored, metadata):
             return False
         key = self._action_instance_provider_sessions.get(metadata.action_instance_id)
-        if key is None or msg.sender_session_id != key.provider_session_id:
-            return False
-        return self._provider_session_key_ready(key)
+        return key is not None and msg.sender_session_id == key.provider_session_id
 
     async def _settings_snapshot_for_command(
         self,
@@ -2223,6 +2410,14 @@ class DeviceManager:
         *,
         context_id: str,
     ) -> None:
+        if body.reason == "stale_lifecycle":
+            logger.info(
+                "Ignoring stale action lifecycle rejection config=%s target=%s",
+                self.config_id,
+                body.target_kind,
+            )
+            return
+
         sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
         if sender_provider_instance_id is None:
             return
@@ -2261,14 +2456,28 @@ class DeviceManager:
                 or metadata.config_id != self.config_id
                 or not _binding_body_matches_lease(lease, metadata)
             ):
-                logger.warning("Ignoring action lifecycle rejection for mismatched binding")
+                logger.warning(
+                    "Ignoring action lifecycle rejection for mismatched binding"
+                )
                 return
+            control = (
+                _find_control_surface(
+                    self.device,
+                    lease.control_id,
+                    raster_capability_id=lease.raster_capability_id,
+                )
+                if body.retryable
+                else None
+            )
             await self._revoke_binding(
                 lease.binding_id,
+                clear_output=not body.retryable,
                 notify_provider=False,
                 reason=body.reason,
                 clear_held_input=True,
             )
+            if control is not None:
+                await self._render_unavailable_to_control(control)
             return
 
         if body.target_kind == "page_session":
@@ -2319,23 +2528,7 @@ class DeviceManager:
         *,
         reason: str,
     ) -> None:
-        if self._dynamic_page_session is session:
-            self._dynamic_page_session = None
-            if isinstance(self._nav.current_page, DynamicPageCommand):
-                self._nav.set_page(
-                    StaticPageRef(
-                        profile_name=session.owner_profile,
-                        page_index=session.owner_page,
-                    )
-                )
-        for binding_id, lease in tuple(self._binding_leases.items()):
-            if lease.page_session_id == session.page_session_id:
-                await self._revoke_binding(
-                    binding_id,
-                    notify_provider=False,
-                    reason=reason,
-                    clear_held_input=True,
-                )
+        await self.close_page(context_id=session.context_id, reason=reason)
 
     async def handle_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from an action provider."""
@@ -2633,15 +2826,27 @@ class DeviceManager:
             self._record_page_activity()
 
         control_id = translated.control_id
+        key = (control_id, translated.capability_id)
+        if translated.action_event.event_type == "up":
+            held = self._held_input_bindings.pop(key, None)
+            if held is not None:
+                lease = self._binding_leases.get(held.binding_id)
+                if lease is None:
+                    self._cancelled_input_keys.add(key)
+                    return
+                await self._deliver_input_to_lease(lease, translated)
+                return
+            if key in self._cancelled_input_keys:
+                self._cancelled_input_keys.remove(key)
+                logger.info(
+                    "Ignoring release after cancel config=%s control=%s capability=%s",
+                    self.config_id,
+                    control_id,
+                    translated.capability_id,
+                )
+                return
+
         binding_id = self._active_binding_by_control.get(control_id)
-        if self._consume_release_for_rebound_control(translated, binding_id):
-            logger.info(
-                "Ignoring release for rebound control config=%s control=%s capability=%s",
-                self.config_id,
-                control_id,
-                translated.capability_id,
-            )
-            return
         lease = self._binding_leases.get(binding_id) if binding_id is not None else None
         if lease is None:
             logger.info(
@@ -2660,7 +2865,18 @@ class DeviceManager:
             )
             return
 
-        self._record_held_input_binding(translated, binding_id)
+        self._record_held_input_binding(translated, lease)
+        await self._deliver_input_to_lease(lease, translated)
+
+    async def _deliver_input_to_lease(self, lease: BindingLease, translated) -> None:
+        if translated.capability_id not in lease.input_capability_ids:
+            logger.info(
+                "Ignoring input for unselected capability config=%s control=%s capability=%s",
+                self.config_id,
+                translated.control_id,
+                translated.capability_id,
+            )
+            return
         try:
             await lease.context.on_input(translated.action_event)
         except Exception as e:
@@ -2671,20 +2887,15 @@ class DeviceManager:
                 exc_info=True,
             )
 
-    def _record_held_input_binding(self, translated, binding_id: str) -> None:
+    def _record_held_input_binding(self, translated, lease: BindingLease) -> None:
         if translated.action_event.event_type != "down":
             return
         self._held_input_bindings[(translated.control_id, translated.capability_id)] = (
-            binding_id
+            HeldInputRecord(
+                binding_id=lease.binding_id,
+                control_id=translated.control_id,
+                capability_id=translated.capability_id,
+                context_id=lease.context_id,
+                down_event=translated.action_event,
+            )
         )
-
-    def _consume_release_for_rebound_control(
-        self,
-        translated,
-        binding_id: str | None,
-    ) -> bool:
-        if translated.action_event.event_type != "up":
-            return False
-        key = (translated.control_id, translated.capability_id)
-        down_binding_id = self._held_input_bindings.pop(key, None)
-        return down_binding_id is not None and down_binding_id != binding_id

@@ -1,4 +1,4 @@
-"""Pure binding validation: selector resolution and action lookup."""
+"""Pure binding validation: selector and capability resolution."""
 
 from __future__ import annotations
 
@@ -46,8 +46,10 @@ BLOCKING_ERROR_CODES = frozenset(
     }
 )
 
-# Error codes that allow partial load (control gets "unavailable" display).
-NON_BLOCKING_ERROR_CODES = frozenset({"action_not_found"})
+# Action availability is intentionally not a validation concern. A resolved
+# binding can be committed as controller intent even when no provider currently
+# advertises the requested action.
+NON_BLOCKING_ERROR_CODES = frozenset()
 
 
 @dataclass
@@ -66,7 +68,7 @@ class ValidationResult:
 
     @property
     def has_non_blocking_errors(self) -> bool:
-        """True if any error allows partial load (e.g. action_not_found)."""
+        """True if any non-blocking validation warning was recorded."""
         return any(e.code in NON_BLOCKING_ERROR_CODES for e in self.errors)
 
     def add_error(
@@ -96,11 +98,17 @@ class ValidationResult:
 async def validate_page_bindings(
     bindings: list[ConfiguredControlBinding],
     device: DeviceDescriptor,
-    get_action: Callable[..., Awaitable[ActionMetadata | None]],
+    get_action: Callable[..., Awaitable[ActionMetadata | None]] | None = None,
     profile_id: str | None = None,
     page_id: str | None = None,
 ) -> ValidationResult:
-    """Validate and resolve all bindings for a page."""
+    """Validate and resolve all bindings for a page.
+
+    ``get_action`` is accepted for older callers but is not invoked. Provider
+    availability is applied later as a runtime overlay on the committed page
+    plan.
+    """
+    del get_action
     result = ValidationResult(valid=True)
     for binding in bindings:
         resolution = resolve_binding(binding, device.controls)
@@ -116,24 +124,7 @@ async def validate_page_bindings(
             )
             continue
         result.bindings.append(resolution.binding)
-        action = await get_action(
-            binding.action_uuid,
-            provider_instance_id=binding.provider_instance_id,
-            provider_labels=binding.provider_labels,
-        )
-        result.actions.append(action)
-        if action is None:
-            # Non-blocking: page loads; this control shows "unavailable"
-            result.add_error(
-                code="action_not_found",
-                message=f"action '{binding.action_uuid}' not found",
-                control_ref=resolution.binding.control_id,
-                action_uuid=binding.action_uuid,
-                profile_id=profile_id,
-                page_id=page_id,
-            )
-            continue
-    # Page can load if no selector/capability errors. action_not_found is non-blocking.
+    # Page can load if no selector/capability errors.
     result.valid = not result.has_blocking_errors
     return result
 
@@ -141,7 +132,7 @@ async def validate_page_bindings(
 async def validate_dynamic_page_bindings(
     bindings: list[PageChildBindingDescriptor],
     device: DeviceDescriptor,
-    get_action: Callable[..., Awaitable[ActionMetadata | None]],
+    get_action: Callable[..., Awaitable[ActionMetadata | None]] | None = None,
     *,
     owner_action_uuid: str,
     owner_provider_instance_id: str,
