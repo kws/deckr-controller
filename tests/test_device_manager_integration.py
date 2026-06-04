@@ -52,6 +52,10 @@ from invariant import Node, SubGraphNode, dump_graph_data_uri
 from invariant.params import ref
 
 from deckr.controller import _device_manager as device_manager_module
+from deckr.controller._action_interest import (
+    ActionInterestSource,
+    ActionInterestStrength,
+)
 from deckr.controller._action_provider_sessions import (
     ActionProviderSessionManager,
     ProviderSessionKey,
@@ -781,6 +785,147 @@ async def test_device_manager_starts_background_loops_explicitly():
     assert all(args == (stopping,) for _, args in started)
     for fn, args in started:
         await fn(*args)
+
+
+def test_device_manager_tracks_connected_config_action_interest():
+    device = _make_mock_device()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action="action.alpha",
+                            )
+                        ]
+                    ),
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "1,0"},
+                                action="action.beta",
+                                provider_instance_id="provider-beta",
+                                provider_labels={"room": "office"},
+                            )
+                        ]
+                    ),
+                ],
+            )
+        ],
+    )
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=config,
+        manager=MagicMock(),
+        actions_bus=_actions_session(_actions_bus()),
+        start_soon=lambda fn, *a, **k: None,
+        clock=lambda: 10.0,
+    )
+
+    snapshot = manager.action_interest_snapshot(now=10.0)
+
+    assert [intent.action_uuid for intent in snapshot.strong_intents] == [
+        "action.alpha",
+        "action.beta",
+    ]
+    beta = next(
+        intent for intent in snapshot.strong_intents if intent.action_uuid == "action.beta"
+    )
+    assert beta.provider_instance_id == "provider-beta"
+    assert beta.provider_labels == (("room", "office"),)
+    assert {record.source for record in snapshot.records} == {
+        ActionInterestSource.CONNECTED_CONFIG
+    }
+
+
+@pytest.mark.asyncio
+async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
+    device = _make_mock_device()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action="action.owner",
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async def get_action(address: str, **kwargs) -> ActionMetadata:
+        del kwargs
+        return _metadata(address)
+
+    registry = MagicMock()
+    registry.get_action = get_action
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(_actions_bus()),
+            start_soon=tg.start_soon,
+            clock=lambda: 20.0,
+        )
+        await manager.set_page(profile="default", page=0)
+        static_snapshot = manager.action_interest_snapshot(now=20.0)
+        assert any(
+            record.source == ActionInterestSource.VISIBLE_BINDING
+            and record.strength == ActionInterestStrength.STRONG
+            and record.intent.action_uuid == "action.owner"
+            for record in static_snapshot.records
+        )
+
+        owner = await manager.action_contexts.get("0,0")
+        assert owner is not None
+        await manager.open_page(
+            descriptor=_dynamic_page_with_action_child(
+                "dynamic-page",
+                "1,0",
+                action_id="action.child",
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+            ),
+            context_id=owner.id,
+        )
+
+        dynamic_snapshot = manager.action_interest_snapshot(now=20.0)
+        assert any(
+            record.source == ActionInterestSource.DYNAMIC_PAGE
+            and record.strength == ActionInterestStrength.STRONG
+            and record.intent.action_uuid == "action.child"
+            for record in dynamic_snapshot.records
+        )
+        assert any(
+            record.source == ActionInterestSource.VISIBLE_BINDING
+            and record.strength == ActionInterestStrength.WARM
+            and record.intent.action_uuid == "action.owner"
+            for record in dynamic_snapshot.records
+        )
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio

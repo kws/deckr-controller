@@ -1,6 +1,6 @@
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -79,6 +79,11 @@ from pydantic import ValidationError
 from deckr.controller._action_availability import (
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
+)
+from deckr.controller._action_interest import (
+    ActionInterestSnapshot,
+    ActionInterestSource,
+    ActionInterestTracker,
 )
 from deckr.controller._action_provider_sessions import (
     ProviderSessionKey,
@@ -194,6 +199,12 @@ def _selected_raster_capability_id(binding: ResolvedControlBinding) -> str | Non
         ):
             return capability.capability_id
     return None
+
+
+def _dedupe_action_intents(
+    intents: Iterable[ActionIntentKey],
+) -> tuple[ActionIntentKey, ...]:
+    return tuple(dict.fromkeys(intents))
 
 
 @dataclass(slots=True)
@@ -366,6 +377,7 @@ class DeviceManager:
         self._page_frames: list[PageFrame] = []
         self._current_plan: PagePlan | None = None
         self._planned_bindings_by_control: dict[str, PlannedBinding] = {}
+        self._config_active = True
         self._action_availability = ActionAvailabilityCache(
             policy=ActionAvailabilityPolicy(
                 fresh_ttl_seconds=None,
@@ -373,6 +385,7 @@ class DeviceManager:
             ),
             clock=self._clock,
         )
+        self._action_interest = ActionInterestTracker(clock=self._clock)
         self._binding_leases: dict[str, BindingLease] = {}
         self._binding_by_context: dict[str, str] = {}
         self._active_binding_by_control: dict[str, str] = {}
@@ -386,6 +399,7 @@ class DeviceManager:
         ] = {}
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
+        self._sync_action_interest()
 
     async def start(
         self,
@@ -666,6 +680,81 @@ class DeviceManager:
         ]
         self._dynamic_page_session = (
             dynamic_sessions[-1] if dynamic_sessions else None
+        )
+        self._sync_action_interest()
+
+    def action_interest_snapshot(
+        self,
+        *,
+        now: float | None = None,
+    ) -> ActionInterestSnapshot:
+        return self._action_interest.snapshot(now=now)
+
+    def _sync_action_interest(self) -> None:
+        now = self._clock()
+        if self._config_active:
+            self._action_interest.replace_strong_interests(
+                ActionInterestSource.CONNECTED_CONFIG,
+                self._configured_action_intents(),
+                now=now,
+            )
+        else:
+            self._action_interest.clear_source(
+                ActionInterestSource.CONNECTED_CONFIG,
+                now=now,
+            )
+
+        visible_source = self._visible_action_interest_source()
+        visible_intents = self._current_plan_action_intents()
+        if visible_source == ActionInterestSource.DYNAMIC_PAGE:
+            self._action_interest.clear_source(
+                ActionInterestSource.VISIBLE_BINDING,
+                now=now,
+            )
+            self._action_interest.replace_strong_interests(
+                ActionInterestSource.DYNAMIC_PAGE,
+                visible_intents,
+                now=now,
+            )
+            return
+
+        self._action_interest.replace_strong_interests(
+            ActionInterestSource.VISIBLE_BINDING,
+            visible_intents,
+            now=now,
+        )
+        self._action_interest.clear_source(
+            ActionInterestSource.DYNAMIC_PAGE,
+            now=now,
+        )
+
+    def _visible_action_interest_source(self) -> ActionInterestSource:
+        if (
+            self._current_plan is not None
+            and self._current_plan.page_session is not None
+        ):
+            return ActionInterestSource.DYNAMIC_PAGE
+        return ActionInterestSource.VISIBLE_BINDING
+
+    def _configured_action_intents(self) -> tuple[ActionIntentKey, ...]:
+        intents: list[ActionIntentKey] = []
+        for profile in self.config.profiles:
+            for page_index in range(len(profile.pages)):
+                bindings = self._nav.resolve_static_bindings(
+                    StaticPageRef(
+                        profile_name=profile.name,
+                        page_index=page_index,
+                    )
+                )
+                intents.extend(self._binding_planner.static_action_intents(bindings))
+        return _dedupe_action_intents(intents)
+
+    def _current_plan_action_intents(self) -> tuple[ActionIntentKey, ...]:
+        if self._current_plan is None:
+            return ()
+        return _dedupe_action_intents(
+            self._binding_planner.resolved_action_intent_key(planned.binding)
+            for planned in self._current_plan.bindings
         )
 
     async def _action_metadata_snapshot_for_plan(
@@ -1946,6 +2035,7 @@ class DeviceManager:
     async def _on_config_changed(self, config: DeviceConfig | None) -> None:
         """Handle config update or removal."""
         if config is None:
+            self._config_active = False
             await self.clear_page()
             if self._on_config_removed is not None:
                 await self._on_config_removed(self.config_id)
@@ -1954,6 +2044,7 @@ class DeviceManager:
             return
         async with self._nav_lock:
             await self._cancel_all_held_inputs()
+            self._config_active = True
             self.config = config
             self._nav.update_config(config)
             await self._finalize_dynamic_page(reason="config_change")

@@ -39,100 +39,88 @@ availability as independent state domains:
 | Provider-session gating removal | In progress | Binding/page transitions should not require Concord provider-session readiness. |
 | Page frame model | In progress | Device runtime needs explicit static/dynamic frames with cached committed plans. |
 | Held input cancellation | In progress | Rebinding must cancel old held inputs before releases are ignored. |
-| Action availability service | Not started | Needs provider candidates, direct probes, cache, selection, expiry, and events. |
+| Action availability service | In progress | Local cache, provider/action records, planner snapshots, and freshness policy exist; provider-direct feeding and events remain. |
 | Binding planner extraction | Done | `_binding_planner.py` owns local planning decisions and outcomes; `DeviceManager` still owns metadata refresh and commit-time mutation. |
-| Action interest service | Not started | Needed actions must be tracked separately from button bindings. |
+| Action interest service | In progress | Local tracker and `DeviceManager` snapshots exist for connected config and visible page-frame interests. |
 | Provider availability protocol | Not started | Requires controller/provider messages and provider-side support. |
 | Multiple-provider selection | Not started | Needs deterministic, sticky provider ranking. |
 
 ## Recommended Next Slice
 
-### 3. Introduce Action Availability Cache Skeleton
+### 5. Connect Beacon as Availability Candidate Input
 
 Recommended commit title:
 
 ```text
-Introduce controller action availability cache
+Feed Beacon action candidates into availability state
 ```
 
-Focus this slice on creating the local availability data model and cache that
-will eventually replace Beacon-backed binding-time `manager.get_action()` calls.
-Keep runtime behavior compatible by bridging the current action registry lookup
-into the new cache as a transitional source.
+Focus this slice on moving Beacon/action-registry catalog changes into explicit
+availability candidate state. Beacon should create provider/action candidates
+that can be probed later, but it should stop being modeled as authoritative
+runtime availability once provider-direct messages exist.
 
 Why this first:
 
-- The planner now consumes local metadata snapshots, so an availability service
-  can be introduced behind that snapshot boundary without touching commit-time
-  mutation.
-- A small cache/data-model slice gives later provider-direct protocol work a
-  stable internal contract before adding new wire messages.
-- Tests can lock down the important distinction between discovery candidates,
-  authoritative availability, stale records, and unavailable records before
-  provider selection and action interest add more states.
-- This is lower risk than replacing Beacon lookup in one step because the
-  transitional bridge can preserve current `DeviceManager` behavior.
+- The availability cache and interest tracker now provide the two local inputs
+  needed by a real availability service: candidate providers and needed actions.
+- Beacon catalog changes already flow through controller-local events, so they
+  are a concrete bridge point that can be separated from planning decisions.
+- Downgrading Beacon to candidate state prepares the code to add direct provider
+  availability without another `DeviceManager`-wide refactor.
+- The slice can remain controller-internal while shared provider-direct message
+  contracts are designed in the sibling `deckr` repo.
 
 Scope for this slice:
 
-- Add an internal action-availability module under `src/deckr/controller`, for
-  example `_action_availability.py`.
-- Define `ProviderActionKey`, `ActionAvailabilityState`, availability records,
-  cache snapshots, freshness timestamps, stale-grace policy inputs, and source
-  labels such as `beacon_candidate` and `provider_direct`.
-- Add a small service/cache API that can answer planner `ActionIntentKey`
-  requests from a local snapshot and update records from transitional
-  `ActionMetadata` values.
-- Keep `DeviceManager` responsible for the temporary `manager.get_action()`
-  orchestration, but move `_action_metadata_cache` semantics behind the new
-  availability cache where possible.
-- Preserve the current metadata snapshot behavior for static pages, dynamic
-  pages, catalog changes, retained-plan restore, and unavailable rendering.
-- Add focused unit tests for record freshness, explicit provider filtering,
-  provider-label matching, stale-grace behavior, and snapshot conversion for the
-  planner.
+- Extend the action availability model with explicit candidate/probing state if
+  needed.
+- Add a controller-local candidate ingestion API that accepts Beacon-derived
+  `ActionMetadata` or catalog entries without doing provider I/O.
+- Keep transitional `manager.get_action()` compatibility isolated while the
+  candidate records are introduced.
+- Ensure candidate records do not become provider-direct authoritative
+  availability records.
+- Add tests for candidate insertion, removal/expiry, and snapshot behavior when
+  only candidates exist.
 
 Acceptance criteria:
 
-- Availability cache APIs perform no bus, hardware, settings, or provider I/O.
-- Beacon/action-registry metadata can populate cache records without making
-  those records authoritative provider-direct availability.
-- Planner metadata snapshots can be built from the cache for all currently
-  visible page intents.
-- Missing or expired records produce unavailable planner metadata without
-  rejecting the page.
-- Retained-plan restoration still works when the current cache snapshot is
-  empty.
-- Existing integration behavior remains unchanged while the transitional
-  `manager.get_action()` bridge is still present.
+- Beacon-derived data is represented as candidate/probing state, not
+  provider-direct `available` state.
+- Candidate APIs perform no bus, hardware, settings, provider, or async I/O.
+- Device replanning on catalog changes can still preserve current transitional
+  behavior until direct provider availability exists.
+- Tests demonstrate that candidate-only records are not mistaken for
+  authoritative provider-direct availability.
+- The next provider-direct protocol slice has a clear local ingestion point for
+  snapshots/events.
 
 Explicit non-goals:
 
 - Do not add provider-direct availability request/snapshot/change messages yet.
 - Do not implement provider-side availability support.
-- Do not implement action interest tracking or warm interest retention.
-- Do not implement deterministic multi-provider ranking beyond explicit
-  provider/label filtering needed by the cache.
 - Do not remove the transitional `manager.get_action()` bridge from
   `DeviceManager` yet.
 - Do not change provider wire protocol or public package API.
+- Do not replace the availability cache or provider-selection policy.
+- Do not send action-interest updates to providers yet.
 
 Suggested tests:
 
 ```bash
 uv run ruff check .
-uv run pytest tests/test_action_availability.py tests/test_binding_planner.py tests/test_device_manager_integration.py
+uv run pytest tests/test_action_availability.py tests/test_action_interest.py tests/test_binding_planner.py tests/test_device_manager_integration.py
 git diff --check
 ```
 
-Add `tests/test_action_availability.py` with coverage for:
+Add or extend availability tests with coverage for:
 
-- cache record keys for explicit provider/action pairs
-- provider-label constrained intent matching
-- Beacon-backed candidate metadata converted into planner snapshots
-- unavailable outcome for missing or expired records
-- stale-grace retention of previously available metadata
-- no awaitable provider lookup or bus mock used by the cache
+- Beacon candidate records do not count as provider-direct authoritative
+  availability.
+- Candidate removal/expiry does not clear device page frames directly.
+- Transitional refresh can still populate behavior-preserving planner metadata
+  while the compatibility bridge remains.
 
 ## Milestones
 
@@ -172,11 +160,11 @@ cache fed by provider-direct state.
 
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
-| Define `ProviderActionKey` and availability records | Not started | Provider identity contracts | Cache records include provider instance, provider id, action id, state, descriptor, reason, timestamps, TTLs, and source. |
+| Define `ProviderActionKey` and availability records | Done | Provider identity contracts | Cache records include provider instance, action id, state, metadata, reason, timestamps, TTLs, and source. |
 | Feed Beacon advertisements as candidates only | Not started | Existing action registry events | Beacon creates `unknown` or `probing` candidates, never authoritative `available` records. |
 | Add direct availability request/snapshot messages | Not started | Provider protocol update | Controller can ask providers for availability for actions of interest. |
 | Add provider availability change messages | Not started | Provider protocol update | Providers can publish action availability updates without Beacon churn. |
-| Implement freshness and stale-grace expiry | Not started | Clock/test helpers | Fresh, stale, retired, and unavailable states transition deterministically. |
+| Implement freshness and stale-grace expiry | Done | Clock/test helpers | Fresh, stale, and expired states transition deterministically in the local cache. |
 | Publish availability-change events to device runtimes | Not started | Runtime subscription path | Only affected devices/pages replan when availability changes. |
 | Keep stale existing bindings stable during grace | Not started | Planner sticky selection | Existing bindings may remain bound while revalidation is pending according to policy. |
 
@@ -187,10 +175,10 @@ resources warm without blocking layout.
 
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
-| Define configured action references | Not started | Config binding model | Action references include action id, optional provider instance, and provider label constraints. |
-| Compute strong interest from visible/static/dynamic pages | Not started | Planner/frame state | Current page actions and dynamic page child actions are marked strongly needed. |
-| Compute warm interest from active configs and recent use | Not started | Config snapshots and retention policy | Interest can outlive button bindings for the configured retention window. |
-| Add interest retention and expiry policy | Not started | Clock/test helpers | Warm interest is retained for hours by policy and expires predictably. |
+| Define configured action references | Done | Config binding model | Action references include action id, optional provider instance, and provider label constraints. |
+| Compute strong interest from visible/static/dynamic pages | Done | Planner/frame state | Connected config, current static page, and dynamic page child actions are marked strongly needed. |
+| Compute warm interest from active configs and recent use | In progress | Config snapshots and retention policy | Removed strong interests are retained warm; recent-use/settings/prewarm sources remain future work. |
+| Add interest retention and expiry policy | Done | Clock/test helpers | Warm interest is retained for hours by policy and expires predictably. |
 | Send interest updates to providers | Not started | Provider protocol update | Providers receive strong/warm interest updates without blocking page transitions. |
 | Optional action-level Concord contract | Not started | Need/resource decision | Contracts, if added, are per provider/action interest and never a layout precondition. |
 
@@ -262,15 +250,17 @@ Goal: make the architecture difficult to regress.
    Landed as `f698bdb`. Planner decisions now live in `_binding_planner.py`;
    `DeviceManager` still owns metadata refresh and commit-time mutation.
 3. Add availability data models and a service skeleton.
-   Recommended next. Introduce the local cache and snapshot API before
-   provider-direct protocol work.
-4. Connect Beacon as candidate input.
-   Preserve existing discovery behavior but downgrade it from availability truth
-   to candidate hints.
-5. Add provider-direct availability protocol.
+   Landed as `1f350dc`. `_action_availability.py` now provides provider/action
+   records, freshness policy, and planner snapshot conversion.
+4. Add action interest tracking.
+   Landed in the local controller slice. `_action_interest.py` tracks
+   strong/warm interest from connected configs and page frames before
+   provider-direct availability work.
+5. Connect Beacon as candidate input.
+   Recommended next. Preserve existing discovery behavior but downgrade it from
+   availability truth to candidate hints.
+6. Add provider-direct availability protocol.
    Implement request/snapshot/change messages and wire provider-side support.
-6. Add action interest tracking.
-   Compute strong/warm interest from frames, configs, settings, and recent use.
 7. Implement deterministic provider selection.
    Add sticky multi-provider selection and stale-grace behavior.
 8. Replace transitional `manager.get_action()` planning calls.
