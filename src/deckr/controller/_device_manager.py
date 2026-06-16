@@ -79,6 +79,7 @@ from pydantic import ValidationError
 from deckr.controller._action_availability import (
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
+    ProviderActionKey,
 )
 from deckr.controller._action_interest import (
     ActionInterestSnapshot,
@@ -242,6 +243,15 @@ class HeldInputRecord:
 
 def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
     return f"{provider_instance_id}::{action_uuid}"
+
+
+def _provider_action_key_from_catalog_id(
+    catalog_id: str,
+) -> ProviderActionKey | None:
+    provider_instance_id, separator, action_uuid = catalog_id.partition("::")
+    if not separator or not provider_instance_id or not action_uuid:
+        return None
+    return ProviderActionKey(provider_instance_id, action_uuid)
 
 
 def _lease_matches_action(lease: BindingLease, action_meta: ActionMetadata) -> bool:
@@ -763,26 +773,40 @@ class DeviceManager:
         *,
         refresh_actions: bool,
     ) -> dict[ActionIntentKey, ActionMetadata]:
-        for intent in intents:
-            if refresh_actions:
-                action_meta = await self.manager.get_action(
-                    intent.action_uuid,
-                    provider_instance_id=intent.provider_instance_id,
-                    provider_labels=dict(intent.provider_labels),
-                )
-                if action_meta is not None:
-                    action_meta = self._action_metadata_with_current_session(
-                        action_meta
-                    )
-                    self._action_availability.record_metadata(
-                        action_meta,
-                        now=self._clock(),
-                        intent=intent,
-                    )
-        return self._action_availability.snapshot_for_intents(
+        authoritative = self._action_availability.snapshot_for_intents(
             intents,
             now=self._clock(),
         )
+        if not refresh_actions:
+            return authoritative
+
+        transitional = await self._transitional_beacon_candidate_metadata_for_plan(
+            intents
+        )
+        return {**transitional, **authoritative}
+
+    async def _transitional_beacon_candidate_metadata_for_plan(
+        self,
+        intents: tuple[ActionIntentKey, ...],
+    ) -> dict[ActionIntentKey, ActionMetadata]:
+        """Bridge Beacon catalog metadata into planning until direct availability exists."""
+        metadata_by_intent: dict[ActionIntentKey, ActionMetadata] = {}
+        for intent in intents:
+            action_meta = await self.manager.get_action(
+                intent.action_uuid,
+                provider_instance_id=intent.provider_instance_id,
+                provider_labels=dict(intent.provider_labels),
+            )
+            if action_meta is None:
+                continue
+            action_meta = self._action_metadata_with_current_session(action_meta)
+            self._action_availability.record_candidate(
+                action_meta,
+                now=self._clock(),
+                intent=intent,
+            )
+            metadata_by_intent[intent] = action_meta
+        return metadata_by_intent
 
     def _log_static_page_plan_rejection(
         self,
@@ -1162,6 +1186,13 @@ class DeviceManager:
                 provider_instance_id=binding.provider_instance_id,
                 provider_labels=binding.provider_labels,
             )
+            if action_meta is not None:
+                action_meta = self._action_metadata_with_current_session(action_meta)
+                self._action_availability.record_candidate(
+                    action_meta,
+                    now=self._clock(),
+                    intent=self._binding_planner.resolved_action_intent_key(binding),
+                )
         if action_meta is None:
             logger.info(
                 "Binding unresolved on profile=%s page=%s control=%s action=%s",
@@ -1172,11 +1203,6 @@ class DeviceManager:
             )
             return False
         action_meta = self._action_metadata_with_current_session(action_meta)
-        self._action_availability.record_metadata(
-            action_meta,
-            now=self._clock(),
-            intent=self._binding_planner.resolved_action_intent_key(binding),
-        )
         provider_session_id = action_meta.provider_session_id
         session_key = (
             None
@@ -1952,6 +1978,7 @@ class DeviceManager:
     ) -> None:
         """Refresh the current page availability overlay after Beacon changes."""
         async with self._nav_lock:
+            self._remove_catalog_candidates(event.catalog_removed)
             current_frame = self._page_frames[-1] if self._page_frames else None
             if current_frame is None:
                 return
@@ -2024,6 +2051,14 @@ class DeviceManager:
                     clear_held_input=True,
                 )
                 await self._install_planned_binding(refreshed_plan, planned)
+
+    def _remove_catalog_candidates(self, catalog_removed: Iterable[str]) -> None:
+        keys = tuple(
+            key
+            for qualified in catalog_removed
+            if (key := _provider_action_key_from_catalog_id(qualified)) is not None
+        )
+        self._action_availability.remove_candidates(keys)
 
     async def _config_listener(self) -> None:
         """Consume config stream and apply changes."""

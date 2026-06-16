@@ -44,8 +44,8 @@ def test_records_are_keyed_by_provider_instance_and_action_id():
     alpha = _metadata("action.same", provider_instance_id="provider-alpha")
     beta = _metadata("action.same", provider_instance_id="provider-beta")
 
-    cache.record_metadata(alpha, now=0.0)
-    cache.record_metadata(beta, now=1.0)
+    cache.record_available(alpha, now=0.0)
+    cache.record_available(beta, now=1.0)
 
     alpha_record = cache.record_for(
         ProviderActionKey("provider-alpha", "action.same")
@@ -70,8 +70,8 @@ def test_explicit_provider_intent_matches_only_that_provider():
         provider_instance_id="provider-missing",
     )
 
-    cache.record_metadata(alpha, now=0.0)
-    cache.record_metadata(beta, now=0.0)
+    cache.record_available(alpha, now=0.0)
+    cache.record_available(beta, now=0.0)
     snapshot = cache.snapshot_for_intents((beta_intent, missing_intent), now=0.0)
 
     assert snapshot == {beta_intent: beta}
@@ -98,8 +98,8 @@ def test_provider_label_intent_uses_required_subset_matching():
         provider_labels={"room": "lab"},
     )
 
-    cache.record_metadata(kitchen, now=0.0)
-    cache.record_metadata(office, now=0.0)
+    cache.record_available(kitchen, now=0.0)
+    cache.record_available(office, now=0.0)
     snapshot = cache.snapshot_for_intents(
         (matching_intent, mismatching_intent),
         now=0.0,
@@ -114,14 +114,14 @@ def test_unqualified_intent_selects_lexicographically_first_provider_instance():
     beta = _metadata("action.same", provider_instance_id="provider-beta")
     intent = _intent("action.same")
 
-    cache.record_metadata(beta, now=0.0)
-    cache.record_metadata(alpha, now=0.0)
+    cache.record_available(beta, now=0.0)
+    cache.record_available(alpha, now=0.0)
     snapshot = cache.snapshot_for_intents((intent,), now=0.0)
 
     assert snapshot == {intent: alpha}
 
 
-def test_beacon_candidate_metadata_converts_to_planner_snapshot_entry():
+def test_beacon_candidate_metadata_records_unknown_but_omits_snapshot_entry():
     cache = ActionAvailabilityCache()
     metadata = _metadata("action.available", provider_instance_id="provider-alpha")
     intent = _intent(
@@ -129,12 +129,71 @@ def test_beacon_candidate_metadata_converts_to_planner_snapshot_entry():
         provider_instance_id="provider-alpha",
     )
 
-    record = cache.record_metadata(metadata, now=0.0)
+    record = cache.record_candidate(metadata, now=0.0)
+    snapshot = cache.snapshot_for_intents((intent,), now=0.0)
+
+    assert record.state == ActionAvailabilityState.UNKNOWN
+    assert record.source == ActionAvailabilitySource.BEACON_CANDIDATE
+    assert snapshot == {}
+
+
+def test_probing_candidate_metadata_records_probing_state():
+    cache = ActionAvailabilityCache()
+    metadata = _metadata("action.probing", provider_instance_id="provider-alpha")
+    key = ProviderActionKey("provider-alpha", "action.probing")
+
+    record = cache.record_candidate(
+        metadata,
+        now=0.0,
+        state=ActionAvailabilityState.PROBING,
+    )
+
+    assert record.state == ActionAvailabilityState.PROBING
+    assert cache.state_for(key, now=0.0) == ActionAvailabilityState.PROBING
+
+
+def test_provider_direct_available_metadata_converts_to_planner_snapshot_entry():
+    cache = ActionAvailabilityCache()
+    metadata = _metadata("action.available", provider_instance_id="provider-alpha")
+    intent = _intent(
+        "action.available",
+        provider_instance_id="provider-alpha",
+    )
+
+    record = cache.record_available(metadata, now=0.0)
     snapshot = cache.snapshot_for_intents((intent,), now=0.0)
 
     assert record.state == ActionAvailabilityState.AVAILABLE
-    assert record.source == ActionAvailabilitySource.BEACON_CANDIDATE
+    assert record.source == ActionAvailabilitySource.PROVIDER_DIRECT
     assert snapshot == {intent: metadata}
+
+
+def test_candidate_refresh_does_not_downgrade_provider_direct_record():
+    cache = ActionAvailabilityCache()
+    authoritative = _metadata(
+        "action.available",
+        provider_instance_id="provider-alpha",
+        provider_id="provider-direct",
+    )
+    candidate = _metadata(
+        "action.available",
+        provider_instance_id="provider-alpha",
+        provider_id="beacon-provider",
+    )
+    key = ProviderActionKey("provider-alpha", "action.available")
+    intent = _intent(
+        "action.available",
+        provider_instance_id="provider-alpha",
+    )
+
+    cache.record_available(authoritative, now=0.0, intent=intent)
+    cache.record_candidate(candidate, now=1.0, intent=intent)
+
+    assert cache.record_for(key).metadata is authoritative
+    assert cache.state_for(key, now=1.0) == ActionAvailabilityState.AVAILABLE
+    assert cache.snapshot_for_intents((intent,), now=1.0) == {
+        intent: authoritative
+    }
 
 
 def test_missing_records_produce_no_snapshot_metadata():
@@ -158,7 +217,7 @@ def test_finite_ttl_policy_omits_expired_records():
         provider_instance_id="provider-alpha",
     )
 
-    cache.record_metadata(metadata, now=100.0)
+    cache.record_available(metadata, now=100.0)
 
     assert cache.state_for(key, now=111.0) == ActionAvailabilityState.EXPIRED
     assert cache.snapshot_for_intents((intent,), now=111.0) == {}
@@ -178,12 +237,48 @@ def test_stale_grace_policy_keeps_stale_but_grace_valid_metadata():
         provider_instance_id="provider-alpha",
     )
 
-    cache.record_metadata(metadata, now=100.0)
+    cache.record_available(metadata, now=100.0)
 
     assert cache.state_for(key, now=112.0) == ActionAvailabilityState.STALE
     assert cache.snapshot_for_intents((intent,), now=112.0) == {intent: metadata}
     assert cache.state_for(key, now=116.0) == ActionAvailabilityState.EXPIRED
     assert cache.snapshot_for_intents((intent,), now=116.0) == {}
+
+
+def test_candidate_removal_clears_records_and_intent_mappings():
+    cache = ActionAvailabilityCache()
+    metadata = _metadata("action.removed", provider_instance_id="provider-alpha")
+    key = ProviderActionKey("provider-alpha", "action.removed")
+    intent = _intent(
+        "action.removed",
+        provider_instance_id="provider-alpha",
+    )
+
+    cache.record_candidate(metadata, now=0.0, intent=intent)
+
+    removed = cache.remove_candidate(key)
+
+    assert removed is not None
+    assert cache.record_for(key) is None
+    assert cache._record_keys_by_intent == {}
+    assert cache.snapshot_for_intents((intent,), now=0.0) == {}
+
+
+def test_candidate_expiry_returns_expired_and_omits_snapshot_metadata():
+    cache = ActionAvailabilityCache(
+        policy=ActionAvailabilityPolicy(candidate_ttl_seconds=10.0)
+    )
+    metadata = _metadata("action.expiring", provider_instance_id="provider-alpha")
+    key = ProviderActionKey("provider-alpha", "action.expiring")
+    intent = _intent(
+        "action.expiring",
+        provider_instance_id="provider-alpha",
+    )
+
+    cache.record_candidate(metadata, now=100.0)
+
+    assert cache.state_for(key, now=111.0) == ActionAvailabilityState.EXPIRED
+    assert cache.snapshot_for_intents((intent,), now=111.0) == {}
 
 
 def test_snapshot_output_keys_are_original_requested_intents():
@@ -199,7 +294,7 @@ def test_snapshot_output_keys_are_original_requested_intents():
         provider_labels=(("room", "office"),),
     )
 
-    cache.record_metadata(metadata, now=0.0)
+    cache.record_available(metadata, now=0.0)
     snapshot = cache.snapshot_for_intents((original_intent,), now=0.0)
 
     assert list(snapshot) == [original_intent]

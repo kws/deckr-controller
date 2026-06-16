@@ -103,7 +103,7 @@ async def _run_registry(registry: ActionRegistry, callback):
 
 
 @pytest.mark.asyncio
-async def test_action_registry_uses_beacon_actions_as_availability_source():
+async def test_action_registry_uses_beacon_actions_as_catalog_candidate_source():
     bus = _state_bus()
     beacon = _beacon(bus)
     registry = _registry(beacon)

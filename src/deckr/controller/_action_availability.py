@@ -23,6 +23,8 @@ class ActionAvailabilitySource(StrEnum):
 
 
 class ActionAvailabilityState(StrEnum):
+    UNKNOWN = "unknown"
+    PROBING = "probing"
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
     STALE = "stale"
@@ -43,6 +45,7 @@ class ActionAvailabilityRecord:
 class ActionAvailabilityPolicy:
     fresh_ttl_seconds: float | None = None
     stale_grace_seconds: float | None = None
+    candidate_ttl_seconds: float | None = None
 
 
 class ActionAvailabilityCache:
@@ -56,18 +59,52 @@ class ActionAvailabilityCache:
     ) -> None:
         self._policy = policy or ActionAvailabilityPolicy()
         self._clock = clock or time.monotonic
-        self._records: dict[ProviderActionKey, ActionAvailabilityRecord] = {}
+        self._availability_records: dict[
+            ProviderActionKey, ActionAvailabilityRecord
+        ] = {}
+        self._candidate_records: dict[ProviderActionKey, ActionAvailabilityRecord] = {}
         self._record_keys_by_intent: dict[ActionIntentKey, ProviderActionKey] = {}
 
     def record(self, record: ActionAvailabilityRecord) -> None:
-        self._records[record.key] = record
+        if record.source == ActionAvailabilitySource.BEACON_CANDIDATE:
+            self._candidate_records[record.key] = record
+            return
+        self._availability_records[record.key] = record
 
-    def record_metadata(
+    def record_candidate(
         self,
         metadata: ActionMetadata,
         *,
         now: float | None = None,
-        source: ActionAvailabilitySource = ActionAvailabilitySource.BEACON_CANDIDATE,
+        intent: ActionIntentKey | None = None,
+        state: ActionAvailabilityState = ActionAvailabilityState.UNKNOWN,
+    ) -> ActionAvailabilityRecord:
+        if state not in (
+            ActionAvailabilityState.UNKNOWN,
+            ActionAvailabilityState.PROBING,
+        ):
+            raise ValueError("candidate state must be unknown or probing")
+        key = ProviderActionKey(
+            provider_instance_id=metadata.provider_instance_id,
+            action_uuid=metadata.uuid,
+        )
+        record = ActionAvailabilityRecord(
+            key=key,
+            state=state,
+            source=ActionAvailabilitySource.BEACON_CANDIDATE,
+            updated_at=self._now(now),
+            metadata=metadata,
+        )
+        self.record(record)
+        if intent is not None:
+            self._record_keys_by_intent[intent] = key
+        return record
+
+    def record_available(
+        self,
+        metadata: ActionMetadata,
+        *,
+        now: float | None = None,
         intent: ActionIntentKey | None = None,
     ) -> ActionAvailabilityRecord:
         key = ProviderActionKey(
@@ -77,7 +114,7 @@ class ActionAvailabilityCache:
         record = ActionAvailabilityRecord(
             key=key,
             state=ActionAvailabilityState.AVAILABLE,
-            source=source,
+            source=ActionAvailabilitySource.PROVIDER_DIRECT,
             updated_at=self._now(now),
             metadata=metadata,
         )
@@ -86,11 +123,33 @@ class ActionAvailabilityCache:
             self._record_keys_by_intent[intent] = key
         return record
 
+    def remove_candidate(
+        self,
+        key: ProviderActionKey,
+    ) -> ActionAvailabilityRecord | None:
+        record = self._candidate_records.get(key)
+        if record is None:
+            return None
+        removed = self._candidate_records.pop(key)
+        self._remove_intent_mappings_for_key(key)
+        return removed
+
+    def remove_candidates(
+        self,
+        keys: Iterable[ProviderActionKey],
+    ) -> tuple[ActionAvailabilityRecord, ...]:
+        removed: list[ActionAvailabilityRecord] = []
+        for key in keys:
+            record = self.remove_candidate(key)
+            if record is not None:
+                removed.append(record)
+        return tuple(removed)
+
     def record_for(
         self,
         key: ProviderActionKey,
     ) -> ActionAvailabilityRecord | None:
-        return self._records.get(key)
+        return self._availability_records.get(key) or self._candidate_records.get(key)
 
     def state_for(
         self,
@@ -98,7 +157,7 @@ class ActionAvailabilityCache:
         *,
         now: float | None = None,
     ) -> ActionAvailabilityState | None:
-        record = self._records.get(key)
+        record = self.record_for(key)
         if record is None:
             return None
         return self._state_for_record(record, now=self._now(now))
@@ -125,7 +184,7 @@ class ActionAvailabilityCache:
     ) -> ActionMetadata | None:
         selected_key = self._record_keys_by_intent.get(intent)
         if selected_key is not None:
-            selected_record = self._records.get(selected_key)
+            selected_record = self._availability_records.get(selected_key)
             if (
                 selected_record is not None
                 and self._record_matches_intent(selected_record, intent, now=now)
@@ -134,7 +193,7 @@ class ActionAvailabilityCache:
 
         candidates = [
             record
-            for record in self._records.values()
+            for record in self._availability_records.values()
             if self._record_matches_intent(record, intent, now=now)
         ]
         if not candidates:
@@ -169,6 +228,8 @@ class ActionAvailabilityCache:
         *,
         now: float,
     ) -> bool:
+        if record.source != ActionAvailabilitySource.PROVIDER_DIRECT:
+            return False
         state = self._state_for_record(record, now=now)
         return state in (
             ActionAvailabilityState.AVAILABLE,
@@ -181,6 +242,8 @@ class ActionAvailabilityCache:
         *,
         now: float,
     ) -> ActionAvailabilityState:
+        if record.source == ActionAvailabilitySource.BEACON_CANDIDATE:
+            return self._candidate_state_for_record(record, now=now)
         if record.state != ActionAvailabilityState.AVAILABLE:
             return record.state
         fresh_ttl = self._policy.fresh_ttl_seconds
@@ -193,6 +256,30 @@ class ActionAvailabilityCache:
         if stale_grace is not None and age_seconds <= fresh_ttl + stale_grace:
             return ActionAvailabilityState.STALE
         return ActionAvailabilityState.EXPIRED
+
+    def _candidate_state_for_record(
+        self,
+        record: ActionAvailabilityRecord,
+        *,
+        now: float,
+    ) -> ActionAvailabilityState:
+        if record.state not in (
+            ActionAvailabilityState.UNKNOWN,
+            ActionAvailabilityState.PROBING,
+        ):
+            return record.state
+        candidate_ttl = self._policy.candidate_ttl_seconds
+        if candidate_ttl is None:
+            return record.state
+        age_seconds = max(0.0, now - record.updated_at)
+        if age_seconds <= candidate_ttl:
+            return record.state
+        return ActionAvailabilityState.EXPIRED
+
+    def _remove_intent_mappings_for_key(self, key: ProviderActionKey) -> None:
+        for intent, mapped_key in tuple(self._record_keys_by_intent.items()):
+            if mapped_key == key:
+                self._record_keys_by_intent.pop(intent, None)
 
     def _now(self, now: float | None) -> float:
         return self._clock() if now is None else now

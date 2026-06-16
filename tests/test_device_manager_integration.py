@@ -52,6 +52,11 @@ from invariant import Node, SubGraphNode, dump_graph_data_uri
 from invariant.params import ref
 
 from deckr.controller import _device_manager as device_manager_module
+from deckr.controller._action_availability import (
+    ActionAvailabilitySource,
+    ActionAvailabilityState,
+    ProviderActionKey,
+)
 from deckr.controller._action_interest import (
     ActionInterestSource,
     ActionInterestStrength,
@@ -3390,7 +3395,7 @@ ACTION_X_UUID = "test.action.x"
 async def test_on_action_catalog_changed_added_resolves_unavailable_control(
     persistence_tmp_dir,
 ):
-    """When action becomes available, catalog change creates context for unavailable control."""
+    """When a catalog candidate appears, the transition bridge can bind it."""
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()
@@ -3456,6 +3461,17 @@ async def test_on_action_catalog_changed_added_resolves_unavailable_control(
         ctx_after = await manager.action_contexts.get("0,0")
         assert ctx_after is not None
         assert ctx_after.action_uuid == ACTION_X_UUID
+        key = ProviderActionKey("test-provider", ACTION_X_UUID)
+        record = manager._action_availability.record_for(key)
+        assert record is not None
+        assert record.state == ActionAvailabilityState.UNKNOWN
+        assert record.source == ActionAvailabilitySource.BEACON_CANDIDATE
+        assert (
+            manager._action_availability.snapshot_for_intents(
+                manager._current_plan_action_intents()
+            )
+            == {}
+        )
 
 
 @pytest.mark.asyncio
@@ -3512,15 +3528,89 @@ async def test_on_action_catalog_changed_removed_preserves_attached_context(
 
         ctx_before = await manager.action_contexts.get("0,0")
         assert ctx_before is not None
+        key = ProviderActionKey("test-provider", ACTION_X_UUID)
+        assert manager._action_availability.record_for(key) is not None
 
         registry.remove_action(ACTION_X_UUID, "test-provider")
         await manager.on_action_catalog_changed(
             _catalog_event(removed=[f"test-provider::{ACTION_X_UUID}"])
         )
 
+        assert manager._action_availability.record_for(key) is None
+        assert (
+            manager._action_availability.snapshot_for_intents(
+                manager._current_plan_action_intents()
+            )
+            == {}
+        )
         assert await manager.action_contexts.get("0,0") is ctx_before
         assert manager._binding_leases
 
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_beacon_only_candidate_state_does_not_become_authoritative_availability(
+    persistence_tmp_dir,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = ConfigurableActionRegistry()
+    registry.add_action(
+        ACTION_X_UUID,
+        _metadata(
+            ACTION_X_UUID,
+            provider_instance_id="test-provider",
+            provider_id="test",
+        ),
+    )
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+
+        assert await manager.action_contexts.get("0,0") is not None
+        key = ProviderActionKey("test-provider", ACTION_X_UUID)
+        record = manager._action_availability.record_for(key)
+        assert record is not None
+        assert record.state == ActionAvailabilityState.UNKNOWN
+        assert record.source == ActionAvailabilitySource.BEACON_CANDIDATE
+        assert (
+            manager._action_availability.snapshot_for_intents(
+                manager._current_plan_action_intents()
+            )
+            == {}
+        )
         tg.cancel_scope.cancel()
 
 
