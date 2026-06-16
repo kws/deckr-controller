@@ -26,6 +26,7 @@ from deckr.controller._binding_validator import (
     validate_page_bindings,
 )
 from deckr.controller._render import RenderResult
+from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import CapabilitySelector, ControlSelector
 
@@ -458,12 +459,17 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
         if uuid == "dev.deckr.controller.builtin.action.go_to_page":
             return ActionMetadata(
                 uuid=action.uuid,
-                provider_instance_id="builtin",
+                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
                 provider_id="dev.deckr.controller.builtin",
             )
         return None
 
     registry.get_action = get_action
+    builtin_action = MagicMock()
+    builtin_action.on_bind = AsyncMock()
+    builtin_action.on_unbind = AsyncMock()
+    builtin_action.on_input = AsyncMock()
+    registry.get_builtin_action.return_value = builtin_action
     registry.provider_session_id.return_value = "provider-session"
     registry.provider_instance_provides_provider.return_value = True
 

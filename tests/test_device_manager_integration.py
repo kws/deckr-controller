@@ -13,6 +13,7 @@ from deckr.actions.messages import (
     ACTION_LIFECYCLE_REJECTED,
     BINDING_OUTPUT,
     CAPABILITY_INPUT,
+    PAGE_SESSION_CLOSED,
     REPLACE_PAGE,
     SETTINGS_PATCH,
     SETTINGS_REQUEST,
@@ -55,7 +56,6 @@ from invariant.params import ref
 
 from deckr.controller import _device_manager as device_manager_module
 from deckr.controller._action_availability import (
-    ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
     ProviderActionKey,
@@ -275,6 +275,14 @@ def _availability_entry(action_uuid: str) -> ActionAvailabilityEntry:
             providerId=PROVIDER_ID,
         ),
     )
+
+
+def _seed_action_availability(
+    manager: DeviceManager,
+    *metadatas: ActionMetadata,
+) -> None:
+    for metadata in metadatas:
+        manager._action_availability.record_available(metadata)
 
 
 def _catalog_event(
@@ -910,6 +918,11 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
             start_soon=tg.start_soon,
             clock=lambda: 20.0,
         )
+        _seed_action_availability(
+            manager,
+            _metadata("action.owner"),
+            _metadata("action.child", provider_instance_id=PROVIDER_INSTANCE_ID),
+        )
         await manager.set_page(profile="default", page=0)
         static_snapshot = manager.action_interest_snapshot(now=20.0)
         assert any(
@@ -1191,6 +1204,10 @@ async def test_key_press_renders_to_device(
             start_soon=tg.start_soon,
             render_backend=render_backend,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         baseline_calls = command_service.set_raster_frame.call_count
         ctx = await manager.action_contexts.get("0,0")
@@ -1266,6 +1283,10 @@ async def test_binding_output_accepts_graph_data_uri(
             start_soon=tg.start_soon,
             render_backend=render_backend,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
@@ -1339,6 +1360,10 @@ async def test_binding_overlay_renders_and_expires(
             start_soon=tg.start_soon,
             render_backend=render_backend,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
@@ -1406,6 +1431,13 @@ async def test_binding_activates_without_concord_provider_session(
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(
+                    SetRasterImageOnAppearAction.uuid,
+                    provider_session_id=None,
+                ),
+            )
             await manager.set_page(profile="default", page=0)
             ctx = await manager.action_contexts.get("0,0")
             assert ctx is not None
@@ -1490,6 +1522,11 @@ async def test_binding_activation_timeout_does_not_block_static_page_bind_loop(
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
     )
+    _seed_action_availability(
+        manager,
+        _metadata(blocked_action),
+        _metadata(NoopAction.uuid),
+    )
 
     with anyio.fail_after(1):
         await manager.set_page(profile="default", page=0)
@@ -1561,6 +1598,11 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
         start_soon=lambda fn, *a, **k: None,
         settings_service=HangingSettingsService(),
     )
+    _seed_action_availability(
+        manager,
+        _metadata(ACTION_X_UUID),
+        _metadata(NoopAction.uuid),
+    )
 
     with anyio.fail_after(1):
         await manager.set_page(profile="default", page=0)
@@ -1596,6 +1638,10 @@ async def test_provider_session_restart_restamps_binding_route(
             manager=registry,
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
@@ -1647,6 +1693,10 @@ async def test_binding_stays_attached_when_beacon_session_changes(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
@@ -1697,6 +1747,10 @@ async def test_binding_stays_attached_when_beacon_session_disappears(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
@@ -1735,6 +1789,10 @@ async def test_attached_binding_survives_nonterminal_provider_session_unavailabl
         manager=registry,
         actions_bus=_actions_session(_actions_bus()),
         start_soon=lambda fn, *a, **k: None,
+    )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
     ctx = await manager.action_contexts.get("0,0")
@@ -1811,6 +1869,10 @@ async def test_beacon_session_reappearance_does_not_resend_binding_attached(
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
             await manager.set_page(profile="default", page=0)
             assert await manager.action_contexts.get("0,0") is not None
             await _drain_action_messages(stream)
@@ -1881,6 +1943,10 @@ async def test_binding_and_page_navigation_do_not_require_provider_session_contr
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
 
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
@@ -1931,6 +1997,10 @@ async def test_binding_survives_provider_session_contract_invalid(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
@@ -1967,6 +2037,10 @@ async def test_provider_session_terminal_cleanup_no_longer_revokes_bindings(
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
             await manager.set_page(profile="default", page=0)
             owner_ctx = await manager.action_contexts.get("0,0")
             assert owner_ctx is not None
@@ -2021,6 +2095,10 @@ async def test_dynamic_page_survives_action_beacon_withdrawal_with_valid_session
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
         assert owner_ctx is not None
@@ -2070,6 +2148,10 @@ async def test_close_dynamic_page_restores_cached_static_plan_after_beacon_withd
             manager=registry,
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
@@ -2132,6 +2214,10 @@ async def test_close_dynamic_page_restores_binding_with_action_instance_context(
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
             await manager.set_page(profile="default", page=0)
             owner_ctx = await manager.action_contexts.get("0,0")
             assert owner_ctx is not None
@@ -2221,6 +2307,10 @@ async def test_static_page_installs_without_provider_session_preparation():
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
     )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
+    )
 
     await manager.set_page(profile="default", page=0)
 
@@ -2273,6 +2363,10 @@ async def test_action_command_authorization_uses_cached_provider_session():
         manager=registry,
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
+    )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
     ctx = await manager.action_contexts.get("0,0")
@@ -2333,6 +2427,10 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
         assert owner_ctx is not None
@@ -2379,6 +2477,10 @@ async def test_held_input_cancelled_when_dynamic_page_rebinds_control(
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
             await manager.set_page(profile="default", page=0)
             await _drain_action_messages(stream)
             owner_ctx = await manager.action_contexts.get("0,0")
@@ -2440,6 +2542,10 @@ async def test_held_input_cancelled_when_closing_dynamic_page_back_to_static(
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
             await manager.set_page(profile="default", page=0)
             await _drain_action_messages(stream)
             owner_ctx = await manager.action_contexts.get("0,0")
@@ -2475,6 +2581,114 @@ async def test_held_input_cancelled_when_closing_dynamic_page_back_to_static(
 
 
 @pytest.mark.asyncio
+async def test_held_input_cancelled_when_config_is_removed(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            await _drain_action_messages(stream)
+            ctx = await manager.action_contexts.get("0,0")
+            assert ctx is not None
+
+            await manager.on_event(_hardware_input("0,0", "down", sequence=1))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == ctx.binding_id
+
+            await manager._on_config_changed(None)
+
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "cancel"
+            assert body.binding.binding_id == ctx.binding_id
+            await _drain_action_messages(stream)
+            assert not manager._config_active
+            assert await manager.action_contexts.get("0,0") is None
+
+            await manager.on_event(_hardware_input("0,0", "up", sequence=2))
+            await _assert_no_action_message(stream)
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_close_dynamic_page_restores_when_close_notification_fails(
+    device_config_set_raster_image,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    original_send = device_manager_module.send_with_endpoint_identity
+
+    async def fail_page_closed(endpoint, message):
+        if message.message_type == PAGE_SESSION_CLOSED:
+            raise RuntimeError("provider offline")
+        return await original_send(endpoint, message)
+
+    monkeypatch.setattr(
+        device_manager_module,
+        "send_with_endpoint_identity",
+        fail_page_closed,
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+
+        await manager.open_page(
+            descriptor=_dynamic_page("dynamic-page", "1,0"),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+
+        await manager.close_page(context_id=session.context_id)
+
+        assert manager._dynamic_page_session is None
+        assert await manager.action_contexts.get("0,0") is not None
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_release_on_same_binding_is_delivered(
     device_config_set_raster_image, persistence_tmp_dir
 ):
@@ -2498,6 +2712,10 @@ async def test_release_on_same_binding_is_delivered(
             start_soon=tg.start_soon,
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
             await manager.set_page(profile="default", page=0)
             await _drain_action_messages(stream)
             ctx = await manager.action_contexts.get("0,0")
@@ -2540,6 +2758,14 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
             manager=registry,
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+            _metadata(
+                "test.virtual.child",
+                provider_instance_id="python-child",
+            ),
         )
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
@@ -2598,6 +2824,14 @@ async def test_replace_page_from_non_owner_is_noop(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+            _metadata(
+                "test.virtual.child",
+                provider_instance_id="python-child",
+            ),
+        )
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
         assert owner_ctx is not None
@@ -2652,6 +2886,14 @@ async def test_close_page_from_non_owner_is_noop(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+            _metadata(
+                "test.virtual.child",
+                provider_instance_id="python-child",
+            ),
+        )
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
         assert owner_ctx is not None
@@ -2697,6 +2939,10 @@ async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
         manager=registry,
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
+    )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
     owner_ctx = await manager.action_contexts.get("0,0")
@@ -2756,6 +3002,10 @@ async def test_action_lifecycle_rejected_binding_detaches_only_that_binding(
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
     )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
+    )
     await manager.set_page(profile="default", page=0)
     ctx = await manager.action_contexts.get("0,0")
     assert ctx is not None
@@ -2800,6 +3050,10 @@ async def test_action_lifecycle_rejected_action_instance_destroys_affected_bindi
         manager=registry,
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
+    )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
     ctx = await manager.action_contexts.get("0,0")
@@ -2849,6 +3103,10 @@ async def test_action_instance_rejection_from_owner_during_nonterminal_unavailab
         manager=registry,
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
+    )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
     ctx = await manager.action_contexts.get("0,0")
@@ -2915,6 +3173,10 @@ async def test_action_lifecycle_rejected_page_session_closes_child_bindings(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
         assert owner_ctx is not None
@@ -2975,6 +3237,10 @@ async def test_action_lifecycle_rejected_from_stale_provider_session_is_ignored(
         actions_bus=_actions_session(action_bus),
         start_soon=lambda fn, *a, **k: None,
     )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
+    )
     await manager.set_page(profile="default", page=0)
     ctx = await manager.action_contexts.get("0,0")
     assert ctx is not None
@@ -3023,6 +3289,10 @@ async def test_set_raster_image_last_write_wins_same_control(
             manager=registry,
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
@@ -3117,6 +3387,7 @@ async def test_settings_isolated_by_page_same_control(persistence_tmp_dir):
             start_soon=start_soon,
             settings_service=settings_service,
         )
+        _seed_action_availability(manager, _metadata(NoopAction.uuid))
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
         page0_ctx = await manager.action_contexts.get("0,0")
@@ -3193,6 +3464,7 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
             start_soon=start_soon,
             settings_service=settings_service,
         )
+        _seed_action_availability(manager, _metadata(NoopAction.uuid))
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
         control_a = await manager.action_contexts.get("0,0")
@@ -3276,6 +3548,7 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
             actions_bus=_actions_session(action_bus),
             start_soon=start_soon,
         )
+        _seed_action_availability(manager, _metadata(NoopAction.uuid))
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
@@ -3331,6 +3604,7 @@ async def test_clear_page_can_skip_hardware_output_for_disconnect(persistence_tm
         actions_bus=_actions_session(_actions_bus()),
         start_soon=lambda fn, *a, **k: None,
     )
+    _seed_action_availability(manager, _metadata(NoopAction.uuid))
 
     await manager.set_page(profile="default", page=0)
     assert await manager.action_contexts.get("0,0") is not None
@@ -3546,6 +3820,14 @@ async def test_unrelated_availability_change_does_not_rebuild_current_page(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(
+                ACTION_X_UUID,
+                provider_instance_id="test-provider",
+                provider_id="test",
+            ),
+        )
         await manager.set_page(profile="default", page=0)
         ctx_before = await manager.action_contexts.get("0,0")
         assert ctx_before is not None
@@ -3565,7 +3847,7 @@ async def test_unrelated_availability_change_does_not_rebuild_current_page(
 
 
 @pytest.mark.asyncio
-async def test_injected_availability_service_skips_legacy_lookup_without_direct_record(
+async def test_default_availability_service_skips_legacy_lookup_without_direct_record(
     persistence_tmp_dir,
 ):
     device = _make_mock_device()
@@ -3580,13 +3862,6 @@ async def test_injected_availability_service_skips_legacy_lookup_without_direct_
     )
     registry.provider_session_id.return_value = PROVIDER_SESSION_ID
     registry.provider_instance_provides_provider.return_value = True
-    availability_service = ActionAvailabilityService(
-        controller_id=CONTROLLER_ID,
-        controller_session_id=action_bus.session_id,
-        actions_bus=_actions_session(action_bus),
-        manager=registry,
-        start_soon=None,
-    )
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
@@ -3619,7 +3894,6 @@ async def test_injected_availability_service_skips_legacy_lookup_without_direct_
         manager=registry,
         actions_bus=_actions_session(action_bus),
         start_soon=lambda *args, **kwargs: None,
-        availability_service=availability_service,
     )
 
     await manager.set_page(profile="default", page=0)
@@ -3676,6 +3950,14 @@ async def test_on_action_catalog_changed_removed_preserves_attached_context(
             manager=registry,
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(
+                ACTION_X_UUID,
+                provider_instance_id="test-provider",
+                provider_id="test",
+            ),
         )
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
@@ -3816,6 +4098,14 @@ async def test_on_action_catalog_changed_same_session_update_does_not_remove_con
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        _seed_action_availability(
+            manager,
+            _metadata(
+                ACTION_X_UUID,
+                provider_instance_id="test-provider",
+                provider_id="test",
+            ),
+        )
         await manager.set_page(profile="default", page=0)
         ctx_before = await manager.action_contexts.get("0,0")
         assert ctx_before is not None
@@ -3875,6 +4165,15 @@ async def test_on_action_catalog_changed_session_succession_restamps_context(
             manager=registry,
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(
+                ACTION_X_UUID,
+                provider_instance_id="test-provider",
+                provider_id="test",
+                provider_session_id="old-session",
+            ),
         )
         await manager.set_page(profile="default", page=0)
         ctx_before = await manager.action_contexts.get("0,0")

@@ -670,10 +670,11 @@ class ControllerService(BaseComponent):
         live = self._device_registry.get(config_id)
         if live is None or live.ref != ref:
             return
-        await self._disconnect_live(
-            live,
-            release_claim=True,
-            reason="config removed",
+        logger.info(
+            "Config %s removed; preserving live hardware claim for %s/%s",
+            config_id,
+            ref.manager_id,
+            ref.device_id,
         )
 
     async def start(self, ctx: RunContext):
@@ -739,18 +740,18 @@ class ControllerService(BaseComponent):
                 first = await anext(stream)
             except StopAsyncIteration:
                 first = initial_config
+            initial_config_removed = first is None
             if first is None:
-                logger.error("Config not found for %s", live.config_id)
-                await self._handle_device_config_removed(live.config_id, live.ref)
-                return
+                logger.info(
+                    "Config %s is currently removed; keeping device claimed but idle",
+                    live.config_id,
+                )
+                first = initial_config
             if (
                 disconnect_event.is_set()
                 or self._device_registry.get(live.config_id) is not live
             ):
                 return
-
-            async def handle_config_removed(config_id: str) -> None:
-                await self._handle_device_config_removed(config_id, live.ref)
 
             ctrl_ctx = DeviceManager(
                 controller_id=self._controller_id,
@@ -765,11 +766,17 @@ class ControllerService(BaseComponent):
                 render_backend=self._render_backend,
                 settings_service=self._settings_service,
                 config_stream=stream,
-                on_config_removed=handle_config_removed,
             )
             await self._controller_contexts.set(live.config_id, ctrl_ctx)
             async with anyio.create_task_group() as device_tg:
                 await ctrl_ctx.start(device_tg, disconnect_event)
+                device_tg.start_soon(ctrl_ctx._config_listener)
+                if initial_config_removed:
+                    await ctrl_ctx._on_config_changed(None)
+                    await disconnect_event.wait()
+                    device_tg.cancel_scope.cancel()
+                    return
+
                 page_ready = anyio.Event()
 
                 async def set_initial_page() -> None:
@@ -791,7 +798,6 @@ class ControllerService(BaseComponent):
                 if disconnect_event.is_set():
                     device_tg.cancel_scope.cancel()
                     return
-                device_tg.start_soon(ctrl_ctx._config_listener)
                 await disconnect_event.wait()
                 device_tg.cancel_scope.cancel()
         finally:

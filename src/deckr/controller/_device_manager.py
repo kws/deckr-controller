@@ -1,6 +1,6 @@
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -243,6 +243,14 @@ class HeldInputRecord:
     down_event: Any
 
 
+@dataclass(frozen=True, slots=True)
+class PageCommit:
+    plan: PagePlan
+    departing: PageStackEntry | None
+    preserve_output_control_ids: frozenset[str]
+    transition_reason: str
+
+
 def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
     return f"{provider_instance_id}::{action_uuid}"
 
@@ -353,7 +361,6 @@ class DeviceManager:
         render_backend: RenderBackend | None = None,
         settings_service: SettingsService | None = None,
         config_stream: AsyncIterator[DeviceConfig | None] | None = None,
-        on_config_removed: Callable[[str], Awaitable[None]] | None = None,
         clock: Callable[[], float] | None = None,
         availability_service: ActionAvailabilityService | None = None,
         page_timeout_check_interval: float = 0.25,
@@ -378,7 +385,6 @@ class DeviceManager:
             start_soon=start_soon,
         )
         self._settings_service = settings_service
-        self._on_config_removed = on_config_removed
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
         self._nav = NavigationService(config)
@@ -391,7 +397,6 @@ class DeviceManager:
         self._current_plan: PagePlan | None = None
         self._planned_bindings_by_control: dict[str, PlannedBinding] = {}
         self._config_active = True
-        self._legacy_action_lookup_enabled = availability_service is None
         self._action_availability_service = availability_service or (
             ActionAvailabilityService(
                 controller_id=controller_id,
@@ -866,51 +871,7 @@ class DeviceManager:
         )
         if not refresh_actions:
             return snapshot
-        if not self._legacy_action_lookup_enabled:
-            return snapshot
-
-        missing_intents = tuple(
-            intent
-            for intent in intents
-            if (
-                intent not in snapshot.metadata
-                and intent not in snapshot.pending
-                and intent not in snapshot.unavailable
-            )
-            or self._action_availability.record_for_intent(
-                intent,
-                now=self._clock(),
-            )
-            is None
-        )
-        if not missing_intents:
-            return snapshot
-
-        legacy_metadata: dict[ActionIntentKey, ActionMetadata] = dict(
-            snapshot.metadata
-        )
-        for intent in missing_intents:
-            action_meta = await self.manager.get_action(
-                intent.action_uuid,
-                provider_instance_id=intent.provider_instance_id,
-                provider_labels=dict(intent.provider_labels),
-            )
-            if action_meta is None:
-                continue
-            action_meta = self._action_metadata_with_current_session(action_meta)
-            legacy_metadata[intent] = action_meta
-            self._action_availability.record_available(
-                action_meta,
-                now=self._clock(),
-                intent=intent,
-            )
-        if legacy_metadata == snapshot.metadata:
-            return snapshot
-        return ActionPlanningSnapshot(
-            metadata=legacy_metadata,
-            pending=snapshot.pending,
-            unavailable=snapshot.unavailable,
-        )
+        return snapshot
 
     def _existing_provider_action_keys(self) -> frozenset[ProviderActionKey]:
         return frozenset(
@@ -1538,7 +1499,14 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await send_with_endpoint_identity(self._actions_bus, msg)
+        try:
+            await send_with_endpoint_identity(self._actions_bus, msg)
+        except Exception:
+            logger.exception(
+                "Error notifying provider of page open config=%s pageSession=%s",
+                self.config_id,
+                session.page_session_id,
+            )
 
     async def _emit_page_closed(
         self,
@@ -1569,7 +1537,15 @@ class DeviceManager:
             ),
             causation_id=causation_id,
         )
-        await send_with_endpoint_identity(self._actions_bus, msg)
+        try:
+            await send_with_endpoint_identity(self._actions_bus, msg)
+        except Exception:
+            logger.exception(
+                "Error notifying provider of page close config=%s pageSession=%s reason=%s",
+                self.config_id,
+                session.page_session_id,
+                reason,
+            )
 
     async def _finalize_dynamic_page(
         self,
@@ -1630,37 +1606,61 @@ class DeviceManager:
         departing: PageStackEntry | None,
         preserve_rebound_outputs: bool = False,
     ) -> None:
+        commit = self._prepare_page_commit(
+            plan,
+            departing=departing,
+            preserve_rebound_outputs=preserve_rebound_outputs,
+        )
+        await self._apply_page_commit(commit)
+
+    def _prepare_page_commit(
+        self,
+        plan: PagePlan,
+        *,
+        departing: PageStackEntry | None,
+        preserve_rebound_outputs: bool,
+    ) -> PageCommit:
+        arriving = plan.entry
+        preserve_output_control_ids = (
+            frozenset(planned.control_id for planned in plan.bindings)
+            if preserve_rebound_outputs
+            else frozenset()
+        )
+        return PageCommit(
+            plan=plan,
+            departing=departing,
+            preserve_output_control_ids=preserve_output_control_ids,
+            transition_reason=(
+                "page_transition:"
+                f"{self._describe_page_entry(departing)}->"
+                f"{self._describe_page_entry(arriving)}"
+            ),
+        )
+
+    async def _apply_page_commit(self, commit: PageCommit) -> None:
+        plan = commit.plan
+        departing = commit.departing
         arriving = plan.entry
         logger.info(
             "Executing page transition config=%s departing=%s arriving=%s "
-            "pageSession=%s preserveReboundOutputs=%s",
+            "pageSession=%s preserveOutputs=%s",
             self.config_id,
             self._describe_page_entry(departing),
             self._describe_page_entry(arriving),
             plan.page_session.page_session_id
             if plan.page_session is not None
             else None,
-            preserve_rebound_outputs,
-        )
-
-        preserve_output_control_ids = (
-            frozenset(planned.control_id for planned in plan.bindings)
-            if preserve_rebound_outputs
-            else frozenset()
+            sorted(commit.preserve_output_control_ids),
         )
 
         if departing is not None:
             await self._revoke_active_bindings_except(
-                preserve_output_control_ids=preserve_output_control_ids,
-                reason=(
-                    "page_transition:"
-                    f"{self._describe_page_entry(departing)}->"
-                    f"{self._describe_page_entry(arriving)}"
-                ),
+                preserve_output_control_ids=commit.preserve_output_control_ids,
+                reason=commit.transition_reason,
             )
 
         await self._clear_all_raster_controls(
-            preserve_control_ids=preserve_output_control_ids,
+            preserve_control_ids=commit.preserve_output_control_ids,
         )
 
         self._current_plan = plan
@@ -1737,6 +1737,9 @@ class DeviceManager:
         causation_id: str | None = None,
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor). Caller must hold _nav_lock."""
+        if not self._config_active:
+            logger.info("Ignoring page transition while config %s is inactive", self.config_id)
+            return False
         dynamic_sessions_to_close = (
             [
                 frame.page_session
@@ -2222,10 +2225,8 @@ class DeviceManager:
         if config is None:
             self._config_active = False
             await self.clear_page()
-            if self._on_config_removed is not None:
-                await self._on_config_removed(self.config_id)
             return
-        if config == self.config:
+        if config == self.config and self._config_active:
             return
         async with self._nav_lock:
             await self._cancel_all_held_inputs()

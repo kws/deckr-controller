@@ -540,7 +540,7 @@ async def test_hardware_claim_becomes_live_after_concord_manager_token():
 
 
 @pytest.mark.asyncio
-async def test_hardware_claim_is_cancelled_when_config_is_removed():
+async def test_hardware_claim_is_preserved_when_config_is_removed():
     config_service = MemoryConfigService(_config())
     async with _running_controller(config_service=config_service) as (
         controller,
@@ -563,17 +563,33 @@ async def test_hardware_claim_is_cancelled_when_config_is_removed():
         with anyio.fail_after(1):
             while controller._device_registry.get("config-room-a") is None:
                 await anyio.sleep(0.01)
+        manager = None
+        with anyio.fail_after(1):
+            while manager is None:
+                manager = await controller._controller_contexts.get("config-room-a")
+                await anyio.sleep(0.01)
 
         await config_service.remove_config("config-room-a")
 
         with anyio.fail_after(1):
-            while controller._owned_claims:
+            while manager._config_active:
                 await anyio.sleep(0.01)
 
-        assert controller._device_registry.get("config-room-a") is None
+        assert controller._owned_claims
+        assert controller._device_registry.get("config-room-a") is not None
+        assert await controller._controller_contexts.get("config-room-a") is manager
         assert (await concord.validate(owned.contract)).status == (
-            ContractValidityStatus.CANCELLED
+            ContractValidityStatus.VALID
         )
+
+        await config_service.write_config(_config())
+
+        with anyio.fail_after(1):
+            while not manager._config_active:
+                await anyio.sleep(0.01)
+
+        assert controller._device_registry.get("config-room-a") is not None
+        assert await controller._controller_contexts.get("config-room-a") is manager
 
 
 @pytest.mark.asyncio

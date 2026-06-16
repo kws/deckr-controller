@@ -37,13 +37,13 @@ availability as independent state domains:
 | Config matching and config subscriptions | Partial | File-backed config service already supports matching, updates, and `None` removal events. |
 | Validator separation from action lookup | Done | Binding validation resolves selectors/capabilities only; planner handles missing metadata as unavailable. |
 | Provider-session gating removal | Done | Binding/page transitions no longer wait on Concord provider-session readiness; endpoint sessions remain routing and authorization metadata. |
-| Page frame model | In progress | Device runtime needs explicit static/dynamic frames with cached committed plans. |
-| Held input cancellation | In progress | Rebinding must cancel old held inputs before releases are ignored. |
+| Page frame model | Done | Device runtime stores explicit static/dynamic frames with cached committed plans. |
+| Held input cancellation | Done | Rebinding, revocation, dynamic close, and config removal cancel old held inputs before releases are ignored. |
 | Action availability service | Done | Local cache owns Beacon candidates, provider-direct records, freshness/stale policy, interest aggregation, provider requests, and changed-key computation. |
 | Binding planner extraction | Done | `_binding_planner.py` owns local planning decisions and outcomes, including pending and invalid-config states. |
 | Action interest service | Done | Local tracker and controller service send provider action-interest updates for connected configs and visible page-frame interests. |
 | Provider availability protocol | Done | Shared contracts and Python provider runtime support request/snapshot/change plus interest updates. |
-| Multiple-provider selection | Partial | Deterministic fallback ranking exists; explicit priority metadata/config remains deferred. |
+| Multiple-provider selection | Done | Deterministic fallback and sticky selected-provider retention are implemented; explicit priority metadata/config remains deferred. |
 
 ## Remaining Work
 
@@ -97,13 +97,13 @@ invariants before extracting services.
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
 | Remove provider-session readiness as a binding precondition | Done | Existing action provider routing metadata | Static and dynamic pages can commit without waiting for Concord/session readiness. |
-| Keep action lookup out of pure binding validation | In progress | Binding validator API compatibility | Validator only reports selector/capability errors; missing actions render unavailable later. |
-| Add explicit page frame state | In progress | Navigation service page refs | Runtime stores committed static and dynamic frames and can restore prior plans. |
-| Make dynamic close transactional | In progress | Page frame state | Closing a dynamic page builds/restores the return plan before finalizing the dynamic close. |
+| Keep action lookup out of pure binding validation | Done | Binding validator API compatibility | Validator only reports selector/capability errors; missing actions render unavailable later. |
+| Add explicit page frame state | Done | Navigation service page refs | Runtime stores committed static and dynamic frames and can restore prior plans. |
+| Make dynamic close transactional | Done | Page frame state | Closing a dynamic page builds/restores the return plan before finalizing the dynamic close. |
 | Keep dynamic timeout device-owned | Partial | Existing timeout loop | Timeout fires even if the owner provider has disappeared. |
-| Render unavailable controls without clearing layout | Partial | Unavailable render overlay | Unavailable action controls stay visible and do not invalidate the page. |
-| Cancel held inputs during rebinding/revocation | In progress | Input tracking records | Every delivered `down` receives either `up` or `cancel` for the same binding. |
-| Make config disappearance preserve device ownership | Partial | Config stream removal events | Bindings and dynamic pages are released, but the device remains connected and controllable. |
+| Render unavailable controls without clearing layout | Done | Unavailable render overlay | Unavailable action controls stay visible and do not invalidate the page. |
+| Cancel held inputs during rebinding/revocation | Done | Input tracking records | Every delivered `down` receives either `up` or `cancel` for the same binding. |
+| Make config disappearance preserve device ownership | Done | Config stream removal events | Bindings and dynamic pages are released, but the device remains connected and controllable. |
 
 ### 2. Extract a Local Binding Planner
 
@@ -114,8 +114,8 @@ Goal: move page planning out of mutation-heavy runtime code.
 | Define planner input/output models | Done | Current page plan/frame shape | Planner has explicit inputs for device, static/dynamic entries, metadata snapshots, retained plans, and dynamic sessions. |
 | Model binding outcomes | Done | Availability state model | Planner models `bound`, `pending`, `unavailable`, `invalid_config`, and `invalid_device_control`. |
 | Move structural validation into build phase | Done | Validator separation | Planner build phase performs no network I/O and no runtime mutation. |
-| Move binding install/detach/render into commit phase | Not started | Planner output | Commit phase cancels inputs, detaches old bindings, installs new bindings, renders controls, and updates frames in order. |
-| Add rollback/fallback handling for structural failures | Not started | Commit phase | Failed builds preserve the old page or enter a controlled fallback, never a half-cleared page. |
+| Move binding install/detach/render into commit phase | In progress | Planner output | Commit phase prepares then applies input cancellation, detaches, installs, and renders; page-frame assignment still lives at transition call sites. |
+| Add rollback/fallback handling for structural failures | Partial | Commit phase | Failed builds preserve the old page; broader fallback policy remains future hardening. |
 | Add unit tests for planner decisions | Done | Planner extraction | Planner tests cover bound/unavailable/pending controls, structural failures, dynamic children, retained metadata restore, and pure metadata snapshots. |
 
 ### 3. Introduce Action Availability Service
@@ -155,10 +155,10 @@ flapping or ad hoc selection.
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
 | Implement provider eligibility filtering | Done | Availability cache | `provider_instance_id` and provider-label constraints filter candidates before ranking. |
-| Add deterministic ranking policy | Partial | Availability records | Current fallback ranking is deterministic; priority metadata/config remains future work. |
-| Preserve sticky provider selections | Partial | Previous binding state | Existing bindings keep their provider while it remains available or stale-usable. |
+| Add deterministic ranking policy | Done | Availability records | Fallback ranking is deterministic; priority metadata/config remains future work. |
+| Preserve sticky provider selections | Done | Previous binding state | Existing bindings keep their provider while it remains available or stale-usable. |
 | Rebind safely when selected provider changes | Done | Input cancellation | Held inputs are cancelled, old action instances detach, and controls remain in layout. |
-| Test multi-provider tie-breaks | Partial | Planner tests | Cache tests cover deterministic fallback selection; priority/sticky-provider expansions remain future work. |
+| Test multi-provider tie-breaks | Done | Planner tests | Cache tests cover deterministic fallback, sticky selection, and failover. |
 
 ### 6. Dynamic Page Hardening
 
@@ -167,12 +167,12 @@ changes.
 
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
-| Represent dynamic pages as explicit frames | In progress | Page frame model | Dynamic descriptor, owner metadata, timeout, and committed plan are stored by the device runtime. |
+| Represent dynamic pages as explicit frames | Done | Page frame model | Dynamic descriptor, owner metadata, timeout, and committed plan are stored by the device runtime. |
 | Allow unavailable child bindings | Partial | Planner outcomes | Dynamic page remains active even if one or more child actions are unavailable. |
-| Close dynamic page after provider disappearance | In progress | Retained static frame | Closing restores the static page without requiring Beacon or provider availability. |
+| Close dynamic page after provider disappearance | Done | Retained static frame | Closing restores the static page without requiring Beacon or provider availability. |
 | Fire timeout after provider disappearance | Partial | Device-owned timeout loop | Timeout returns to the static page even if the owning provider is gone. |
 | Reject replacement commands from missing/stale owners | Partial | Command authorization | Missing or stale provider sessions cannot mutate a dynamic page. |
-| Preserve page close notification best-effort | Partial | Provider command routing | Runtime completes close locally even if notifying the owner is impossible. |
+| Preserve page close notification best-effort | Done | Provider command routing | Runtime completes close locally even if notifying the owner is impossible. |
 
 ### 7. Command Authorization and Lifecycle Semantics
 
@@ -182,9 +182,9 @@ letting provider liveness own device state.
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
 | Keep sender/session authorization for active contexts | Partial | Existing message subject parsing | Stale sessions cannot issue commands for active bindings or page sessions. |
-| Remove provider-session validity as layout authority | In progress | Provider-session gating removal | Session invalidity alone does not clear pages or revoke device state. |
+| Remove provider-session validity as layout authority | Done | Provider-session gating removal | Session invalidity alone does not clear pages or revoke device state. |
 | Define lifecycle rejection handling policy | Partial | Availability states | Retryable/unavailable rejections render unavailable without destroying layout. |
-| Define explicit input cancel message or event | In progress | Provider API agreement | Providers can distinguish `cancel` from physical `up`. |
+| Define explicit input cancel message or event | Done | Provider API agreement | Providers can distinguish `cancel` from physical `up`. |
 | Audit provider settings authorization | Partial | Settings target model | Settings commands require correct provider identity but do not depend on binding sessions. |
 
 ### 8. Regression Tests and Invariants
@@ -193,17 +193,17 @@ Goal: make the architecture difficult to regress.
 
 | Invariant | Status | Required Tests |
 | --- | --- | --- |
-| Device ownership invariant | Partial | Availability/provider changes do not clear current static or dynamic page frames. |
+| Device ownership invariant | Done | Availability/provider changes do not clear current static or dynamic page frames. |
 | No remote wait invariant | Done | Page transition tests with hanging provider calls/settings calls complete within bounded time. |
 | Config prerequisite invariant | Not started | No action binding exists without an active config snapshot. |
 | Unavailable action invariant | Done | Missing/unavailable actions render unavailable while the page remains active. |
-| Dynamic timeout invariant | Partial | Dynamic timeout fires after owner provider disappearance. |
+| Dynamic timeout invariant | Partial | Dynamic timeout is device-owned; owner-disappearance-specific timeout coverage remains to add. |
 | Return home invariant | Done | Closing dynamic page restores cached static plan after Beacon withdrawal. |
-| Input terminal invariant | In progress | Rebind/revoke while pressed sends `cancel`; later physical `up` is not delivered to the new binding. |
+| Input terminal invariant | Done | Rebind/revoke/config removal while pressed sends `cancel`; later physical `up` is not delivered to the new binding. |
 | Beacon candidate invariant | Done | Beacon advertisements create candidates only, not authoritative availability. |
-| Multiple provider invariant | Not started | Provider selection is deterministic and sticky. |
-| Config disappearance invariant | Partial | Config removal releases bindings but keeps hardware connected. |
-| Provider disappearance invariant | Partial | Provider disappearance changes availability, not device state. |
+| Multiple provider invariant | Done | Provider selection is deterministic and sticky. |
+| Config disappearance invariant | Done | Config removal releases bindings but keeps hardware connected. |
+| Provider disappearance invariant | Done | Provider disappearance changes availability, not device state. |
 | Action interest invariant | Done | Interest updates are provider/action scoped, not button scoped. |
 
 ## Suggested PR Sequence
@@ -232,11 +232,13 @@ Goal: make the architecture difficult to regress.
    Deterministic fallback and stale-existing behavior are in place. Optional
    priority metadata/config remains future work.
 8. Replace transitional `manager.get_action()` planning calls.
-   Production `DeviceManager` instances with the controller availability service
-   plan from availability snapshots/local cache. Standalone test-helper lookup
-   compatibility remains for direct `DeviceManager` construction.
+   Landed in this slice. `DeviceManager` planning now uses availability
+   snapshots/local cache only; direct provider lookup compatibility has been
+   removed from planning.
 9. Broaden regression tests around all invariants.
-   Add failure-mode tests before deleting compatibility paths.
+   Added regression tests for scoped fanout, stale/expired availability,
+   sticky provider selection, config disappearance, dynamic close notification
+   failure, and held-input cancellation.
 
 ## Done Definition
 

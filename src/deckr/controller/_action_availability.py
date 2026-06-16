@@ -299,7 +299,9 @@ class ActionAvailabilityCache:
         if not candidates:
             return None
         candidates.sort(key=lambda record: record.key.provider_instance_id)
-        return candidates[0]
+        selected = candidates[0]
+        self._record_keys_by_intent[intent] = selected.key
+        return selected
 
     def planning_snapshot(
         self,
@@ -315,6 +317,15 @@ class ActionAvailabilityCache:
         unavailable: set[ActionIntentKey] = set()
 
         for intent in intents:
+            selected_metadata = self._metadata_for_intent(
+                intent,
+                now=lookup_now,
+                stale_provider_keys=stale_keys,
+            )
+            if selected_metadata is not None:
+                metadata[intent] = selected_metadata
+                continue
+
             record = self.record_for_intent(intent, now=lookup_now)
             if record is None:
                 unavailable.add(intent)
@@ -394,7 +405,9 @@ class ActionAvailabilityCache:
         if not candidates:
             return None
         candidates.sort(key=lambda record: record.key.provider_instance_id)
-        return candidates[0].metadata
+        selected = candidates[0]
+        self._record_keys_by_intent[intent] = selected.key
+        return selected.metadata
 
     def _record_matches_intent(
         self,

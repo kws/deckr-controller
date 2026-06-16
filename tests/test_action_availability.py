@@ -203,6 +203,41 @@ def test_unqualified_intent_selects_lexicographically_first_provider_instance():
     assert snapshot == {intent: alpha}
 
 
+def test_unqualified_intent_sticks_to_previous_provider_selection():
+    cache = ActionAvailabilityCache()
+    alpha = _metadata("action.same", provider_instance_id="provider-alpha")
+    beta = _metadata("action.same", provider_instance_id="provider-beta")
+    intent = _intent("action.same")
+
+    cache.record_available(beta, now=0.0)
+    initial = cache.planning_snapshot((intent,), now=0.0)
+    cache.record_available(alpha, now=1.0)
+    refreshed = cache.planning_snapshot((intent,), now=1.0)
+
+    assert initial.metadata == {intent: beta}
+    assert refreshed.metadata == {intent: beta}
+
+
+def test_unqualified_intent_fails_over_when_selected_provider_is_unusable():
+    cache = ActionAvailabilityCache()
+    alpha = _metadata("action.same", provider_instance_id="provider-alpha")
+    beta = _metadata("action.same", provider_instance_id="provider-beta")
+    intent = _intent("action.same")
+
+    cache.record_available(beta, now=0.0)
+    initial = cache.planning_snapshot((intent,), now=0.0)
+    cache.record_available(alpha, now=1.0)
+    cache.record_unavailable(
+        ProviderActionKey("provider-beta", "action.same"),
+        metadata=beta,
+        now=1.0,
+    )
+    refreshed = cache.planning_snapshot((intent,), now=1.0)
+
+    assert initial.metadata == {intent: beta}
+    assert refreshed.metadata == {intent: alpha}
+
+
 def test_beacon_candidate_metadata_records_unknown_but_omits_snapshot_entry():
     cache = ActionAvailabilityCache()
     metadata = _metadata("action.available", provider_instance_id="provider-alpha")
