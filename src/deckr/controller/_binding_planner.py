@@ -27,7 +27,9 @@ from deckr.controller.settings import derive_action_instance_id
 
 class BindingPlanStatus(StrEnum):
     BOUND = "bound"
+    PENDING = "pending"
     UNAVAILABLE = "unavailable"
+    INVALID_CONFIG = "invalid_config"
     INVALID_DEVICE_CONTROL = "invalid_device_control"
 
 
@@ -146,6 +148,7 @@ class BindingPlanner:
         bindings: Sequence[ConfiguredControlBinding],
         device: DeviceDescriptor,
         action_metadata: Mapping[ActionIntentKey, ActionMetadata],
+        action_status: Mapping[ActionIntentKey, BindingPlanStatus] | None = None,
         retained_plan: PagePlan | None = None,
     ) -> PagePlanBuildResult:
         planned: list[PlannedBinding] = []
@@ -184,6 +187,7 @@ class BindingPlanner:
                     resolved.binding,
                 ),
                 action_metadata=action_metadata,
+                action_status=action_status or {},
                 retained_plan=retained_plan,
                 page_session_id=None,
                 persist_settings=True,
@@ -215,6 +219,7 @@ class BindingPlanner:
         device: DeviceDescriptor,
         page_session: DynamicPageSession,
         action_metadata: Mapping[ActionIntentKey, ActionMetadata],
+        action_status: Mapping[ActionIntentKey, BindingPlanStatus] | None = None,
         retained_plan: PagePlan | None = None,
     ) -> PagePlanBuildResult:
         planned: list[PlannedBinding] = []
@@ -239,7 +244,7 @@ class BindingPlanner:
                 validation_errors.append(error)
                 outcomes.append(
                     BindingPlanOutcome(
-                        status=BindingPlanStatus.INVALID_DEVICE_CONTROL,
+                        status=BindingPlanStatus.INVALID_CONFIG,
                         intent=ActionIntentKey("", None, ()),
                         control_ref=child.control_id,
                         error=error,
@@ -277,6 +282,7 @@ class BindingPlanner:
                     binding=resolved.binding,
                 ),
                 action_metadata=action_metadata,
+                action_status=action_status or {},
                 retained_plan=retained_plan,
                 page_session_id=page_session.page_session_id,
                 persist_settings=False,
@@ -330,6 +336,7 @@ class BindingPlanner:
         binding: ResolvedControlBinding,
         action_instance_id: str,
         action_metadata: Mapping[ActionIntentKey, ActionMetadata],
+        action_status: Mapping[ActionIntentKey, BindingPlanStatus],
         retained_plan: PagePlan | None,
         page_session_id: str | None,
         persist_settings: bool,
@@ -339,6 +346,7 @@ class BindingPlanner:
     ) -> PlannedBinding:
         action_meta = self._action_metadata_for_binding(
             action_metadata=action_metadata,
+            action_status=action_status,
             retained_plan=retained_plan,
             binding=binding,
             action_instance_id=action_instance_id,
@@ -346,7 +354,10 @@ class BindingPlanner:
         status = (
             BindingPlanStatus.BOUND
             if action_meta is not None
-            else BindingPlanStatus.UNAVAILABLE
+            else action_status.get(
+                self.resolved_action_intent_key(binding),
+                BindingPlanStatus.UNAVAILABLE,
+            )
         )
         return PlannedBinding(
             binding=binding,
@@ -364,6 +375,7 @@ class BindingPlanner:
         self,
         *,
         action_metadata: Mapping[ActionIntentKey, ActionMetadata],
+        action_status: Mapping[ActionIntentKey, BindingPlanStatus],
         retained_plan: PagePlan | None,
         binding: ResolvedControlBinding,
         action_instance_id: str,
@@ -372,6 +384,8 @@ class BindingPlanner:
         provided = action_metadata.get(intent)
         if provided is not None:
             return provided
+        if intent in action_status:
+            return None
         return self._retained_action_metadata(
             retained_plan=retained_plan,
             binding=binding,

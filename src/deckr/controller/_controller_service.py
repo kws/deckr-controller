@@ -5,6 +5,8 @@ from uuid import uuid4
 
 import anyio
 from deckr.actions.messages import (
+    ACTION_AVAILABILITY_CHANGED,
+    ACTION_AVAILABILITY_SNAPSHOT,
     COMMAND_MESSAGE_TYPES,
     SETTINGS_PATCH,
     SETTINGS_REPLACE,
@@ -50,6 +52,7 @@ from deckr.hardware.profiles import (
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
 
+from deckr.controller._action_availability import ActionAvailabilityService
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
@@ -134,6 +137,7 @@ class ControllerService(BaseComponent):
         self._controller_contexts = AsyncMap[str, DeviceManager]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
+        self._action_availability_service: ActionAvailabilityService | None = None
         self._start_soon: Callable | None = None
         self._render_backend = render_backend
         self._session_id = endpoint.session_id
@@ -189,6 +193,11 @@ class ControllerService(BaseComponent):
         self,
         event: ActionCatalogChangedEvent,
     ) -> None:
+        changed_keys = frozenset()
+        if self._action_availability_service is not None:
+            changed_keys = await self._action_availability_service.ingest_catalog_changed(
+                event
+            )
         controller_contexts = await self._controller_contexts.values()
         logger.log(
             logging.INFO if controller_contexts else logging.DEBUG,
@@ -200,7 +209,18 @@ class ControllerService(BaseComponent):
             event.provider_session_successions,
         )
         for ctrl_ctx in controller_contexts:
-            await ctrl_ctx.on_action_catalog_changed(event)
+            await ctrl_ctx.on_action_availability_changed(changed_keys)
+
+    async def _handle_action_availability_message(self, msg: DeckrMessage) -> None:
+        if self._action_availability_service is None:
+            return
+        changed_keys = await self._action_availability_service.handle_availability_message(
+            msg
+        )
+        if not changed_keys:
+            return
+        for ctrl_ctx in await self._controller_contexts.values():
+            await ctrl_ctx.on_action_availability_changed(changed_keys)
 
     async def _actions_subscription_loop(self, stopping: anyio.Event) -> None:
         """Subscribe to action lane and route command messages to DeviceManagers."""
@@ -213,6 +233,12 @@ class ControllerService(BaseComponent):
                     if not isinstance(event, DeckrMessage):
                         continue
                     if not action_message_for_controller(event, self._controller_id):
+                        continue
+                    if event.message_type in {
+                        ACTION_AVAILABILITY_SNAPSHOT,
+                        ACTION_AVAILABILITY_CHANGED,
+                    }:
+                        await self._handle_action_availability_message(event)
                         continue
                     if event.message_type in COMMAND_MESSAGE_TYPES:
                         await self._handle_action_command(event)
@@ -653,6 +679,15 @@ class ControllerService(BaseComponent):
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
         self._start_soon = ctx.tg.start_soon
+        if self._action_registry is not None:
+            self._action_availability_service = ActionAvailabilityService(
+                controller_id=self._controller_id,
+                controller_session_id=self._session_id,
+                actions_bus=self._endpoint,
+                manager=self._action_registry,
+                start_soon=ctx.tg.start_soon,
+            )
+            await self._action_availability_service.start(ctx.tg, ctx.stopping)
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
         ctx.tg.start_soon(self._actions_subscription_loop, ctx.stopping)
@@ -726,6 +761,7 @@ class ControllerService(BaseComponent):
                 manager=self._action_registry,
                 actions_bus=self._endpoint,
                 start_soon=self._start_soon,
+                availability_service=self._action_availability_service,
                 render_backend=self._render_backend,
                 settings_service=self._settings_service,
                 config_stream=stream,

@@ -79,6 +79,8 @@ from pydantic import ValidationError
 from deckr.controller._action_availability import (
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
+    ActionAvailabilityService,
+    ActionPlanningSnapshot,
     ProviderActionKey,
 )
 from deckr.controller._action_interest import (
@@ -353,6 +355,7 @@ class DeviceManager:
         config_stream: AsyncIterator[DeviceConfig | None] | None = None,
         on_config_removed: Callable[[str], Awaitable[None]] | None = None,
         clock: Callable[[], float] | None = None,
+        availability_service: ActionAvailabilityService | None = None,
         page_timeout_check_interval: float = 0.25,
     ):
         self._controller_id = controller_id
@@ -388,13 +391,22 @@ class DeviceManager:
         self._current_plan: PagePlan | None = None
         self._planned_bindings_by_control: dict[str, PlannedBinding] = {}
         self._config_active = True
-        self._action_availability = ActionAvailabilityCache(
-            policy=ActionAvailabilityPolicy(
-                fresh_ttl_seconds=None,
-                stale_grace_seconds=None,
-            ),
-            clock=self._clock,
+        self._legacy_action_lookup_enabled = availability_service is None
+        self._action_availability_service = availability_service or (
+            ActionAvailabilityService(
+                controller_id=controller_id,
+                controller_session_id=actions_bus.session_id,
+                actions_bus=actions_bus,
+                manager=manager,
+                start_soon=None,
+                cache=ActionAvailabilityCache(
+                    policy=ActionAvailabilityPolicy(),
+                    clock=self._clock,
+                ),
+                clock=self._clock,
+            )
         )
+        self._action_availability = self._action_availability_service.cache
         self._action_interest = ActionInterestTracker(clock=self._clock)
         self._binding_leases: dict[str, BindingLease] = {}
         self._binding_by_context: dict[str, str] = {}
@@ -420,9 +432,21 @@ class DeviceManager:
 
     async def _render_unavailable_to_control(self, control: ControlSurface) -> None:
         """Render a not-available overlay to an output-capable control."""
+        await self._render_status_to_control(control, overlay_type="unavailable")
+
+    async def _render_pending_to_control(self, control: ControlSurface) -> None:
+        """Render a pending overlay to an output-capable control."""
+        await self._render_status_to_control(control, overlay_type="pending")
+
+    async def _render_status_to_control(
+        self,
+        control: ControlSurface,
+        *,
+        overlay_type: str,
+    ) -> None:
         if control.image_format is None or control.raster_capability_id is None:
             return
-        model = RenderModel(overlay_type="unavailable")
+        model = RenderModel(overlay_type=overlay_type)
         render_service = RenderService()
         output = DeviceOutput(
             self._command_service,
@@ -726,6 +750,7 @@ class DeviceManager:
                 visible_intents,
                 now=now,
             )
+            self._publish_action_interest_snapshot(now=now)
             return
 
         self._action_interest.replace_strong_interests(
@@ -737,6 +762,16 @@ class DeviceManager:
             ActionInterestSource.DYNAMIC_PAGE,
             now=now,
         )
+        self._publish_action_interest_snapshot(now=now)
+
+    def _publish_action_interest_snapshot(self, *, now: float) -> None:
+        if self._config_active:
+            self._action_availability_service.update_config_interest(
+                self.config_id,
+                self._action_interest.snapshot(now=now),
+            )
+        else:
+            self._action_availability_service.clear_config_interest(self.config_id)
 
     def _visible_action_interest_source(self) -> ActionInterestSource:
         if (
@@ -772,26 +807,42 @@ class DeviceManager:
         intents: tuple[ActionIntentKey, ...],
         *,
         refresh_actions: bool,
-    ) -> dict[ActionIntentKey, ActionMetadata]:
-        authoritative = self._action_availability.snapshot_for_intents(
+    ) -> ActionPlanningSnapshot:
+        if refresh_actions:
+            await self._action_availability_service.ensure_local_builtin_availability(
+                intents
+            )
+        snapshot = self._action_availability_service.planning_snapshot(
             intents,
+            existing_provider_keys=self._existing_provider_action_keys(),
             now=self._clock(),
         )
         if not refresh_actions:
-            return authoritative
+            return snapshot
+        if not self._legacy_action_lookup_enabled:
+            return snapshot
 
-        transitional = await self._transitional_beacon_candidate_metadata_for_plan(
-            intents
+        missing_intents = tuple(
+            intent
+            for intent in intents
+            if (
+                intent not in snapshot.metadata
+                and intent not in snapshot.pending
+                and intent not in snapshot.unavailable
+            )
+            or self._action_availability.record_for_intent(
+                intent,
+                now=self._clock(),
+            )
+            is None
         )
-        return {**transitional, **authoritative}
+        if not missing_intents:
+            return snapshot
 
-    async def _transitional_beacon_candidate_metadata_for_plan(
-        self,
-        intents: tuple[ActionIntentKey, ...],
-    ) -> dict[ActionIntentKey, ActionMetadata]:
-        """Bridge Beacon catalog metadata into planning until direct availability exists."""
-        metadata_by_intent: dict[ActionIntentKey, ActionMetadata] = {}
-        for intent in intents:
+        legacy_metadata: dict[ActionIntentKey, ActionMetadata] = dict(
+            snapshot.metadata
+        )
+        for intent in missing_intents:
             action_meta = await self.manager.get_action(
                 intent.action_uuid,
                 provider_instance_id=intent.provider_instance_id,
@@ -800,13 +851,25 @@ class DeviceManager:
             if action_meta is None:
                 continue
             action_meta = self._action_metadata_with_current_session(action_meta)
-            self._action_availability.record_candidate(
+            legacy_metadata[intent] = action_meta
+            self._action_availability.record_available(
                 action_meta,
                 now=self._clock(),
                 intent=intent,
             )
-            metadata_by_intent[intent] = action_meta
-        return metadata_by_intent
+        if legacy_metadata == snapshot.metadata:
+            return snapshot
+        return ActionPlanningSnapshot(
+            metadata=legacy_metadata,
+            pending=snapshot.pending,
+            unavailable=snapshot.unavailable,
+        )
+
+    def _existing_provider_action_keys(self) -> frozenset[ProviderActionKey]:
+        return frozenset(
+            ProviderActionKey(lease.provider_instance_id, lease.action_uuid)
+            for lease in self._binding_leases.values()
+        )
 
     def _log_static_page_plan_rejection(
         self,
@@ -856,11 +919,13 @@ class DeviceManager:
             self._binding_planner.static_action_intents(bindings),
             refresh_actions=refresh_actions,
         )
+        action_status = self._binding_plan_status(action_metadata)
         result = self._binding_planner.build_static_page_plan(
             entry,
             bindings=bindings,
             device=self.device,
-            action_metadata=action_metadata,
+            action_metadata=action_metadata.metadata,
+            action_status=action_status,
             retained_plan=retained_plan,
         )
         if result.plan is None:
@@ -883,11 +948,13 @@ class DeviceManager:
             ),
             refresh_actions=refresh_actions,
         )
+        action_status = self._binding_plan_status(action_metadata)
         result = self._binding_planner.build_dynamic_page_plan(
             entry,
             device=self.device,
             page_session=page_session,
-            action_metadata=action_metadata,
+            action_metadata=action_metadata.metadata,
+            action_status=action_status,
             retained_plan=retained_plan,
         )
         if result.plan is None:
@@ -917,6 +984,21 @@ class DeviceManager:
             retained_plan=retained_plan,
             refresh_actions=refresh_actions,
         )
+
+    def _binding_plan_status(
+        self,
+        snapshot: ActionPlanningSnapshot,
+    ) -> dict[ActionIntentKey, BindingPlanStatus]:
+        status: dict[ActionIntentKey, BindingPlanStatus] = {
+            intent: BindingPlanStatus.PENDING for intent in snapshot.pending
+        }
+        status.update(
+            {
+                intent: BindingPlanStatus.UNAVAILABLE
+                for intent in snapshot.unavailable
+            }
+        )
+        return status
 
     def _binding_lease_for_control(self, control_id: str) -> BindingLease | None:
         active_binding_id = self._active_binding_by_control.get(control_id)
@@ -1181,18 +1263,7 @@ class DeviceManager:
             )
             return False
         if action_meta is _ACTION_METADATA_UNSET:
-            action_meta = await self.manager.get_action(
-                binding.action_uuid,
-                provider_instance_id=binding.provider_instance_id,
-                provider_labels=binding.provider_labels,
-            )
-            if action_meta is not None:
-                action_meta = self._action_metadata_with_current_session(action_meta)
-                self._action_availability.record_candidate(
-                    action_meta,
-                    now=self._clock(),
-                    intent=self._binding_planner.resolved_action_intent_key(binding),
-                )
+            action_meta = None
         if action_meta is None:
             logger.info(
                 "Binding unresolved on profile=%s page=%s control=%s action=%s",
@@ -1570,14 +1641,20 @@ class DeviceManager:
         plan: PagePlan,
         planned: PlannedBinding,
     ) -> bool:
-        if planned.status == BindingPlanStatus.UNAVAILABLE:
+        if planned.status in {
+            BindingPlanStatus.PENDING,
+            BindingPlanStatus.UNAVAILABLE,
+        }:
             control = _find_control_surface(
                 self.device,
                 planned.control_id,
                 raster_capability_id=_selected_raster_capability_id(planned.binding),
             )
             if control is not None:
-                await self._render_unavailable_to_control(control)
+                if planned.status == BindingPlanStatus.PENDING:
+                    await self._render_pending_to_control(control)
+                else:
+                    await self._render_unavailable_to_control(control)
             return False
         ok = await self._try_resolve_binding(
             planned.binding,
@@ -1977,8 +2054,16 @@ class DeviceManager:
         event: ActionCatalogChangedEvent,
     ) -> None:
         """Refresh the current page availability overlay after Beacon changes."""
+        await self._action_availability_service.ingest_catalog_changed(event)
+        await self.on_action_availability_changed()
+
+    async def on_action_availability_changed(
+        self,
+        changed_keys: Iterable[ProviderActionKey] = (),
+    ) -> None:
+        """Refresh the current page availability overlay after provider availability changes."""
+        del changed_keys
         async with self._nav_lock:
-            self._remove_catalog_candidates(event.catalog_removed)
             current_frame = self._page_frames[-1] if self._page_frames else None
             if current_frame is None:
                 return
@@ -1996,13 +2081,9 @@ class DeviceManager:
                 return
 
             logger.info(
-                "Re-evaluating page bindings for config=%s page=%s after action catalog change +%s -%s ~%s successor=%s",
+                "Re-evaluating page bindings for config=%s page=%s after action availability change",
                 self.config_id,
                 refreshed_plan.page_id,
-                event.catalog_added,
-                event.catalog_removed,
-                event.catalog_updated,
-                event.provider_session_successions,
             )
 
             self._page_frames[-1] = PageFrame(
@@ -2014,16 +2095,28 @@ class DeviceManager:
 
             for planned in refreshed_plan.bindings:
                 lease = self._binding_lease_for_control(planned.control_id)
-                if planned.status == BindingPlanStatus.UNAVAILABLE:
-                    if lease is None:
-                        control = _find_control_surface(
-                            self.device,
-                            planned.control_id,
-                            raster_capability_id=_selected_raster_capability_id(
-                                planned.binding
-                            ),
+                if planned.status in {
+                    BindingPlanStatus.PENDING,
+                    BindingPlanStatus.UNAVAILABLE,
+                }:
+                    if lease is not None:
+                        await self._revoke_binding(
+                            lease.binding_id,
+                            clear_output=False,
+                            reason=f"action_{planned.status}",
+                            clear_held_input=True,
                         )
-                        if control is not None:
+                    control = _find_control_surface(
+                        self.device,
+                        planned.control_id,
+                        raster_capability_id=_selected_raster_capability_id(
+                            planned.binding
+                        ),
+                    )
+                    if control is not None:
+                        if planned.status == BindingPlanStatus.PENDING:
+                            await self._render_pending_to_control(control)
+                        else:
                             await self._render_unavailable_to_control(control)
                     continue
 

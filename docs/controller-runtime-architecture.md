@@ -762,8 +762,8 @@ Suggested defaults:
 ```text
 strong interest: while visible/config-active
 warm retention: 4 hours
-provider revalidation interval: 30–120 seconds
-availability stale grace: 5–10 minutes
+provider revalidation interval: 60 seconds
+availability stale grace: 5 minutes
 ```
 
 The “hours” timeout is important. It prevents a provider from repeatedly tearing down and rebuilding actions while the user navigates around. But that timeout belongs to action interest, not button binding.
@@ -782,6 +782,9 @@ This contract is per provider/action interest, not per control binding.
 It should not block page layout. If the contract is pending, the control renders pending/unavailable while the controller continues to own the layout.
 
 Concord may be useful here only when there is a real resource commitment or exclusivity requirement. For ordinary action availability, direct provider messages plus TTL are likely simpler and better.
+
+Current policy reserves Concord for explicit resource commitments. Ordinary
+action availability uses provider-direct messages and local freshness policy.
 
 ---
 
@@ -816,14 +819,9 @@ Controller to provider:
   "messageType": "actionAvailabilityRequest",
   "body": {
     "requestId": "uuid",
-    "actions": [
-      {
-        "actionId": "clock",
-        "providerLabels": { "runtime": "python" }
-      }
-    ],
-    "reason": "connected_config",
-    "freshnessMs": 30000
+    "selectors": [
+      { "actionId": "clock" }
+    ]
   }
 }
 ```
@@ -839,17 +837,16 @@ Provider to controller:
     "requestId": "uuid",
     "providerInstanceId": "python",
     "providerId": "dev.deckr.python",
-    "actions": [
+    "entries": [
       {
         "actionId": "clock",
-        "state": "available",
-        "descriptor": {},
-        "freshUntil": "2026-06-04T12:30:00Z",
+        "status": "available",
+        "descriptor": { "actionId": "clock", "name": "Clock" },
         "reason": null
       },
       {
         "actionId": "weather",
-        "state": "unavailable",
+        "status": "unavailable",
         "descriptor": null,
         "reason": "missing_api_key"
       }
@@ -868,12 +865,11 @@ Provider to controller:
   "body": {
     "providerInstanceId": "python",
     "providerId": "dev.deckr.python",
-    "changes": [
+    "entries": [
       {
         "actionId": "weather",
-        "state": "available",
-        "descriptor": {},
-        "freshUntil": "2026-06-04T12:35:00Z"
+        "status": "available",
+        "descriptor": { "actionId": "weather", "name": "Weather" }
       }
     ]
   }
@@ -888,19 +884,11 @@ Controller to provider:
 {
   "messageType": "actionInterestUpdate",
   "body": {
-    "controllerId": "controller-main",
-    "retainUntil": "2026-06-04T16:00:00Z",
-    "actions": [
-      {
-        "actionId": "clock",
-        "interest": "strong",
-        "sources": ["visible_binding", "connected_config"]
-      },
-      {
-        "actionId": "weather",
-        "interest": "warm",
-        "sources": ["recent_use"]
-      }
+    "providerInstanceId": "python",
+    "providerId": "dev.deckr.python",
+    "entries": [
+      { "actionId": "clock", "level": "strong" },
+      { "actionId": "weather", "level": "warm" }
     ]
   }
 }
@@ -1093,7 +1081,7 @@ Suggested policy:
 ```text
 fresh available: bind normally
 stale available + existing binding: keep existing binding while revalidating
-stale available + new binding: render pending or bind with degraded confidence, configurable
+stale available + new binding: render pending until fresh availability arrives
 unknown candidate: render pending and query
 known unavailable: render unavailable
 no candidate: render unavailable

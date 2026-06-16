@@ -17,6 +17,8 @@ from deckr.actions.messages import (
     SETTINGS_PATCH,
     SETTINGS_REQUEST,
     SETTINGS_SNAPSHOT,
+    ActionAvailabilityEntry,
+    ActionDescriptor,
     CapabilityInputBody,
     DynamicPageCommand,
     PageChildBindingDescriptor,
@@ -53,6 +55,7 @@ from invariant.params import ref
 
 from deckr.controller import _device_manager as device_manager_module
 from deckr.controller._action_availability import (
+    ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
     ProviderActionKey,
@@ -260,6 +263,17 @@ def _metadata(
         provider_instance_id=provider_instance_id,
         provider_id=provider_id,
         provider_session_id=provider_session_id,
+    )
+
+
+def _availability_entry(action_uuid: str) -> ActionAvailabilityEntry:
+    return ActionAvailabilityEntry(
+        actionId=action_uuid,
+        status="available",
+        descriptor=ActionDescriptor(
+            actionId=action_uuid,
+            providerId=PROVIDER_ID,
+        ),
     )
 
 
@@ -2327,7 +2341,7 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
             descriptor=_dynamic_page("dynamic-page", "0,0", "1,0"),
             context_id=owner_ctx.id,
         )
-        assert registry.get_action.await_count == 2
+        assert registry.get_action.await_count == 0
         session = manager._dynamic_page_session
         assert session is not None
 
@@ -3392,10 +3406,10 @@ ACTION_X_UUID = "test.action.x"
 
 
 @pytest.mark.asyncio
-async def test_on_action_catalog_changed_added_resolves_unavailable_control(
+async def test_provider_direct_availability_resolves_candidate_control(
     persistence_tmp_dir,
 ):
-    """When a catalog candidate appears, the transition bridge can bind it."""
+    """Beacon candidates render pending until provider-direct availability arrives."""
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()
@@ -3457,21 +3471,93 @@ async def test_on_action_catalog_changed_added_resolves_unavailable_control(
             _catalog_event(added=[f"test-provider::{ACTION_X_UUID}"])
         )
 
-        # Control should now have context
-        ctx_after = await manager.action_contexts.get("0,0")
-        assert ctx_after is not None
-        assert ctx_after.action_uuid == ACTION_X_UUID
         key = ProviderActionKey("test-provider", ACTION_X_UUID)
         record = manager._action_availability.record_for(key)
         assert record is not None
         assert record.state == ActionAvailabilityState.UNKNOWN
         assert record.source == ActionAvailabilitySource.BEACON_CANDIDATE
+        assert await manager.action_contexts.get("0,0") is None
         assert (
             manager._action_availability.snapshot_for_intents(
                 manager._current_plan_action_intents()
             )
             == {}
         )
+
+        changed = manager._action_availability_service.ingest_provider_entries(
+            provider_instance_id="test-provider",
+            provider_id="test",
+            entries=[_availability_entry(ACTION_X_UUID)],
+        )
+        await manager.on_action_availability_changed(changed)
+
+        ctx_after = await manager.action_contexts.get("0,0")
+        assert ctx_after is not None
+        assert ctx_after.action_uuid == ACTION_X_UUID
+
+
+@pytest.mark.asyncio
+async def test_injected_availability_service_skips_legacy_lookup_without_direct_record(
+    persistence_tmp_dir,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(
+            ACTION_X_UUID,
+            provider_instance_id="test-provider",
+            provider_id="test",
+        )
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    availability_service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=_actions_session(action_bus),
+        manager=registry,
+        start_soon=None,
+    )
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                provider_instance_id="test-provider",
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=config,
+        manager=registry,
+        actions_bus=_actions_session(action_bus),
+        start_soon=lambda *args, **kwargs: None,
+        availability_service=availability_service,
+    )
+
+    await manager.set_page(profile="default", page=0)
+
+    registry.get_action.assert_not_awaited()
+    assert await manager.action_contexts.get("0,0") is None
 
 
 @pytest.mark.asyncio
@@ -3536,13 +3622,10 @@ async def test_on_action_catalog_changed_removed_preserves_attached_context(
             _catalog_event(removed=[f"test-provider::{ACTION_X_UUID}"])
         )
 
-        assert manager._action_availability.record_for(key) is None
-        assert (
-            manager._action_availability.snapshot_for_intents(
-                manager._current_plan_action_intents()
-            )
-            == {}
-        )
+        record = manager._action_availability.record_for(key)
+        assert record is not None
+        assert record.source == ActionAvailabilitySource.PROVIDER_DIRECT
+        assert record.state == ActionAvailabilityState.AVAILABLE
         assert await manager.action_contexts.get("0,0") is ctx_before
         assert manager._binding_leases
 
@@ -3597,9 +3680,12 @@ async def test_beacon_only_candidate_state_does_not_become_authoritative_availab
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        await manager._action_availability_service.ingest_catalog_changed(
+            _catalog_event(added=[f"test-provider::{ACTION_X_UUID}"])
+        )
         await manager.set_page(profile="default", page=0)
 
-        assert await manager.action_contexts.get("0,0") is not None
+        assert await manager.action_contexts.get("0,0") is None
         key = ProviderActionKey("test-provider", ACTION_X_UUID)
         record = manager._action_availability.record_for(key)
         assert record is not None
