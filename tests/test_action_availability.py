@@ -336,6 +336,62 @@ def test_stale_grace_policy_keeps_stale_but_grace_valid_metadata():
     ) == {}
 
 
+def test_expired_provider_direct_record_is_unavailable_after_stale_grace():
+    cache = ActionAvailabilityCache(
+        policy=ActionAvailabilityPolicy(
+            fresh_ttl_seconds=10.0,
+            stale_grace_seconds=5.0,
+        )
+    )
+    metadata = _metadata("action.expired", provider_instance_id="provider-alpha")
+    key = ProviderActionKey("provider-alpha", "action.expired")
+    intent = _intent(
+        "action.expired",
+        provider_instance_id="provider-alpha",
+    )
+
+    cache.record_available(metadata, now=100.0, intent=intent)
+    snapshot = cache.planning_snapshot(
+        (intent,),
+        now=116.0,
+        stale_provider_keys=(key,),
+    )
+
+    assert cache.state_for(key, now=116.0) == ActionAvailabilityState.EXPIRED
+    assert snapshot.metadata == {}
+    assert snapshot.pending == frozenset()
+    assert snapshot.unavailable == frozenset({intent})
+
+
+def test_expired_provider_direct_record_stays_pending_with_live_candidate():
+    cache = ActionAvailabilityCache(
+        policy=ActionAvailabilityPolicy(
+            fresh_ttl_seconds=10.0,
+            stale_grace_seconds=5.0,
+            candidate_ttl_seconds=10.0,
+        )
+    )
+    metadata = _metadata("action.expired", provider_instance_id="provider-alpha")
+    key = ProviderActionKey("provider-alpha", "action.expired")
+    intent = _intent(
+        "action.expired",
+        provider_instance_id="provider-alpha",
+    )
+
+    cache.record_available(metadata, now=100.0, intent=intent)
+    cache.record_candidate(metadata, now=115.0)
+    snapshot = cache.planning_snapshot(
+        (intent,),
+        now=116.0,
+        stale_provider_keys=(key,),
+    )
+
+    assert cache.state_for(key, now=116.0) == ActionAvailabilityState.EXPIRED
+    assert snapshot.metadata == {}
+    assert snapshot.pending == frozenset({intent})
+    assert snapshot.unavailable == frozenset()
+
+
 def test_candidate_removal_clears_records_and_intent_mappings():
     cache = ActionAvailabilityCache()
     metadata = _metadata("action.removed", provider_instance_id="provider-alpha")

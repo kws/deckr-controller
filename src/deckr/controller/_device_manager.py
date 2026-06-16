@@ -802,6 +802,53 @@ class DeviceManager:
             for planned in self._current_plan.bindings
         )
 
+    def _action_availability_change_affects_plan(
+        self,
+        changed_keys: frozenset[ProviderActionKey],
+        plan: PagePlan,
+    ) -> bool:
+        if not changed_keys:
+            return True
+        exact_keys = set(self._existing_provider_action_keys())
+        for planned in plan.bindings:
+            if planned.action_meta is None:
+                continue
+            exact_keys.add(
+                ProviderActionKey(
+                    planned.action_meta.provider_instance_id,
+                    planned.action_meta.uuid,
+                )
+            )
+        if changed_keys & exact_keys:
+            return True
+
+        intents = tuple(
+            self._binding_planner.resolved_action_intent_key(planned.binding)
+            for planned in plan.bindings
+        )
+        return any(
+            self._provider_action_key_matches_intent(key, intent)
+            for key in changed_keys
+            for intent in intents
+        )
+
+    def _provider_action_key_matches_intent(
+        self,
+        key: ProviderActionKey,
+        intent: ActionIntentKey,
+    ) -> bool:
+        if key.action_uuid != intent.action_uuid:
+            return False
+        if intent.provider_instance_id is not None:
+            return key.provider_instance_id == intent.provider_instance_id
+        if not intent.provider_labels:
+            return True
+        record = self._action_availability.record_for(key)
+        if record is None or record.metadata is None:
+            return True
+        labels = record.metadata.provider_labels or {}
+        return all(labels.get(name) == value for name, value in intent.provider_labels)
+
     async def _action_metadata_snapshot_for_plan(
         self,
         intents: tuple[ActionIntentKey, ...],
@@ -2062,10 +2109,20 @@ class DeviceManager:
         changed_keys: Iterable[ProviderActionKey] = (),
     ) -> None:
         """Refresh the current page availability overlay after provider availability changes."""
-        del changed_keys
+        changed_key_set = frozenset(changed_keys)
         async with self._nav_lock:
             current_frame = self._page_frames[-1] if self._page_frames else None
             if current_frame is None:
+                return
+            if changed_key_set and not self._action_availability_change_affects_plan(
+                changed_key_set,
+                current_frame.committed_plan,
+            ):
+                logger.debug(
+                    "Skipping action availability refresh for config=%s page=%s; changed keys do not affect current page",
+                    self.config_id,
+                    current_frame.committed_plan.page_id,
+                )
                 return
 
             refreshed_plan = await self._build_page_plan(

@@ -39,7 +39,7 @@ availability as independent state domains:
 | Provider-session gating removal | Done | Binding/page transitions no longer wait on Concord provider-session readiness; endpoint sessions remain routing and authorization metadata. |
 | Page frame model | In progress | Device runtime needs explicit static/dynamic frames with cached committed plans. |
 | Held input cancellation | In progress | Rebinding must cancel old held inputs before releases are ignored. |
-| Action availability service | Done | Local cache owns Beacon candidates, provider-direct records, freshness/stale policy, interest aggregation, provider requests, and availability-change notifications. |
+| Action availability service | Done | Local cache owns Beacon candidates, provider-direct records, freshness/stale policy, interest aggregation, provider requests, and changed-key computation. |
 | Binding planner extraction | Done | `_binding_planner.py` owns local planning decisions and outcomes, including pending and invalid-config states. |
 | Action interest service | Done | Local tracker and controller service send provider action-interest updates for connected configs and visible page-frame interests. |
 | Provider availability protocol | Done | Shared contracts and Python provider runtime support request/snapshot/change plus interest updates. |
@@ -130,7 +130,7 @@ cache fed by provider-direct state.
 | Add direct availability request/snapshot messages | Done | Provider protocol update | Controller can ask providers for availability for actions of interest. |
 | Add provider availability change messages | Done | Provider protocol update | Providers can publish action availability updates without Beacon churn. |
 | Implement freshness and stale-grace expiry | Done | Clock/test helpers | Fresh, stale, and expired states transition deterministically in the local cache. |
-| Publish availability-change events to device runtimes | Done | Runtime subscription path | Affected current controls replan in place when availability changes. |
+| Publish availability-change events to device runtimes | Done | Runtime subscription path | The service computes changed keys; ControllerService and DeviceManager apply scoped fanout so affected current controls replan in place. |
 | Keep stale existing bindings stable during grace | Done | Planner sticky selection | Existing bindings may remain bound during stale grace; new stale bindings render pending. |
 
 ### 4. Implement Action Interest

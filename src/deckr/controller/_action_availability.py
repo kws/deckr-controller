@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -338,6 +338,12 @@ class ActionAvailabilityCache:
             ):
                 metadata[intent] = record.metadata
                 continue
+            if state == ActionAvailabilityState.EXPIRED:
+                if self._has_live_candidate_for_key(record.key, now=lookup_now):
+                    pending.add(intent)
+                else:
+                    unavailable.add(intent)
+                continue
             if state == ActionAvailabilityState.UNAVAILABLE:
                 unavailable.add(intent)
             else:
@@ -468,6 +474,20 @@ class ActionAvailabilityCache:
             return record.state
         return ActionAvailabilityState.EXPIRED
 
+    def _has_live_candidate_for_key(
+        self,
+        key: ProviderActionKey,
+        *,
+        now: float,
+    ) -> bool:
+        candidate = self._candidate_records.get(key)
+        if candidate is None:
+            return False
+        return self._candidate_state_for_record(candidate, now=now) in {
+            ActionAvailabilityState.UNKNOWN,
+            ActionAvailabilityState.PROBING,
+        }
+
     def _remove_intent_mappings_for_key(self, key: ProviderActionKey) -> None:
         for intent, mapped_key in tuple(self._record_keys_by_intent.items()):
             if mapped_key == key:
@@ -501,10 +521,6 @@ class ActionAvailabilityService:
         cache: ActionAvailabilityCache | None = None,
         clock: Callable[[], float] | None = None,
         revalidation_interval_seconds: float = DEFAULT_PROVIDER_REVALIDATION_SECONDS,
-        on_availability_changed: Callable[
-            [frozenset[ProviderActionKey]], Awaitable[None]
-        ]
-        | None = None,
     ) -> None:
         self.controller_id = controller_id
         self.controller_session_id = controller_session_id
@@ -514,7 +530,6 @@ class ActionAvailabilityService:
         self._clock = clock or time.monotonic
         self._start_soon = start_soon
         self._revalidation_interval_seconds = revalidation_interval_seconds
-        self._on_availability_changed = on_availability_changed
         self._interest_by_config: dict[str, ActionInterestSnapshot] = {}
         self._last_interest_wire_by_provider: dict[
             str,

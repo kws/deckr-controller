@@ -188,7 +188,7 @@ Responsibilities:
 * Select the best provider for a configured action reference.
 * Preserve sticky provider selection for existing bindings where possible.
 * Expire stale availability using policy.
-* Publish availability-change events to affected device runtimes.
+* Compute changed provider/action keys for provider and catalog updates.
 * Manage optional action-interest leases/contracts.
 
 Non-responsibilities:
@@ -1148,7 +1148,7 @@ This service should own:
 * availability cache
 * provider selection
 * action interest TTLs
-* availability events for device runtimes
+* changed provider/action keys for scoped ControllerService/DeviceManager fanout
 
 ## 15.3 Introduce `BindingPlanner`
 

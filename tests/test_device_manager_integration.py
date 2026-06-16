@@ -3497,6 +3497,74 @@ async def test_provider_direct_availability_resolves_candidate_control(
 
 
 @pytest.mark.asyncio
+async def test_unrelated_availability_change_does_not_rebuild_current_page(
+    persistence_tmp_dir,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = ConfigurableActionRegistry()
+    registry.add_action(
+        ACTION_X_UUID,
+        _metadata(
+            ACTION_X_UUID,
+            provider_instance_id="test-provider",
+            provider_id="test",
+        ),
+    )
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        command_service = FakeHardwareCommandService()
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx_before = await manager.action_contexts.get("0,0")
+        assert ctx_before is not None
+
+        build_page_plan = AsyncMock(wraps=manager._build_page_plan)
+        monkeypatch.setattr(manager, "_build_page_plan", build_page_plan)
+        command_service.clear_raster.reset_mock()
+
+        await manager.on_action_availability_changed(
+            {ProviderActionKey("other-provider", "test.action.unrelated")}
+        )
+
+        build_page_plan.assert_not_awaited()
+        command_service.clear_raster.assert_not_awaited()
+        assert await manager.action_contexts.get("0,0") is ctx_before
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_injected_availability_service_skips_legacy_lookup_without_direct_record(
     persistence_tmp_dir,
 ):
