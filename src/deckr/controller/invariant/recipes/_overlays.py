@@ -1,5 +1,7 @@
 """Overlay recipes for controller-owned status render states."""
 
+from dataclasses import dataclass
+
 from invariant import Node, SubGraphNode
 from invariant.params import ref
 from invariant_gfx.anchors import relative
@@ -14,32 +16,39 @@ COLOR_GREEN = (34, 197, 94, 255)
 COLOR_SLATE = (148, 163, 184, 255)
 COLOR_BLUE = (96, 165, 250, 255)
 
-_OVERLAY_ICON: dict[str, str] = {
-    "ok": "lucide:check",
-    "error": "lucide:triangle-alert",
-    "unavailable": "lucide:circle-alert",
-    "pending": "lucide:loader-circle",
-    "loading": "lucide:ellipsis",
-    "unknown": "lucide:message-circle-question-mark",
+
+@dataclass(frozen=True, slots=True)
+class StatusOverlayStyle:
+    icon: str
+    color: tuple[int, int, int, int]
+    title: str
+
+
+STATUS_OVERLAY_STYLES: dict[str, StatusOverlayStyle] = {
+    "ok": StatusOverlayStyle("lucide:circle-check", COLOR_GREEN, "OK"),
+    "error": StatusOverlayStyle("lucide:circle-x", COLOR_RED, "Error"),
+    "unavailable": StatusOverlayStyle(
+        "lucide:circle-alert",
+        COLOR_SLATE,
+        "Unavailable",
+    ),
+    "pending": StatusOverlayStyle("lucide:circle-ellipsis", COLOR_BLUE, "Pending"),
+    "loading": StatusOverlayStyle("lucide:circle-dashed", COLOR_BLUE, "Loading"),
+    "unknown": StatusOverlayStyle(
+        "lucide:circle-question-mark",
+        COLOR_AMBER,
+        "Unknown",
+    ),
 }
 
-_OVERLAY_COLOR: dict[str, tuple[int, int, int, int]] = {
-    "ok": COLOR_GREEN,
-    "error": COLOR_RED,
-    "unavailable": COLOR_SLATE,
-    "pending": COLOR_BLUE,
-    "loading": COLOR_BLUE,
-    "unknown": COLOR_AMBER,
-}
+UNKNOWN_STATUS_OVERLAY = "unknown"
 
-_OVERLAY_TITLE: dict[str, str] = {
-    "ok": "OK",
-    "error": "Error",
-    "unavailable": "Unavailable",
-    "pending": "Pending",
-    "loading": "Loading",
-    "unknown": "Unknown",
-}
+
+def status_overlay_style(template: str) -> StatusOverlayStyle:
+    return STATUS_OVERLAY_STYLES.get(
+        template,
+        STATUS_OVERLAY_STYLES[UNKNOWN_STATUS_OVERLAY],
+    )
 
 
 def feedback_overlay(
@@ -50,9 +59,8 @@ def feedback_overlay(
 ) -> SubGraphNode:
     """SubGraphNode: semantic transient feedback over an optional base image."""
 
-    icon = _OVERLAY_ICON.get(template, _OVERLAY_ICON["unknown"])
-    color = _OVERLAY_COLOR.get(template, _OVERLAY_COLOR["unknown"])
-    label = title or _OVERLAY_TITLE.get(template, _OVERLAY_TITLE["unknown"])
+    style = status_overlay_style(template)
+    label = title or style.title
     graph: dict[str, Node | SubGraphNode] = {}
     layers: list[dict] = []
     deps: list[str] = []
@@ -90,7 +98,7 @@ def feedback_overlay(
 
     graph["icon_blob"] = Node(
         op_name="gfx:resolve_resource",
-        params={"name": icon},
+        params={"name": style.icon},
         deps=[],
     )
     graph["icon_raster"] = Node(
@@ -104,7 +112,7 @@ def feedback_overlay(
     )
     graph["icon"] = Node(
         op_name="gfx:colorize",
-        params={"image": ref("icon_raster"), "color": color},
+        params={"image": ref("icon_raster"), "color": style.color},
         deps=["icon_raster"],
     )
     graph["label"] = Node(
@@ -147,53 +155,8 @@ def feedback_overlay(
 
 
 def alert_overlay() -> SubGraphNode:
-    """SubGraphNode: amber triangle-alert icon centered on dark background."""
-    inner = {
-        "bg": Node(
-            op_name="gfx:create_solid",
-            params={
-                "size": ["${canvas.width}", "${canvas.height}"],
-                "color": (40, 40, 40, 255),
-            },
-            deps=["canvas"],
-        ),
-        "icon_blob": Node(
-            op_name="gfx:resolve_resource",
-            params={"name": "lucide:triangle-alert"},
-            deps=[],
-        ),
-        "icon_raster": Node(
-            op_name="gfx:render_svg",
-            params={
-                "svg_content": ref("icon_blob"),
-                "width": 48,
-                "height": 48,
-            },
-            deps=["icon_blob"],
-        ),
-        "icon": Node(
-            op_name="gfx:colorize",
-            params={"image": ref("icon_raster"), "color": COLOR_AMBER},
-            deps=["icon_raster"],
-        ),
-        "output": Node(
-            op_name="gfx:composite",
-            params={
-                "layers": [
-                    {"image": ref("bg"), "id": "bg"},
-                    {
-                        "image": ref("icon"),
-                        "anchor": relative("bg", "c@c"),
-                        "id": "icon",
-                    },
-                ],
-            },
-            deps=["bg", "icon"],
-        ),
-    }
-    return SubGraphNode(
-        params={"canvas": ref("canvas")}, deps=["canvas"], graph=inner, output="output"
-    )
+    """SubGraphNode: unknown status overlay for legacy alert call sites."""
+    return feedback_overlay("unknown")
 
 
 def unavailable_overlay() -> SubGraphNode:

@@ -6,11 +6,16 @@ import pytest
 import pytest_asyncio
 from deckr.actions.messages import SettingsSnapshot, SettingsTargetRef
 
-from deckr.controller._command_router import CommandRouter, DeviceOutput
+from deckr.controller._command_router import (
+    OVERLAY_TEMPLATES,
+    CommandRouter,
+    DeviceOutput,
+)
 from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
+from deckr.controller.invariant.recipes import STATUS_OVERLAY_STYLES
 
 
 class FakeHardwareCommandService:
@@ -34,6 +39,10 @@ def _make_output(
         control_id,
         capability_id,
     )
+
+
+def test_command_router_overlay_templates_match_status_styles():
+    assert frozenset(STATUS_OVERLAY_STYLES) == OVERLAY_TEMPLATES
 
 
 # --- DeviceOutput: last_frame tracking ---

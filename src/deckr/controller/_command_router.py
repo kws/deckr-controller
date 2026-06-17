@@ -12,6 +12,10 @@ from deckr.contracts.models import thaw_json
 from deckr.controller._render import RenderService, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore, RenderOverlay
+from deckr.controller.invariant.recipes import (
+    STATUS_OVERLAY_STYLES,
+    UNKNOWN_STATUS_OVERLAY,
+)
 from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
@@ -26,16 +30,7 @@ OVERLAY_TEMPLATE_DEFAULT_SECONDS = {
     "unavailable": 2.0,
     "unknown": 2.0,
 }
-OVERLAY_TEMPLATES = frozenset(
-    {
-        "ok",
-        "error",
-        "unavailable",
-        "pending",
-        "loading",
-        "unknown",
-    }
-)
+OVERLAY_TEMPLATES = frozenset(STATUS_OVERLAY_STYLES)
 SETTINGS_HYDRATE_TIMEOUT_SECONDS = 0.25
 
 
@@ -209,7 +204,7 @@ class CommandRouter:
                 "Unknown binding overlay template %s; rendering unknown fallback",
                 template,
             )
-            resolved_template = "unknown"
+            resolved_template = UNKNOWN_STATUS_OVERLAY
 
         if resolved_duration is None:
             resolved_duration = OVERLAY_TEMPLATE_DEFAULT_SECONDS.get(resolved_template)

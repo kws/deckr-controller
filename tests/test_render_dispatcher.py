@@ -35,6 +35,7 @@ from deckr.controller._render_dispatcher import (
     RenderDispatcher,
     ThreadRenderBackend,
 )
+from deckr.controller.invariant.recipes import STATUS_OVERLAY_STYLES
 
 
 class FakeHardwareCommandService:
@@ -304,6 +305,23 @@ def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
         model,
         fmt,
         context_id=f"ctx:{case_id}",
+        control_id="0,0",
+    )
+    assert request is not None
+
+    frame = render_request_to_jpeg(request)
+
+    assert isinstance(frame, bytes)
+    assert len(frame) > 100
+
+
+@pytest.mark.parametrize("status", sorted(STATUS_OVERLAY_STYLES))
+def test_status_overlay_render_request_to_jpeg_round_trips(status):
+    fmt = RasterImageFormat(width=72, height=72)
+    request = RenderService().build_request(
+        RenderModel(overlay_type=status),
+        fmt,
+        context_id=f"ctx:{status}",
         control_id="0,0",
     )
     assert request is not None
