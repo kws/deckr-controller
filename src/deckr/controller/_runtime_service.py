@@ -20,6 +20,7 @@ from deckr.concord import Concord
 from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE
 from deckr.lanes import EndpointSession
 
+from deckr.controller._action_availability import ActionAvailabilityService
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
     parse_controller_config,
@@ -93,11 +94,19 @@ class ControllerRuntimeService(BaseComponent):
                 on_catalog_changed=on_catalog_changed,
             )
             await self._component_manager.add_component(action_registry)
+            action_availability_service = ActionAvailabilityService(
+                controller_id=self._runtime.controller_id,
+                controller_session_id=self._endpoint.session_id,
+                actions_bus=self._endpoint,
+                manager=action_registry,
+                start_soon=ctx.tg.start_soon,
+            )
             settings_service = build_settings_service(
                 self._runtime.config,
                 controller_id=self._runtime.controller_id,
                 config_service=config_service,
                 action_provider=action_registry.get_action,
+                availability_service=action_availability_service,
             )
 
             controller_service = ControllerService(
@@ -108,6 +117,7 @@ class ControllerRuntimeService(BaseComponent):
                 settings_service=settings_service,
                 controller_id=self._runtime.controller_id,
                 action_registry=action_registry,
+                action_availability_service=action_availability_service,
             )
             await self._component_manager.add_component(controller_service)
         except BaseException:

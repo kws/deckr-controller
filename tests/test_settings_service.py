@@ -10,9 +10,12 @@ from typing import Any
 import anyio
 import pytest
 import yaml
+from conftest import LaneHarness
 from deckr.actions.messages import SettingsTargetRef
+from deckr.contracts.messages import ACTIONS_LANE, controller_address
 from pydantic import ValidationError
 
+from deckr.controller._action_availability import ActionAvailabilityService
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import (
     Control,
@@ -262,8 +265,6 @@ async def test_schema_validation_rejects_invalid_settings(tmp_path: Path) -> Non
     [
         {"actionId": "action.other"},
         {"stableId": "clock-secondary"},
-        {"providerInstanceId": "python.other"},
-        {"providerId": "other"},
         {"stableId": None},
     ],
 )
@@ -284,6 +285,66 @@ async def test_action_target_metadata_mismatch_is_unknown(
     reloaded = await config_service.get_config(CONFIG_ID)
     assert reloaded is not None
     assert reloaded.profiles[0].pages[0].controls[0].settings == {"mode": "time"}
+
+
+@pytest.mark.asyncio
+async def test_action_target_survives_missing_provider_metadata_as_stale(
+    tmp_path: Path,
+) -> None:
+    service, _ = await _service(tmp_path)
+    target = _target_with(providerInstanceId="python.other", providerId="other")
+
+    snapshot = await service.get(target)
+    description = await service.describe_target(target)
+
+    assert snapshot.settings == {
+        "mode": "time",
+        "templateOverrides": {"title": "Clock"},
+    }
+    assert snapshot.schema_metadata.stale is True
+    assert snapshot.schema_metadata.json_schema is None
+    assert description.schema_metadata.stale is True
+
+
+@pytest.mark.asyncio
+async def test_settings_metadata_reads_from_action_availability_service(
+    tmp_path: Path,
+) -> None:
+    config_service = FileBackedDeviceConfigService(config_dir=tmp_path)
+    await config_service.write_config(_config())
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    availability = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=object(),
+        start_soon=None,
+        clock=lambda: 0.0,
+    )
+    availability.cache.record_available(
+        ActionMetadata(
+            uuid="action.clock",
+            name="Clock",
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+            settings_schema={"type": "object"},
+            provider_settings_schema={"type": "object"},
+        ),
+        now=0.0,
+    )
+    service = ConfigBackedSettingsService(
+        controller_id=CONTROLLER_ID,
+        config_service=config_service,
+        availability_service=availability,
+    )
+
+    snapshot = await service.get(_stable_action_target())
+
+    assert snapshot.schema_metadata.stale is False
+    assert snapshot.schema_metadata.json_schema == {"type": "object"}
 
 
 @pytest.mark.asyncio

@@ -120,6 +120,7 @@ class ControllerService(BaseComponent):
         *,
         controller_id: str,
         action_registry: ActionRegistry | None = None,
+        action_availability_service: ActionAvailabilityService | None = None,
         render_backend: RenderBackend | None = None,
     ):
         super().__init__()
@@ -137,7 +138,7 @@ class ControllerService(BaseComponent):
         self._controller_contexts = AsyncMap[str, DeviceManager]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
-        self._action_availability_service: ActionAvailabilityService | None = None
+        self._action_availability_service = action_availability_service
         self._start_soon: Callable | None = None
         self._render_backend = render_backend
         self._session_id = endpoint.session_id
@@ -377,6 +378,8 @@ class ControllerService(BaseComponent):
                 continue
 
             if validity.status == ContractValidityStatus.VALID:
+                if await self._rematch_owned_claim_if_needed(owned, candidate):
+                    continue
                 if not owned.live:
                     await self._connect_owned_claim(owned, candidate)
                 else:
@@ -555,6 +558,14 @@ class ControllerService(BaseComponent):
         owned: OwnedHardwareClaim,
         candidate: HardwareCandidate,
     ) -> None:
+        config = await self._config_service.get_config(owned.config_id)
+        if config is None or not config.enabled:
+            logger.info(
+                "Config %s is unavailable; keeping hardware claim %s idle",
+                owned.config_id,
+                owned.claim_id,
+            )
+            return
         live = self._device_registry.connect(
             config_id=owned.config_id,
             ref=owned.ref,
@@ -569,15 +580,79 @@ class ControllerService(BaseComponent):
             device=candidate.device,
             manager_session_id=candidate.payload.session_id,
         )
-        config = await self._config_service.get_config(owned.config_id)
-        if config is None:
-            await self._revoke_owned_claim(
-                owned,
-                cancel_contract=True,
-                reason="matched config disappeared before hardware claim became valid",
-            )
-            return
         await self.on_device_connected(live, initial_config=config)
+
+    async def _rematch_owned_claim_if_needed(
+        self,
+        owned: OwnedHardwareClaim,
+        candidate: HardwareCandidate,
+    ) -> bool:
+        current_config = await self._config_service.get_config(owned.config_id)
+        if current_config is not None and current_config.enabled:
+            return False
+        try:
+            matched = await self._config_service.match_device(
+                fingerprint=candidate.device.fingerprint,
+                labels=candidate.labels,
+            )
+        except ValueError:
+            logger.exception(
+                "Ambiguous rematch config for claimed hardware fingerprint=%s "
+                "labels=%s manager=%s",
+                candidate.device.fingerprint,
+                dict(candidate.labels),
+                candidate.ref.manager_id,
+            )
+            return False
+        if matched is None:
+            return False
+        if matched.id == owned.config_id:
+            return False
+        await self._migrate_owned_claim_config(
+            owned,
+            candidate,
+            next_config=matched,
+        )
+        return True
+
+    async def _migrate_owned_claim_config(
+        self,
+        owned: OwnedHardwareClaim,
+        candidate: HardwareCandidate,
+        *,
+        next_config,
+    ) -> None:
+        previous_config_id = owned.config_id
+        logger.info(
+            "Rematching claimed hardware %s/%s from config %s to %s",
+            owned.ref.manager_id,
+            owned.ref.device_id,
+            previous_config_id,
+            next_config.id,
+        )
+        if self._device_registry.get(previous_config_id) is not None:
+            self._device_registry.disconnect_config(previous_config_id)
+            self._command_service.unregister_config(previous_config_id)
+        await self.on_device_disconnected(
+            previous_config_id,
+            reason=f"hardware rematched to config {next_config.id}",
+        )
+        owned.config_id = next_config.id
+        owned.device = candidate.device
+        live = self._device_registry.connect(
+            config_id=next_config.id,
+            ref=owned.ref,
+            device=candidate.device,
+            manager_session_id=candidate.payload.session_id,
+        )
+        owned.live = True
+        self._command_service.register_device(
+            config_id=next_config.id,
+            ref=owned.ref,
+            device=candidate.device,
+            manager_session_id=candidate.payload.session_id,
+        )
+        await self.on_device_connected(live, initial_config=next_config)
 
     async def _refresh_live_descriptor(
         self,
@@ -680,7 +755,10 @@ class ControllerService(BaseComponent):
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
         self._start_soon = ctx.tg.start_soon
-        if self._action_registry is not None:
+        if (
+            self._action_availability_service is None
+            and self._action_registry is not None
+        ):
             self._action_availability_service = ActionAvailabilityService(
                 controller_id=self._controller_id,
                 controller_session_id=self._session_id,
@@ -688,6 +766,7 @@ class ControllerService(BaseComponent):
                 manager=self._action_registry,
                 start_soon=ctx.tg.start_soon,
             )
+        if self._action_availability_service is not None:
             await self._action_availability_service.start(ctx.tg, ctx.stopping)
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()

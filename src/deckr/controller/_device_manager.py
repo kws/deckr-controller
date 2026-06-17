@@ -150,6 +150,13 @@ _SETTINGS_COMMAND_TYPES = frozenset(
     }
 )
 _IMAGE_SOURCE_SCHEMES = ("data:", "http://", "https://")
+_TERMINAL_LIFECYCLE_REJECTION_REASONS = frozenset(
+    {
+        "invalid_settings",
+        "unsupported_capability",
+        "permission_denied",
+    }
+)
 
 
 def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
@@ -427,6 +434,10 @@ class DeviceManager:
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
         self._sync_action_interest()
+
+    @property
+    def config_active(self) -> bool:
+        return self._config_active
 
     async def start(
         self,
@@ -878,6 +889,90 @@ class DeviceManager:
             ProviderActionKey(lease.provider_instance_id, lease.action_uuid)
             for lease in self._binding_leases.values()
         )
+
+    def _lifecycle_rejection_is_terminal(
+        self,
+        body: ActionLifecycleRejectedBody,
+    ) -> bool:
+        if body.reason == "stale_lifecycle":
+            return False
+        if body.retryable:
+            return False
+        return body.reason in _TERMINAL_LIFECYCLE_REJECTION_REASONS
+
+    def _planned_intent_for_lease(self, lease: BindingLease) -> ActionIntentKey:
+        planned = self._planned_bindings_by_control.get(lease.control_id)
+        if planned is not None:
+            return self._binding_planner.resolved_action_intent_key(planned.binding)
+        return ActionIntentKey(
+            action_uuid=lease.action_uuid,
+            provider_instance_id=lease.provider_instance_id,
+            provider_labels=(),
+        )
+
+    def _record_lifecycle_unavailable_for_binding(
+        self,
+        lease: BindingLease,
+        *,
+        reason: str,
+    ) -> ProviderActionKey:
+        return self._action_availability_service.record_lifecycle_unavailable(
+            provider_instance_id=lease.provider_instance_id,
+            provider_id=lease.provider_id,
+            provider_session_id=lease.provider_session_id,
+            action_uuid=lease.action_uuid,
+            reason=reason,
+            intent=self._planned_intent_for_lease(lease),
+            now=self._clock(),
+        )
+
+    def _record_lifecycle_unavailable_for_action_instance(
+        self,
+        metadata: ActionInstanceMetadata,
+        *,
+        reason: str,
+    ) -> ProviderActionKey:
+        return self._action_availability_service.record_lifecycle_unavailable(
+            provider_instance_id=metadata.provider_instance_id,
+            provider_id=metadata.provider_id,
+            action_uuid=metadata.action_id,
+            provider_session_id=self.manager.provider_session_id(
+                metadata.provider_instance_id
+            ),
+            reason=reason,
+            intent=ActionIntentKey(
+                action_uuid=metadata.action_id,
+                provider_instance_id=metadata.provider_instance_id,
+                provider_labels=(),
+            ),
+            now=self._clock(),
+        )
+
+    def _record_lifecycle_unavailable_for_page_session(
+        self,
+        session: DynamicPageSession,
+        *,
+        reason: str,
+    ) -> ProviderActionKey:
+        return self._action_availability_service.record_lifecycle_unavailable(
+            provider_instance_id=session.owner_provider_instance_id,
+            provider_id=session.owner_provider_id,
+            action_uuid=session.owner_action_uuid,
+            provider_session_id=session.owner_provider_session_id,
+            reason=reason,
+            intent=ActionIntentKey(
+                action_uuid=session.owner_action_uuid,
+                provider_instance_id=session.owner_provider_instance_id,
+                provider_labels=(),
+            ),
+            now=self._clock(),
+        )
+
+    async def _handle_nondestructive_lifecycle_rejection(
+        self,
+        key: ProviderActionKey,
+    ) -> None:
+        await self.on_action_availability_changed(frozenset({key}))
 
     def _log_static_page_plan_rejection(
         self,
@@ -2561,7 +2656,14 @@ class DeviceManager:
                     metadata.action_instance_id,
                 )
                 return
-            await self._reject_action_instance(metadata, reason=body.reason)
+            if self._lifecycle_rejection_is_terminal(body):
+                await self._reject_action_instance(metadata, reason=body.reason)
+                return
+            key = self._record_lifecycle_unavailable_for_action_instance(
+                metadata,
+                reason=body.reason,
+            )
+            await self._handle_nondestructive_lifecycle_rejection(key)
             return
 
         authorization = await self._authorize_action_command(
@@ -2584,24 +2686,20 @@ class DeviceManager:
                     "Ignoring action lifecycle rejection for mismatched binding"
                 )
                 return
-            control = (
-                _find_control_surface(
-                    self.device,
-                    lease.control_id,
-                    raster_capability_id=lease.raster_capability_id,
+            if self._lifecycle_rejection_is_terminal(body):
+                await self._revoke_binding(
+                    lease.binding_id,
+                    clear_output=True,
+                    notify_provider=False,
+                    reason=body.reason,
+                    clear_held_input=True,
                 )
-                if body.retryable
-                else None
-            )
-            await self._revoke_binding(
-                lease.binding_id,
-                clear_output=not body.retryable,
-                notify_provider=False,
+                return
+            key = self._record_lifecycle_unavailable_for_binding(
+                lease,
                 reason=body.reason,
-                clear_held_input=True,
             )
-            if control is not None:
-                await self._render_unavailable_to_control(control)
+            await self._handle_nondestructive_lifecycle_rejection(key)
             return
 
         if body.target_kind == "page_session":
@@ -2617,7 +2715,14 @@ class DeviceManager:
                     "Ignoring action lifecycle rejection for mismatched page session"
                 )
                 return
-            await self._close_rejected_page_session(session, reason=body.reason)
+            if self._lifecycle_rejection_is_terminal(body):
+                await self._close_rejected_page_session(session, reason=body.reason)
+                return
+            key = self._record_lifecycle_unavailable_for_page_session(
+                session,
+                reason=body.reason,
+            )
+            await self._handle_nondestructive_lifecycle_rejection(key)
 
     async def _reject_action_instance(
         self,

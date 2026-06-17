@@ -37,6 +37,7 @@ from deckr.controller._action_interest import (
     ActionInterestStrength,
 )
 from deckr.controller._binding_planner import ActionIntentKey
+from deckr.controller._settings_metadata import SettingsActionMetadata
 from deckr.controller.action_provider.events import ActionCatalogChangedEvent
 from deckr.controller.action_provider.provider import (
     ActionMetadata,
@@ -91,6 +92,12 @@ class ActionPlanningSnapshot:
     metadata: Mapping[ActionIntentKey, ActionMetadata]
     pending: frozenset[ActionIntentKey]
     unavailable: frozenset[ActionIntentKey]
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanningRecord:
+    record: ActionAvailabilityRecord
+    state: ActionAvailabilityState
 
 
 class ActionAvailabilityCache:
@@ -278,30 +285,14 @@ class ActionAvailabilityCache:
         now: float | None = None,
     ) -> ActionAvailabilityRecord | None:
         lookup_now = self._now(now)
-        selected_key = self._record_keys_by_intent.get(intent)
-        if selected_key is not None:
-            record = self.record_for(selected_key)
-            if record is not None and self._record_matches_intent(
-                record,
-                intent,
-                now=lookup_now,
-                trust_mapped_key=True,
-            ):
-                return record
-        candidates = [
-            record
-            for record in (
-                *self._availability_records.values(),
-                *self._candidate_records.values(),
-            )
-            if self._record_matches_intent(record, intent, now=lookup_now)
-        ]
-        if not candidates:
+        selected = self._selected_planning_record(
+            intent,
+            now=lookup_now,
+            stale_provider_keys=frozenset(),
+        )
+        if selected is None:
             return None
-        candidates.sort(key=lambda record: record.key.provider_instance_id)
-        selected = candidates[0]
-        self._record_keys_by_intent[intent] = selected.key
-        return selected
+        return selected.record
 
     def planning_snapshot(
         self,
@@ -317,48 +308,29 @@ class ActionAvailabilityCache:
         unavailable: set[ActionIntentKey] = set()
 
         for intent in intents:
-            selected_metadata = self._metadata_for_intent(
+            selected = self._selected_planning_record(
                 intent,
                 now=lookup_now,
                 stale_provider_keys=stale_keys,
             )
-            if selected_metadata is not None:
-                metadata[intent] = selected_metadata
-                continue
-
-            record = self.record_for_intent(intent, now=lookup_now)
-            if record is None:
+            if selected is None:
                 unavailable.add(intent)
                 continue
 
-            state = self._state_for_record(record, now=lookup_now)
-            if record.source == ActionAvailabilitySource.BEACON_CANDIDATE:
-                pending.add(intent)
-                continue
-            if state == ActionAvailabilityState.AVAILABLE:
+            record = selected.record
+            if self._planning_record_is_usable(
+                selected,
+                stale_provider_keys=stale_keys,
+            ):
                 if record.metadata is not None:
                     metadata[intent] = record.metadata
                 else:
                     pending.add(intent)
                 continue
-            if (
-                state == ActionAvailabilityState.STALE
-                and record.key in stale_keys
-                and record.state == ActionAvailabilityState.AVAILABLE
-                and record.metadata is not None
-            ):
-                metadata[intent] = record.metadata
-                continue
-            if state == ActionAvailabilityState.EXPIRED:
-                if self._has_live_candidate_for_key(record.key, now=lookup_now):
-                    pending.add(intent)
-                else:
-                    unavailable.add(intent)
-                continue
-            if state == ActionAvailabilityState.UNAVAILABLE:
-                unavailable.add(intent)
-            else:
+            if self._planning_record_is_pending(selected):
                 pending.add(intent)
+                continue
+            unavailable.add(intent)
 
         return ActionPlanningSnapshot(
             metadata=metadata,
@@ -373,41 +345,174 @@ class ActionAvailabilityCache:
         now: float,
         stale_provider_keys: frozenset[ProviderActionKey],
     ) -> ActionMetadata | None:
+        selected = self._selected_planning_record(
+            intent,
+            now=now,
+            stale_provider_keys=stale_provider_keys,
+        )
+        if selected is None or not self._planning_record_is_usable(
+            selected,
+            stale_provider_keys=stale_provider_keys,
+        ):
+            return None
+        return selected.record.metadata
+
+    def settings_metadata_for_intent(
+        self,
+        intent: ActionIntentKey,
+        *,
+        provider_id: str | None = None,
+        now: float | None = None,
+    ) -> SettingsActionMetadata:
+        lookup_now = self._now(now)
+        for records, candidate_stale in (
+            (self._availability_records.values(), False),
+            (self._candidate_records.values(), True),
+        ):
+            matches = [
+                record
+                for record in records
+                if record.metadata is not None
+                and self._record_matches_intent(record, intent, now=lookup_now)
+                and (provider_id is None or record.metadata.provider_id == provider_id)
+                and self._state_for_record(record, now=lookup_now)
+                != ActionAvailabilityState.EXPIRED
+            ]
+            if not matches:
+                continue
+            matches.sort(key=lambda record: record.key.provider_instance_id)
+            selected = matches[0]
+            return SettingsActionMetadata(
+                action=selected.metadata,
+                stale=candidate_stale
+                or self._state_for_record(selected, now=lookup_now)
+                != ActionAvailabilityState.AVAILABLE,
+            )
+        return SettingsActionMetadata(action=None, stale=True)
+
+    def _selected_planning_record(
+        self,
+        intent: ActionIntentKey,
+        *,
+        now: float,
+        stale_provider_keys: frozenset[ProviderActionKey],
+    ) -> _PlanningRecord | None:
+        records = self._planning_records_for_intent(intent, now=now)
+        if not records:
+            return None
+
         selected_key = self._record_keys_by_intent.get(intent)
         if selected_key is not None:
-            selected_record = self._availability_records.get(selected_key)
-            if (
-                selected_record is not None
-                and self._record_matches_intent(
-                    selected_record,
-                    intent,
-                    now=now,
-                    trust_mapped_key=True,
-                )
-            ):
-                if self._is_snapshot_eligible(
-                    selected_record,
-                    now=now,
+            for item in records:
+                if item.record.key == selected_key and self._planning_record_is_usable(
+                    item,
                     stale_provider_keys=stale_provider_keys,
                 ):
-                    return selected_record.metadata
+                    return item
 
-        candidates = [
-            record
-            for record in self._availability_records.values()
-            if self._record_matches_intent(record, intent, now=now)
-            and self._is_snapshot_eligible(
+        for predicate in (
+            self._planning_record_is_fresh_available,
+            self._planning_record_is_provider_direct_pending,
+            self._planning_record_is_live_candidate,
+        ):
+            for item in records:
+                if predicate(item):
+                    self._record_keys_by_intent[intent] = item.record.key
+                    return item
+
+        selected = records[0]
+        self._record_keys_by_intent[intent] = selected.record.key
+        return selected
+
+    def _planning_records_for_intent(
+        self,
+        intent: ActionIntentKey,
+        *,
+        now: float,
+    ) -> tuple[_PlanningRecord, ...]:
+        selected_key = self._record_keys_by_intent.get(intent)
+        records = [
+            _PlanningRecord(record=record, state=self._state_for_record(record, now=now))
+            for record in (
+                *self._availability_records.values(),
+                *self._candidate_records.values(),
+            )
+            if self._record_matches_intent(
                 record,
+                intent,
                 now=now,
-                stale_provider_keys=stale_provider_keys,
+                trust_mapped_key=record.key == selected_key,
             )
         ]
-        if not candidates:
-            return None
-        candidates.sort(key=lambda record: record.key.provider_instance_id)
-        selected = candidates[0]
-        self._record_keys_by_intent[intent] = selected.key
-        return selected.metadata
+        records.sort(
+            key=lambda item: (
+                item.record.key.provider_instance_id,
+                0
+                if item.record.source == ActionAvailabilitySource.PROVIDER_DIRECT
+                else 1,
+            )
+        )
+        return tuple(records)
+
+    def _planning_record_is_usable(
+        self,
+        item: _PlanningRecord,
+        *,
+        stale_provider_keys: frozenset[ProviderActionKey],
+    ) -> bool:
+        record = item.record
+        if record.source != ActionAvailabilitySource.PROVIDER_DIRECT:
+            return False
+        if record.state != ActionAvailabilityState.AVAILABLE:
+            return False
+        if item.state == ActionAvailabilityState.AVAILABLE:
+            return record.metadata is not None
+        return (
+            item.state == ActionAvailabilityState.STALE
+            and record.key in stale_provider_keys
+            and record.metadata is not None
+        )
+
+    def _planning_record_is_fresh_available(self, item: _PlanningRecord) -> bool:
+        record = item.record
+        return (
+            record.source == ActionAvailabilitySource.PROVIDER_DIRECT
+            and record.state == ActionAvailabilityState.AVAILABLE
+            and item.state == ActionAvailabilityState.AVAILABLE
+            and record.metadata is not None
+        )
+
+    def _planning_record_is_provider_direct_pending(
+        self,
+        item: _PlanningRecord,
+    ) -> bool:
+        record = item.record
+        if record.source != ActionAvailabilitySource.PROVIDER_DIRECT:
+            return False
+        if item.state == ActionAvailabilityState.EXPIRED:
+            return False
+        if record.state == ActionAvailabilityState.UNAVAILABLE:
+            return False
+        return item.state in {
+            ActionAvailabilityState.UNKNOWN,
+            ActionAvailabilityState.PROBING,
+            ActionAvailabilityState.STALE,
+        }
+
+    def _planning_record_is_live_candidate(self, item: _PlanningRecord) -> bool:
+        return (
+            item.record.source == ActionAvailabilitySource.BEACON_CANDIDATE
+            and item.state
+            in {
+                ActionAvailabilityState.UNKNOWN,
+                ActionAvailabilityState.PROBING,
+            }
+        )
+
+    def _planning_record_is_pending(self, item: _PlanningRecord) -> bool:
+        return self._planning_record_is_provider_direct_pending(
+            item
+        ) or self._planning_record_is_live_candidate(item)
 
     def _record_matches_intent(
         self,
@@ -427,27 +532,11 @@ class ActionAvailabilityCache:
         metadata = record.metadata
         if metadata is None and trust_mapped_key:
             return True
+        if metadata is None and not intent.provider_labels:
+            return True
         if metadata is None:
             return False
         return _labels_match(metadata.provider_labels, intent.provider_labels)
-
-    def _is_snapshot_eligible(
-        self,
-        record: ActionAvailabilityRecord,
-        *,
-        now: float,
-        stale_provider_keys: frozenset[ProviderActionKey],
-    ) -> bool:
-        if record.source != ActionAvailabilitySource.PROVIDER_DIRECT:
-            return False
-        state = self._state_for_record(record, now=now)
-        if state == ActionAvailabilityState.AVAILABLE:
-            return record.state == ActionAvailabilityState.AVAILABLE
-        return (
-            state == ActionAvailabilityState.STALE
-            and record.state == ActionAvailabilityState.AVAILABLE
-            and record.key in stale_provider_keys
-        )
 
     def _state_for_record(
         self,
@@ -486,20 +575,6 @@ class ActionAvailabilityCache:
         if age_seconds <= candidate_ttl:
             return record.state
         return ActionAvailabilityState.EXPIRED
-
-    def _has_live_candidate_for_key(
-        self,
-        key: ProviderActionKey,
-        *,
-        now: float,
-    ) -> bool:
-        candidate = self._candidate_records.get(key)
-        if candidate is None:
-            return False
-        return self._candidate_state_for_record(candidate, now=now) in {
-            ActionAvailabilityState.UNKNOWN,
-            ActionAvailabilityState.PROBING,
-        }
 
     def _remove_intent_mappings_for_key(self, key: ProviderActionKey) -> None:
         for intent, mapped_key in tuple(self._record_keys_by_intent.items()):
@@ -570,6 +645,55 @@ class ActionAvailabilityService:
             stale_provider_keys=existing_provider_keys,
             now=self._now(now),
         )
+
+    def settings_action_metadata(
+        self,
+        action_uuid: str,
+        *,
+        provider_instance_id: str | None = None,
+        provider_id: str | None = None,
+        provider_labels: Mapping[str, str] | None = None,
+        now: float | None = None,
+    ) -> SettingsActionMetadata:
+        return self.cache.settings_metadata_for_intent(
+            ActionIntentKey(
+                action_uuid=action_uuid,
+                provider_instance_id=provider_instance_id,
+                provider_labels=tuple(sorted((provider_labels or {}).items())),
+            ),
+            provider_id=provider_id,
+            now=self._now(now),
+        )
+
+    def record_lifecycle_unavailable(
+        self,
+        *,
+        provider_instance_id: str,
+        provider_id: str,
+        action_uuid: str,
+        provider_session_id: str | None = None,
+        reason: str | None = None,
+        intent: ActionIntentKey | None = None,
+        now: float | None = None,
+    ) -> ProviderActionKey:
+        key = ProviderActionKey(provider_instance_id, action_uuid)
+        existing = self.cache.record_for(key)
+        metadata = existing.metadata if existing is not None else None
+        if metadata is None:
+            metadata = ActionMetadata(
+                uuid=action_uuid,
+                provider_instance_id=provider_instance_id,
+                provider_id=provider_id,
+                provider_session_id=provider_session_id,
+            )
+        self.cache.record_unavailable(
+            key,
+            metadata=metadata,
+            reason=reason,
+            now=self._now(now),
+            intent=intent,
+        )
+        return key
 
     def update_config_interest(
         self,

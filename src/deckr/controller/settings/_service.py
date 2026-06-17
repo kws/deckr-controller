@@ -18,6 +18,7 @@ from deckr.contracts.models import thaw_json
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema import validate as validate_json_schema
 
+from deckr.controller._settings_metadata import SettingsActionMetadata
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.config._data import Control, DeviceConfig
@@ -26,6 +27,18 @@ from deckr.controller.settings._identity import derive_action_instance_id
 logger = logging.getLogger(__name__)
 
 ActionProvider = Callable[..., Awaitable[ActionMetadata | None]]
+
+
+class ActionMetadataResolver(Protocol):
+    def settings_action_metadata(
+        self,
+        action_uuid: str,
+        *,
+        provider_instance_id: str | None = None,
+        provider_id: str | None = None,
+        provider_labels: Mapping[str, str] | None = None,
+        now: float | None = None,
+    ) -> SettingsActionMetadata: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,10 +101,11 @@ def _split_action_settings(
 
 
 def _schema_metadata(
-    action: ActionMetadata | None,
+    metadata: SettingsActionMetadata,
     *,
     scope: str,
 ) -> SettingsSchemaMetadata:
+    action = metadata.action
     schema = None
     if action is not None:
         schema = (
@@ -101,7 +115,7 @@ def _schema_metadata(
         )
     return SettingsSchemaMetadata(
         schema=schema,
-        stale=schema is None,
+        stale=metadata.stale or schema is None,
     )
 
 
@@ -129,10 +143,12 @@ class ConfigBackedSettingsService:
         controller_id: str,
         config_service: DeviceConfigService,
         action_provider: ActionProvider | None = None,
+        availability_service: ActionMetadataResolver | None = None,
     ) -> None:
         self._controller_id = controller_id
         self._config_service = config_service
         self._action_provider = action_provider
+        self._availability_service = availability_service
         self._subscribers: dict[
             str, set[anyio.abc.ObjectSendStream[SettingsSnapshot]]
         ] = {}
@@ -145,23 +161,26 @@ class ConfigBackedSettingsService:
         descriptions: list[SettingsTargetDescription] = []
         provider_targets: dict[tuple[str, str], SettingsTargetRef] = {}
         for location in self._control_locations(config):
-            action = await self._action_metadata_for_control(location.control)
-            if action is None:
+            metadata = await self._action_metadata_for_control(location.control)
+            action = metadata.action
+            provider_instance_id, provider_id = self._provider_ids_for_control(
+                location.control,
+                action,
+            )
+            if provider_instance_id is None or provider_id is None:
                 continue
-            provider_targets[(action.provider_instance_id, action.provider_id)] = (
-                self.provider_target(
-                    config,
-                    provider_instance_id=action.provider_instance_id,
-                    provider_id=action.provider_id,
-                )
+            provider_targets[(provider_instance_id, provider_id)] = self.provider_target(
+                config,
+                provider_instance_id=provider_instance_id,
+                provider_id=provider_id,
             )
             descriptions.append(
                 await self.describe_target(
                     self.action_target(
                         config,
                         location,
-                        provider_instance_id=action.provider_instance_id,
-                        provider_id=action.provider_id,
+                        provider_instance_id=provider_instance_id,
+                        provider_id=provider_id,
                     )
                 )
             )
@@ -174,14 +193,14 @@ class ConfigBackedSettingsService:
     ) -> SettingsTargetDescription:
         config = await self._require_config(target.config_id)
         if target.scope == "action_provider_instance":
-            action = await self._action_for_target(target)
+            metadata = await self._action_for_target(target)
             return SettingsTargetDescription(
                 target=target,
                 providerInstanceId=target.provider_instance_id,
                 providerId=target.provider_id,
                 label=target.provider_id,
                 schemaMetadata=_schema_metadata(
-                    action,
+                    metadata,
                     scope="action_provider_instance",
                 ),
                 provenance=("config_default",),
@@ -212,24 +231,25 @@ class ConfigBackedSettingsService:
     async def get(self, target: SettingsTargetRef) -> SettingsSnapshot:
         config = await self._require_config(target.config_id)
         if target.scope == "action_provider_instance":
-            action = await self._action_for_target(target)
+            metadata = await self._action_for_target(target)
             settings = _settings_copy(
                 config.provider_settings.get(target.provider_instance_id)
             )
-            metadata = _schema_metadata(action, scope="action_provider_instance")
             return SettingsSnapshot(
                 target=target,
                 settings=settings,
                 provenance=("config_default",),
-                schemaMetadata=metadata,
+                schemaMetadata=_schema_metadata(
+                    metadata,
+                    scope="action_provider_instance",
+                ),
             )
-        location, action = await self._find_verified_control(config, target)
-        metadata = _schema_metadata(action, scope="action_instance")
+        location, metadata = await self._find_verified_control(config, target)
         return SettingsSnapshot(
             target=target,
             settings=_action_settings_from_control(location.control),
             provenance=self._action_provenance(location.control),
-            schemaMetadata=metadata,
+            schemaMetadata=_schema_metadata(metadata, scope="action_instance"),
         )
 
     async def patch(
@@ -246,12 +266,12 @@ class ConfigBackedSettingsService:
         config = await self._require_config(target.config_id)
         if target.scope == "action_provider_instance":
             location = None
-            action = await self._action_for_target(target)
+            metadata = await self._action_for_target(target)
         else:
-            location, action = await self._find_verified_control(config, target)
-        metadata = _schema_metadata(action, scope=target.scope)
+            location, metadata = await self._find_verified_control(config, target)
+        schema_metadata = _schema_metadata(metadata, scope=target.scope)
         next_settings = _settings_copy(settings)
-        _validate_settings(next_settings, metadata)
+        _validate_settings(next_settings, schema_metadata)
         if target.scope == "action_provider_instance":
             provider_settings = dict(config.provider_settings)
             provider_settings[target.provider_instance_id] = next_settings
@@ -353,19 +373,34 @@ class ConfigBackedSettingsService:
         *,
         provider_instance_id: str | None = None,
         provider_labels: Mapping[str, str] | None = None,
-    ) -> ActionMetadata | None:
+        provider_id: str | None = None,
+    ) -> SettingsActionMetadata:
+        if self._availability_service is not None:
+            return self._availability_service.settings_action_metadata(
+                action_id,
+                provider_instance_id=provider_instance_id,
+                provider_id=provider_id,
+                provider_labels=provider_labels,
+            )
         if self._action_provider is None:
-            return None
-        return await self._action_provider(
+            return SettingsActionMetadata(action=None, stale=True)
+        action = await self._action_provider(
             action_id,
             provider_instance_id=provider_instance_id,
             provider_labels=provider_labels,
         )
+        if (
+            action is not None
+            and provider_id is not None
+            and action.provider_id != provider_id
+        ):
+            action = None
+        return SettingsActionMetadata(action=action, stale=action is None)
 
     async def _action_metadata_for_control(
         self,
         control: Control,
-    ) -> ActionMetadata | None:
+    ) -> SettingsActionMetadata:
         return await self._action_metadata(
             control.action,
             provider_instance_id=control.provider_instance_id,
@@ -374,24 +409,39 @@ class ConfigBackedSettingsService:
 
     async def _action_for_target(
         self, target: SettingsTargetRef
-    ) -> ActionMetadata | None:
+    ) -> SettingsActionMetadata:
         if target.scope == "action_provider_instance":
             config = await self._require_config(target.config_id)
             for location in self._control_locations(config):
-                action = await self._action_metadata_for_control(location.control)
+                metadata = await self._action_metadata_for_control(location.control)
+                action = metadata.action
                 if (
                     action is not None
                     and action.provider_instance_id == target.provider_instance_id
                     and action.provider_id == target.provider_id
                 ):
-                    return action
-            return None
+                    return metadata
+            return SettingsActionMetadata(action=None, stale=True)
         if not target.action_id:
-            return None
+            return SettingsActionMetadata(action=None, stale=True)
         return await self._action_metadata(
             target.action_id,
             provider_instance_id=target.provider_instance_id,
+            provider_id=target.provider_id,
         )
+
+    def _provider_ids_for_control(
+        self,
+        control: Control,
+        action: ActionMetadata | None,
+    ) -> tuple[str | None, str | None]:
+        provider_instance_id = (
+            action.provider_instance_id
+            if action is not None
+            else control.provider_instance_id
+        )
+        provider_id = action.provider_id if action is not None else None
+        return provider_instance_id, provider_id
 
     def _control_locations(self, config: DeviceConfig) -> tuple[_ControlLocation, ...]:
         locations: list[_ControlLocation] = []
@@ -435,19 +485,19 @@ class ConfigBackedSettingsService:
         self,
         config: DeviceConfig,
         target: SettingsTargetRef,
-    ) -> tuple[_ControlLocation, ActionMetadata | None]:
+    ) -> tuple[_ControlLocation, SettingsActionMetadata]:
         location = self._find_control(config, target)
-        action = await self._action_metadata_for_control(location.control)
         if target.action_id != location.control.action:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
         if target.stable_id != location.control.id:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
-        if action is not None and (
-            target.provider_instance_id != action.provider_instance_id
-            or target.provider_id != action.provider_id
-        ):
-            raise KeyError(f"Unknown action settings target {target.key()!r}")
-        return location, action
+        metadata = await self._action_metadata(
+            location.control.action,
+            provider_instance_id=target.provider_instance_id,
+            provider_id=target.provider_id,
+            provider_labels=location.control.provider_labels,
+        )
+        return location, metadata
 
     def _replace_control(
         self,

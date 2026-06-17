@@ -2625,6 +2625,8 @@ async def test_held_input_cancelled_when_config_is_removed(
             await _drain_action_messages(stream)
             assert not manager._config_active
             assert await manager.action_contexts.get("0,0") is None
+            assert manager._binding_leases == {}
+            assert manager._action_availability_service._interest_by_config == {}
 
             await manager.on_event(_hardware_input("0,0", "up", sequence=2))
             await _assert_no_action_message(stream)
@@ -3031,7 +3033,7 @@ async def test_action_lifecycle_rejected_binding_detaches_only_that_binding(
 
 
 @pytest.mark.asyncio
-async def test_action_lifecycle_rejected_action_instance_destroys_affected_bindings(
+async def test_terminal_action_lifecycle_rejected_action_instance_destroys_affected_bindings(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3070,7 +3072,7 @@ async def test_action_lifecycle_rejected_action_instance_destroys_affected_bindi
                     exclude_none=True,
                     mode="json",
                 ),
-                "reason": "action_not_available",
+                "reason": "invalid_settings",
             },
             context_id=metadata.context_id,
             action_instance_id=metadata.action_instance_id,
@@ -3084,7 +3086,7 @@ async def test_action_lifecycle_rejected_action_instance_destroys_affected_bindi
 
 
 @pytest.mark.asyncio
-async def test_action_instance_rejection_from_owner_during_nonterminal_unavailable(
+async def test_action_instance_rejection_from_owner_during_nonterminal_unavailable_replans(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3148,11 +3150,78 @@ async def test_action_instance_rejection_from_owner_during_nonterminal_unavailab
 
     assert await manager.action_contexts.get("0,0") is None
     assert manager._binding_leases == {}
-    assert ctx.action_instance_id not in manager._action_instances
+    assert ctx.action_instance_id in manager._action_instances
+    assert manager._page_frames
+    assert manager._page_frames[-1].committed_plan.bindings[0].status == "unavailable"
 
 
 @pytest.mark.asyncio
-async def test_action_lifecycle_rejected_page_session_closes_child_bindings(
+@pytest.mark.parametrize(
+    "reason,retryable",
+    [
+        ("action_not_available", False),
+        ("provider_not_ready", False),
+        ("resource_unavailable", False),
+        ("internal_error", False),
+        ("invalid_settings", True),
+    ],
+)
+async def test_action_lifecycle_rejected_binding_nonterminal_replans_current_page(
+    device_config_set_raster_image,
+    reason,
+    retryable,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    manager = DeviceManager(
+        controller_id=CONTROLLER_ID,
+        device=device,
+        hardware_ref=_hardware_ref(device),
+        command_service=FakeHardwareCommandService(),
+        config=device_config_set_raster_image,
+        manager=registry,
+        actions_bus=_actions_session(action_bus),
+        start_soon=lambda fn, *a, **k: None,
+    )
+    _seed_action_availability(
+        manager,
+        _metadata(SetRasterImageOnAppearAction.uuid),
+    )
+    await manager.set_page(profile="default", page=0)
+    ctx = await manager.action_contexts.get("0,0")
+    assert ctx is not None
+
+    payload = {
+        "targetKind": "binding",
+        "binding": ctx.metadata.model_dump(
+            by_alias=True,
+            exclude_none=True,
+            mode="json",
+        ),
+        "reason": reason,
+    }
+    if retryable:
+        payload["retryable"] = True
+    msg = await _action_command_for_active_binding(
+        manager,
+        ACTION_LIFECYCLE_REJECTED,
+        payload,
+    )
+    await manager.handle_command(msg)
+
+    assert await manager.action_contexts.get("0,0") is None
+    assert manager._binding_leases == {}
+    assert manager._page_frames
+    assert manager._page_frames[-1].committed_plan.bindings[0].status == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_action_lifecycle_rejected_page_session_resource_unavailable_replans(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3207,8 +3276,13 @@ async def test_action_lifecycle_rejected_page_session_closes_child_bindings(
             )
         )
 
-        assert manager._dynamic_page_session is None
+        assert manager._dynamic_page_session is session
         assert await manager.action_contexts.get("1,0") is None
+        assert manager._page_frames
+        assert manager._page_frames[-1].page_session is session
+        assert manager._page_frames[-1].committed_plan.bindings[0].status == (
+            "unavailable"
+        )
         assert all(
             lease.page_session_id != session.page_session_id
             for lease in manager._binding_leases.values()

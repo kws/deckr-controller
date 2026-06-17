@@ -593,6 +593,61 @@ async def test_hardware_claim_is_preserved_when_config_is_removed():
 
 
 @pytest.mark.asyncio
+async def test_removed_config_rematches_claimed_hardware_to_new_matching_config():
+    config_service = MemoryConfigService(_config())
+    async with _running_controller(config_service=config_service) as (
+        controller,
+        beacon,
+        concord,
+    ):
+        await _advertise_hardware(beacon)
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        owned = next(iter(controller._owned_claims.values()))
+        original_claim_id = owned.claim_id
+        await concord.attach(
+            owned.contract,
+            participant=hardware_manager_address("room-a"),
+            session_id="manager-session",
+        )
+        await controller._reconcile_hardware_current_state(reason="test manager token")
+
+        with anyio.fail_after(1):
+            while controller._device_registry.get("config-room-a") is None:
+                await anyio.sleep(0.01)
+        old_manager = None
+        with anyio.fail_after(1):
+            while old_manager is None:
+                old_manager = await controller._controller_contexts.get("config-room-a")
+                await anyio.sleep(0.01)
+
+        await config_service.remove_config("config-room-a")
+        with anyio.fail_after(1):
+            while old_manager.config_active:
+                await anyio.sleep(0.01)
+
+        await config_service.write_config(_config(config_id="config-room-b"))
+        await controller._reconcile_hardware_current_state(reason="test rematch")
+
+        with anyio.fail_after(1):
+            while controller._device_registry.get("config-room-b") is None:
+                await anyio.sleep(0.01)
+
+        current_owned = next(iter(controller._owned_claims.values()))
+        assert current_owned.claim_id == original_claim_id
+        assert current_owned.config_id == "config-room-b"
+        assert controller._device_registry.get("config-room-a") is None
+        assert controller._device_registry.get("config-room-b") is not None
+        assert await controller._controller_contexts.get("config-room-a") is None
+        assert await controller._controller_contexts.get("config-room-b") is not None
+        assert (await concord.validate(current_owned.contract)).status == (
+            ContractValidityStatus.VALID
+        )
+
+
+@pytest.mark.asyncio
 async def test_device_manager_background_work_is_scoped_to_device_lifecycle(
     monkeypatch,
 ):

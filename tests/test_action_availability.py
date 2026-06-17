@@ -238,6 +238,81 @@ def test_unqualified_intent_fails_over_when_selected_provider_is_unusable():
     assert refreshed.metadata == {intent: alpha}
 
 
+def test_direct_unavailable_does_not_hide_alternate_candidate():
+    cache = ActionAvailabilityCache()
+    alpha = _metadata("action.same", provider_instance_id="provider-alpha")
+    beta = _metadata("action.same", provider_instance_id="provider-beta")
+    intent = _intent("action.same")
+
+    cache.record_unavailable(
+        ProviderActionKey("provider-alpha", "action.same"),
+        metadata=alpha,
+        now=0.0,
+        intent=intent,
+    )
+    cache.record_candidate(beta, now=0.0)
+    snapshot = cache.planning_snapshot((intent,), now=0.0)
+
+    assert snapshot.metadata == {}
+    assert snapshot.pending == frozenset({intent})
+    assert snapshot.unavailable == frozenset()
+
+
+def test_direct_unavailable_does_not_hide_alternate_available_provider():
+    cache = ActionAvailabilityCache()
+    alpha = _metadata("action.same", provider_instance_id="provider-alpha")
+    beta = _metadata("action.same", provider_instance_id="provider-beta")
+    intent = _intent("action.same")
+
+    cache.record_unavailable(
+        ProviderActionKey("provider-alpha", "action.same"),
+        metadata=alpha,
+        now=0.0,
+        intent=intent,
+    )
+    cache.record_available(beta, now=0.0)
+    snapshot = cache.planning_snapshot((intent,), now=0.0)
+
+    assert snapshot.metadata == {intent: beta}
+    assert snapshot.pending == frozenset()
+    assert snapshot.unavailable == frozenset()
+
+
+def test_label_constrained_intent_ignores_unavailable_mismatch_candidate():
+    cache = ActionAvailabilityCache()
+    unavailable = _metadata(
+        "action.labelled",
+        provider_instance_id="provider-alpha",
+        provider_labels={"room": "office"},
+    )
+    mismatch = _metadata(
+        "action.labelled",
+        provider_instance_id="provider-beta",
+        provider_labels={"room": "kitchen"},
+    )
+    match = _metadata(
+        "action.labelled",
+        provider_instance_id="provider-gamma",
+        provider_labels={"room": "office"},
+    )
+    intent = _intent("action.labelled", provider_labels={"room": "office"})
+
+    cache.record_unavailable(
+        ProviderActionKey("provider-alpha", "action.labelled"),
+        metadata=unavailable,
+        now=0.0,
+        intent=intent,
+    )
+    cache.record_candidate(mismatch, now=0.0)
+    cache.record_candidate(match, now=0.0)
+    snapshot = cache.planning_snapshot((intent,), now=0.0)
+
+    assert snapshot.metadata == {}
+    assert snapshot.pending == frozenset({intent})
+    assert snapshot.unavailable == frozenset()
+    assert cache.record_for_intent(intent, now=0.0).metadata is match
+
+
 def test_beacon_candidate_metadata_records_unknown_but_omits_snapshot_entry():
     cache = ActionAvailabilityCache()
     metadata = _metadata("action.available", provider_instance_id="provider-alpha")
@@ -415,6 +490,33 @@ def test_expired_provider_direct_record_stays_pending_with_live_candidate():
 
     cache.record_available(metadata, now=100.0, intent=intent)
     cache.record_candidate(metadata, now=115.0)
+    snapshot = cache.planning_snapshot(
+        (intent,),
+        now=116.0,
+        stale_provider_keys=(key,),
+    )
+
+    assert cache.state_for(key, now=116.0) == ActionAvailabilityState.EXPIRED
+    assert snapshot.metadata == {}
+    assert snapshot.pending == frozenset({intent})
+    assert snapshot.unavailable == frozenset()
+
+
+def test_expired_provider_direct_record_does_not_hide_alternate_candidate():
+    cache = ActionAvailabilityCache(
+        policy=ActionAvailabilityPolicy(
+            fresh_ttl_seconds=10.0,
+            stale_grace_seconds=5.0,
+            candidate_ttl_seconds=10.0,
+        )
+    )
+    alpha = _metadata("action.expired", provider_instance_id="provider-alpha")
+    beta = _metadata("action.expired", provider_instance_id="provider-beta")
+    key = ProviderActionKey("provider-alpha", "action.expired")
+    intent = _intent("action.expired")
+
+    cache.record_available(alpha, now=100.0, intent=intent)
+    cache.record_candidate(beta, now=115.0)
     snapshot = cache.planning_snapshot(
         (intent,),
         now=116.0,
