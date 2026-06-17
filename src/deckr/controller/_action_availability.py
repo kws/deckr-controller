@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol
 
 import anyio
 from deckr.actions.endpoints import (
@@ -92,6 +93,15 @@ class ActionPlanningSnapshot:
     metadata: Mapping[ActionIntentKey, ActionMetadata]
     pending: frozenset[ActionIntentKey]
     unavailable: frozenset[ActionIntentKey]
+
+
+class ActionProviderSessionPreparer(Protocol):
+    async def prepare_many(
+        self,
+        actions: Iterable[ActionMetadata],
+    ) -> Mapping[object, object]: ...
+
+    async def aclose(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,6 +616,7 @@ class ActionAvailabilityService:
         actions_bus: EndpointSession,
         manager: ActionProviderManager,
         start_soon: Callable[..., object] | None = None,
+        provider_sessions: ActionProviderSessionPreparer | None = None,
         cache: ActionAvailabilityCache | None = None,
         clock: Callable[[], float] | None = None,
         revalidation_interval_seconds: float = DEFAULT_PROVIDER_REVALIDATION_SECONDS,
@@ -614,6 +625,7 @@ class ActionAvailabilityService:
         self.controller_session_id = controller_session_id
         self.actions_bus = actions_bus
         self.manager = manager
+        self._provider_sessions = provider_sessions
         self.cache = cache or ActionAvailabilityCache(clock=clock)
         self._clock = clock or time.monotonic
         self._start_soon = start_soon
@@ -632,6 +644,12 @@ class ActionAvailabilityService:
         stopping,
     ) -> None:
         tg.start_soon(self._revalidation_loop, stopping)
+
+    async def aclose(self) -> None:
+        provider_sessions = self._provider_sessions
+        self._provider_sessions = None
+        if provider_sessions is not None:
+            await provider_sessions.aclose()
 
     def planning_snapshot(
         self,
@@ -889,6 +907,7 @@ class ActionAvailabilityService:
         action_ids: Iterable[str],
         *,
         force: bool = False,
+        prepare_session: bool = True,
     ) -> None:
         if provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
@@ -901,6 +920,12 @@ class ActionAvailabilityService:
             not force
             and last_request_at is not None
             and now - last_request_at < self._revalidation_interval_seconds
+        ):
+            return
+        if prepare_session and not await self._prepare_provider_session(
+            provider_instance_id,
+            provider_id=provider_id,
+            action_ids=action_ids,
         ):
             return
         self._last_request_at_by_provider[provider_instance_id] = now
@@ -927,6 +952,12 @@ class ActionAvailabilityService:
         self._flush_scheduled = False
         provider_interests = self._interests_by_provider()
         for provider_instance_id, provider_id, entries in provider_interests:
+            if not await self._prepare_provider_session(
+                provider_instance_id,
+                provider_id=provider_id,
+                action_ids=(entry.action_id for entry in entries),
+            ):
+                continue
             wire = tuple((entry.action_id, entry.level) for entry in entries)
             if self._last_interest_wire_by_provider.get(provider_instance_id) != wire:
                 self._last_interest_wire_by_provider[provider_instance_id] = wire
@@ -952,7 +983,64 @@ class ActionAvailabilityService:
                 provider_id,
                 (entry.action_id for entry in entries),
                 force=force_requests,
+                prepare_session=False,
             )
+
+    async def _prepare_provider_session(
+        self,
+        provider_instance_id: str,
+        *,
+        provider_id: str,
+        action_ids: Iterable[str],
+    ) -> bool:
+        provider_sessions = self._provider_sessions
+        if provider_sessions is None:
+            return True
+        actions = tuple(
+            self._metadata_for_session_prepare(
+                provider_instance_id,
+                provider_id=provider_id,
+                action_id=action_id,
+            )
+            for action_id in dict.fromkeys(action_ids)
+        )
+        actions = tuple(action for action in actions if action is not None)
+        if not actions:
+            return True
+        try:
+            snapshots = await provider_sessions.prepare_many(actions)
+        except Exception:
+            logger.warning(
+                "Could not prepare action provider session for %s",
+                provider_instance_id,
+                exc_info=True,
+            )
+            return False
+        return not snapshots or any(
+            not bool(getattr(snapshot, "terminal", False))
+            for snapshot in snapshots.values()
+        )
+
+    def _metadata_for_session_prepare(
+        self,
+        provider_instance_id: str,
+        *,
+        provider_id: str,
+        action_id: str,
+    ) -> ActionMetadata | None:
+        record = self.cache.record_for(ProviderActionKey(provider_instance_id, action_id))
+        metadata = record.metadata if record is not None else None
+        if metadata is not None:
+            return self._with_current_provider_session(metadata)
+        provider_session_id = self.manager.provider_session_id(provider_instance_id)
+        if provider_session_id is None:
+            return None
+        return ActionMetadata(
+            uuid=action_id,
+            provider_instance_id=provider_instance_id,
+            provider_id=provider_id,
+            provider_session_id=provider_session_id,
+        )
 
     async def _revalidation_loop(self, stopping) -> None:
         while not stopping.is_set():

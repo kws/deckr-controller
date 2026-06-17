@@ -53,6 +53,7 @@ from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller._action_availability import ActionAvailabilityService
+from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
@@ -765,6 +766,12 @@ class ControllerService(BaseComponent):
                 actions_bus=self._endpoint,
                 manager=self._action_registry,
                 start_soon=ctx.tg.start_soon,
+                provider_sessions=ActionProviderSessionManager(
+                    controller_id=self._controller_id,
+                    controller_session_id=self._session_id,
+                    concord=self._concord,
+                    start_soon=ctx.tg.start_soon,
+                ),
             )
         if self._action_availability_service is not None:
             await self._action_availability_service.start(ctx.tg, ctx.stopping)
@@ -794,6 +801,8 @@ class ControllerService(BaseComponent):
             await ctrl_ctx.clear_page(clear_outputs=False)
         await self._controller_contexts.clear()
         await self._release_owned_claims()
+        if self._action_availability_service is not None:
+            await self._action_availability_service.aclose()
         if self._render_backend is not None:
             await self._render_backend.aclose()
 

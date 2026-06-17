@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import anyio
 import pytest
@@ -114,6 +115,26 @@ class _FakeActionProviderManager:
 
     def provider_session_id(self, provider_instance_id: str) -> str | None:
         return self._provider_sessions.get(provider_instance_id)
+
+
+class _FakeProviderSessions:
+    def __init__(self, *, terminal: bool = False) -> None:
+        self.terminal = terminal
+        self.prepare_calls: list[tuple[ActionMetadata, ...]] = []
+        self.closed = False
+
+    async def prepare_many(self, actions):
+        prepared = tuple(actions)
+        self.prepare_calls.append(prepared)
+        return {
+            (action.provider_instance_id, action.uuid): SimpleNamespace(
+                terminal=self.terminal
+            )
+            for action in prepared
+        }
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 async def _next_action_message(stream, *, timeout: float = 1.0) -> DeckrMessage:
@@ -602,12 +623,14 @@ async def test_service_flushes_interest_and_availability_request_to_candidate_pr
         metadata,
         provider_sessions={"provider-alpha": provider_session_id},
     )
+    provider_sessions = _FakeProviderSessions()
     service = ActionAvailabilityService(
         controller_id=CONTROLLER_ID,
         controller_session_id=action_bus.session_id,
         actions_bus=action_bus.endpoint().session,
         manager=manager,
         start_soon=None,
+        provider_sessions=provider_sessions,
     )
     intent = _intent(
         "action.alpha",
@@ -647,6 +670,23 @@ async def test_service_flushes_interest_and_availability_request_to_candidate_pr
     assert [(entry.action_id, entry.level) for entry in interest_body.entries] == [
         ("action.alpha", "strong")
     ]
+    assert len(provider_sessions.prepare_calls) == 1
+    assert [
+        (
+            action.provider_instance_id,
+            action.provider_id,
+            action.uuid,
+            action.provider_session_id,
+        )
+        for action in provider_sessions.prepare_calls[0]
+    ] == [
+        (
+            "provider-alpha",
+            "provider.test",
+            "action.alpha",
+            provider_session_id,
+        )
+    ]
 
     assert request.message_type == ACTION_AVAILABILITY_REQUEST
     assert request.recipient_session_id == provider_session_id
@@ -658,6 +698,44 @@ async def test_service_flushes_interest_and_availability_request_to_candidate_pr
     assert [selector.action_id for selector in request_body.selectors] == [
         "action.alpha"
     ]
+
+
+@pytest.mark.asyncio
+async def test_service_direct_availability_request_prepares_provider_session():
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    provider_address = action_provider_address("provider-alpha")
+    provider_session_id = action_bus.endpoint(provider_address).session_id
+    manager = _FakeActionProviderManager(
+        provider_sessions={"provider-alpha": provider_session_id}
+    )
+    provider_sessions = _FakeProviderSessions()
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=manager,
+        provider_sessions=provider_sessions,
+        start_soon=None,
+    )
+
+    async with action_bus.subscribe(provider_address) as stream:
+        await service.request_provider_availability(
+            "provider-alpha",
+            "provider.test",
+            ("action.alpha",),
+            force=True,
+        )
+        request = await _next_action_message(stream)
+
+    assert len(provider_sessions.prepare_calls) == 1
+    prepared = provider_sessions.prepare_calls[0]
+    assert [(action.uuid, action.provider_session_id) for action in prepared] == [
+        ("action.alpha", provider_session_id)
+    ]
+    assert request.message_type == ACTION_AVAILABILITY_REQUEST
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE
 from deckr.lanes import EndpointSession
 
 from deckr.controller._action_availability import ActionAvailabilityService
+from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
     parse_controller_config,
@@ -100,6 +101,12 @@ class ControllerRuntimeService(BaseComponent):
                 actions_bus=self._endpoint,
                 manager=action_registry,
                 start_soon=ctx.tg.start_soon,
+                provider_sessions=ActionProviderSessionManager(
+                    controller_id=self._runtime.controller_id,
+                    controller_session_id=self._endpoint.session_id,
+                    concord=self._concord,
+                    start_soon=ctx.tg.start_soon,
+                ),
             )
             settings_service = build_settings_service(
                 self._runtime.config,
