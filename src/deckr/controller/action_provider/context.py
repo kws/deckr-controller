@@ -187,6 +187,9 @@ class ControlContext:
     async def clear_raster(self, *, generation: int | None = None) -> None:
         await self._router.clear(generation=generation)
 
+    async def refresh_raster(self) -> None:
+        await self._router.render()
+
     async def show_overlay(
         self,
         *,

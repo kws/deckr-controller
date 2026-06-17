@@ -2454,6 +2454,88 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
 
 
 @pytest.mark.asyncio
+async def test_action_availability_refresh_repaints_existing_binding_output(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    """Existing leases must repaint cached output during availability reconciliation."""
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+
+        binding = ctx.metadata.model_copy(update={"output_generation": 1})
+        msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OUTPUT,
+            {
+                "binding": binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": "test-device",
+                    },
+                    "controlId": "0,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "set_frame",
+                "params": {"image": "ZnJhbWU=", "encoding": "jpeg"},
+                "generation": 1,
+            },
+        )
+        await manager.handle_command(msg)
+
+        with anyio.fail_after(5.0):
+            while not render_backend.calls:
+                await anyio.sleep(0.01)
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
+            while command_service.set_raster_frame.call_count == 0:
+                await anyio.sleep(0.01)
+
+        baseline_render_calls = len(render_backend.calls)
+        baseline_output_calls = command_service.set_raster_frame.call_count
+
+        await manager.on_action_availability_changed()
+
+        with anyio.fail_after(5.0):
+            while len(render_backend.calls) <= baseline_render_calls:
+                await anyio.sleep(0.01)
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
+            while command_service.set_raster_frame.call_count <= baseline_output_calls:
+                await anyio.sleep(0.01)
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_held_input_cancelled_when_dynamic_page_rebinds_control(
     device_config_set_raster_image, persistence_tmp_dir
 ):

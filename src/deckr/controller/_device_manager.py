@@ -624,6 +624,23 @@ class DeviceManager:
                 clear_held_input=clear_held_input,
             )
 
+    async def _refresh_binding_output(self, lease: BindingLease, *, reason: str) -> None:
+        if not lease.attached:
+            return
+        try:
+            await lease.context.refresh_raster()
+        except Exception:
+            logger.exception(
+                "Error refreshing binding output config=%s control=%s action=%s "
+                "provider=%s binding=%s reason=%s",
+                self.config_id,
+                lease.control_id,
+                lease.action_uuid,
+                lease.provider_instance_id,
+                lease.binding_id,
+                reason,
+            )
+
     async def _clear_all_raster_controls(
         self,
         *,
@@ -2280,7 +2297,11 @@ class DeviceManager:
                     continue
 
                 if _lease_matches_action(lease, planned.action_meta):
-                    await self._activate_binding(lease)
+                    if await self._activate_binding(lease):
+                        await self._refresh_binding_output(
+                            lease,
+                            reason="action_availability_changed",
+                        )
                     continue
 
                 if _lease_matches_action_ignoring_session(
@@ -2288,7 +2309,11 @@ class DeviceManager:
                     planned.action_meta,
                 ):
                     self._restamp_binding_route(lease, planned.action_meta)
-                    await self._activate_binding(lease)
+                    if await self._activate_binding(lease):
+                        await self._refresh_binding_output(
+                            lease,
+                            reason="action_availability_changed",
+                        )
                     continue
 
                 await self._revoke_binding(
