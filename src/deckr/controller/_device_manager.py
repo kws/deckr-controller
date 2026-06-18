@@ -104,6 +104,12 @@ from deckr.controller._binding_planner import (
 from deckr.controller._binding_resolution import ResolvedControlBinding
 from deckr.controller._binding_validator import format_validation_summary
 from deckr.controller._command_router import DeviceOutput
+from deckr.controller._control_attachment_state import (
+    AuthorizedCommandTarget,
+    BindingLease,
+    ControlAttachmentState,
+    HeldInputRecord,
+)
 from deckr.controller._device_layout import (
     ControlSurface,
     control_surface_for_raster_capability,
@@ -217,39 +223,6 @@ def _dedupe_action_intents(
     return tuple(dict.fromkeys(intents))
 
 
-@dataclass(slots=True)
-class BindingLease:
-    binding_id: str
-    context_id: str
-    action_instance_id: str
-    action_uuid: str
-    provider_instance_id: str
-    provider_id: str
-    provider_session_id: str | None
-    provider_session_key: ProviderSessionKey | None
-    attached: bool
-    control_id: str
-    control: ControlSurface
-    input_capability_ids: frozenset[str]
-    raster_capability_id: str | None
-    profile_id: str
-    page_id: str
-    settings_target: SettingsTargetRef | None
-    context: ControlContext
-    page_session_id: str | None = None
-    item_key: str | None = None
-    handler: str | None = None
-
-
-@dataclass(slots=True)
-class HeldInputRecord:
-    binding_id: str
-    control_id: str
-    capability_id: str
-    context_id: str
-    down_event: Any
-
-
 @dataclass(frozen=True, slots=True)
 class PageCommit:
     plan: PagePlan
@@ -289,14 +262,6 @@ def _lease_matches_action_ignoring_session(
         and lease.provider_instance_id == action_meta.provider_instance_id
         and lease.provider_id == action_meta.provider_id
     )
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class AuthorizedCommandTarget:
-    sender_provider_instance_id: str
-    context_id: str
-    binding: BindingLease | None = None
-    page_session: DynamicPageSession | None = None
 
 
 def _binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
@@ -385,11 +350,13 @@ class DeviceManager:
         self._config_listener_task = None
         self._render_backend = render_backend or ThreadRenderBackend()
         self._clock = clock or time.monotonic
+        self._attachments = ControlAttachmentState()
         self._render_dispatcher = RenderDispatcher(
             command_service=command_service,
             config_id=self.config_id,
             backend=self._render_backend,
             start_soon=start_soon,
+            result_authorizer=self._attachments.output_render_authorized,
         )
         self._settings_service = settings_service
         self.action_contexts = AsyncMap[str, ControlContext]()
@@ -420,11 +387,10 @@ class DeviceManager:
         )
         self._action_availability = self._action_availability_service.cache
         self._action_interest = ActionInterestTracker(clock=self._clock)
-        self._binding_leases: dict[str, BindingLease] = {}
-        self._binding_by_context: dict[str, str] = {}
-        self._active_binding_by_control: dict[str, str] = {}
-        self._held_input_bindings: dict[tuple[str, str], HeldInputRecord] = {}
-        self._cancelled_input_keys: set[tuple[str, str]] = set()
+        self._binding_leases = self._attachments.binding_leases
+        self._binding_by_context = self._attachments.binding_by_context
+        self._active_binding_by_control = self._attachments.active_input_by_control
+        self._held_input_bindings = self._attachments.held_input_bindings
         self._action_instances: dict[str, ActionInstanceMetadata] = {}
         self._action_instance_providers: dict[str, str] = {}
         self._action_instance_provider_sessions: dict[
@@ -507,9 +473,14 @@ class DeviceManager:
         reason: str = "detach",
         clear_held_input: bool = False,
     ) -> BindingLease | None:
-        lease = self._binding_leases.pop(binding_id, None)
+        lease = self._binding_leases.get(binding_id)
         if lease is None:
             return None
+        was_active = (
+            self._attachments.active_input_lease(lease.control_id) is lease
+            or self._attachments.active_output_lease(lease.control_id) is lease
+        )
+        self._attachments.disable_binding_authority(lease)
         logger.info(
             "Revoking binding config=%s control=%s action=%s provider=%s "
             "binding=%s reason=%s clearOutput=%s notifyProvider=%s",
@@ -524,11 +495,9 @@ class DeviceManager:
         )
         if clear_held_input:
             await self._cancel_held_inputs_for_binding(lease)
-        self._binding_by_context.pop(lease.context_id, None)
-        active_binding = self._active_binding_by_control.get(lease.control_id)
-        if active_binding == binding_id:
-            self._active_binding_by_control.pop(lease.control_id, None)
+        if was_active:
             await self.action_contexts.delete(lease.control_id)
+        self._attachments.remove_binding(binding_id)
         if lease.attached and notify_provider:
             with anyio.move_on_after(DETACH_NOTIFY_TIMEOUT_SECONDS) as scope:
                 await lease.context.on_binding_detached(reason)
@@ -563,11 +532,9 @@ class DeviceManager:
         return lease
 
     async def _cancel_held_inputs_for_binding(self, lease: BindingLease) -> None:
-        for key, held in tuple(self._held_input_bindings.items()):
-            if held.binding_id != lease.binding_id:
-                continue
-            self._held_input_bindings.pop(key, None)
-            self._cancelled_input_keys.add(key)
+        for held in self._attachments.cancel_held_inputs_for_binding(
+            lease.binding_id,
+        ):
             if not lease.attached or held.context_id != lease.context_id:
                 continue
             cancel_event = held.down_event.model_copy(
@@ -583,14 +550,27 @@ class DeviceManager:
                 )
 
     async def _cancel_all_held_inputs(self) -> None:
-        for held in tuple(self._held_input_bindings.values()):
+        for held in self._attachments.cancel_all_held_inputs():
             lease = self._binding_leases.get(held.binding_id)
             if lease is not None:
-                await self._cancel_held_inputs_for_binding(lease)
-            else:
-                key = (held.control_id, held.capability_id)
-                self._held_input_bindings.pop(key, None)
-                self._cancelled_input_keys.add(key)
+                await self._deliver_cancelled_input(lease, held)
+
+    async def _deliver_cancelled_input(
+        self,
+        lease: BindingLease,
+        held: HeldInputRecord,
+    ) -> None:
+        if not lease.attached or held.context_id != lease.context_id:
+            return
+        cancel_event = held.down_event.model_copy(update={"event_type": "cancel"})
+        try:
+            await lease.context.on_input(cancel_event)
+        except Exception:
+            logger.exception(
+                "Error delivering cancel to action %s binding=%s",
+                lease.action_uuid,
+                lease.binding_id,
+            )
 
     async def _revoke_active_bindings(
         self,
@@ -1121,15 +1101,7 @@ class DeviceManager:
         return status
 
     def _binding_lease_for_control(self, control_id: str) -> BindingLease | None:
-        active_binding_id = self._active_binding_by_control.get(control_id)
-        if active_binding_id is not None:
-            lease = self._binding_leases.get(active_binding_id)
-            if lease is not None:
-                return lease
-        for lease in self._binding_leases.values():
-            if lease.control_id == control_id:
-                return lease
-        return None
+        return self._attachments.binding_for_control(control_id)
 
     def _restamp_binding_route(
         self,
@@ -1148,11 +1120,33 @@ class DeviceManager:
             lease.provider_session_key
         )
 
+    async def _claim_binding_output_route(self, lease: BindingLease) -> None:
+        if lease.raster_capability_id is None:
+            return
+        await self._render_dispatcher.submit_request(
+            control_id=lease.control_id,
+            context_id=lease.context_id,
+            binding_id=lease.binding_id,
+            request=None,
+            output=DeviceOutput(
+                self._command_service,
+                self.config_id,
+                lease.control_id,
+                lease.raster_capability_id,
+            ),
+        )
+
+    async def _enable_binding_authority(self, lease: BindingLease) -> None:
+        self._attachments.enable_binding_authority(lease)
+        await self.action_contexts.set(lease.control_id, lease.context)
+        await self._claim_binding_output_route(lease)
+
     async def _activate_binding(
         self,
         lease: BindingLease,
     ) -> bool:
         if lease.attached:
+            await self._enable_binding_authority(lease)
             return True
         action_meta = ActionMetadata(
             uuid=lease.action_uuid,
@@ -1205,10 +1199,8 @@ class DeviceManager:
             lease.provider_instance_id,
             lease.binding_id,
         )
-        self._binding_by_context[lease.context_id] = lease.binding_id
-        self._active_binding_by_control[lease.control_id] = lease.binding_id
-        await self.action_contexts.set(lease.control_id, lease.context)
         lease.attached = True
+        await self._enable_binding_authority(lease)
         with anyio.move_on_after(BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS) as scope:
             await lease.context.on_binding_attached()
         if scope.cancel_called:
@@ -1509,7 +1501,7 @@ class DeviceManager:
             item_key=item_key,
             handler=handler,
         )
-        self._binding_leases[binding_id] = lease
+        self._attachments.add_binding(lease)
         attached = await self._activate_binding(lease)
         if attached:
             logger.info(
@@ -1942,62 +1934,50 @@ class DeviceManager:
         *,
         descriptor: DynamicPageCommand,
         context_id: str,
+        binding_id: str | None = None,
         causation_id: str | None = None,
-    ) -> None:
+    ) -> DynamicPageSession | None:
         """Open or claim the dynamic page context for the sending action context."""
         if not descriptor or not descriptor.bindings:
-            return
+            return None
 
         async with self._nav_lock:
             current = self._dynamic_page_session
-            binding_id = self._binding_by_context.get(context_id)
-            owner_lease = (
-                self._binding_leases.get(binding_id) if binding_id is not None else None
-            )
-            if owner_lease is None and current is None:
+            if binding_id is not None:
+                owner_lease = self._binding_leases.get(binding_id)
+                if owner_lease is not None and (
+                    owner_lease.context_id != context_id
+                    or not self._attachments.binding_command_authorized(owner_lease)
+                ):
+                    owner_lease = None
+            else:
+                owner_lease = self._attachments.binding_for_context(context_id)
+
+            if owner_lease is None:
                 logger.warning(
                     "open_page ignored: no active context for %s", context_id
                 )
-                return
+                return None
 
-            if owner_lease is not None:
-                try:
-                    owner_page = int(owner_lease.page_id)
-                except ValueError:
-                    owner_page = current.owner_page if current is not None else 0
-                if owner_lease.page_session_id is not None and current is not None:
-                    owner_profile = current.owner_profile
-                    owner_page = current.owner_page
-                else:
-                    owner_profile = owner_lease.profile_id
-                timeout_ms = self._resolve_widget_timeout_ms(owner_profile, owner_page)
-                owner_context_id = context_id
-                owner_binding_id = owner_lease.binding_id
-                owner_control_id = owner_lease.control_id
-                owner_action_uuid = owner_lease.action_uuid
-                owner_provider_instance_id = owner_lease.provider_instance_id
-                owner_provider_id = owner_lease.provider_id
-                owner_provider_session_id = owner_lease.provider_session_id
-                action_instance_id = owner_lease.action_instance_id
-                settings_target = owner_lease.settings_target
-            elif current is not None and context_id == current.context_id:
+            try:
+                owner_page = int(owner_lease.page_id)
+            except ValueError:
+                owner_page = current.owner_page if current is not None else 0
+            if owner_lease.page_session_id is not None and current is not None:
                 owner_profile = current.owner_profile
                 owner_page = current.owner_page
-                timeout_ms = current.timeout_ms
-                owner_context_id = current.owner_context_id
-                owner_binding_id = current.owner_binding_id
-                owner_control_id = current.owner_control_id
-                owner_action_uuid = current.owner_action_uuid
-                owner_provider_instance_id = current.owner_provider_instance_id
-                owner_provider_id = current.owner_provider_id
-                owner_provider_session_id = current.owner_provider_session_id
-                action_instance_id = current.action_instance_id
-                settings_target = current.settings_target
             else:
-                logger.warning(
-                    "open_page ignored: no active context for %s", context_id
-                )
-                return
+                owner_profile = owner_lease.profile_id
+            timeout_ms = self._resolve_widget_timeout_ms(owner_profile, owner_page)
+            owner_context_id = context_id
+            owner_binding_id = owner_lease.binding_id
+            owner_control_id = owner_lease.control_id
+            owner_action_uuid = owner_lease.action_uuid
+            owner_provider_instance_id = owner_lease.provider_instance_id
+            owner_provider_id = owner_lease.provider_id
+            owner_provider_session_id = owner_lease.provider_session_id
+            action_instance_id = owner_lease.action_instance_id
+            settings_target = owner_lease.settings_target
 
             page_id = descriptor.page_id or make_dynamic_page_id()
             descriptor = DynamicPageCommand(
@@ -2031,6 +2011,8 @@ class DeviceManager:
             )
             if ok:
                 await self._emit_page_opened(session, causation_id=causation_id)
+                return session
+            return None
 
     def _page_control_session(self, context_id: str) -> DynamicPageSession | None:
         session = self._dynamic_page_session
@@ -2038,17 +2020,7 @@ class DeviceManager:
             return None
         if context_id == session.context_id:
             return session
-        binding_id = self._binding_by_context.get(context_id)
-        lease = self._binding_leases.get(binding_id) if binding_id is not None else None
-        if lease is None:
-            return None
-        if lease.page_session_id != session.page_session_id:
-            return None
-        if lease.action_instance_id != session.action_instance_id:
-            return None
-        if lease.provider_instance_id != session.owner_provider_instance_id:
-            return None
-        return session
+        return None
 
     async def replace_page(
         self,
@@ -2423,17 +2395,9 @@ class DeviceManager:
                     binding_id,
                 )
                 return None
-            active_binding_id = self._active_binding_by_control.get(lease.control_id)
-            if active_binding_id != binding_id:
+            if not self._attachments.binding_command_authorized(lease):
                 logger.warning(
-                    "Ignoring action command %s for inactive control binding %s",
-                    msg.message_type,
-                    binding_id,
-                )
-                return None
-            if not lease.attached:
-                logger.warning(
-                    "Ignoring action command %s for pending binding %s",
+                    "Ignoring action command %s for unauthorized binding %s",
                     msg.message_type,
                     binding_id,
                 )
@@ -2865,30 +2829,49 @@ class DeviceManager:
             return
 
         if msg_type == OPEN_PAGE:
+            if authorization.binding is None:
+                logger.warning(
+                    "Ignoring open_page without binding authority for %s",
+                    context_id,
+                )
+                return
             desc_data = payload.get("descriptor")
             descriptor = _descriptor_from_payload(desc_data) if desc_data else None
             if descriptor is not None:
                 await self.open_page(
                     descriptor=descriptor,
                     context_id=context_id,
+                    binding_id=authorization.binding.binding_id,
                     causation_id=msg.message_id,
                 )
             return
 
         if msg_type == REPLACE_PAGE:
+            if authorization.page_session is None:
+                logger.warning(
+                    "Ignoring replace_page without page-session authority for %s",
+                    context_id,
+                )
+                return
             desc_data = payload.get("descriptor")
             descriptor = _descriptor_from_payload(desc_data) if desc_data else None
             if descriptor is not None:
                 await self.replace_page(
                     descriptor=descriptor,
-                    context_id=context_id,
+                    context_id=authorization.page_session.context_id,
                     causation_id=msg.message_id,
                 )
             return
 
         if msg_type == CLOSE_PAGE:
+            if authorization.page_session is None:
+                logger.warning(
+                    "Ignoring close_page without page-session authority for %s",
+                    context_id,
+                )
+                return
             await self.close_page(
-                context_id=context_id,
+                context_id=authorization.page_session.context_id,
                 reason="close",
                 causation_id=msg.message_id,
             )
@@ -2967,6 +2950,12 @@ class DeviceManager:
         lease: BindingLease,
         body: BindingOutputBody,
     ) -> None:
+        if not self._attachments.binding_output_authorized(lease):
+            logger.warning(
+                "Ignoring binding output from non-output owner binding %s",
+                lease.binding_id,
+            )
+            return
         if not _binding_body_matches_lease(lease, body.binding):
             logger.warning(
                 "Ignoring binding output with mismatched mirrored lease identity"
@@ -3028,6 +3017,12 @@ class DeviceManager:
         lease: BindingLease,
         body: BindingOverlayBody,
     ) -> None:
+        if not self._attachments.binding_output_authorized(lease):
+            logger.warning(
+                "Ignoring binding overlay from non-output owner binding %s",
+                lease.binding_id,
+            )
+            return
         if not _binding_body_matches_lease(lease, body.binding):
             logger.warning(
                 "Ignoring binding overlay with mismatched mirrored lease identity"
@@ -3054,6 +3049,12 @@ class DeviceManager:
         lease: BindingLease,
         body: BindingOverlayClearBody,
     ) -> None:
+        if not self._attachments.binding_output_authorized(lease):
+            logger.warning(
+                "Ignoring binding overlay clear from non-output owner binding %s",
+                lease.binding_id,
+            )
+            return
         if not _binding_body_matches_lease(lease, body.binding):
             logger.warning(
                 "Ignoring binding overlay clear with mismatched mirrored lease identity"
@@ -3080,29 +3081,28 @@ class DeviceManager:
             self._record_page_activity()
 
         control_id = translated.control_id
-        key = (control_id, translated.capability_id)
-        if translated.action_event.event_type == "up":
-            held = self._held_input_bindings.pop(key, None)
-            if held is not None:
-                lease = self._binding_leases.get(held.binding_id)
-                if lease is None:
-                    self._cancelled_input_keys.add(key)
-                    return
-                await self._deliver_input_to_lease(lease, translated)
+        route_owner = self._attachments.active_input_for_event(
+            control_id,
+            translated.capability_id,
+            translated.action_event.event_type,
+        )
+        if isinstance(route_owner, HeldInputRecord):
+            lease = self._binding_leases.get(route_owner.binding_id)
+            if lease is None:
                 return
-            if key in self._cancelled_input_keys:
-                self._cancelled_input_keys.remove(key)
+            await self._deliver_input_to_lease(lease, translated)
+            return
+
+        lease = route_owner
+        if lease is None:
+            if translated.action_event.event_type == "up":
                 logger.info(
-                    "Ignoring release after cancel config=%s control=%s capability=%s",
+                    "Ignoring release without held owner config=%s control=%s capability=%s",
                     self.config_id,
                     control_id,
                     translated.capability_id,
                 )
                 return
-
-        binding_id = self._active_binding_by_control.get(control_id)
-        lease = self._binding_leases.get(binding_id) if binding_id is not None else None
-        if lease is None:
             logger.info(
                 "Ignoring input from unbound control config=%s control=%s capability=%s",
                 self.config_id,
@@ -3144,12 +3144,9 @@ class DeviceManager:
     def _record_held_input_binding(self, translated, lease: BindingLease) -> None:
         if translated.action_event.event_type != "down":
             return
-        self._held_input_bindings[(translated.control_id, translated.capability_id)] = (
-            HeldInputRecord(
-                binding_id=lease.binding_id,
-                control_id=translated.control_id,
-                capability_id=translated.capability_id,
-                context_id=lease.context_id,
-                down_event=translated.action_event,
-            )
+        self._attachments.record_held_input(
+            lease=lease,
+            control_id=translated.control_id,
+            capability_id=translated.capability_id,
+            down_event=translated.action_event,
         )

@@ -28,6 +28,7 @@ class ControllerActionContext:
         self._context_id = context_id
         self.binding_metadata = binding_metadata
         self._settings_service = settings_service
+        self._page_session_context_id: str | None = None
 
     async def set_title(self, text: str) -> None:
         await self._router.set_title(text)
@@ -50,14 +51,23 @@ class ControllerActionContext:
         await self._manager.set_page(profile=profile, page=page)
 
     async def open_page(self, descriptor: DynamicPageCommand) -> None:
-        await self._manager.open_page(
-            descriptor=descriptor, context_id=self._context_id
+        session = await self._manager.open_page(
+            descriptor=descriptor,
+            context_id=self._context_id,
+            binding_id=self.binding_metadata.binding_id,
         )
+        if session is not None:
+            self._page_session_context_id = session.context_id
 
     async def replace_page(self, descriptor: DynamicPageCommand) -> None:
+        if self._page_session_context_id is None:
+            return
         await self._manager.replace_page(
-            descriptor=descriptor, context_id=self._context_id
+            descriptor=descriptor,
+            context_id=self._page_session_context_id,
         )
 
     async def close_page(self) -> None:
-        await self._manager.close_page(context_id=self._context_id)
+        if self._page_session_context_id is None:
+            return
+        await self._manager.close_page(context_id=self._page_session_context_id)

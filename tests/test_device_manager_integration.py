@@ -7,12 +7,14 @@ import anyio
 import pytest
 import pytest_asyncio
 from conftest import LaneHarness
-from deckr.actions.endpoints import action_provider_address
+from deckr.actions.endpoints import BUILTIN_ACTION_PROVIDER_ID, action_provider_address
 from deckr.actions.messages import (
     ACTION_INSTANCE_CREATED,
     ACTION_LIFECYCLE_REJECTED,
     BINDING_OUTPUT,
     CAPABILITY_INPUT,
+    CLOSE_PAGE,
+    OPEN_PAGE,
     PAGE_SESSION_CLOSED,
     REPLACE_PAGE,
     SETTINGS_PATCH,
@@ -266,6 +268,15 @@ def _metadata(
     )
 
 
+def _builtin_metadata(uuid: str) -> ActionMetadata:
+    return _metadata(
+        uuid,
+        provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
+        provider_id=BUILTIN_ACTION_PROVIDER_ID,
+        provider_session_id=None,
+    )
+
+
 def _availability_entry(action_uuid: str) -> ActionAvailabilityEntry:
     return ActionAvailabilityEntry(
         actionId=action_uuid,
@@ -323,12 +334,14 @@ async def _action_command_for_active_binding(
     payload: dict | None = None,
     *,
     control_id: str = "0,0",
+    config_id: str = "test-device",
 ) -> DeckrMessage:
     ctx = await manager.action_contexts.get(control_id)
     assert ctx is not None
     return _action_command(
         message_type,
         payload,
+        config_id=config_id,
         context_id=ctx.id,
         action_instance_id=ctx.action_instance_id,
         binding_id=ctx.binding_id,
@@ -395,6 +408,9 @@ def _make_control(
     kind: str = "key",
     events: list[str] | None = None,
     has_display: bool = True,
+    raster_width: int = 72,
+    raster_height: int = 72,
+    raster_rotation: int | None = None,
 ) -> ControlDescriptor:
     if events is None:
         events = ["momentary", "press"]
@@ -452,6 +468,29 @@ def _make_control(
         )
     output_capabilities = []
     if has_display:
+        raster_constraints = [
+            {
+                "type": "fixed",
+                "subject": "width",
+                "value": raster_width,
+                "unit": "pixel",
+            },
+            {
+                "type": "fixed",
+                "subject": "height",
+                "value": raster_height,
+                "unit": "pixel",
+            },
+        ]
+        if raster_rotation is not None:
+            raster_constraints.append(
+                {
+                    "type": "fixed",
+                    "subject": "rotation",
+                    "value": raster_rotation,
+                    "unit": "degree",
+                }
+            )
         output_capabilities.append(
             CapabilityDescriptor.model_validate(
                 {
@@ -461,20 +500,7 @@ def _make_control(
                     "direction": "output",
                     "access": ["settable"],
                     "commandTypes": ["set_frame", "clear"],
-                    "constraints": [
-                        {
-                            "type": "fixed",
-                            "subject": "width",
-                            "value": 72,
-                            "unit": "pixel",
-                        },
-                        {
-                            "type": "fixed",
-                            "subject": "height",
-                            "value": 72,
-                            "unit": "pixel",
-                        },
-                    ],
+                    "constraints": raster_constraints,
                 }
             )
         )
@@ -502,6 +528,59 @@ def _make_mock_device(
     )
 
 
+def _make_mars_msd_two_device() -> DeviceDescriptor:
+    key_kwargs = {
+        "kind": "key",
+        "events": ["momentary"],
+        "raster_width": 64,
+        "raster_height": 64,
+        "raster_rotation": 270,
+    }
+    controls = [
+        _make_control("0,0", row=0, col=0, **key_kwargs),
+        _make_control("1,0", row=0, col=1, **key_kwargs),
+        _make_control("2,0", row=0, col=2, **key_kwargs),
+        _make_control("0,1", row=1, col=0, **key_kwargs),
+        _make_control("1,1", row=1, col=1, **key_kwargs),
+        _make_control("2,1", row=1, col=2, **key_kwargs),
+        _make_control(
+            "3,0",
+            row=0,
+            col=3,
+            kind="dial",
+            events=["rotate", "momentary"],
+            has_display=False,
+        ),
+        _make_control(
+            "3,1",
+            row=1,
+            col=3,
+            kind="dial",
+            events=["rotate", "momentary"],
+            has_display=False,
+        ),
+        _make_control(
+            "4,1",
+            row=1,
+            col=4,
+            kind="dial",
+            events=["rotate", "momentary"],
+            has_display=False,
+        ),
+        _make_control("B1", row=2, col=0, kind="button", events=["momentary"], has_display=False),
+        _make_control("B2", row=2, col=1, kind="button", events=["momentary"], has_display=False),
+        _make_control("B3", row=2, col=2, kind="button", events=["momentary"], has_display=False),
+    ]
+    return DeviceDescriptor(
+        deviceId="mars-gaming-msd-two",
+        displayName="Mars Gaming MSD-TWO",
+        fingerprint="0B00:1001:0300D0785616",
+        manufacturer="MiraBox",
+        model="MSD-TWO",
+        controls=tuple(controls),
+    )
+
+
 def _hardware_ref(device: DeviceDescriptor) -> DeviceRef:
     return DeviceRef(
         managerId="manager-main",
@@ -515,11 +594,12 @@ def _hardware_input(
     *,
     capability_id: str = "button.momentary",
     sequence: int | None = None,
+    device_id: str = "test-device",
 ) -> DeckrMessage:
     return hw_messages.control_input_message(
         manager_id="manager-main",
         sender_session_id="manager-session",
-        device_id="test-device",
+        device_id=device_id,
         control_id=control_id,
         capability_id=capability_id,
         event_type=event_type,
@@ -599,10 +679,12 @@ class ControlledFrameBackend:
 
     def __init__(self):
         self.calls: list[int] = []
+        self.requests: list = []
         self._events: dict[int, anyio.Event] = {}
 
     async def render(self, request) -> RenderResult:
         self.calls.append(request.generation)
+        self.requests.append(request)
         event = self._events.setdefault(request.generation, anyio.Event())
         await event.wait()
         return RenderResult(
@@ -640,6 +722,21 @@ class NoopAction:
 
     async def on_will_disappear(self, event, context):
         pass
+
+
+class CapturingBuiltinAction:
+    def __init__(self, uuid: str):
+        self.uuid = uuid
+        self.contexts = []
+
+    async def on_bind(self, context) -> None:
+        self.contexts.append(context)
+
+    async def on_unbind(self, context, reason: str) -> None:
+        del context, reason
+
+    async def on_input(self, context, event) -> None:
+        del context, event
 
 
 class MemoryConfigService:
@@ -1253,6 +1350,47 @@ async def test_key_press_renders_to_device(
     assert call_args[0][1] == "0,0"
     assert call_args[0][2] == "raster.bitmap"
     assert call_args[0][3] == f"frame-{render_backend.calls[-1]}".encode()
+
+
+@pytest.mark.asyncio
+async def test_anonymous_status_render_writes_without_active_output_lease(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(return_value=None)
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        await manager.set_page(profile="default", page=0)
+
+        with anyio.fail_after(5.0):
+            while not render_backend.calls:
+                await anyio.sleep(0.01)
+        assert render_backend.requests[-1].binding_id is None
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
+            while command_service.set_raster_frame.call_count == 0:
+                await anyio.sleep(0.01)
+        tg.cancel_scope.cancel()
+
+    call_args = command_service.set_raster_frame.call_args
+    assert call_args[0][0] == "test-device"
+    assert call_args[0][1] == "0,0"
+    assert call_args[0][2] == "raster.bitmap"
 
 
 @pytest.mark.asyncio
@@ -2261,6 +2399,155 @@ async def test_close_dynamic_page_restores_binding_with_action_instance_context(
 
 
 @pytest.mark.asyncio
+async def test_mars_close_dynamic_page_drops_delayed_child_output(persistence_tmp_dir):
+    device = _make_mars_msd_two_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+    config = DeviceConfig(
+        id="mars-gaming-msd-two",
+        name="Mars Gaming MSD-TWO",
+        match={"fingerprint": device.fingerprint},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "1,0"},
+                                action=SetRasterImageOnAppearAction.uuid,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        home_ctx = await manager.action_contexts.get("1,0")
+        assert home_ctx is not None
+        assert home_ctx.control.raster_capability_id == "raster.bitmap"
+        assert home_ctx.control.image_format is not None
+
+        home_binding = home_ctx.metadata.model_copy(update={"output_generation": 1})
+        home_msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OUTPUT,
+            {
+                "binding": home_binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": device.device_id,
+                        "fingerprint": device.fingerprint,
+                    },
+                    "controlId": "1,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "set_frame",
+                "params": {"image": "ZnJhbWU=", "encoding": "jpeg"},
+                "generation": 1,
+            },
+            control_id="1,0",
+            config_id="mars-gaming-msd-two",
+        )
+        await manager.handle_command(home_msg)
+        with anyio.fail_after(5.0):
+            while not render_backend.calls:
+                await anyio.sleep(0.01)
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
+            while command_service.set_raster_frame.call_count == 0:
+                await anyio.sleep(0.01)
+        assert command_service.set_raster_frame.call_args.args[1] == "1,0"
+        home_frame = command_service.set_raster_frame.call_args.args[3]
+
+        await manager.open_page(
+            descriptor=_dynamic_page("album-page", "1,0"),
+            context_id=home_ctx.id,
+        )
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+        assert child_ctx.binding_id != home_ctx.binding_id
+
+        child_binding = child_ctx.metadata.model_copy(update={"output_generation": 1})
+        child_msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OUTPUT,
+            {
+                "binding": child_binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": device.device_id,
+                        "fingerprint": device.fingerprint,
+                    },
+                    "controlId": "1,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "set_frame",
+                "params": {"image": "Y2hpbGQ=", "encoding": "jpeg"},
+                "generation": 1,
+            },
+            control_id="1,0",
+            config_id="mars-gaming-msd-two",
+        )
+        await manager.handle_command(child_msg)
+        with anyio.fail_after(5.0):
+            while len(render_backend.calls) < 2:
+                await anyio.sleep(0.01)
+        child_render_generation = render_backend.calls[-1]
+
+        session = manager._dynamic_page_session
+        assert session is not None
+        await manager.close_page(context_id=session.context_id)
+        restored_ctx = await manager.action_contexts.get("1,0")
+        assert restored_ctx is not None
+        assert restored_ctx.binding_id != child_ctx.binding_id
+
+        baseline_calls = command_service.set_raster_frame.call_count
+        render_backend.release(child_render_generation)
+        with anyio.move_on_after(0.2):
+            while command_service.set_raster_frame.call_count == baseline_calls:
+                await anyio.sleep(0.01)
+
+        assert command_service.set_raster_frame.call_count == baseline_calls
+        assert command_service.set_raster_frame.call_args.args[3] == home_frame
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_static_page_installs_without_provider_session_preparation():
     device = _make_mock_device()
     action_bus = _actions_bus()
@@ -2601,6 +2888,97 @@ async def test_held_input_cancelled_when_dynamic_page_rebinds_control(
 
 
 @pytest.mark.asyncio
+async def test_mars_same_control_dynamic_page_rebinds_opener_slot(persistence_tmp_dir):
+    device = _make_mars_msd_two_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    config = DeviceConfig(
+        id="mars-gaming-msd-two",
+        name="Mars Gaming MSD-TWO",
+        match={"fingerprint": device.fingerprint},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "1,0"},
+                                action=SetRasterImageOnAppearAction.uuid,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            await _drain_action_messages(stream)
+            owner_ctx = await manager.action_contexts.get("1,0")
+            assert owner_ctx is not None
+
+            await manager.on_event(
+                _hardware_input("1,0", "down", sequence=1, device_id=device.device_id)
+            )
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == owner_ctx.binding_id
+
+            await manager.open_page(
+                descriptor=_dynamic_page("album-page", "1,0", "2,0"),
+                context_id=owner_ctx.id,
+            )
+            child_ctx = await manager.action_contexts.get("1,0")
+            assert child_ctx is not None
+            assert child_ctx.binding_id != owner_ctx.binding_id
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "cancel"
+            assert body.binding.binding_id == owner_ctx.binding_id
+            await _drain_action_messages(stream)
+
+            await manager.on_event(
+                _hardware_input("1,0", "up", sequence=2, device_id=device.device_id)
+            )
+            await _assert_no_action_message(stream)
+
+            await manager.on_event(
+                _hardware_input("1,0", "down", sequence=3, device_id=device.device_id)
+            )
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == child_ctx.binding_id
+
+            await manager.on_event(
+                _hardware_input("1,0", "up", sequence=4, device_id=device.device_id)
+            )
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "up"
+            assert body.binding.binding_id == child_ctx.binding_id
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_held_input_cancelled_when_closing_dynamic_page_back_to_static(
     device_config_set_raster_image, persistence_tmp_dir
 ):
@@ -2818,6 +3196,63 @@ async def test_release_on_same_binding_is_delivered(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_release_is_ignored_until_next_down(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            await _drain_action_messages(stream)
+            ctx = await manager.action_contexts.get("0,0")
+            assert ctx is not None
+
+            await manager.on_event(_hardware_input("0,0", "down", sequence=1))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == ctx.binding_id
+
+            await manager.on_event(_hardware_input("0,0", "up", sequence=2))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "up"
+            assert body.binding.binding_id == ctx.binding_id
+
+            await manager.on_event(_hardware_input("0,0", "up", sequence=3))
+            await _assert_no_action_message(stream)
+
+            await manager.on_event(_hardware_input("0,0", "down", sequence=4))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "down"
+            assert body.binding.binding_id == ctx.binding_id
+
+            await manager.on_event(_hardware_input("0,0", "up", sequence=5))
+            body = await _next_capability_input(stream)
+            assert body.event.event_type == "up"
+            assert body.binding.binding_id == ctx.binding_id
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_open_page_from_dynamic_child_dismisses_previous_owner(
     device_config_set_raster_image, persistence_tmp_dir
 ):
@@ -2879,6 +3314,67 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
         assert second_session.page_session_id != first_session.page_session_id
         assert second_session.owner_binding_id == child_ctx.binding_id
         assert second_session.owner_provider_instance_id == "python-child"
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_stale_opener_binding_cannot_open_page_after_transition(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+        stale_open = _action_command(
+            OPEN_PAGE,
+            {
+                "descriptor": _dynamic_page("stale-page", "0,0").model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                )
+            },
+            context_id=owner_ctx.id,
+            action_instance_id=owner_ctx.action_instance_id,
+            binding_id=owner_ctx.binding_id,
+        )
+
+        await manager.open_page(
+            descriptor=_dynamic_page("active-page", "1,0"),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        assert session.page_id == "active-page"
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        await manager.handle_command(stale_open)
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
+        assert await manager.action_contexts.get("0,0") is None
         tg.cancel_scope.cancel()
 
 
@@ -2996,6 +3492,284 @@ async def test_close_page_from_non_owner_is_noop(
         assert child_ctx is not None
 
         await manager.close_page(context_id=child_ctx.id)
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
+        assert await manager.action_contexts.get("0,0") is None
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_child_binding_commands_cannot_close_or_replace_page_session(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+        await manager.open_page(
+            descriptor=_dynamic_page("dynamic-page", "1,0"),
+            context_id=owner_ctx.id,
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        child_replace = await _action_command_for_active_binding(
+            manager,
+            REPLACE_PAGE,
+            {
+                "descriptor": _dynamic_page(session.page_id, "0,0").model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                )
+            },
+            control_id="1,0",
+        )
+        await manager.handle_command(child_replace)
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
+        assert await manager.action_contexts.get("0,0") is None
+
+        child_close = await _action_command_for_active_binding(
+            manager,
+            CLOSE_PAGE,
+            control_id="1,0",
+        )
+        await manager.handle_command(child_close)
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
+        assert await manager.action_contexts.get("0,0") is None
+
+        await manager.handle_command(
+            _page_session_command(
+                CLOSE_PAGE,
+                {},
+                session_id=session.page_session_id,
+                context_id=session.context_id,
+                action_instance_id=session.action_instance_id,
+            )
+        )
+
+        assert manager._dynamic_page_session is None
+        assert await manager.action_contexts.get("0,0") is not None
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_builtin_context_replaces_and_closes_opened_dynamic_page():
+    owner_action = CapturingBuiltinAction("test.builtin.owner")
+    child_action = CapturingBuiltinAction("test.builtin.child")
+    builtin_actions = {
+        owner_action.uuid: owner_action,
+        child_action.uuid: child_action,
+    }
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+
+    async def get_action(uuid, provider_instance_id=None, **kwargs):
+        del kwargs
+        if provider_instance_id not in {None, BUILTIN_ACTION_PROVIDER_ID}:
+            return None
+        if uuid in builtin_actions:
+            return _builtin_metadata(uuid)
+        return None
+
+    registry.get_action = get_action
+    registry.get_builtin_action.side_effect = builtin_actions.get
+    registry.provider_session_id.return_value = None
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=owner_action.uuid,
+                                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _builtin_metadata(owner_action.uuid),
+            _builtin_metadata(child_action.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_context = owner_action.contexts[-1]
+
+        await owner_context.open_page(
+            _dynamic_page_with_action_child(
+                "dynamic-page",
+                "1,0",
+                action_id=child_action.uuid,
+                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
+            )
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        assert await manager.action_contexts.get("1,0") is not None
+
+        await owner_context.replace_page(
+            _dynamic_page_with_action_child(
+                session.page_id,
+                "0,0",
+                action_id=child_action.uuid,
+                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
+            )
+        )
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is None
+        assert await manager.action_contexts.get("0,0") is not None
+
+        await owner_context.close_page()
+
+        assert manager._dynamic_page_session is None
+        restored = await manager.action_contexts.get("0,0")
+        assert restored is not None
+        assert restored.action_uuid == owner_action.uuid
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_builtin_child_context_cannot_control_parent_page_session():
+    owner_action = CapturingBuiltinAction("test.builtin.owner")
+    child_action = CapturingBuiltinAction("test.builtin.child")
+    builtin_actions = {
+        owner_action.uuid: owner_action,
+        child_action.uuid: child_action,
+    }
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+
+    async def get_action(uuid, provider_instance_id=None, **kwargs):
+        del kwargs
+        if provider_instance_id not in {None, BUILTIN_ACTION_PROVIDER_ID}:
+            return None
+        if uuid in builtin_actions:
+            return _builtin_metadata(uuid)
+        return None
+
+    registry.get_action = get_action
+    registry.get_builtin_action.side_effect = builtin_actions.get
+    registry.provider_session_id.return_value = None
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=owner_action.uuid,
+                                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _builtin_metadata(owner_action.uuid),
+            _builtin_metadata(child_action.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_context = owner_action.contexts[-1]
+        await owner_context.open_page(
+            _dynamic_page_with_action_child(
+                "dynamic-page",
+                "1,0",
+                action_id=child_action.uuid,
+                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
+            )
+        )
+        session = manager._dynamic_page_session
+        assert session is not None
+        child_context = child_action.contexts[-1]
+        child_ctx = await manager.action_contexts.get("1,0")
+        assert child_ctx is not None
+
+        await child_context.replace_page(
+            _dynamic_page_with_action_child(
+                session.page_id,
+                "0,0",
+                action_id=child_action.uuid,
+                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
+            )
+        )
+
+        assert manager._dynamic_page_session is session
+        assert await manager.action_contexts.get("1,0") is child_ctx
+        assert await manager.action_contexts.get("0,0") is None
+
+        await child_context.close_page()
 
         assert manager._dynamic_page_session is session
         assert await manager.action_contexts.get("1,0") is child_ctx
@@ -3300,6 +4074,84 @@ async def test_action_lifecycle_rejected_binding_nonterminal_replans_current_pag
     assert manager._binding_leases == {}
     assert manager._page_frames
     assert manager._page_frames[-1].committed_plan.bindings[0].status == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_delayed_unavailable_status_does_not_write_after_binding_restored(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+
+        msg = await _action_command_for_active_binding(
+            manager,
+            ACTION_LIFECYCLE_REJECTED,
+            {
+                "targetKind": "binding",
+                "binding": ctx.metadata.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "reason": "invalid_settings",
+                "retryable": True,
+            },
+        )
+        await manager.handle_command(msg)
+
+        assert await manager.action_contexts.get("0,0") is None
+        with anyio.fail_after(5.0):
+            while not render_backend.calls:
+                await anyio.sleep(0.01)
+        unavailable_render = render_backend.calls[-1]
+        assert render_backend.requests[-1].binding_id is None
+
+        changed = manager._action_availability_service.ingest_provider_entries(
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+            entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
+        )
+        await manager.on_action_availability_changed(changed)
+
+        restored_ctx = await manager.action_contexts.get("0,0")
+        assert restored_ctx is not None
+        assert restored_ctx.binding_id != ctx.binding_id
+
+        baseline_calls = command_service.set_raster_frame.call_count
+        render_backend.release(unavailable_render)
+        with anyio.move_on_after(0.2):
+            while command_service.set_raster_frame.call_count == baseline_calls:
+                await anyio.sleep(0.01)
+
+        assert command_service.set_raster_frame.call_count == baseline_calls
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio

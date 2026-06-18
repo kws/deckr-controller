@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import signal
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
@@ -193,11 +194,13 @@ class RenderDispatcher:
         config_id: str,
         backend: RenderBackend,
         start_soon,
+        result_authorizer: Callable[[str, str | None, str | None], bool] | None = None,
     ):
         self._command_service = command_service
         self._config_id = config_id
         self._backend = backend
         self._start_soon = start_soon
+        self._result_authorizer = result_authorizer
         self._lock = anyio.Lock()
         self._controls: dict[str, _ControlRenderState] = {}
 
@@ -304,6 +307,14 @@ class RenderDispatcher:
                 if state.context_id != result.context_id:
                     return
                 if state.binding_id != result.binding_id:
+                    return
+                if self._result_authorizer is not None and not (
+                    self._result_authorizer(
+                        result.control_id,
+                        result.binding_id,
+                        result.context_id,
+                    )
+                ):
                     return
                 target_output = state.output
 
