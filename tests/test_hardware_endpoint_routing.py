@@ -510,6 +510,110 @@ async def test_pending_hardware_claim_waits_for_acceptance_timeout_before_redisc
 
 
 @pytest.mark.asyncio
+async def test_timed_out_hardware_claim_throttles_same_candidate_retry(monkeypatch):
+    monkeypatch.setattr(
+        controller_service_module,
+        "DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
+        await _advertise_hardware(beacon, session_id="manager-session")
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        owned = next(iter(controller._owned_claims.values()))
+
+        await anyio.sleep(0.06)
+        await controller._reconcile_hardware_current_state(reason="test throttle")
+
+        assert (await concord.validate(owned.contract)).status == (
+            ContractValidityStatus.CANCELLED
+        )
+        assert controller._owned_claims == {}
+
+        await controller._reconcile_hardware_current_state(reason="test throttle again")
+
+        assert controller._owned_claims == {}
+
+
+@pytest.mark.asyncio
+async def test_hardware_claim_throttle_resets_on_manager_session_change(monkeypatch):
+    monkeypatch.setattr(
+        controller_service_module,
+        "DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        _concord,
+    ):
+        handle = await _advertise_hardware(beacon, session_id="manager-session")
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        first = next(iter(controller._owned_claims.values()))
+
+        await anyio.sleep(0.06)
+        await controller._reconcile_hardware_current_state(reason="test throttle")
+        assert controller._owned_claims == {}
+
+        await handle.aclose()
+        await _advertise_hardware(
+            beacon,
+            session_id="next-manager-session",
+            advertisement_id="hardware-ad-2",
+        )
+        await controller._reconcile_hardware_current_state(reason="test session reset")
+
+        replacement = next(iter(controller._owned_claims.values()))
+        assert replacement.claim_id != first.claim_id
+        assert replacement.current_sessions[
+            str(hardware_manager_address("room-a"))
+        ] == ("next-manager-session")
+
+
+@pytest.mark.asyncio
+async def test_hardware_claim_throttle_resets_on_config_change(monkeypatch):
+    monkeypatch.setattr(
+        controller_service_module,
+        "DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    config_service = MemoryConfigService(_config())
+    async with _running_controller(config_service=config_service) as (
+        controller,
+        beacon,
+        _concord,
+    ):
+        await _advertise_hardware(beacon, session_id="manager-session")
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        first = next(iter(controller._owned_claims.values()))
+
+        await anyio.sleep(0.06)
+        await controller._reconcile_hardware_current_state(reason="test throttle")
+        assert controller._owned_claims == {}
+
+        await config_service.write_config(
+            _config().model_copy(update={"name": "Changed Test Device"})
+        )
+        await controller._reconcile_hardware_current_state(reason="test config reset")
+
+        replacement = next(iter(controller._owned_claims.values()))
+        assert replacement.claim_id != first.claim_id
+        assert replacement.config_id == "config-room-a"
+
+
+@pytest.mark.asyncio
 async def test_hardware_claim_becomes_live_after_concord_manager_token():
     async with _running_controller(config_service=MemoryConfigService(_config())) as (
         controller,
@@ -739,7 +843,7 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
 
 
 @pytest.mark.asyncio
-async def test_live_hardware_claim_survives_session_changing_beacon_replacement():
+async def test_live_hardware_claim_is_replaced_on_manager_session_change():
     async with _running_controller(config_service=MemoryConfigService(_config())) as (
         controller,
         beacon,
@@ -772,12 +876,26 @@ async def test_live_hardware_claim_survives_session_changing_beacon_replacement(
         )
         await controller._reconcile_hardware_current_state(reason="test session change")
 
-        assert controller._device_registry.get("config-room-a") is not None
-        current_owned = next(iter(controller._owned_claims.values()))
-        assert current_owned.claim_id == owned.claim_id
         assert (await concord.validate(owned.contract)).status == (
-            ContractValidityStatus.VALID
+            ContractValidityStatus.CANCELLED
         )
+        assert controller._device_registry.get("config-room-a") is None
+        current_owned = next(iter(controller._owned_claims.values()))
+        assert current_owned.claim_id != owned.claim_id
+        assert current_owned.current_sessions[
+            str(hardware_manager_address("room-a"))
+        ] == "new-session"
+
+        await concord.attach(
+            current_owned.contract,
+            participant=hardware_manager_address("room-a"),
+            session_id="new-session",
+        )
+        await controller._reconcile_hardware_current_state(
+            reason="test replacement manager token"
+        )
+
+        assert controller._device_registry.get("config-room-a") is not None
 
 
 @pytest.mark.asyncio

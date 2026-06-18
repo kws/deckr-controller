@@ -110,6 +110,13 @@ class OwnedHardwareClaim:
         return self.agreement.contract
 
 
+@dataclass(frozen=True, slots=True)
+class HardwareClaimRetryThrottle:
+    config_id: str
+    config_signature: str
+    manager_session_id: str
+
+
 class ControllerService(BaseComponent):
     def __init__(
         self,
@@ -147,6 +154,10 @@ class ControllerService(BaseComponent):
         self._unmatched_hardware_signatures: dict[
             tuple[str, str],
             tuple[str, tuple[tuple[str, str], ...]],
+        ] = {}
+        self._hardware_claim_retry_throttles: dict[
+            tuple[str, str],
+            HardwareClaimRetryThrottle,
         ] = {}
         self._hardware_candidates: dict[tuple[str, str], HardwareCandidate] = {}
         self._hardware_reconcile_lock = anyio.Lock()
@@ -379,6 +390,16 @@ class ControllerService(BaseComponent):
                 continue
 
             if validity.status == ContractValidityStatus.VALID:
+                if _manager_session_changed(owned, candidate):
+                    await self._revoke_owned_claim(
+                        owned,
+                        cancel_contract=True,
+                        reason=(
+                            f"hardware manager session changed during {reason}: "
+                            f"{candidate.payload.session_id}"
+                        ),
+                    )
+                    continue
                 if await self._rematch_owned_claim_if_needed(owned, candidate):
                     continue
                 if not owned.live:
@@ -397,6 +418,8 @@ class ControllerService(BaseComponent):
             if not owned.live and _pending_hardware_claim_status(validity.status):
                 if now < owned.acceptance_deadline:
                     continue
+                if not _manager_session_changed(owned, candidate):
+                    await self._throttle_hardware_claim_retry(owned, candidate)
                 await self._revoke_owned_claim(
                     owned,
                     cancel_contract=True,
@@ -493,6 +516,24 @@ class ControllerService(BaseComponent):
                 self._unmatched_hardware_signatures[key] = unmatched_signature
             return
         self._unmatched_hardware_signatures.pop(key, None)
+        config_signature = _hardware_config_signature(config)
+        throttle = self._hardware_claim_retry_throttles.get(key)
+        if throttle is not None:
+            if (
+                throttle.config_id == config.id
+                and throttle.config_signature == config_signature
+                and throttle.manager_session_id == candidate.payload.session_id
+            ):
+                logger.debug(
+                    "Throttling hardware claim retry for %s/%s config=%s "
+                    "manager_session=%s",
+                    candidate.ref.manager_id,
+                    candidate.ref.device_id,
+                    config.id,
+                    candidate.payload.session_id,
+                )
+                return
+            self._hardware_claim_retry_throttles.pop(key, None)
 
         claim_id = str(uuid4())
         terms = HardwareClaimTerms(
@@ -573,6 +614,7 @@ class ControllerService(BaseComponent):
             device=candidate.device,
             manager_session_id=candidate.payload.session_id,
         )
+        self._hardware_claim_retry_throttles.pop(_ref_key(owned.ref), None)
         owned.device = candidate.device
         owned.live = True
         self._command_service.register_device(
@@ -609,6 +651,7 @@ class ControllerService(BaseComponent):
             return False
         if matched.id == owned.config_id:
             return False
+        self._hardware_claim_retry_throttles.pop(_ref_key(owned.ref), None)
         await self._migrate_owned_claim_config(
             owned,
             candidate,
@@ -704,6 +747,20 @@ class ControllerService(BaseComponent):
             await self._cancel_hardware_claim(owned, reason=reason)
         else:
             await owned.agreement.aclose()
+
+    async def _throttle_hardware_claim_retry(
+        self,
+        owned: OwnedHardwareClaim,
+        candidate: HardwareCandidate,
+    ) -> None:
+        config = await self._config_service.get_config(owned.config_id)
+        self._hardware_claim_retry_throttles[_ref_key(owned.ref)] = (
+            HardwareClaimRetryThrottle(
+                config_id=owned.config_id,
+                config_signature=_hardware_config_signature(config),
+                manager_session_id=candidate.payload.session_id,
+            )
+        )
 
     async def _cancel_hardware_claim(
         self,
@@ -972,6 +1029,22 @@ def _unmatched_hardware_signature(
     labels: Mapping[str, str],
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
     return device.fingerprint, tuple(sorted(labels.items()))
+
+
+def _manager_session_changed(
+    owned: OwnedHardwareClaim,
+    candidate: HardwareCandidate,
+) -> bool:
+    return (
+        owned.current_sessions.get(str(candidate.payload.manager_endpoint))
+        != candidate.payload.session_id
+    )
+
+
+def _hardware_config_signature(config) -> str:
+    if config is None:
+        return "<missing>"
+    return config.model_dump_json(by_alias=True, exclude_none=True)
 
 
 def _pending_hardware_claim_status(status: ContractValidityStatus) -> bool:
