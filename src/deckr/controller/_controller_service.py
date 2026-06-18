@@ -1,6 +1,8 @@
+import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from uuid import uuid4
 
 import anyio
@@ -51,6 +53,7 @@ from deckr.hardware.profiles import (
 )
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
+from pydantic import BaseModel
 
 from deckr.controller._action_availability import ActionAvailabilityService
 from deckr.controller._action_provider_sessions import ActionProviderSessionManager
@@ -1044,7 +1047,36 @@ def _manager_session_changed(
 def _hardware_config_signature(config) -> str:
     if config is None:
         return "<missing>"
-    return config.model_dump_json(by_alias=True, exclude_none=True)
+    payload = config.model_dump(by_alias=True, exclude_none=True, mode="python")
+    return json.dumps(
+        _json_signature_value(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _json_signature_value(value):
+    if isinstance(value, BaseModel):
+        return _json_signature_value(
+            value.model_dump(by_alias=True, exclude_none=True, mode="python")
+        )
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_signature_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, list | tuple):
+        return [_json_signature_value(item) for item in value]
+    if isinstance(value, set | frozenset):
+        items = [_json_signature_value(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+    if isinstance(value, Enum):
+        return _json_signature_value(value.value)
+    if isinstance(value, bytes):
+        return {"__bytes__": value.hex()}
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return repr(value)
 
 
 def _pending_hardware_claim_status(status: ContractValidityStatus) -> bool:

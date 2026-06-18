@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -205,6 +206,28 @@ def _config(
         match=DeviceConfigMatch(fingerprint=fingerprint, labels=labels or {}),
         profiles=[Profile(name="default", pages=[Page(controls=[])])],
     )
+
+
+def test_hardware_config_signature_handles_mappingproxy_values():
+    config = _config().model_copy(
+        update={
+            "provider_settings": {
+                "provider-a": {"schema": MappingProxyType({"mode": "test"})}
+            }
+        }
+    )
+    changed = _config().model_copy(
+        update={
+            "provider_settings": {
+                "provider-a": {"schema": MappingProxyType({"mode": "changed"})}
+            }
+        }
+    )
+
+    signature = controller_service_module._hardware_config_signature(config)
+
+    assert signature == controller_service_module._hardware_config_signature(config)
+    assert signature != controller_service_module._hardware_config_signature(changed)
 
 
 def _beacon(bus: LaneHarness) -> Beacon:
