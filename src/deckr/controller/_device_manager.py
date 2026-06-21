@@ -605,8 +605,55 @@ class DeviceManager:
             )
 
     async def _refresh_binding_output(self, lease: BindingLease, *, reason: str) -> None:
+        base_output_generation = getattr(
+            getattr(lease.context, "_store", None),
+            "base_output_generation",
+            None,
+        )
+        metadata_output_generation = getattr(
+            lease.context.metadata,
+            "output_generation",
+            None,
+        )
         if not lease.attached:
+            logger.debug(
+                "Skipping cached binding output refresh for detached lease "
+                "config=%s control=%s action=%s provider=%s "
+                "provider_session=%s binding=%s context=%s "
+                "action_instance=%s output_route_generation=%s "
+                "base_output_generation=%s metadata_output_generation=%s reason=%s",
+                self.config_id,
+                lease.control_id,
+                lease.action_uuid,
+                lease.provider_instance_id,
+                lease.provider_session_id,
+                lease.binding_id,
+                lease.context_id,
+                lease.action_instance_id,
+                lease.output_route_generation,
+                base_output_generation,
+                metadata_output_generation,
+                reason,
+            )
             return
+        logger.debug(
+            "Refreshing cached binding output config=%s control=%s action=%s "
+            "provider=%s provider_session=%s binding=%s context=%s "
+            "action_instance=%s output_route_generation=%s "
+            "base_output_generation=%s metadata_output_generation=%s reason=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.provider_session_id,
+            lease.binding_id,
+            lease.context_id,
+            lease.action_instance_id,
+            lease.output_route_generation,
+            base_output_generation,
+            metadata_output_generation,
+            reason,
+        )
         try:
             await lease.context.refresh_raster()
         except Exception:
