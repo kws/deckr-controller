@@ -454,8 +454,13 @@ class ControllerService(BaseComponent):
     async def _hardware_candidates_from_beacon(
         self,
     ) -> dict[tuple[str, str], HardwareCandidate]:
+        try:
+            beacon_candidates = self._beacon.candidates(HARDWARE_FEATURE_ID)
+        except KvUnavailable:
+            await self._beacon.wait_current()
+            beacon_candidates = self._beacon.candidates(HARDWARE_FEATURE_ID)
         candidates: dict[tuple[str, str], HardwareCandidate] = {}
-        for candidate in self._beacon.candidates(HARDWARE_FEATURE_ID):
+        for candidate in beacon_candidates:
             payload = _valid_hardware_payload(candidate)
             if payload is None:
                 continue

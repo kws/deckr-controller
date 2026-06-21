@@ -35,6 +35,7 @@ from deckr.hardware.descriptors import (
     DeviceRef,
 )
 from deckr.hardware.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
+from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller import _controller_service as controller_service_module
 from deckr.controller._controller_service import ControllerService
@@ -232,6 +233,35 @@ def test_hardware_config_signature_handles_mappingproxy_values():
 
 def _beacon(bus: LaneHarness) -> Beacon:
     return Beacon(bus.substrate.kv_bucket(BEACON_ADVERTISEMENT_STORE_POLICY))
+
+
+@pytest.mark.asyncio
+async def test_hardware_candidates_wait_for_beacon_currentness_before_reading():
+    class WaitRequiredBeacon:
+        def __init__(self) -> None:
+            self.waited = False
+            self.reads = 0
+
+        async def wait_current(self) -> None:
+            self.waited = True
+
+        def candidates(self, feature_id: str):
+            assert feature_id == HARDWARE_FEATURE_ID
+            self.reads += 1
+            if not self.waited:
+                raise KvUnavailable("stale")
+            assert self.waited
+            return ()
+
+    beacon = WaitRequiredBeacon()
+    controller = ControllerService.__new__(ControllerService)
+    controller._beacon = beacon
+
+    candidates = await ControllerService._hardware_candidates_from_beacon(controller)
+
+    assert candidates == {}
+    assert beacon.waited
+    assert beacon.reads == 2
 
 
 def _concord(bus: LaneHarness) -> Concord:
