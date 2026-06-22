@@ -215,6 +215,11 @@ class ControllerService(BaseComponent):
                 event
             )
         controller_contexts = await self._controller_contexts.values()
+        logger.debug(
+            "Action catalog changed handoff changed_keys=%s devices=%s",
+            len(changed_keys),
+            len(controller_contexts),
+        )
         logger.log(
             logging.INFO if controller_contexts else logging.DEBUG,
             "Applying ActionCatalogChangedEvent to %d device(s): +%s -%s ~%s successor=%s",
@@ -234,8 +239,19 @@ class ControllerService(BaseComponent):
             msg
         )
         if not changed_keys:
+            logger.debug(
+                "Action availability handoff skipped type=%s changed_keys=0",
+                msg.message_type,
+            )
             return
-        for ctrl_ctx in await self._controller_contexts.values():
+        controller_contexts = await self._controller_contexts.values()
+        logger.debug(
+            "Action availability handoff type=%s changed_keys=%s devices=%s",
+            msg.message_type,
+            len(changed_keys),
+            len(controller_contexts),
+        )
+        for ctrl_ctx in controller_contexts:
             await ctrl_ctx.on_action_availability_changed(changed_keys)
 
     async def _actions_subscription_loop(self, stopping: anyio.Event) -> None:

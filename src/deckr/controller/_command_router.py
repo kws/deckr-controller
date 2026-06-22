@@ -34,6 +34,22 @@ OVERLAY_TEMPLATES = frozenset(STATUS_OVERLAY_STYLES)
 SETTINGS_HYDRATE_TIMEOUT_SECONDS = 0.25
 
 
+def _store_content_kind(store: ControlStateStore) -> str:
+    if store.overlay is not None:
+        return f"overlay:{store.overlay.template}"
+    if store.content.image is not None:
+        if store.content.image.startswith("data:application/vnd.invariant.graph"):
+            return "invariant_graph"
+        if store.content.image.startswith("data:"):
+            return "data_image"
+        if store.content.image.startswith(("http://", "https://")):
+            return "remote_image"
+        return "image"
+    if store.content.title is not None:
+        return "title"
+    return "empty"
+
+
 class DeviceOutput:
     """Thin wrapper: writes raster frames to a selected control capability."""
 
@@ -109,19 +125,42 @@ class CommandRouter:
             control_id=self._output.control_id,
         )
         if request is None and clear_when_empty:
-            await self._render_dispatcher.clear_control(
+            generation = await self._render_dispatcher.clear_control(
                 self._output.control_id,
                 context_id=self._store.context_id,
                 binding_id=self._store.binding_id,
                 output=self._output,
             )
+            logger.debug(
+                "Command router render clear enqueued control=%s binding=%s "
+                "base_generation=%s overlay_generation=%s content_kind=%s "
+                "request_generation=%s",
+                self._output.control_id,
+                self._store.binding_id,
+                self._store.base_output_generation,
+                self._store.overlay_generation,
+                _store_content_kind(self._store),
+                generation,
+            )
             return
-        await self._render_dispatcher.submit_request(
+        generation = await self._render_dispatcher.submit_request(
             control_id=self._output.control_id,
             context_id=self._store.context_id,
             binding_id=self._store.binding_id,
             request=request,
             output=self._output,
+        )
+        logger.debug(
+            "Command router render enqueue control=%s binding=%s "
+            "base_generation=%s overlay_generation=%s content_kind=%s "
+            "request_generation=%s request_present=%s",
+            self._output.control_id,
+            self._store.binding_id,
+            self._store.base_output_generation,
+            self._store.overlay_generation,
+            _store_content_kind(self._store),
+            generation,
+            request is not None,
         )
 
     async def render(self) -> None:

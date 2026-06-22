@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
@@ -221,6 +223,51 @@ def _dedupe_action_intents(
     intents: Iterable[ActionIntentKey],
 ) -> tuple[ActionIntentKey, ...]:
     return tuple(dict.fromkeys(intents))
+
+
+def _format_provider_action_keys(
+    keys: Iterable[ProviderActionKey],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted((key.provider_instance_id, key.action_uuid) for key in keys))
+
+
+def _context_content_kind(context: object) -> str:
+    store = getattr(context, "_store", None)
+    content = getattr(store, "content", None)
+    overlay = getattr(store, "overlay", None)
+    if overlay is not None:
+        return f"overlay:{getattr(overlay, 'template', 'unknown')}"
+    image = getattr(content, "image", None)
+    if image is not None:
+        image = str(image)
+        if image.startswith("data:application/vnd.invariant.graph"):
+            return "invariant_graph"
+        if image.startswith("data:"):
+            return "data_image"
+        if image.startswith(("http://", "https://")):
+            return "remote_image"
+        return "image"
+    if getattr(content, "title", None) is not None:
+        return "title"
+    return "empty"
+
+
+def _payload_kind_hash(params: Mapping[str, Any]) -> tuple[str, str | None]:
+    image = params.get("image")
+    if isinstance(image, str):
+        if image.startswith("data:"):
+            kind = "data_uri"
+        elif image.startswith(("http://", "https://")):
+            kind = "remote_uri"
+        elif image:
+            kind = "encoded_image"
+        else:
+            kind = "empty_image"
+        return kind, hashlib.sha256(image.encode("utf-8")).hexdigest()[:12]
+    if not params:
+        return "empty", None
+    payload = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+    return "params", hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass(frozen=True, slots=True)
@@ -615,13 +662,15 @@ class DeviceManager:
             "output_generation",
             None,
         )
+        content_kind = _context_content_kind(lease.context)
         if not lease.attached:
             logger.debug(
                 "Skipping cached binding output refresh for detached lease "
                 "config=%s control=%s action=%s provider=%s "
                 "provider_session=%s binding=%s context=%s "
                 "action_instance=%s output_route_generation=%s "
-                "base_output_generation=%s metadata_output_generation=%s reason=%s",
+                "base_output_generation=%s metadata_output_generation=%s "
+                "content_kind=%s attached=%s reason=%s",
                 self.config_id,
                 lease.control_id,
                 lease.action_uuid,
@@ -633,6 +682,8 @@ class DeviceManager:
                 lease.output_route_generation,
                 base_output_generation,
                 metadata_output_generation,
+                content_kind,
+                lease.attached,
                 reason,
             )
             return
@@ -640,7 +691,8 @@ class DeviceManager:
             "Refreshing cached binding output config=%s control=%s action=%s "
             "provider=%s provider_session=%s binding=%s context=%s "
             "action_instance=%s output_route_generation=%s "
-            "base_output_generation=%s metadata_output_generation=%s reason=%s",
+            "base_output_generation=%s metadata_output_generation=%s "
+            "content_kind=%s attached=%s reason=%s",
             self.config_id,
             lease.control_id,
             lease.action_uuid,
@@ -652,6 +704,8 @@ class DeviceManager:
             lease.output_route_generation,
             base_output_generation,
             metadata_output_generation,
+            content_kind,
+            lease.attached,
             reason,
         )
         try:
@@ -2247,17 +2301,34 @@ class DeviceManager:
         async with self._nav_lock:
             current_frame = self._page_frames[-1] if self._page_frames else None
             if current_frame is None:
+                logger.debug(
+                    "Action availability page refresh skipped config=%s "
+                    "changed_keys=%s reason=no_current_page",
+                    self.config_id,
+                    len(changed_key_set),
+                )
                 return
             if changed_key_set and not self._action_availability_change_affects_plan(
                 changed_key_set,
                 current_frame.committed_plan,
             ):
                 logger.debug(
-                    "Skipping action availability refresh for config=%s page=%s; changed keys do not affect current page",
+                    "Action availability page refresh decision config=%s page=%s "
+                    "changed_keys=%s affected=False keys=%s",
                     self.config_id,
                     current_frame.committed_plan.page_id,
+                    len(changed_key_set),
+                    _format_provider_action_keys(changed_key_set),
                 )
                 return
+            logger.debug(
+                "Action availability page refresh decision config=%s page=%s "
+                "changed_keys=%s affected=True keys=%s",
+                self.config_id,
+                current_frame.committed_plan.page_id,
+                len(changed_key_set),
+                _format_provider_action_keys(changed_key_set),
+            )
 
             refreshed_plan = await self._build_page_plan(
                 current_frame.entry,
@@ -3028,6 +3099,22 @@ class DeviceManager:
                 lease.binding_id,
             )
             return
+        payload_kind, payload_hash = _payload_kind_hash(body.params)
+        logger.debug(
+            "Accepted binding output config=%s control=%s action=%s provider=%s "
+            "binding=%s command_type=%s generation=%s capability=%s "
+            "payload_kind=%s payload_hash=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.binding_id,
+            body.command_type,
+            body.generation,
+            body.capability.capability_id,
+            payload_kind,
+            payload_hash,
+        )
         if body.command_type == "clear":
             try:
                 params = raster_bitmap_command_params(body.command_type, body.params)

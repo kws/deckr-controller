@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from types import SimpleNamespace
 
@@ -821,6 +822,52 @@ async def test_service_ingests_provider_snapshot_and_change_messages():
     planning = service.planning_snapshot((_intent("action.alpha"),))
     assert planning.metadata == {}
     assert planning.unavailable == frozenset({_intent("action.alpha")})
+
+
+def test_service_logs_unchanged_provider_snapshot(caplog):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="deckr.controller._action_availability",
+    )
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    provider_address = action_provider_address("provider-alpha")
+    provider_endpoint = action_bus.endpoint(provider_address)
+    manager = _FakeActionProviderManager(
+        provider_sessions={"provider-alpha": provider_endpoint.session_id}
+    )
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=manager,
+        start_soon=None,
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    entry = ActionAvailabilityEntry(
+        actionId="action.alpha",
+        status="available",
+        descriptor=ActionDescriptor(actionId="action.alpha", name="Alpha"),
+    )
+
+    assert service.ingest_provider_entries(
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        entries=(entry,),
+    ) == frozenset({key})
+    caplog.clear()
+
+    assert service.ingest_provider_entries(
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        entries=(entry,),
+    ) == frozenset({key})
+
+    assert "Action availability entry ingested" in caplog.text
+    assert "same_as_existing=True" in caplog.text
+    assert "changed_keys=1" in caplog.text
 
 
 def test_service_planning_snapshot_preserves_only_existing_stale_bindings():

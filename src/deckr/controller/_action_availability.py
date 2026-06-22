@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 import uuid
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROVIDER_REVALIDATION_SECONDS = 60.0
 DEFAULT_STALE_GRACE_SECONDS = 5 * 60.0
+_HASH_SIZE = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -605,6 +608,62 @@ def _labels_match(
     return all(actual.get(key) == value for key, value in required)
 
 
+def _availability_state_for_entry(
+    entry: ActionAvailabilityEntry,
+) -> ActionAvailabilityState:
+    if entry.status == "available":
+        return ActionAvailabilityState.AVAILABLE
+    if entry.status == "unavailable":
+        return ActionAvailabilityState.UNAVAILABLE
+    return ActionAvailabilityState.PROBING
+
+
+def _state_value(state: ActionAvailabilityState | None) -> str | None:
+    return state.value if state is not None else None
+
+
+def _json_hash(value: object) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "to_dict"):
+        value = value.to_dict()
+    elif hasattr(value, "model_dump"):
+        value = value.model_dump(by_alias=True, exclude_none=True, mode="json")
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:_HASH_SIZE]
+
+
+def _descriptor_hash(descriptor: object | None) -> str | None:
+    return _json_hash(descriptor)
+
+
+def _entry_same_as_existing(
+    existing: ActionAvailabilityRecord | None,
+    new_state: ActionAvailabilityState,
+    metadata: ActionMetadata | None,
+    reason: str | None,
+) -> bool:
+    return (
+        existing is not None
+        and existing.source == ActionAvailabilitySource.PROVIDER_DIRECT
+        and existing.state == new_state
+        and existing.metadata == metadata
+        and existing.reason == reason
+    )
+
+
+def _provider_interest_counts(
+    provider_interests: Iterable[
+        tuple[str, str, tuple[ActionInterestEntry, ...]]
+    ],
+) -> tuple[int, int]:
+    provider_interests = tuple(provider_interests)
+    return (
+        len(provider_interests),
+        sum(len(entries) for _provider, _provider_id, entries in provider_interests),
+    )
+
+
 class ActionAvailabilityService:
     """Controller-level action availability state and provider-direct I/O."""
 
@@ -771,7 +830,18 @@ class ActionAvailabilityService:
             else:
                 self.cache.record_candidate(metadata, now=now)
             changed.add(key)
+            logger.debug(
+                "Action catalog availability ingest provider=%s action=%s "
+                "provider_session=%s changed=True",
+                key.provider_instance_id,
+                key.action_uuid,
+                metadata.provider_session_id,
+            )
         self._schedule_interest_flush()
+        logger.debug(
+            "Action catalog availability ingest complete changed_keys=%s",
+            len(changed),
+        )
         return frozenset(changed)
 
     async def handle_availability_message(
@@ -810,6 +880,16 @@ class ActionAvailabilityService:
                 exc_info=True,
             )
             return frozenset()
+        logger.debug(
+            "Action availability message received type=%s provider=%s "
+            "provider_id=%s sender_session=%s entries=%s request_id=%s",
+            msg.message_type,
+            body.provider_instance_id,
+            body.provider_id,
+            msg.sender_session_id,
+            len(body.entries),
+            getattr(body, "request_id", None),
+        )
         if body.provider_instance_id != provider_instance_id:
             logger.warning(
                 "Ignoring availability message with mismatched providerInstanceId %s from %s",
@@ -817,12 +897,21 @@ class ActionAvailabilityService:
                 msg.sender,
             )
             return frozenset()
-        return self.ingest_provider_entries(
+        changed = self.ingest_provider_entries(
             provider_instance_id=body.provider_instance_id,
             provider_id=body.provider_id,
             entries=body.entries,
             now=self._clock(),
         )
+        logger.debug(
+            "Action availability message applied type=%s provider=%s "
+            "entries=%s changed_keys=%s",
+            msg.message_type,
+            body.provider_instance_id,
+            len(body.entries),
+            len(changed),
+        )
+        return changed
 
     def ingest_provider_entries(
         self,
@@ -836,14 +925,29 @@ class ActionAvailabilityService:
         record_now = self._now(now)
         for entry in entries:
             key = ProviderActionKey(provider_instance_id, entry.action_id)
+            existing = self.cache.record_for(key)
+            old_state = (
+                self.cache.state_for(key, now=record_now)
+                if existing is not None
+                else None
+            )
             metadata = self._metadata_for_entry(
                 key=key,
                 provider_id=provider_id,
                 entry=entry,
             )
             mapped_intent = self._mapped_intent_for_key(key)
+            new_state = _availability_state_for_entry(entry)
             if entry.status == "available":
                 if metadata is None:
+                    logger.debug(
+                        "Action availability entry ignored provider=%s action=%s "
+                        "status=%s old_state=%s reason=missing_metadata",
+                        provider_instance_id,
+                        entry.action_id,
+                        entry.status,
+                        _state_value(old_state),
+                    )
                     continue
                 self.cache.record_available(
                     metadata,
@@ -867,6 +971,27 @@ class ActionAvailabilityService:
                     intent=mapped_intent,
                 )
             changed.add(key)
+            logger.debug(
+                "Action availability entry ingested provider=%s provider_id=%s "
+                "action=%s old_state=%s new_status=%s provider_session=%s "
+                "descriptor_hash=%s same_as_existing=%s mapped_intent=%s",
+                provider_instance_id,
+                provider_id,
+                entry.action_id,
+                _state_value(old_state),
+                entry.status,
+                metadata.provider_session_id if metadata is not None else None,
+                _descriptor_hash(entry.descriptor),
+                _entry_same_as_existing(existing, new_state, metadata, entry.reason),
+                mapped_intent is not None,
+            )
+        logger.debug(
+            "Action availability provider ingest complete provider=%s provider_id=%s "
+            "changed_keys=%s",
+            provider_instance_id,
+            provider_id,
+            len(changed),
+        )
         return frozenset(changed)
 
     async def ensure_local_builtin_availability(
@@ -910,9 +1035,17 @@ class ActionAvailabilityService:
         prepare_session: bool = True,
     ) -> None:
         if provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            logger.debug(
+                "Skipping provider availability request provider=%s reason=builtin",
+                provider_instance_id,
+            )
             return
         action_ids = tuple(dict.fromkeys(action_ids))
         if not action_ids:
+            logger.debug(
+                "Skipping provider availability request provider=%s reason=no_actions",
+                provider_instance_id,
+            )
             return
         now = self._clock()
         last_request_at = self._last_request_at_by_provider.get(provider_instance_id)
@@ -921,12 +1054,27 @@ class ActionAvailabilityService:
             and last_request_at is not None
             and now - last_request_at < self._revalidation_interval_seconds
         ):
+            logger.debug(
+                "Skipping provider availability request provider=%s force=%s "
+                "actions=%s reason=throttled elapsed_ms=%s",
+                provider_instance_id,
+                force,
+                len(action_ids),
+                int((now - last_request_at) * 1000),
+            )
             return
         if prepare_session and not await self._prepare_provider_session(
             provider_instance_id,
             provider_id=provider_id,
             action_ids=action_ids,
         ):
+            logger.debug(
+                "Skipping provider availability request provider=%s provider_id=%s "
+                "actions=%s reason=session_prepare_terminal",
+                provider_instance_id,
+                provider_id,
+                len(action_ids),
+            )
             return
         self._last_request_at_by_provider[provider_instance_id] = now
         selectors = tuple(
@@ -947,10 +1095,27 @@ class ActionAvailabilityService:
                 provider_id=provider_id,
             ),
         )
+        logger.debug(
+            "Provider availability request sent provider=%s provider_id=%s "
+            "provider_session=%s force=%s prepare_session=%s selectors=%s",
+            provider_instance_id,
+            provider_id,
+            self.manager.provider_session_id(provider_instance_id),
+            force,
+            prepare_session,
+            sorted(action_ids),
+        )
 
     async def flush_interest(self, *, force_requests: bool = False) -> None:
         self._flush_scheduled = False
         provider_interests = self._interests_by_provider()
+        provider_count, action_count = _provider_interest_counts(provider_interests)
+        logger.debug(
+            "Action availability interest flush starting force=%s providers=%s actions=%s",
+            force_requests,
+            provider_count,
+            action_count,
+        )
         for provider_instance_id, provider_id, entries in provider_interests:
             if not await self._prepare_provider_session(
                 provider_instance_id,
@@ -985,6 +1150,12 @@ class ActionAvailabilityService:
                 force=force_requests,
                 prepare_session=False,
             )
+        logger.debug(
+            "Action availability interest flush complete force=%s providers=%s actions=%s",
+            force_requests,
+            provider_count,
+            action_count,
+        )
 
     async def _prepare_provider_session(
         self,
@@ -1049,7 +1220,27 @@ class ActionAvailabilityService:
             if stopping.is_set():
                 return
             try:
+                provider_interests = self._interests_by_provider()
+                provider_count, action_count = _provider_interest_counts(
+                    provider_interests
+                )
+                started_at = self._clock()
+                logger.debug(
+                    "Action availability revalidation starting force=%s "
+                    "providers=%s actions=%s",
+                    True,
+                    provider_count,
+                    action_count,
+                )
                 await self.flush_interest(force_requests=True)
+                logger.debug(
+                    "Action availability revalidation complete force=%s "
+                    "providers=%s actions=%s elapsed_ms=%s",
+                    True,
+                    provider_count,
+                    action_count,
+                    int((self._clock() - started_at) * 1000),
+                )
             except Exception:
                 logger.exception("Error refreshing provider action availability")
 

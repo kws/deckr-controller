@@ -1,5 +1,6 @@
 """DeviceManager integration tests. Uses mock devices (no VirtualDevice)."""
 
+import logging
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2742,9 +2743,11 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
 
 @pytest.mark.asyncio
 async def test_action_availability_refresh_repaints_existing_binding_output(
-    device_config_set_raster_image, persistence_tmp_dir
+    device_config_set_raster_image, persistence_tmp_dir, caplog
 ):
     """Existing leases must repaint cached output during availability reconciliation."""
+    caplog.set_level(logging.DEBUG, logger="deckr.controller._device_manager")
+    caplog.set_level(logging.DEBUG, logger="deckr.controller._command_router")
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = MagicMock()
@@ -2809,6 +2812,7 @@ async def test_action_availability_refresh_repaints_existing_binding_output(
 
         baseline_render_calls = len(render_backend.calls)
         baseline_output_calls = command_service.set_raster_frame.call_count
+        caplog.clear()
 
         await manager.on_action_availability_changed()
 
@@ -2819,6 +2823,11 @@ async def test_action_availability_refresh_repaints_existing_binding_output(
         with anyio.fail_after(5.0):
             while command_service.set_raster_frame.call_count <= baseline_output_calls:
                 await anyio.sleep(0.01)
+        assert "Action availability page refresh decision" in caplog.text
+        assert "changed_keys=0 affected=True" in caplog.text
+        assert "Refreshing cached binding output" in caplog.text
+        assert "content_kind=" in caplog.text
+        assert "Command router render enqueue" in caplog.text
         tg.cancel_scope.cancel()
 
 

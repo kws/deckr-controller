@@ -226,6 +226,15 @@ class RenderDispatcher:
 
             if request is None:
                 state.pending_request = None
+                logger.debug(
+                    "Render dispatcher route claimed config=%s control=%s "
+                    "binding=%s context=%s generation=%s",
+                    self._config_id,
+                    control_id,
+                    binding_id,
+                    context_id,
+                    generation,
+                )
                 return generation
 
             request = replace(
@@ -236,10 +245,32 @@ class RenderDispatcher:
                 generation=generation,
             )
             if state.running:
+                replaced_pending = state.pending_request is not None
                 state.pending_request = request
+                logger.debug(
+                    "Render dispatcher request queued config=%s control=%s "
+                    "binding=%s context=%s generation=%s running=True "
+                    "replaced_pending=%s",
+                    self._config_id,
+                    control_id,
+                    binding_id,
+                    context_id,
+                    generation,
+                    replaced_pending,
+                )
             else:
                 state.running = True
                 self._start_soon(self._run_control, control_id, request)
+                logger.debug(
+                    "Render dispatcher request queued config=%s control=%s "
+                    "binding=%s context=%s generation=%s running=False "
+                    "replaced_pending=False",
+                    self._config_id,
+                    control_id,
+                    binding_id,
+                    context_id,
+                    generation,
+                )
             return generation
 
     async def clear_control(
@@ -265,6 +296,17 @@ class RenderDispatcher:
             state.pending_request = None
             io_lock = state.io_lock
             target_output = state.output
+
+        logger.debug(
+            "Render dispatcher clear queued config=%s control=%s binding=%s "
+            "context=%s generation=%s clear_output=%s",
+            self._config_id,
+            control_id,
+            binding_id,
+            context_id,
+            generation,
+            clear_output,
+        )
 
         if clear_output:
             async with io_lock:
