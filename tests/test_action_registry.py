@@ -15,6 +15,7 @@ from deckr.beacon import (
 )
 from deckr.components import RunContext
 from deckr.profiles import ACTIONS_FEATURE_ID, ActionsBeaconPayload
+from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
@@ -119,10 +120,38 @@ async def test_action_registry_uses_beacon_actions_as_catalog_candidate_source()
         assert meta.provider_instance_id == PROVIDER_INSTANCE_ID
         assert meta.provider_id == PROVIDER_ID
         assert meta.provider_labels == {"room": "office"}
-        assert meta.provider_session_id == "session-1"
+        assert meta.provider_session_id is None
+        candidate = registry.provider_session_candidate(PROVIDER_INSTANCE_ID, PROVIDER_ID)
+        assert candidate is not None
+        assert candidate.provider_session_id == "session-1"
         assert events[-1].catalog_added == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
 
     await _run_registry(registry, scenario)
+
+
+@pytest.mark.asyncio
+async def test_action_registry_uses_exact_beacon_fallback_when_cache_unavailable(
+    monkeypatch,
+):
+    bus = _state_bus()
+    beacon = _beacon(bus)
+    registry = _registry(beacon)
+    await _advertise_actions(beacon)
+
+    def unavailable_candidates(feature_id: str):
+        assert feature_id == ACTIONS_FEATURE_ID
+        raise KvUnavailable("cache unavailable")
+
+    monkeypatch.setattr(beacon, "candidates", unavailable_candidates)
+
+    await registry._reconcile_current_state(reason="test exact fallback")
+
+    meta = await registry.get_action(ACTION_UUID)
+    assert meta is not None
+    assert meta.provider_session_id is None
+    candidate = registry.provider_session_candidate(PROVIDER_INSTANCE_ID, PROVIDER_ID)
+    assert candidate is not None
+    assert candidate.provider_session_id == "session-1"
 
 
 @pytest.mark.asyncio
@@ -158,7 +187,7 @@ async def test_action_registry_filters_by_provider_instance_and_labels():
 
 
 @pytest.mark.asyncio
-async def test_action_registry_provider_settings_authority_uses_beacon_session():
+async def test_action_registry_exposes_beacon_session_as_candidate_only():
     bus = _state_bus()
     beacon = _beacon(bus)
     registry = _registry(beacon)
@@ -167,7 +196,12 @@ async def test_action_registry_provider_settings_authority_uses_beacon_session()
         del events
         old = await _advertise_actions(beacon, session_id="old")
         with anyio.fail_after(1):
-            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "old":
+            while (
+                candidate := registry.provider_session_candidate(
+                    PROVIDER_INSTANCE_ID,
+                    PROVIDER_ID,
+                )
+            ) is None or candidate.provider_session_id != "old":
                 await anyio.sleep(0.01)
         assert registry.provider_instance_provides_provider(
             PROVIDER_INSTANCE_ID, PROVIDER_ID
@@ -176,7 +210,12 @@ async def test_action_registry_provider_settings_authority_uses_beacon_session()
         await old.aclose()
         await _advertise_actions(beacon, session_id="new")
         with anyio.fail_after(1):
-            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
+            while (
+                candidate := registry.provider_session_candidate(
+                    PROVIDER_INSTANCE_ID,
+                    PROVIDER_ID,
+                )
+            ) is None or candidate.provider_session_id != "new":
                 await anyio.sleep(0.01)
         assert registry.provider_instance_provides_provider(
             PROVIDER_INSTANCE_ID, PROVIDER_ID
@@ -233,7 +272,12 @@ async def test_action_registry_beacon_session_change_refreshes_action_metadata()
         await old.aclose()
         await _advertise_actions(beacon, session_id="new")
         with anyio.fail_after(1):
-            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
+            while (
+                candidate := registry.provider_session_candidate(
+                    PROVIDER_INSTANCE_ID,
+                    PROVIDER_ID,
+                )
+            ) is None or candidate.provider_session_id != "new":
                 await anyio.sleep(0.01)
 
         qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
@@ -261,19 +305,22 @@ async def test_action_registry_prefers_latest_duplicate_provider_advertisement()
             session_id="new",
         )
         with anyio.fail_after(1):
-            while registry.provider_session_id(PROVIDER_INSTANCE_ID) != "new":
+            while (
+                candidate := registry.provider_session_candidate(
+                    PROVIDER_INSTANCE_ID,
+                    PROVIDER_ID,
+                )
+            ) is None or candidate.provider_session_id != "new":
                 await anyio.sleep(0.01)
 
         meta = await registry.get_action(ACTION_UUID)
         assert meta is not None
-        assert meta.provider_session_id == "new"
+        assert meta.provider_session_id is None
         qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
         assert events[-1].catalog_added == []
         assert events[-1].catalog_removed == []
-        assert events[-1].catalog_updated == []
-        assert events[-1].provider_session_successions[0].actions == [qualified]
-        assert events[-1].provider_session_successions[0].previous_session_id == "old"
-        assert events[-1].provider_session_successions[0].successor_session_id == "new"
+        assert events[-1].catalog_updated == [qualified]
+        assert events[-1].provider_session_successions == []
 
     await _run_registry(registry, scenario)
 
@@ -296,7 +343,7 @@ async def test_action_registry_removes_actions_when_beacon_advertisement_is_with
                 await anyio.sleep(0.01)
 
         assert events[-1].catalog_removed == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
-        assert registry.provider_session_id(PROVIDER_INSTANCE_ID) is None
+        assert registry.provider_session_candidate(PROVIDER_INSTANCE_ID, PROVIDER_ID) is None
 
     await _run_registry(registry, scenario)
 

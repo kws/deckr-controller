@@ -3,7 +3,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import anyio
@@ -800,15 +800,7 @@ class DeviceManager:
         self,
         action_meta: ActionMetadata,
     ) -> ActionMetadata:
-        registry_session = self.manager.provider_session_id(
-            action_meta.provider_instance_id
-        )
-        if not isinstance(registry_session, str):
-            registry_session = None
-        provider_session_id = registry_session or action_meta.provider_session_id
-        if provider_session_id == action_meta.provider_session_id:
-            return action_meta
-        return replace(action_meta, provider_session_id=provider_session_id)
+        return action_meta
 
     def _sync_top_frame_state(self) -> None:
         frame = self._page_frames[-1] if self._page_frames else None
@@ -1030,12 +1022,15 @@ class DeviceManager:
         *,
         reason: str,
     ) -> ProviderActionKey:
+        session_key = self._action_instance_provider_sessions.get(
+            metadata.action_instance_id
+        )
         return self._action_availability_service.record_lifecycle_unavailable(
             provider_instance_id=metadata.provider_instance_id,
             provider_id=metadata.provider_id,
             action_uuid=metadata.action_id,
-            provider_session_id=self.manager.provider_session_id(
-                metadata.provider_instance_id
+            provider_session_id=(
+                session_key.provider_session_id if session_key is not None else None
             ),
             reason=reason,
             intent=ActionIntentKey(
@@ -2649,28 +2644,20 @@ class DeviceManager:
                 target.provider_instance_id,
             )
             return False
-        if not self.manager.provider_instance_provides_provider(
-            sender_provider_instance_id,
-            target.provider_id,
-        ):
-            logger.warning(
-                "Ignoring provider settings command from %s for unadvertised provider %s",
-                sender_provider_instance_id,
-                target.provider_id,
-            )
-            return False
         if sender_session_id is None:
             logger.warning(
                 "Ignoring provider settings command from %s without sender session",
                 sender_provider_instance_id,
             )
             return False
-        current_session_id = self.manager.provider_session_id(
-            sender_provider_instance_id
-        )
-        if sender_session_id != current_session_id:
+        if not await self._action_availability_service.provider_session_valid(
+            provider_instance_id=sender_provider_instance_id,
+            provider_id=target.provider_id,
+            provider_session_id=sender_session_id,
+        ):
             logger.warning(
-                "Ignoring provider settings command from %s with stale provider session %s",
+                "Ignoring provider settings command from %s without valid Concord "
+                "provider session %s",
                 sender_provider_instance_id,
                 sender_session_id,
             )

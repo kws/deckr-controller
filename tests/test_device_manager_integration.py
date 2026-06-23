@@ -59,6 +59,7 @@ from invariant.params import ref
 
 from deckr.controller import _device_manager as device_manager_module
 from deckr.controller._action_availability import (
+    ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
     ProviderActionKey,
@@ -79,7 +80,10 @@ from deckr.controller.action_provider.events import (
     ActionCatalogChangedEvent,
     ProviderSessionSuccession,
 )
-from deckr.controller.action_provider.provider import ActionMetadata
+from deckr.controller.action_provider.provider import (
+    ActionMetadata,
+    ActionProviderSessionCandidate,
+)
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.settings import ConfigBackedSettingsService
 
@@ -783,8 +787,22 @@ def _provider_settings_device_manager(
     config_service: MemoryConfigService,
     actions_bus: LaneHarness,
     registry: MagicMock,
+    provider_sessions: ActionProviderSessionManager | None = None,
 ) -> DeviceManager:
     device = _make_mock_device()
+    actions_session = _actions_session(actions_bus)
+    availability_service = (
+        ActionAvailabilityService(
+            controller_id=CONTROLLER_ID,
+            controller_session_id=actions_session.session_id,
+            actions_bus=actions_session,
+            manager=registry,
+            start_soon=None,
+            provider_sessions=provider_sessions,
+        )
+        if provider_sessions is not None
+        else None
+    )
     return DeviceManager(
         controller_id=CONTROLLER_ID,
         device=device,
@@ -792,8 +810,9 @@ def _provider_settings_device_manager(
         command_service=FakeHardwareCommandService(),
         config=config_service.config,
         manager=registry,
-        actions_bus=_actions_session(actions_bus),
+        actions_bus=actions_session,
         start_soon=lambda fn, *a, **k: None,
+        availability_service=availability_service,
         settings_service=ConfigBackedSettingsService(
             controller_id=CONTROLLER_ID,
             config_service=config_service,
@@ -1059,7 +1078,7 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
 
 
 @pytest.mark.asyncio
-async def test_provider_settings_patch_after_beacon_loss_is_ignored():
+async def test_provider_settings_patch_after_beacon_loss_uses_concord_session():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
     concord = _concord(action_bus)
@@ -1076,6 +1095,7 @@ async def test_provider_settings_patch_after_beacon_loss_is_ignored():
         config_service=config_service,
         actions_bus=action_bus,
         registry=registry,
+        provider_sessions=provider_sessions,
     )
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
@@ -1086,16 +1106,14 @@ async def test_provider_settings_patch_after_beacon_loss_is_ignored():
                 settings={"timezone": "Europe/Amsterdam"},
             )
         )
-        await _assert_no_action_message(stream)
+        reply = await _next_action_message(stream)
 
     assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "UTC"
+        "timezone": "Europe/Amsterdam"
     }
+    assert reply.message_type == SETTINGS_SNAPSHOT
     registry.provider_session_id.assert_not_called()
-    registry.provider_instance_provides_provider.assert_called_once_with(
-        PROVIDER_INSTANCE_ID,
-        "dev.deckr.clock",
-    )
+    registry.provider_instance_provides_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1146,6 +1164,7 @@ async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
         config_service=config_service,
         actions_bus=action_bus,
         registry=registry,
+        provider_sessions=provider_sessions,
     )
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
@@ -1161,14 +1180,11 @@ async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
         "timezone": "UTC"
     }
     registry.provider_session_id.assert_not_called()
-    registry.provider_instance_provides_provider.assert_called_once_with(
-        PROVIDER_INSTANCE_ID,
-        "other",
-    )
+    registry.provider_instance_provides_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_provider_settings_ignores_concord_session_validity():
+async def test_provider_settings_rejects_invalid_concord_session():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
     concord = _concord(action_bus)
@@ -1189,6 +1205,7 @@ async def test_provider_settings_ignores_concord_session_validity():
         config_service=config_service,
         actions_bus=action_bus,
         registry=registry,
+        provider_sessions=provider_sessions,
     )
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
@@ -1199,17 +1216,13 @@ async def test_provider_settings_ignores_concord_session_validity():
                 settings={"timezone": "Europe/Amsterdam"},
             )
         )
-        reply = await _next_action_message(stream)
+        await _assert_no_action_message(stream)
 
     assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "Europe/Amsterdam"
+        "timezone": "UTC"
     }
-    assert reply.message_type == SETTINGS_SNAPSHOT
-    registry.provider_session_id.assert_called_once_with(PROVIDER_INSTANCE_ID)
-    registry.provider_instance_provides_provider.assert_called_once_with(
-        PROVIDER_INSTANCE_ID,
-        "dev.deckr.clock",
-    )
+    registry.provider_session_id.assert_not_called()
+    registry.provider_instance_provides_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1543,7 +1556,7 @@ async def test_binding_overlay_renders_and_expires(
 
 
 @pytest.mark.asyncio
-async def test_binding_activates_without_concord_provider_session(
+async def test_binding_without_live_provider_session_remains_pending(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1554,8 +1567,6 @@ async def test_binding_activates_without_concord_provider_session(
             provider_session_id=None,
         )
     )
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = True
     action_bus = _actions_bus()
 
     async with anyio.create_task_group() as tg:
@@ -1579,15 +1590,12 @@ async def test_binding_activates_without_concord_provider_session(
             )
             await manager.set_page(profile="default", page=0)
             ctx = await manager.action_contexts.get("0,0")
-            assert ctx is not None
-            lease = next(iter(manager._binding_leases.values()))
-            assert lease.attached
-            assert lease.provider_session_id == PROVIDER_SESSION_ID
-
-            created = await stream.receive()
-            attached = await stream.receive()
-            assert created.message_type == "actionInstanceCreated"
-            assert attached.message_type == "bindingAttached"
+            assert ctx is None
+            assert manager._binding_leases == {}
+            assert manager._page_frames[-1].committed_plan.bindings[0].status == (
+                "pending"
+            )
+            await _assert_no_action_message(stream)
 
         tg.cancel_scope.cancel()
 
@@ -1755,7 +1763,7 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
 
 
 @pytest.mark.asyncio
-async def test_provider_session_restart_restamps_binding_route(
+async def test_provider_direct_availability_restamps_binding_route(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1788,18 +1796,13 @@ async def test_provider_session_restart_restamps_binding_route(
         lease = next(iter(manager._binding_leases.values()))
         assert lease.provider_session_id == PROVIDER_SESSION_ID
 
-        registry.provider_session_id.return_value = "new-provider-session"
-        qualified = f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
-        await manager.on_action_catalog_changed(
-            _catalog_event(
-                successions=[
-                    _provider_session_succession(
-                        successor_session_id="new-provider-session",
-                        actions=[qualified],
-                    )
-                ],
-            )
+        changed = manager._action_availability_service.ingest_provider_entries(
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+            provider_session_id="new-provider-session",
+            entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
         )
+        await manager.on_action_availability_changed(changed)
 
         assert await manager.action_contexts.get("0,0") is ctx
         assert lease.provider_session_id == "new-provider-session"
@@ -1842,7 +1845,6 @@ async def test_binding_stays_attached_when_beacon_session_changes(
         lease = manager._binding_lease_for_control("0,0")
         assert lease is not None
 
-        registry.provider_session_id.return_value = "new-provider-session"
         await manager.on_action_catalog_changed(
             _catalog_event(
                 successions=[
@@ -1857,7 +1859,7 @@ async def test_binding_stays_attached_when_beacon_session_changes(
         )
 
         assert await manager.action_contexts.get("0,0") is ctx
-        assert lease.provider_session_id == "new-provider-session"
+        assert lease.provider_session_id == PROVIDER_SESSION_ID
 
         tg.cancel_scope.cancel()
 
@@ -4145,6 +4147,7 @@ async def test_delayed_unavailable_status_does_not_write_after_binding_restored(
         changed = manager._action_availability_service.ingest_provider_entries(
             provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
+            provider_session_id=PROVIDER_SESSION_ID,
             entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
         )
         await manager.on_action_availability_changed(changed)
@@ -4677,8 +4680,22 @@ class ConfigurableActionRegistry:
             for meta in self._actions.values()
         )
 
-    def provider_session_id(self, provider_instance_id: str) -> str | None:
-        del provider_instance_id
+    def provider_session_candidate(
+        self,
+        provider_instance_id: str,
+        provider_id: str,
+    ) -> ActionProviderSessionCandidate | None:
+        for meta in self._actions.values():
+            if (
+                meta.provider_instance_id == provider_instance_id
+                and meta.provider_id == provider_id
+                and meta.provider_session_id is not None
+            ):
+                return ActionProviderSessionCandidate(
+                    provider_instance_id=provider_instance_id,
+                    provider_id=provider_id,
+                    provider_session_id=meta.provider_session_id,
+                )
         return None
 
     def add_action(self, action_uuid: str, meta: ActionMetadata) -> None:
@@ -4778,6 +4795,7 @@ async def test_provider_direct_availability_resolves_candidate_control(
         changed = manager._action_availability_service.ingest_provider_entries(
             provider_instance_id="test-provider",
             provider_id="test",
+            provider_session_id=PROVIDER_SESSION_ID,
             entries=[_availability_entry(ACTION_X_UUID)],
         )
         await manager.on_action_availability_changed(changed)
@@ -5135,7 +5153,7 @@ async def test_on_action_catalog_changed_same_session_update_does_not_remove_con
 
 
 @pytest.mark.asyncio
-async def test_on_action_catalog_changed_session_succession_restamps_context(
+async def test_on_action_catalog_changed_session_succession_does_not_restamp_context(
     persistence_tmp_dir,
 ):
     device = _make_mock_device()
@@ -5223,7 +5241,7 @@ async def test_on_action_catalog_changed_session_succession_restamps_context(
         ctx_after = await manager.action_contexts.get("0,0")
         assert ctx_after is ctx_before
         lease = next(iter(manager._binding_leases.values()))
-        assert lease.provider_session_id == "new-session"
+        assert lease.provider_session_id == "old-session"
         assert lease.context is ctx_after
         assert len(manager._binding_leases) == 1
         tg.cancel_scope.cancel()

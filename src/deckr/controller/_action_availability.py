@@ -39,6 +39,7 @@ from deckr.controller._action_interest import (
     ActionInterestSnapshot,
     ActionInterestStrength,
 )
+from deckr.controller._action_provider_sessions import ProviderSessionKey
 from deckr.controller._binding_planner import ActionIntentKey
 from deckr.controller._settings_metadata import SettingsActionMetadata
 from deckr.controller.action_provider.events import ActionCatalogChangedEvent
@@ -99,10 +100,22 @@ class ActionPlanningSnapshot:
 
 
 class ActionProviderSessionPreparer(Protocol):
+    def set_change_callback(self, callback) -> None: ...
+
+    def start(self, stopping: anyio.Event) -> None: ...
+
     async def prepare_many(
         self,
         actions: Iterable[ActionMetadata],
     ) -> Mapping[object, object]: ...
+
+    async def valid(
+        self,
+        *,
+        provider_instance_id: str,
+        provider_id: str,
+        provider_session_id: str | None,
+    ) -> bool: ...
 
     async def aclose(self) -> None: ...
 
@@ -474,25 +487,29 @@ class ActionAvailabilityCache:
         stale_provider_keys: frozenset[ProviderActionKey],
     ) -> bool:
         record = item.record
+        metadata = record.metadata
         if record.source != ActionAvailabilitySource.PROVIDER_DIRECT:
             return False
         if record.state != ActionAvailabilityState.AVAILABLE:
             return False
         if item.state == ActionAvailabilityState.AVAILABLE:
-            return record.metadata is not None
+            return metadata is not None and _metadata_has_live_provider_session(metadata)
         return (
             item.state == ActionAvailabilityState.STALE
             and record.key in stale_provider_keys
-            and record.metadata is not None
+            and metadata is not None
+            and _metadata_has_live_provider_session(metadata)
         )
 
     def _planning_record_is_fresh_available(self, item: _PlanningRecord) -> bool:
         record = item.record
+        metadata = record.metadata
         return (
             record.source == ActionAvailabilitySource.PROVIDER_DIRECT
             and record.state == ActionAvailabilityState.AVAILABLE
             and item.state == ActionAvailabilityState.AVAILABLE
-            and record.metadata is not None
+            and metadata is not None
+            and _metadata_has_live_provider_session(metadata)
         )
 
     def _planning_record_is_provider_direct_pending(
@@ -504,6 +521,12 @@ class ActionAvailabilityCache:
             return False
         if item.state == ActionAvailabilityState.EXPIRED:
             return False
+        if (
+            record.state == ActionAvailabilityState.AVAILABLE
+            and record.metadata is not None
+            and not _metadata_has_live_provider_session(record.metadata)
+        ):
+            return True
         if record.state == ActionAvailabilityState.UNAVAILABLE:
             return False
         return item.state in {
@@ -608,6 +631,13 @@ def _labels_match(
     return all(actual.get(key) == value for key, value in required)
 
 
+def _metadata_has_live_provider_session(metadata: ActionMetadata) -> bool:
+    return (
+        metadata.provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS
+        or bool(metadata.provider_session_id)
+    )
+
+
 def _availability_state_for_entry(
     entry: ActionAvailabilityEntry,
 ) -> ActionAvailabilityState:
@@ -696,18 +726,30 @@ class ActionAvailabilityService:
         ] = {}
         self._last_request_at_by_provider: dict[str, float] = {}
         self._flush_scheduled = False
+        if provider_sessions is not None:
+            set_change_callback = getattr(provider_sessions, "set_change_callback", None)
+            if callable(set_change_callback):
+                set_change_callback(self._provider_session_changed)
 
     async def start(
         self,
         tg,
         stopping,
     ) -> None:
+        provider_sessions = self._provider_sessions
+        if provider_sessions is not None:
+            start = getattr(provider_sessions, "start", None)
+            if callable(start):
+                start(stopping)
         tg.start_soon(self._revalidation_loop, stopping)
 
     async def aclose(self) -> None:
         provider_sessions = self._provider_sessions
         self._provider_sessions = None
         if provider_sessions is not None:
+            set_change_callback = getattr(provider_sessions, "set_change_callback", None)
+            if callable(set_change_callback):
+                set_change_callback(None)
             await provider_sessions.aclose()
 
     def planning_snapshot(
@@ -801,11 +843,6 @@ class ActionAvailabilityService:
         for qualified in (
             *event.catalog_added,
             *event.catalog_updated,
-            *(
-                action
-                for succession in event.provider_session_successions
-                for action in succession.actions
-            ),
         ):
             key = _provider_action_key_from_catalog_id(qualified)
             if key is None:
@@ -816,19 +853,7 @@ class ActionAvailabilityService:
             )
             if metadata is None:
                 continue
-            metadata = self._with_current_provider_session(metadata)
-            existing = self.cache._availability_records.get(key)
-            if (
-                existing is not None
-                and existing.state == ActionAvailabilityState.AVAILABLE
-            ):
-                self.cache.record_available(
-                    metadata,
-                    now=now,
-                    intent=self._mapped_intent_for_key(key),
-                )
-            else:
-                self.cache.record_candidate(metadata, now=now)
+            self.cache.record_candidate(metadata, now=now)
             changed.add(key)
             logger.debug(
                 "Action catalog availability ingest provider=%s action=%s "
@@ -854,17 +879,6 @@ class ActionAvailabilityService:
                 "Ignoring availability message %s from non-provider sender %s",
                 msg.message_type,
                 msg.sender,
-            )
-            return frozenset()
-        current_session_id = self.manager.provider_session_id(provider_instance_id)
-        if (
-            current_session_id is not None
-            and msg.sender_session_id != current_session_id
-        ):
-            logger.warning(
-                "Ignoring availability message %s from stale provider session %s",
-                msg.message_type,
-                msg.sender_session_id,
             )
             return frozenset()
         try:
@@ -897,9 +911,23 @@ class ActionAvailabilityService:
                 msg.sender,
             )
             return frozenset()
+        if not await self.provider_session_valid(
+            provider_instance_id=body.provider_instance_id,
+            provider_id=body.provider_id,
+            provider_session_id=msg.sender_session_id,
+        ):
+            logger.warning(
+                "Ignoring availability message %s from provider %s without valid "
+                "Concord provider session %s",
+                msg.message_type,
+                body.provider_instance_id,
+                msg.sender_session_id,
+            )
+            return frozenset()
         changed = self.ingest_provider_entries(
             provider_instance_id=body.provider_instance_id,
             provider_id=body.provider_id,
+            provider_session_id=msg.sender_session_id,
             entries=body.entries,
             now=self._clock(),
         )
@@ -918,6 +946,7 @@ class ActionAvailabilityService:
         *,
         provider_instance_id: str,
         provider_id: str,
+        provider_session_id: str | None = None,
         entries: Iterable[ActionAvailabilityEntry],
         now: float | None = None,
     ) -> frozenset[ProviderActionKey]:
@@ -934,6 +963,7 @@ class ActionAvailabilityService:
             metadata = self._metadata_for_entry(
                 key=key,
                 provider_id=provider_id,
+                provider_session_id=provider_session_id,
                 entry=entry,
             )
             mapped_intent = self._mapped_intent_for_key(key)
@@ -1025,6 +1055,35 @@ class ActionAvailabilityService:
                 intent=intent,
             )
 
+    async def provider_session_valid(
+        self,
+        *,
+        provider_instance_id: str,
+        provider_id: str,
+        provider_session_id: str | None,
+    ) -> bool:
+        provider_sessions = self._provider_sessions
+        if provider_sessions is None:
+            return False
+        try:
+            return await provider_sessions.valid(
+                provider_instance_id=provider_instance_id,
+                provider_id=provider_id,
+                provider_session_id=provider_session_id,
+            )
+        except Exception:
+            logger.warning(
+                "Could not validate action provider session for %s/%s",
+                provider_instance_id,
+                provider_id,
+                exc_info=True,
+            )
+            return False
+
+    def _provider_session_changed(self) -> None:
+        self._last_request_at_by_provider.clear()
+        self._schedule_interest_flush()
+
     async def request_provider_availability(
         self,
         provider_instance_id: str,
@@ -1033,6 +1092,7 @@ class ActionAvailabilityService:
         *,
         force: bool = False,
         prepare_session: bool = True,
+        recipient_session_id: str | None = None,
     ) -> None:
         if provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             logger.debug(
@@ -1063,14 +1123,26 @@ class ActionAvailabilityService:
                 int((now - last_request_at) * 1000),
             )
             return
-        if prepare_session and not await self._prepare_provider_session(
-            provider_instance_id,
-            provider_id=provider_id,
-            action_ids=action_ids,
-        ):
+        if prepare_session:
+            session_key = await self._prepare_provider_session(
+                provider_instance_id,
+                provider_id=provider_id,
+                action_ids=action_ids,
+            )
+            if session_key is None:
+                logger.debug(
+                    "Skipping provider availability request provider=%s provider_id=%s "
+                    "actions=%s reason=session_not_ready",
+                    provider_instance_id,
+                    provider_id,
+                    len(action_ids),
+                )
+                return
+            recipient_session_id = session_key.provider_session_id
+        elif recipient_session_id is None:
             logger.debug(
                 "Skipping provider availability request provider=%s provider_id=%s "
-                "actions=%s reason=session_prepare_terminal",
+                "actions=%s reason=no_concord_provider_session",
                 provider_instance_id,
                 provider_id,
                 len(action_ids),
@@ -1084,7 +1156,7 @@ class ActionAvailabilityService:
         await self.actions_bus.send(
             lane=ACTIONS_LANE,
             recipient=action_provider_address(provider_instance_id),
-            recipient_session_id=self.manager.provider_session_id(provider_instance_id),
+            recipient_session_id=recipient_session_id,
             message_type=ACTION_AVAILABILITY_REQUEST,
             body=ActionAvailabilityRequestBody(
                 requestId=str(uuid.uuid4()),
@@ -1100,7 +1172,7 @@ class ActionAvailabilityService:
             "provider_session=%s force=%s prepare_session=%s selectors=%s",
             provider_instance_id,
             provider_id,
-            self.manager.provider_session_id(provider_instance_id),
+            recipient_session_id,
             force,
             prepare_session,
             sorted(action_ids),
@@ -1117,11 +1189,12 @@ class ActionAvailabilityService:
             action_count,
         )
         for provider_instance_id, provider_id, entries in provider_interests:
-            if not await self._prepare_provider_session(
+            session_key = await self._prepare_provider_session(
                 provider_instance_id,
                 provider_id=provider_id,
                 action_ids=(entry.action_id for entry in entries),
-            ):
+            )
+            if session_key is None:
                 continue
             wire = tuple((entry.action_id, entry.level) for entry in entries)
             if self._last_interest_wire_by_provider.get(provider_instance_id) != wire:
@@ -1129,9 +1202,7 @@ class ActionAvailabilityService:
                 await self.actions_bus.send(
                     lane=ACTIONS_LANE,
                     recipient=action_provider_address(provider_instance_id),
-                    recipient_session_id=self.manager.provider_session_id(
-                        provider_instance_id
-                    ),
+                    recipient_session_id=session_key.provider_session_id,
                     message_type=ACTION_INTEREST_UPDATE,
                     body=ActionInterestUpdateBody(
                         providerInstanceId=provider_instance_id,
@@ -1149,6 +1220,7 @@ class ActionAvailabilityService:
                 (entry.action_id for entry in entries),
                 force=force_requests,
                 prepare_session=False,
+                recipient_session_id=session_key.provider_session_id,
             )
         logger.debug(
             "Action availability interest flush complete force=%s providers=%s actions=%s",
@@ -1163,10 +1235,10 @@ class ActionAvailabilityService:
         *,
         provider_id: str,
         action_ids: Iterable[str],
-    ) -> bool:
+    ) -> ProviderSessionKey | None:
         provider_sessions = self._provider_sessions
         if provider_sessions is None:
-            return True
+            return None
         actions = tuple(
             self._metadata_for_session_prepare(
                 provider_instance_id,
@@ -1177,7 +1249,7 @@ class ActionAvailabilityService:
         )
         actions = tuple(action for action in actions if action is not None)
         if not actions:
-            return True
+            return None
         try:
             snapshots = await provider_sessions.prepare_many(actions)
         except Exception:
@@ -1186,11 +1258,22 @@ class ActionAvailabilityService:
                 provider_instance_id,
                 exc_info=True,
             )
-            return False
-        return not snapshots or any(
-            not bool(getattr(snapshot, "terminal", False))
+            return None
+        ready_keys = [
+            snapshot.key
             for snapshot in snapshots.values()
-        )
+            if bool(getattr(snapshot, "ready", False))
+        ]
+        if ready_keys:
+            return sorted(
+                ready_keys,
+                key=lambda key: (
+                    key.provider_instance_id,
+                    key.provider_id,
+                    key.provider_session_id,
+                ),
+            )[0]
+        return None
 
     def _metadata_for_session_prepare(
         self,
@@ -1201,16 +1284,25 @@ class ActionAvailabilityService:
     ) -> ActionMetadata | None:
         record = self.cache.record_for(ProviderActionKey(provider_instance_id, action_id))
         metadata = record.metadata if record is not None else None
-        if metadata is not None:
-            return self._with_current_provider_session(metadata)
-        provider_session_id = self.manager.provider_session_id(provider_instance_id)
-        if provider_session_id is None:
+        candidate = self.manager.provider_session_candidate(
+            provider_instance_id,
+            provider_id,
+        )
+        if candidate is None:
             return None
         return ActionMetadata(
             uuid=action_id,
             provider_instance_id=provider_instance_id,
             provider_id=provider_id,
-            provider_session_id=provider_session_id,
+            name=metadata.name if metadata is not None else None,
+            provider_session_id=candidate.provider_session_id,
+            provider_labels=(
+                metadata.provider_labels if metadata is not None else None
+            ),
+            settings_schema=metadata.settings_schema if metadata is not None else None,
+            provider_settings_schema=(
+                metadata.provider_settings_schema if metadata is not None else None
+            ),
         )
 
     async def _revalidation_loop(self, stopping) -> None:
@@ -1302,6 +1394,7 @@ class ActionAvailabilityService:
         *,
         key: ProviderActionKey,
         provider_id: str,
+        provider_session_id: str | None,
         entry: ActionAvailabilityEntry,
     ) -> ActionMetadata | None:
         descriptor = entry.descriptor
@@ -1316,9 +1409,7 @@ class ActionAvailabilityService:
             name=descriptor.name if descriptor is not None else (
                 candidate_metadata.name if candidate_metadata is not None else None
             ),
-            provider_session_id=self.manager.provider_session_id(
-                key.provider_instance_id
-            ),
+            provider_session_id=provider_session_id,
             provider_labels=(
                 candidate_metadata.provider_labels
                 if candidate_metadata is not None
@@ -1342,26 +1433,6 @@ class ActionAvailabilityService:
             if mapped_key == key:
                 return intent
         return None
-
-    def _with_current_provider_session(
-        self,
-        metadata: ActionMetadata,
-    ) -> ActionMetadata:
-        provider_session_id = self.manager.provider_session_id(
-            metadata.provider_instance_id
-        )
-        if provider_session_id == metadata.provider_session_id:
-            return metadata
-        return ActionMetadata(
-            uuid=metadata.uuid,
-            provider_instance_id=metadata.provider_instance_id,
-            provider_id=metadata.provider_id,
-            name=metadata.name,
-            provider_session_id=provider_session_id or metadata.provider_session_id,
-            provider_labels=metadata.provider_labels,
-            settings_schema=metadata.settings_schema,
-            provider_settings_schema=metadata.provider_settings_schema,
-        )
 
     def _schedule_interest_flush(self) -> None:
         if self._flush_scheduled or self._start_soon is None:

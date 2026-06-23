@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import anyio
@@ -25,12 +25,13 @@ from deckr.profiles import (
     action_provider_session_contract_id,
 )
 
+from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
 from deckr.controller.action_provider.provider import ActionMetadata
 
 logger = logging.getLogger(__name__)
 
 PROVIDER_SESSION_HEARTBEAT_SECONDS = DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS
-DEFAULT_PROVIDER_SESSION_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
+_WATCH_RETRY_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,9 @@ class ProviderSessionKey:
     provider_instance_id: str
     provider_id: str
     provider_session_id: str
+
+
+_ProviderSessionChangeCallback = Callable[[], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +61,6 @@ class ProviderSessionLease:
     provider_session_id: str
     agreement: ConcordAgreementLease
     current_sessions: dict[str, str]
-    acceptance_deadline: float
     controller_token: ParticipantHandle | None = None
 
     @property
@@ -75,9 +78,6 @@ class ActionProviderSessionManager:
         controller_session_id: str,
         concord: Concord,
         start_soon,
-        acceptance_timeout_seconds: float = (
-            DEFAULT_PROVIDER_SESSION_ACCEPTANCE_TIMEOUT_SECONDS
-        ),
     ) -> None:
         self._controller_id = controller_id
         self._controller_session_id = controller_session_id
@@ -85,8 +85,21 @@ class ActionProviderSessionManager:
         self._sessions: dict[ProviderSessionKey, ProviderSessionLease] = {}
         self._retired_provider_session_ids: set[str] = set()
         self._start_soon = start_soon
-        self._acceptance_timeout_seconds = acceptance_timeout_seconds
         self._lock = anyio.Lock()
+        self._change_callback: _ProviderSessionChangeCallback | None = None
+        self._started = False
+
+    def set_change_callback(
+        self,
+        callback: _ProviderSessionChangeCallback | None,
+    ) -> None:
+        self._change_callback = callback
+
+    def start(self, stopping: anyio.Event) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._start_soon(self._watch_loop, stopping)
 
     async def ensure(self, action: ActionMetadata) -> bool:
         snapshot = await self.prepare(action)
@@ -161,13 +174,10 @@ class ActionProviderSessionManager:
             provider_session_id=key.provider_session_id,
             agreement=agreement,
             current_sessions=current_sessions,
-            acceptance_deadline=(
-                anyio.current_time() + self._acceptance_timeout_seconds
-            ),
             controller_token=agreement.local_token,
         )
         self._sessions[key] = session
-        return _snapshot(session)
+        return await self._refresh_unlocked(key)
 
     async def refresh_many(
         self,
@@ -190,19 +200,19 @@ class ActionProviderSessionManager:
             if key.provider_session_id in self._retired_provider_session_ids:
                 return _retired_snapshot(key)
             return _missing_snapshot(key)
-        validity = await session.agreement.refresh()
+        try:
+            await session.agreement.refresh()
+        except ConcordConflict:
+            pass
         session.controller_token = session.agreement.local_token
-        if (
-            validity.status == ContractValidityStatus.NOT_YET_FULFILLED
-            and anyio.current_time() >= session.acceptance_deadline
-        ):
-            return ProviderSessionSnapshot(
-                key=key,
-                ready=False,
-                terminal=False,
-                status=validity.status,
-                reason="provider_session_acceptance_timeout",
+        try:
+            validity = await self._concord.validate_exact(
+                session.contract,
+                current_sessions=session.current_sessions,
             )
+        except ConcordUnavailable:
+            validity = ContractValidity(ContractValidityStatus.UNAVAILABLE)
+        session.agreement._validity = validity  # noqa: SLF001
         if _terminal_session_status(validity.status):
             reason = _terminal_session_reason(validity)
             await self._cancel_key_unlocked(
@@ -290,6 +300,39 @@ class ActionProviderSessionManager:
         async with self._lock:
             for key in tuple(self._sessions):
                 await self._cancel_key_unlocked(key, reason="controller_stop")
+
+    async def _watch_loop(self, stopping: anyio.Event) -> None:
+        controller_endpoint = controller_address(self._controller_id)
+        while not stopping.is_set():
+            try:
+                async with (
+                    self._concord.watch(
+                        ACTION_PROVIDER_SESSION_PROFILE_ID,
+                        participant=controller_endpoint,
+                    ) as stream,
+                    cancel_on_stopping(stopping),
+                ):
+                    self._notify_changed()
+                    async for _event in stream:
+                        if stopping.is_set():
+                            return
+                        self._notify_changed()
+            except ConcordUnavailable:
+                logger.warning(
+                    "Action provider session Concord watch unavailable; retrying",
+                    exc_info=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Action provider session Concord watch failed; retrying",
+                    exc_info=True,
+                )
+            await sleep_until_stopping(stopping, _WATCH_RETRY_SECONDS)
+
+    def _notify_changed(self) -> None:
+        callback = self._change_callback
+        if callback is not None:
+            callback()
 
 
 def provider_session_key(action: ActionMetadata) -> ProviderSessionKey | None:

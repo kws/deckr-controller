@@ -1,8 +1,6 @@
-import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from enum import Enum
 from uuid import uuid4
 
 import anyio
@@ -39,6 +37,7 @@ from deckr.contracts.messages import (
     DeckrMessage,
     EndpointAddress,
     controller_address,
+    hardware_manager_address,
 )
 from deckr.core.util.anyio import AsyncMap, CoalescedTrigger
 from deckr.hardware import messages as hw_messages
@@ -53,7 +52,6 @@ from deckr.hardware.profiles import (
 )
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
-from pydantic import BaseModel
 
 from deckr.controller._action_availability import ActionAvailabilityService
 from deckr.controller._action_provider_sessions import ActionProviderSessionManager
@@ -76,7 +74,6 @@ from deckr.controller.settings import SettingsService
 logger = logging.getLogger(__name__)
 
 CLAIM_HEARTBEAT_SECONDS = DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS
-DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
 _STATE_RECONCILE_SECONDS = 15.0
 _STATE_NOTIFICATION_BATCH_SECONDS = 0.05
 _WATCH_RETRY_SECONDS = 1.0
@@ -104,20 +101,12 @@ class OwnedHardwareClaim:
     device: DeviceDescriptor
     agreement: ConcordAgreementLease
     current_sessions: dict[str, str]
-    acceptance_deadline: float
     controller_token: ParticipantHandle | None = None
     live: bool = False
 
     @property
     def contract(self) -> ContractHandle:
         return self.agreement.contract
-
-
-@dataclass(frozen=True, slots=True)
-class HardwareClaimRetryThrottle:
-    config_id: str
-    config_signature: str
-    manager_session_id: str
 
 
 class ControllerService(BaseComponent):
@@ -157,10 +146,6 @@ class ControllerService(BaseComponent):
         self._unmatched_hardware_signatures: dict[
             tuple[str, str],
             tuple[str, tuple[tuple[str, str], ...]],
-        ] = {}
-        self._hardware_claim_retry_throttles: dict[
-            tuple[str, str],
-            HardwareClaimRetryThrottle,
         ] = {}
         self._hardware_candidates: dict[tuple[str, str], HardwareCandidate] = {}
         self._hardware_reconcile_lock = anyio.Lock()
@@ -383,23 +368,41 @@ class ControllerService(BaseComponent):
         candidates = await self._hardware_candidates_from_beacon()
         self._hardware_candidates = candidates
 
-        now = anyio.current_time()
         for owned in tuple(self._owned_claims.values()):
             candidate = candidates.get(_ref_key(owned.ref))
+            if candidate is not None and _manager_session_changed(owned, candidate):
+                validity = await self._hardware_claim_contract_validity(
+                    owned,
+                    current_sessions=_hardware_claim_current_sessions(
+                        self._controller_id,
+                        self._session_id,
+                        candidate,
+                    ),
+                )
+                owned.controller_token = owned.agreement.local_token
+                if validity.status == ContractValidityStatus.UNAVAILABLE:
+                    continue
+                await self._revoke_owned_claim(
+                    owned,
+                    cancel_contract=True,
+                    reason=(
+                        f"hardware manager session changed during {reason}: "
+                        f"{candidate.payload.session_id}"
+                    ),
+                )
+                continue
+
             validity = await self._hardware_claim_contract_validity(owned)
             owned.controller_token = owned.agreement.local_token
 
             if candidate is None:
-                if owned.live:
-                    if validity.status in {
-                        ContractValidityStatus.VALID,
-                        ContractValidityStatus.UNAVAILABLE,
-                    }:
-                        continue
-                elif (
-                    _pending_hardware_claim_status(validity.status)
-                    and now < owned.acceptance_deadline
-                ):
+                if validity.status == ContractValidityStatus.UNAVAILABLE:
+                    continue
+                if validity.status == ContractValidityStatus.VALID:
+                    if not owned.live:
+                        await self._connect_owned_claim(owned, None)
+                    continue
+                if self._pending_hardware_claim_validity(owned, validity):
                     continue
                 await self._revoke_owned_claim(
                     owned,
@@ -409,16 +412,6 @@ class ControllerService(BaseComponent):
                 continue
 
             if validity.status == ContractValidityStatus.VALID:
-                if _manager_session_changed(owned, candidate):
-                    await self._revoke_owned_claim(
-                        owned,
-                        cancel_contract=True,
-                        reason=(
-                            f"hardware manager session changed during {reason}: "
-                            f"{candidate.payload.session_id}"
-                        ),
-                    )
-                    continue
                 if await self._rematch_owned_claim_if_needed(owned, candidate):
                     continue
                 if not owned.live:
@@ -428,25 +421,10 @@ class ControllerService(BaseComponent):
                 continue
 
             if owned.live:
-                if validity.status in {
-                    ContractValidityStatus.VALID,
-                    ContractValidityStatus.UNAVAILABLE,
-                }:
+                if validity.status == ContractValidityStatus.UNAVAILABLE:
                     continue
 
-            if not owned.live and _pending_hardware_claim_status(validity.status):
-                if now < owned.acceptance_deadline:
-                    continue
-                if not _manager_session_changed(owned, candidate):
-                    await self._throttle_hardware_claim_retry(owned, candidate)
-                await self._revoke_owned_claim(
-                    owned,
-                    cancel_contract=True,
-                    reason=(
-                        f"hardware claim acceptance timeout during {reason}: "
-                        f"{validity.status}"
-                    ),
-                )
+            if not owned.live and self._pending_hardware_claim_validity(owned, validity):
                 continue
 
             await self._revoke_owned_claim(
@@ -473,8 +451,7 @@ class ControllerService(BaseComponent):
         try:
             beacon_candidates = self._beacon.candidates(HARDWARE_FEATURE_ID)
         except KvUnavailable:
-            await self._beacon.wait_current()
-            beacon_candidates = self._beacon.candidates(HARDWARE_FEATURE_ID)
+            beacon_candidates = await self._beacon.candidates_exact(HARDWARE_FEATURE_ID)
         candidates: dict[tuple[str, str], HardwareCandidate] = {}
         for candidate in beacon_candidates:
             payload = _valid_hardware_payload(candidate)
@@ -540,24 +517,6 @@ class ControllerService(BaseComponent):
                 self._unmatched_hardware_signatures[key] = unmatched_signature
             return
         self._unmatched_hardware_signatures.pop(key, None)
-        config_signature = _hardware_config_signature(config)
-        throttle = self._hardware_claim_retry_throttles.get(key)
-        if throttle is not None:
-            if (
-                throttle.config_id == config.id
-                and throttle.config_signature == config_signature
-                and throttle.manager_session_id == candidate.payload.session_id
-            ):
-                logger.debug(
-                    "Throttling hardware claim retry for %s/%s config=%s "
-                    "manager_session=%s",
-                    candidate.ref.manager_id,
-                    candidate.ref.device_id,
-                    config.id,
-                    candidate.payload.session_id,
-                )
-                return
-            self._hardware_claim_retry_throttles.pop(key, None)
 
         claim_id = str(uuid4())
         terms = HardwareClaimTerms(
@@ -571,10 +530,11 @@ class ControllerService(BaseComponent):
                 ),
             ),
         )
-        current_sessions = {
-            str(controller_address(self._controller_id)): self._session_id,
-            str(candidate.payload.manager_endpoint): candidate.payload.session_id,
-        }
+        current_sessions = _hardware_claim_current_sessions(
+            self._controller_id,
+            self._session_id,
+            candidate,
+        )
         try:
             agreement = await self._concord.propose(
                 ConcordAgreementSpec(
@@ -603,9 +563,6 @@ class ControllerService(BaseComponent):
             device=device,
             agreement=agreement,
             current_sessions=current_sessions,
-            acceptance_deadline=(
-                anyio.current_time() + DEFAULT_HARDWARE_CLAIM_ACCEPTANCE_TIMEOUT_SECONDS
-            ),
         )
         self._owned_claims[key] = owned
         validity = await self._hardware_claim_contract_validity(owned)
@@ -616,13 +573,28 @@ class ControllerService(BaseComponent):
     async def _hardware_claim_contract_validity(
         self,
         owned: OwnedHardwareClaim,
+        *,
+        current_sessions: Mapping[str, str] | None = None,
     ) -> ContractValidity:
-        return await owned.agreement.refresh()
+        try:
+            await owned.agreement.refresh()
+        except ConcordConflict:
+            pass
+        sessions = current_sessions or owned.current_sessions
+        try:
+            validity = await self._concord.validate_exact(
+                owned.contract,
+                current_sessions=sessions,
+            )
+        except ConcordUnavailable:
+            return ContractValidity(ContractValidityStatus.UNAVAILABLE)
+        owned.agreement._validity = validity  # noqa: SLF001
+        return validity
 
     async def _connect_owned_claim(
         self,
         owned: OwnedHardwareClaim,
-        candidate: HardwareCandidate,
+        candidate: HardwareCandidate | None,
     ) -> None:
         config = await self._config_service.get_config(owned.config_id)
         if config is None or not config.enabled:
@@ -632,22 +604,43 @@ class ControllerService(BaseComponent):
                 owned.claim_id,
             )
             return
+        device = candidate.device if candidate is not None else owned.device
+        manager_session_id = (
+            candidate.payload.session_id
+            if candidate is not None
+            else _owned_manager_session_id(owned)
+        )
+        if manager_session_id is None:
+            logger.warning(
+                "Claim %s is valid but manager session is unknown; keeping idle",
+                owned.claim_id,
+            )
+            return
         live = self._device_registry.connect(
             config_id=owned.config_id,
             ref=owned.ref,
-            device=candidate.device,
-            manager_session_id=candidate.payload.session_id,
+            device=device,
+            manager_session_id=manager_session_id,
         )
-        self._hardware_claim_retry_throttles.pop(_ref_key(owned.ref), None)
-        owned.device = candidate.device
+        owned.device = device
         owned.live = True
         self._command_service.register_device(
             config_id=owned.config_id,
             ref=owned.ref,
-            device=candidate.device,
-            manager_session_id=candidate.payload.session_id,
+            device=device,
+            manager_session_id=manager_session_id,
         )
         await self.on_device_connected(live, initial_config=config)
+
+    def _pending_hardware_claim_validity(
+        self,
+        owned: OwnedHardwareClaim,
+        validity: ContractValidity,
+    ) -> bool:
+        return (
+            validity.status == ContractValidityStatus.NOT_YET_FULFILLED
+            and str(controller_address(self._controller_id)) in validity.tokens
+        )
 
     async def _rematch_owned_claim_if_needed(
         self,
@@ -675,7 +668,6 @@ class ControllerService(BaseComponent):
             return False
         if matched.id == owned.config_id:
             return False
-        self._hardware_claim_retry_throttles.pop(_ref_key(owned.ref), None)
         await self._migrate_owned_claim_config(
             owned,
             candidate,
@@ -771,20 +763,6 @@ class ControllerService(BaseComponent):
             await self._cancel_hardware_claim(owned, reason=reason)
         else:
             await owned.agreement.aclose()
-
-    async def _throttle_hardware_claim_retry(
-        self,
-        owned: OwnedHardwareClaim,
-        candidate: HardwareCandidate,
-    ) -> None:
-        config = await self._config_service.get_config(owned.config_id)
-        self._hardware_claim_retry_throttles[_ref_key(owned.ref)] = (
-            HardwareClaimRetryThrottle(
-                config_id=owned.config_id,
-                config_signature=_hardware_config_signature(config),
-                manager_session_id=candidate.payload.session_id,
-            )
-        )
 
     async def _cancel_hardware_claim(
         self,
@@ -1065,43 +1043,18 @@ def _manager_session_changed(
     )
 
 
-def _hardware_config_signature(config) -> str:
-    if config is None:
-        return "<missing>"
-    payload = config.model_dump(by_alias=True, exclude_none=True, mode="python")
-    return json.dumps(
-        _json_signature_value(payload),
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _json_signature_value(value):
-    if isinstance(value, BaseModel):
-        return _json_signature_value(
-            value.model_dump(by_alias=True, exclude_none=True, mode="python")
-        )
-    if isinstance(value, Mapping):
-        return {
-            str(key): _json_signature_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, list | tuple):
-        return [_json_signature_value(item) for item in value]
-    if isinstance(value, set | frozenset):
-        items = [_json_signature_value(item) for item in value]
-        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
-    if isinstance(value, Enum):
-        return _json_signature_value(value.value)
-    if isinstance(value, bytes):
-        return {"__bytes__": value.hex()}
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    return repr(value)
-
-
-def _pending_hardware_claim_status(status: ContractValidityStatus) -> bool:
-    return status in {
-        ContractValidityStatus.NOT_YET_FULFILLED,
-        ContractValidityStatus.UNAVAILABLE,
+def _hardware_claim_current_sessions(
+    controller_id: str,
+    controller_session_id: str,
+    candidate: HardwareCandidate,
+) -> dict[str, str]:
+    return {
+        str(controller_address(controller_id)): controller_session_id,
+        str(candidate.payload.manager_endpoint): candidate.payload.session_id,
     }
+
+
+def _owned_manager_session_id(owned: OwnedHardwareClaim) -> str | None:
+    return owned.current_sessions.get(
+        str(hardware_manager_address(owned.ref.manager_id))
+    )

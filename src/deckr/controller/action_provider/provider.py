@@ -9,7 +9,11 @@ from typing import Protocol
 
 @dataclass
 class ActionMetadata:
-    """Metadata for an action from provider-instance current state."""
+    """Metadata for an action.
+
+    ``provider_session_id`` is live routing metadata. Beacon advertisements must
+    not populate it; only Concord-authorized provider-direct availability may.
+    """
 
     uuid: str
     provider_instance_id: str
@@ -19,6 +23,15 @@ class ActionMetadata:
     provider_labels: Mapping[str, str] | None = None
     settings_schema: dict | None = None
     provider_settings_schema: dict | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActionProviderSessionCandidate:
+    """Beacon-discovered provider runtime session for Concord negotiation only."""
+
+    provider_instance_id: str
+    provider_id: str
+    provider_session_id: str
 
 
 class ActionProviderManager(Protocol):
@@ -38,4 +51,8 @@ class ActionProviderManager(Protocol):
         provider_id: str,
     ) -> bool: ...
 
-    def provider_session_id(self, provider_instance_id: str) -> str | None: ...
+    def provider_session_candidate(
+        self,
+        provider_instance_id: str,
+        provider_id: str,
+    ) -> ActionProviderSessionCandidate | None: ...

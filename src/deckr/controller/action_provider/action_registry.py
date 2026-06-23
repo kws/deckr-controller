@@ -30,9 +30,11 @@ from deckr.controller.action_provider.builtin import (
 )
 from deckr.controller.action_provider.events import (
     ActionCatalogChangedEvent,
-    ProviderSessionSuccession,
 )
-from deckr.controller.action_provider.provider import ActionMetadata
+from deckr.controller.action_provider.provider import (
+    ActionMetadata,
+    ActionProviderSessionCandidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,9 +164,19 @@ class ActionRegistry(BaseComponent):
             for entry in self._action_registry.values()
         )
 
-    def provider_session_id(self, provider_instance_id: str) -> str | None:
+    def provider_session_candidate(
+        self,
+        provider_instance_id: str,
+        provider_id: str,
+    ) -> ActionProviderSessionCandidate | None:
         advertisement = self._advertisements.get(provider_instance_id)
-        return advertisement.session_id if advertisement is not None else None
+        if advertisement is None or advertisement.provider_id != provider_id:
+            return None
+        return ActionProviderSessionCandidate(
+            provider_instance_id=provider_instance_id,
+            provider_id=provider_id,
+            provider_session_id=advertisement.session_id,
+        )
 
     def _builtin_action_metadata(self, action_uuid: str) -> ActionMetadata | None:
         descriptor = self._builtin_action_registry.get(action_uuid)
@@ -262,7 +274,10 @@ class ActionRegistry(BaseComponent):
             await self._reconcile_current_state_locked(reason=reason)
 
     async def _reconcile_current_state_locked(self, *, reason: str) -> None:
-        candidates = self._beacon.candidates(ACTIONS_FEATURE_ID)
+        try:
+            candidates = self._beacon.candidates(ACTIONS_FEATURE_ID)
+        except KvUnavailable:
+            candidates = await self._beacon.candidates_exact(ACTIONS_FEATURE_ID)
         next_candidates: dict[str, tuple[Candidate, ActionsBeaconPayload]] = {}
 
         for candidate in candidates:
@@ -305,37 +320,27 @@ class ActionRegistry(BaseComponent):
         }
         added = sorted(set(desired) - set(existing))
         removed = sorted(set(existing) - set(desired))
-        successions = _provider_session_successions(
-            provider_instance_id,
-            existing,
-            desired,
-            updated_or_succeeded,
-        )
-        succeeded_actions = {
-            action for succession in successions for action in succession.actions
-        }
-        updated = sorted(updated_or_succeeded - succeeded_actions)
+        updated = sorted(updated_or_succeeded)
 
         for qualified in set(existing) - set(desired):
             self._action_registry.pop(qualified, None)
         self._action_registry.update(desired)
 
-        if added or removed or updated or successions:
+        if added or removed or updated:
             logger.debug(
-                "Action provider %s Beacon catalog changed via %s: +%s -%s ~%s successor=%s",
+                "Action provider %s Beacon catalog changed via %s: +%s -%s ~%s",
                 provider_instance_id,
                 reason,
                 added,
                 removed,
                 updated,
-                successions,
             )
             await self._publish_catalog_changed(
                 ActionCatalogChangedEvent(
                     catalog_added=added,
                     catalog_removed=removed,
                     catalog_updated=updated,
-                    provider_session_successions=successions,
+                    provider_session_successions=[],
                 )
             )
 
@@ -366,38 +371,6 @@ class ActionRegistry(BaseComponent):
             await self._on_catalog_changed(event)
 
 
-def _provider_session_successions(
-    provider_instance_id: str,
-    existing: Mapping[str, _BeaconAction],
-    desired: Mapping[str, _BeaconAction],
-    changed: set[str],
-) -> list[ProviderSessionSuccession]:
-    by_session: dict[tuple[str, str, str], list[str]] = {}
-    for qualified in changed:
-        old = existing.get(qualified)
-        new = desired.get(qualified)
-        if old is None or new is None:
-            continue
-        if old.session_id == new.session_id:
-            continue
-        key = (old.provider_id, old.session_id, new.session_id)
-        by_session.setdefault(key, []).append(qualified)
-    return [
-        ProviderSessionSuccession(
-            provider_instance_id=provider_instance_id,
-            provider_id=provider_id,
-            previous_session_id=previous_session_id,
-            successor_session_id=successor_session_id,
-            actions=sorted(actions),
-        )
-        for (
-            provider_id,
-            previous_session_id,
-            successor_session_id,
-        ), actions in sorted(by_session.items())
-    ]
-
-
 def _metadata(entry: _BeaconAction) -> ActionMetadata:
     descriptor = entry.descriptor
     return ActionMetadata(
@@ -405,7 +378,6 @@ def _metadata(entry: _BeaconAction) -> ActionMetadata:
         provider_instance_id=entry.provider_instance_id,
         provider_id=entry.provider_id,
         name=descriptor.name,
-        provider_session_id=entry.session_id,
         provider_labels=dict(entry.labels),
         settings_schema=(
             thaw_json(descriptor.settings_schema)

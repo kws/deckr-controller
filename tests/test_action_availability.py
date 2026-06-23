@@ -37,10 +37,15 @@ from deckr.controller._action_interest import (
     ActionInterestSource,
     ActionInterestStrength,
 )
+from deckr.controller._action_provider_sessions import ProviderSessionKey
 from deckr.controller._binding_planner import ActionIntentKey
-from deckr.controller.action_provider.provider import ActionMetadata
+from deckr.controller.action_provider.provider import (
+    ActionMetadata,
+    ActionProviderSessionCandidate,
+)
 
 CONTROLLER_ID = "controller-main"
+PROVIDER_SESSION_ID = "provider-session"
 
 
 def _metadata(
@@ -49,12 +54,14 @@ def _metadata(
     provider_instance_id: str = "provider-a",
     provider_id: str = "provider",
     provider_labels: dict[str, str] | None = None,
+    provider_session_id: str | None = PROVIDER_SESSION_ID,
 ) -> ActionMetadata:
     return ActionMetadata(
         uuid=action_uuid,
         provider_instance_id=provider_instance_id,
         provider_id=provider_id,
         provider_labels=provider_labels,
+        provider_session_id=provider_session_id,
     )
 
 
@@ -114,25 +121,53 @@ class _FakeActionProviderManager:
             for action in self._actions.values()
         )
 
-    def provider_session_id(self, provider_instance_id: str) -> str | None:
-        return self._provider_sessions.get(provider_instance_id)
+    def provider_session_candidate(
+        self,
+        provider_instance_id: str,
+        provider_id: str,
+    ) -> ActionProviderSessionCandidate | None:
+        provider_session_id = self._provider_sessions.get(provider_instance_id)
+        if provider_session_id is None:
+            return None
+        return ActionProviderSessionCandidate(
+            provider_instance_id=provider_instance_id,
+            provider_id=provider_id,
+            provider_session_id=provider_session_id,
+        )
 
 
 class _FakeProviderSessions:
-    def __init__(self, *, terminal: bool = False) -> None:
+    def __init__(self, *, terminal: bool = False, ready: bool = True) -> None:
         self.terminal = terminal
+        self.ready = ready
         self.prepare_calls: list[tuple[ActionMetadata, ...]] = []
+        self.valid_calls: list[dict[str, str | None]] = []
         self.closed = False
 
     async def prepare_many(self, actions):
         prepared = tuple(actions)
         self.prepare_calls.append(prepared)
         return {
-            (action.provider_instance_id, action.uuid): SimpleNamespace(
-                terminal=self.terminal
+            ProviderSessionKey(
+                action.provider_instance_id,
+                action.provider_id,
+                action.provider_session_id,
+            ): SimpleNamespace(
+                key=ProviderSessionKey(
+                    action.provider_instance_id,
+                    action.provider_id,
+                    action.provider_session_id,
+                ),
+                ready=self.ready,
+                terminal=self.terminal,
             )
             for action in prepared
+            if action.provider_session_id is not None
         }
+
+    async def valid(self, **kwargs) -> bool:
+        self.valid_calls.append(kwargs)
+        return self.ready and not self.terminal
 
     async def aclose(self) -> None:
         self.closed = True
@@ -141,6 +176,12 @@ class _FakeProviderSessions:
 async def _next_action_message(stream, *, timeout: float = 1.0) -> DeckrMessage:
     with anyio.fail_after(timeout):
         return await anext(stream)
+
+
+async def _assert_no_action_message(stream, *, timeout: float = 0.1) -> None:
+    with anyio.move_on_after(timeout) as scope:
+        await anext(stream)
+    assert scope.cancel_called
 
 
 def test_records_are_keyed_by_provider_instance_and_action_id():
@@ -740,6 +781,112 @@ async def test_service_direct_availability_request_prepares_provider_session():
 
 
 @pytest.mark.asyncio
+async def test_service_pending_provider_session_sends_no_interest_or_request():
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    provider_address = action_provider_address("provider-alpha")
+    provider_session_id = action_bus.endpoint(provider_address).session_id
+    metadata = _metadata(
+        "action.alpha",
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+    )
+    manager = _FakeActionProviderManager(
+        metadata,
+        provider_sessions={"provider-alpha": provider_session_id},
+    )
+    provider_sessions = _FakeProviderSessions(ready=False)
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=manager,
+        start_soon=None,
+        provider_sessions=provider_sessions,
+    )
+    intent = _intent("action.alpha", provider_instance_id="provider-alpha")
+    service.cache.record_candidate(metadata, now=0.0, intent=intent)
+    service.update_config_interest(
+        "config-a",
+        ActionInterestSnapshot(
+            records=(
+                ActionInterestRecord(
+                    intent=intent,
+                    source=ActionInterestSource.VISIBLE_BINDING,
+                    strength=ActionInterestStrength.STRONG,
+                    first_needed_at=0.0,
+                    last_needed_at=0.0,
+                    retain_until=None,
+                ),
+            )
+        ),
+    )
+
+    async with action_bus.subscribe(provider_address) as stream:
+        await service.flush_interest(force_requests=True)
+        await _assert_no_action_message(stream)
+
+    assert len(provider_sessions.prepare_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_service_pending_provider_session_direct_request_sends_nothing():
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    provider_address = action_provider_address("provider-alpha")
+    provider_session_id = action_bus.endpoint(provider_address).session_id
+    manager = _FakeActionProviderManager(
+        provider_sessions={"provider-alpha": provider_session_id}
+    )
+    provider_sessions = _FakeProviderSessions(ready=False)
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=manager,
+        provider_sessions=provider_sessions,
+        start_soon=None,
+    )
+
+    async with action_bus.subscribe(provider_address) as stream:
+        await service.request_provider_availability(
+            "provider-alpha",
+            "provider.test",
+            ("action.alpha",),
+            force=True,
+        )
+        await _assert_no_action_message(stream)
+
+    assert len(provider_sessions.prepare_calls) == 1
+
+
+def test_service_provider_session_change_schedules_immediate_flush():
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    scheduled: list[object] = []
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=_FakeActionProviderManager(),
+        start_soon=lambda fn, *args: scheduled.append((fn, args)),
+    )
+    service._last_request_at_by_provider["provider-alpha"] = 12.0
+    service._last_request_at_by_provider["provider-beta"] = 24.0
+
+    service._provider_session_changed()
+
+    assert not service._last_request_at_by_provider
+    assert scheduled == [(service.flush_interest, ())]
+
+
+@pytest.mark.asyncio
 async def test_service_ingests_provider_snapshot_and_change_messages():
     action_bus = LaneHarness(
         ACTIONS_LANE,
@@ -755,6 +902,7 @@ async def test_service_ingests_provider_snapshot_and_change_messages():
         controller_session_id=action_bus.session_id,
         actions_bus=action_bus.endpoint().session,
         manager=manager,
+        provider_sessions=_FakeProviderSessions(),
         start_soon=None,
     )
     key = ProviderActionKey("provider-alpha", "action.alpha")
@@ -791,6 +939,7 @@ async def test_service_ingests_provider_snapshot_and_change_messages():
     assert record.state == ActionAvailabilityState.AVAILABLE
     assert record.metadata is not None
     assert record.metadata.name == "Alpha"
+    assert record.metadata.provider_session_id == provider_endpoint.session_id
     assert record.metadata.settings_schema == {"type": "object"}
 
     changed = await provider_endpoint.send(
@@ -822,6 +971,51 @@ async def test_service_ingests_provider_snapshot_and_change_messages():
     planning = service.planning_snapshot((_intent("action.alpha"),))
     assert planning.metadata == {}
     assert planning.unavailable == frozenset({_intent("action.alpha")})
+
+
+@pytest.mark.asyncio
+async def test_service_ignores_provider_snapshot_without_valid_session():
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    provider_address = action_provider_address("provider-alpha")
+    provider_endpoint = action_bus.endpoint(provider_address)
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=_FakeActionProviderManager(
+            provider_sessions={"provider-alpha": provider_endpoint.session_id}
+        ),
+        provider_sessions=_FakeProviderSessions(ready=False),
+        start_soon=None,
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+
+    snapshot = await provider_endpoint.send(
+        lane=ACTIONS_LANE,
+        recipient=controller_address(CONTROLLER_ID),
+        subject=action_provider_instance_subject(
+            "provider-alpha",
+            provider_id="provider.test",
+        ),
+        message_type=ACTION_AVAILABILITY_SNAPSHOT,
+        body=ActionAvailabilitySnapshotBody(
+            providerInstanceId="provider-alpha",
+            providerId="provider.test",
+            entries=(
+                ActionAvailabilityEntry(
+                    actionId="action.alpha",
+                    status="available",
+                    descriptor=ActionDescriptor(actionId="action.alpha", name="Alpha"),
+                ),
+            ),
+        ).to_dict(),
+    )
+
+    assert await service.handle_availability_message(snapshot) == frozenset()
+    assert service.cache.record_for(key) is None
 
 
 def test_service_logs_unchanged_provider_snapshot(caplog):
