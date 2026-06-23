@@ -1028,6 +1028,15 @@ class ActionAvailabilityService:
                 and existing.state == ActionAvailabilityState.UNAVAILABLE
                 and existing.reason == PROVIDER_SESSION_INVALID_REASON
             )
+            same_as_existing = old_state == new_state and _entry_same_as_existing(
+                existing,
+                new_state,
+                metadata,
+                entry.reason,
+                requires_provider_lifecycle_recovery=(
+                    requires_provider_lifecycle_recovery
+                ),
+            )
             if entry.status == "available":
                 if metadata is None:
                     logger.debug(
@@ -1063,7 +1072,8 @@ class ActionAvailabilityService:
                     now=record_now,
                     intent=mapped_intent,
                 )
-            changed.add(key)
+            if not same_as_existing:
+                changed.add(key)
             logger.debug(
                 "Action availability entry ingested provider=%s provider_id=%s "
                 "action=%s old_state=%s new_status=%s provider_session=%s "
@@ -1075,15 +1085,7 @@ class ActionAvailabilityService:
                 entry.status,
                 metadata.provider_session_id if metadata is not None else None,
                 _descriptor_hash(entry.descriptor),
-                _entry_same_as_existing(
-                    existing,
-                    new_state,
-                    metadata,
-                    entry.reason,
-                    requires_provider_lifecycle_recovery=(
-                        requires_provider_lifecycle_recovery
-                    ),
-                ),
+                same_as_existing,
                 mapped_intent is not None,
             )
         logger.debug(

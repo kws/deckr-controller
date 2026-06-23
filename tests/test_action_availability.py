@@ -1058,11 +1058,58 @@ def test_service_logs_unchanged_provider_snapshot(caplog):
         provider_instance_id="provider-alpha",
         provider_id="provider.test",
         entries=(entry,),
-    ) == frozenset({key})
+    ) == frozenset()
 
     assert "Action availability entry ingested" in caplog.text
     assert "same_as_existing=True" in caplog.text
-    assert "changed_keys=1" in caplog.text
+    assert "changed_keys=0" in caplog.text
+
+
+def test_service_provider_snapshot_refresh_from_stale_reports_changed():
+    now = 100.0
+    metadata = ActionMetadata(
+        uuid="action.alpha",
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        name="Alpha",
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    cache = ActionAvailabilityCache(
+        policy=ActionAvailabilityPolicy(
+            stale_grace_seconds=10.0,
+            candidate_ttl_seconds=60.0,
+        ),
+        clock=lambda: now,
+    )
+    cache.record_available(metadata, now=0.0)
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=_FakeActionProviderManager(metadata),
+        start_soon=None,
+        cache=cache,
+        clock=lambda: now,
+    )
+    entry = ActionAvailabilityEntry(
+        actionId="action.alpha",
+        status="available",
+        descriptor=ActionDescriptor(actionId="action.alpha", name="Alpha"),
+    )
+
+    changed = service.ingest_provider_entries(
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        entries=(entry,),
+        now=now,
+    )
+
+    assert changed == frozenset({key})
+    assert service.cache.state_for(key, now=now) == ActionAvailabilityState.AVAILABLE
 
 
 def test_service_planning_snapshot_preserves_only_existing_stale_bindings():
