@@ -38,6 +38,7 @@ class BindingLease:
     handler: str | None = None
     output_route_generation: int = 0
     command_route_generation: int = 0
+    stale_lifecycle_retries: int = 0
 
 
 @dataclass(slots=True)

@@ -1142,6 +1142,54 @@ async def test_service_reconcile_marks_invalid_provider_session_unavailable():
     assert service.planning_snapshot((intent,)).unavailable == frozenset({intent})
 
 
+def test_provider_direct_available_after_invalid_session_requires_lifecycle_recovery():
+    metadata = _metadata(
+        "action.alpha",
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        provider_session_id="stale-session",
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=_FakeActionProviderManager(metadata),
+        start_soon=None,
+    )
+    service.cache.record_unavailable(
+        key,
+        metadata=metadata,
+        reason=PROVIDER_SESSION_INVALID_REASON,
+        now=0.0,
+    )
+    entry = ActionAvailabilityEntry(
+        actionId="action.alpha",
+        status="available",
+        descriptor=ActionDescriptor(actionId="action.alpha", name="Alpha"),
+    )
+
+    changed = service.ingest_provider_entries(
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        provider_session_id=PROVIDER_SESSION_ID,
+        entries=(entry,),
+        now=1.0,
+    )
+
+    assert changed == frozenset({key})
+    record = service.cache.record_for(key)
+    assert record is not None
+    assert record.requires_provider_lifecycle_recovery
+    assert service.cache.provider_lifecycle_recovery_required(key)
+    assert service.cache.consume_provider_lifecycle_recovery(key)
+    assert not service.cache.provider_lifecycle_recovery_required(key)
+
+
 @pytest.mark.asyncio
 async def test_provider_session_change_reconciles_and_notifies_invalid_records():
     metadata = _metadata(

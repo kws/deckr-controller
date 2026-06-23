@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from inspect import isawaitable
 from typing import Protocol
@@ -88,6 +88,7 @@ class ActionAvailabilityRecord:
     updated_at: float
     metadata: ActionMetadata | None = None
     reason: str | None = None
+    requires_provider_lifecycle_recovery: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +190,7 @@ class ActionAvailabilityCache:
         *,
         now: float | None = None,
         intent: ActionIntentKey | None = None,
+        requires_provider_lifecycle_recovery: bool = False,
     ) -> ActionAvailabilityRecord:
         key = ProviderActionKey(
             provider_instance_id=metadata.provider_instance_id,
@@ -200,6 +202,7 @@ class ActionAvailabilityCache:
             source=ActionAvailabilitySource.PROVIDER_DIRECT,
             updated_at=self._now(now),
             metadata=metadata,
+            requires_provider_lifecycle_recovery=requires_provider_lifecycle_recovery,
         )
         self.record(record)
         if intent is not None:
@@ -280,6 +283,25 @@ class ActionAvailabilityCache:
 
     def provider_direct_records(self) -> tuple[ActionAvailabilityRecord, ...]:
         return tuple(self._availability_records.values())
+
+    def provider_lifecycle_recovery_required(self, key: ProviderActionKey) -> bool:
+        record = self._availability_records.get(key)
+        return (
+            record is not None
+            and record.source == ActionAvailabilitySource.PROVIDER_DIRECT
+            and record.state == ActionAvailabilityState.AVAILABLE
+            and record.requires_provider_lifecycle_recovery
+        )
+
+    def consume_provider_lifecycle_recovery(self, key: ProviderActionKey) -> bool:
+        record = self._availability_records.get(key)
+        if record is None or not record.requires_provider_lifecycle_recovery:
+            return False
+        self._availability_records[key] = replace(
+            record,
+            requires_provider_lifecycle_recovery=False,
+        )
+        return True
 
     def state_for(
         self,
@@ -690,6 +712,8 @@ def _entry_same_as_existing(
     new_state: ActionAvailabilityState,
     metadata: ActionMetadata | None,
     reason: str | None,
+    *,
+    requires_provider_lifecycle_recovery: bool = False,
 ) -> bool:
     return (
         existing is not None
@@ -697,6 +721,8 @@ def _entry_same_as_existing(
         and existing.state == new_state
         and existing.metadata == metadata
         and existing.reason == reason
+        and existing.requires_provider_lifecycle_recovery
+        == requires_provider_lifecycle_recovery
     )
 
 
@@ -995,6 +1021,13 @@ class ActionAvailabilityService:
             )
             mapped_intent = self._mapped_intent_for_key(key)
             new_state = _availability_state_for_entry(entry)
+            requires_provider_lifecycle_recovery = (
+                new_state == ActionAvailabilityState.AVAILABLE
+                and existing is not None
+                and existing.source == ActionAvailabilitySource.PROVIDER_DIRECT
+                and existing.state == ActionAvailabilityState.UNAVAILABLE
+                and existing.reason == PROVIDER_SESSION_INVALID_REASON
+            )
             if entry.status == "available":
                 if metadata is None:
                     logger.debug(
@@ -1010,6 +1043,9 @@ class ActionAvailabilityService:
                     metadata,
                     now=record_now,
                     intent=mapped_intent,
+                    requires_provider_lifecycle_recovery=(
+                        requires_provider_lifecycle_recovery
+                    ),
                 )
             elif entry.status == "unavailable":
                 self.cache.record_unavailable(
@@ -1039,7 +1075,15 @@ class ActionAvailabilityService:
                 entry.status,
                 metadata.provider_session_id if metadata is not None else None,
                 _descriptor_hash(entry.descriptor),
-                _entry_same_as_existing(existing, new_state, metadata, entry.reason),
+                _entry_same_as_existing(
+                    existing,
+                    new_state,
+                    metadata,
+                    entry.reason,
+                    requires_provider_lifecycle_recovery=(
+                        requires_provider_lifecycle_recovery
+                    ),
+                ),
                 mapped_intent is not None,
             )
         logger.debug(

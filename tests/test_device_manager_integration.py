@@ -60,6 +60,7 @@ from invariant.params import ref
 
 from deckr.controller import _device_manager as device_manager_module
 from deckr.controller._action_availability import (
+    PROVIDER_SESSION_INVALID_REASON,
     ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
@@ -1818,6 +1819,92 @@ async def test_provider_direct_availability_recreates_binding_for_new_session(
             assert replacement_lease is not lease
             assert replacement_lease.provider_session_id == PROVIDER_SESSION_ID
             assert replacement_lease.attached
+            messages = await _collect_action_messages(stream)
+            created = [
+                msg
+                for msg in messages
+                if msg.message_type == ACTION_INSTANCE_CREATED
+            ]
+            attached = [
+                msg for msg in messages if msg.message_type == BINDING_ATTACHED
+            ]
+            assert len(created) == 1
+            assert len(attached) == 1
+            assert created[0].recipient_session_id == PROVIDER_SESSION_ID
+            assert attached[0].recipient_session_id == PROVIDER_SESSION_ID
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_provider_direct_availability_recovers_same_session_after_invalidated(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            ctx = await manager.action_contexts.get("0,0")
+            lease = manager._binding_lease_for_control("0,0")
+            assert ctx is not None
+            assert lease is not None
+            assert lease.provider_session_id == PROVIDER_SESSION_ID
+            await _drain_action_messages(stream)
+
+            key = manager._action_availability_service.record_lifecycle_unavailable(
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+                provider_id=PROVIDER_ID,
+                provider_session_id=PROVIDER_SESSION_ID,
+                action_uuid=SetRasterImageOnAppearAction.uuid,
+                reason=PROVIDER_SESSION_INVALID_REASON,
+                intent=manager._planned_intent_for_lease(lease),
+            )
+            changed = manager._action_availability_service.ingest_provider_entries(
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+                provider_id=PROVIDER_ID,
+                provider_session_id=PROVIDER_SESSION_ID,
+                entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
+            )
+            record = manager._action_availability.record_for(key)
+            assert record is not None
+            assert record.requires_provider_lifecycle_recovery
+
+            await manager.on_action_availability_changed(changed)
+
+            replacement_ctx = await manager.action_contexts.get("0,0")
+            replacement_lease = manager._binding_lease_for_control("0,0")
+            assert replacement_ctx is not None
+            assert replacement_ctx is not ctx
+            assert replacement_lease is not None
+            assert replacement_lease is not lease
+            assert replacement_lease.provider_session_id == PROVIDER_SESSION_ID
+            assert replacement_lease.attached
+            assert not manager._action_availability.provider_lifecycle_recovery_required(
+                key
+            )
+
             messages = await _collect_action_messages(stream)
             created = [
                 msg
@@ -4257,6 +4344,76 @@ async def test_action_lifecycle_rejected_page_session_resource_unavailable_repla
             lease.page_session_id != session.page_session_id
             for lease in manager._binding_leases.values()
         )
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_stale_lifecycle_rejection_from_current_session_retries_binding(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            ctx = await manager.action_contexts.get("0,0")
+            lease = manager._binding_lease_for_control("0,0")
+            assert ctx is not None
+            assert lease is not None
+            await _drain_action_messages(stream)
+
+            msg = await _action_command_for_active_binding(
+                manager,
+                ACTION_LIFECYCLE_REJECTED,
+                {
+                    "targetKind": "binding",
+                    "binding": ctx.metadata.model_dump(
+                        by_alias=True,
+                        exclude_none=True,
+                        mode="json",
+                    ),
+                    "reason": "stale_lifecycle",
+                },
+            )
+            await manager.handle_command(msg)
+
+            messages = await _collect_action_messages(stream)
+            created = [
+                event
+                for event in messages
+                if event.message_type == ACTION_INSTANCE_CREATED
+            ]
+            attached = [
+                event for event in messages if event.message_type == BINDING_ATTACHED
+            ]
+            assert len(created) == 1
+            assert len(attached) == 1
+            assert created[0].recipient_session_id == PROVIDER_SESSION_ID
+            assert attached[0].recipient_session_id == PROVIDER_SESSION_ID
+            assert lease.stale_lifecycle_retries == 1
+
+            await manager.handle_command(msg)
+            await _assert_no_action_message(stream)
+
         tg.cancel_scope.cancel()
 
 

@@ -980,6 +980,23 @@ class DeviceManager:
             for lease in self._binding_leases.values()
         )
 
+    def _provider_lifecycle_recovery_key(
+        self,
+        lease: BindingLease,
+        action_meta: ActionMetadata,
+    ) -> ProviderActionKey | None:
+        if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return None
+        if not _lease_matches_action(lease, action_meta):
+            return None
+        key = ProviderActionKey(
+            action_meta.provider_instance_id,
+            action_meta.uuid,
+        )
+        if not self._action_availability.provider_lifecycle_recovery_required(key):
+            return None
+        return key
+
     def _lifecycle_rejection_is_terminal(
         self,
         body: ActionLifecycleRejectedBody,
@@ -1350,12 +1367,25 @@ class DeviceManager:
         self._action_instance_provider_sessions[action_instance_id] = (
             provider_session_key_for_action
         )
-        if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+        await self._publish_action_instance_created(
+            metadata=metadata,
+            settings=settings,
+            provider_session_key_for_action=provider_session_key_for_action,
+        )
+
+    async def _publish_action_instance_created(
+        self,
+        *,
+        metadata: ActionInstanceMetadata,
+        settings: Mapping[str, Any],
+        provider_session_key_for_action: ProviderSessionKey | None,
+    ) -> None:
+        if metadata.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
         msg = action_message(
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
-            recipient=action_provider_address(action_meta.provider_instance_id),
+            recipient=action_provider_address(metadata.provider_instance_id),
             recipient_session_id=(
                 provider_session_key_for_action.provider_session_id
                 if provider_session_key_for_action is not None
@@ -1367,14 +1397,67 @@ class DeviceManager:
                 settings=dict(settings),
             ),
             subject=context_subject(
-                context_id,
-                provider_instance_id=action_meta.provider_instance_id,
-                provider_id=action_meta.provider_id,
-                config_id=self.config_id,
-                action_instance_id=action_instance_id,
+                metadata.context_id or "",
+                provider_instance_id=metadata.provider_instance_id,
+                provider_id=metadata.provider_id,
+                config_id=metadata.config_id,
+                action_instance_id=metadata.action_instance_id,
             ),
         )
         await send_with_endpoint_identity(self._actions_bus, msg)
+
+    async def _retry_binding_lifecycle(
+        self,
+        lease: BindingLease,
+        *,
+        reason: str,
+    ) -> None:
+        if lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return
+        if lease.stale_lifecycle_retries >= 1:
+            logger.info(
+                "Ignoring repeated stale lifecycle rejection config=%s control=%s "
+                "action=%s provider=%s binding=%s reason=%s",
+                self.config_id,
+                lease.control_id,
+                lease.action_uuid,
+                lease.provider_instance_id,
+                lease.binding_id,
+                reason,
+            )
+            return
+        metadata = self._action_instances.get(lease.action_instance_id)
+        if metadata is None:
+            return
+        lease.stale_lifecycle_retries += 1
+        logger.info(
+            "Retrying binding lifecycle config=%s control=%s action=%s "
+            "provider=%s binding=%s reason=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.binding_id,
+            reason,
+        )
+        await self._publish_action_instance_created(
+            metadata=metadata,
+            settings=lease.context.settings,
+            provider_session_key_for_action=lease.provider_session_key,
+        )
+        with anyio.move_on_after(BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS) as scope:
+            await lease.context.on_binding_attached()
+        if scope.cancel_called:
+            logger.warning(
+                "Binding lifecycle retry timed out config=%s control=%s action=%s "
+                "provider=%s binding=%s timeout=%ss",
+                self.config_id,
+                lease.control_id,
+                lease.action_uuid,
+                lease.provider_instance_id,
+                lease.binding_id,
+                BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS,
+            )
 
     async def _destroy_action_instance(
         self,
@@ -2365,6 +2448,21 @@ class DeviceManager:
                     continue
 
                 if _lease_matches_action(lease, planned.action_meta):
+                    recovery_key = self._provider_lifecycle_recovery_key(
+                        lease,
+                        planned.action_meta,
+                    )
+                    if recovery_key is not None:
+                        await self._replace_binding_provider_session(
+                            refreshed_plan,
+                            planned,
+                            lease,
+                            reason="provider_session_recovered",
+                        )
+                        self._action_availability.consume_provider_lifecycle_recovery(
+                            recovery_key
+                        )
+                        continue
                     if await self._activate_binding(lease):
                         await self._refresh_binding_output(
                             lease,
@@ -2397,18 +2495,20 @@ class DeviceManager:
         plan: PagePlan,
         planned: PlannedBinding,
         lease: BindingLease,
+        *,
+        reason: str = "provider_session_changed",
     ) -> None:
         action_instance_id = lease.action_instance_id
         await self._revoke_binding(
             lease.binding_id,
             clear_output=False,
             notify_provider=False,
-            reason="provider_session_changed",
+            reason=reason,
             clear_held_input=True,
         )
         await self._destroy_action_instance(
             action_instance_id,
-            reason="provider_session_changed",
+            reason=reason,
             notify_provider=False,
         )
         await self._install_planned_binding(plan, planned)
@@ -2727,10 +2827,10 @@ class DeviceManager:
         context_id: str,
     ) -> None:
         if body.reason == "stale_lifecycle":
-            logger.info(
-                "Ignoring stale action lifecycle rejection config=%s target=%s",
-                self.config_id,
-                body.target_kind,
+            await self._handle_stale_lifecycle_rejected(
+                msg,
+                body,
+                context_id=context_id,
             )
             return
 
@@ -2820,6 +2920,41 @@ class DeviceManager:
                 reason=body.reason,
             )
             await self._handle_nondestructive_lifecycle_rejection(key)
+
+    async def _handle_stale_lifecycle_rejected(
+        self,
+        msg: DeckrMessage,
+        body: ActionLifecycleRejectedBody,
+        *,
+        context_id: str,
+    ) -> None:
+        if body.target_kind != "binding":
+            logger.info(
+                "Ignoring stale action lifecycle rejection config=%s target=%s",
+                self.config_id,
+                body.target_kind,
+            )
+            return
+        authorization = await self._authorize_action_command(
+            msg,
+            context_id=context_id,
+        )
+        if authorization is None:
+            return
+        lease = authorization.binding
+        metadata = body.binding
+        if (
+            lease is None
+            or metadata is None
+            or metadata.config_id != self.config_id
+            or not _binding_body_matches_lease(lease, metadata)
+        ):
+            logger.warning("Ignoring stale lifecycle rejection for mismatched binding")
+            return
+        await self._retry_binding_lifecycle(
+            lease,
+            reason="stale_lifecycle_rejected",
+        )
 
     async def _reject_action_instance(
         self,
