@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from inspect import isawaitable
 from typing import Protocol
 
 import anyio
@@ -52,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROVIDER_REVALIDATION_SECONDS = 60.0
 DEFAULT_STALE_GRACE_SECONDS = 5 * 60.0
+PROVIDER_SESSION_INVALID_REASON = "provider_session_invalid"
 _HASH_SIZE = 12
 
 
@@ -59,6 +61,9 @@ _HASH_SIZE = 12
 class ProviderActionKey:
     provider_instance_id: str
     action_uuid: str
+
+
+_AvailabilityChangedCallback = Callable[[frozenset[ProviderActionKey]], object]
 
 
 class ActionAvailabilitySource(StrEnum):
@@ -272,6 +277,9 @@ class ActionAvailabilityCache:
         key: ProviderActionKey,
     ) -> ActionAvailabilityRecord | None:
         return self._availability_records.get(key) or self._candidate_records.get(key)
+
+    def provider_direct_records(self) -> tuple[ActionAvailabilityRecord, ...]:
+        return tuple(self._availability_records.values())
 
     def state_for(
         self,
@@ -638,6 +646,16 @@ def _metadata_has_live_provider_session(metadata: ActionMetadata) -> bool:
     )
 
 
+def _metadata_requires_provider_session_revalidation(
+    metadata: ActionMetadata | None,
+) -> bool:
+    return (
+        metadata is not None
+        and metadata.provider_instance_id not in RESERVED_BUILTIN_PROVIDER_IDS
+        and bool(metadata.provider_session_id)
+    )
+
+
 def _availability_state_for_entry(
     entry: ActionAvailabilityEntry,
 ) -> ActionAvailabilityState:
@@ -706,6 +724,7 @@ class ActionAvailabilityService:
         manager: ActionProviderManager,
         start_soon: Callable[..., object] | None = None,
         provider_sessions: ActionProviderSessionPreparer | None = None,
+        on_availability_changed: _AvailabilityChangedCallback | None = None,
         cache: ActionAvailabilityCache | None = None,
         clock: Callable[[], float] | None = None,
         revalidation_interval_seconds: float = DEFAULT_PROVIDER_REVALIDATION_SECONDS,
@@ -726,10 +745,18 @@ class ActionAvailabilityService:
         ] = {}
         self._last_request_at_by_provider: dict[str, float] = {}
         self._flush_scheduled = False
+        self._provider_session_reconcile_scheduled = False
+        self._on_availability_changed = on_availability_changed
         if provider_sessions is not None:
             set_change_callback = getattr(provider_sessions, "set_change_callback", None)
             if callable(set_change_callback):
                 set_change_callback(self._provider_session_changed)
+
+    def set_availability_changed_callback(
+        self,
+        callback: _AvailabilityChangedCallback | None,
+    ) -> None:
+        self._on_availability_changed = callback
 
     async def start(
         self,
@@ -1082,7 +1109,82 @@ class ActionAvailabilityService:
 
     def _provider_session_changed(self) -> None:
         self._last_request_at_by_provider.clear()
+        self._schedule_provider_session_reconcile()
         self._schedule_interest_flush()
+
+    async def reconcile_provider_sessions(self) -> frozenset[ProviderActionKey]:
+        provider_sessions = self._provider_sessions
+        if provider_sessions is None:
+            return frozenset()
+        now = self._clock()
+        changed: set[ProviderActionKey] = set()
+        for record in self.cache.provider_direct_records():
+            metadata = record.metadata
+            if not _metadata_requires_provider_session_revalidation(metadata):
+                continue
+            if (
+                record.state == ActionAvailabilityState.UNAVAILABLE
+                and record.reason == PROVIDER_SESSION_INVALID_REASON
+            ):
+                continue
+            if await self.provider_session_valid(
+                provider_instance_id=metadata.provider_instance_id,
+                provider_id=metadata.provider_id,
+                provider_session_id=metadata.provider_session_id,
+            ):
+                continue
+            mapped_intent = self._mapped_intent_for_key(record.key)
+            old_state = self.cache.state_for(record.key, now=now)
+            self.cache.record_unavailable(
+                record.key,
+                metadata=metadata,
+                reason=PROVIDER_SESSION_INVALID_REASON,
+                now=now,
+                intent=mapped_intent,
+            )
+            changed.add(record.key)
+            logger.info(
+                "Action availability invalidated provider=%s provider_id=%s "
+                "action=%s provider_session=%s old_state=%s reason=%s",
+                metadata.provider_instance_id,
+                metadata.provider_id,
+                metadata.uuid,
+                metadata.provider_session_id,
+                _state_value(old_state),
+                PROVIDER_SESSION_INVALID_REASON,
+            )
+        return frozenset(changed)
+
+    def _schedule_provider_session_reconcile(self) -> None:
+        if (
+            self._provider_sessions is None
+            or self._provider_session_reconcile_scheduled
+            or self._start_soon is None
+        ):
+            return
+        self._provider_session_reconcile_scheduled = True
+        self._start_soon(self._provider_session_reconcile_task)
+
+    async def _provider_session_reconcile_task(self) -> None:
+        self._provider_session_reconcile_scheduled = False
+        try:
+            changed = await self.reconcile_provider_sessions()
+        except Exception:
+            logger.exception("Error reconciling action provider sessions")
+            return
+        if changed:
+            await self._notify_availability_changed(changed)
+
+    async def _notify_availability_changed(
+        self,
+        changed: frozenset[ProviderActionKey],
+    ) -> None:
+        callback = self._on_availability_changed
+        if callback is None:
+            return
+        result = callback(changed)
+        if isawaitable(result):
+            await result
 
     async def request_provider_availability(
         self,

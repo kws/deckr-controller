@@ -12,6 +12,7 @@ from deckr.actions.endpoints import BUILTIN_ACTION_PROVIDER_ID, action_provider_
 from deckr.actions.messages import (
     ACTION_INSTANCE_CREATED,
     ACTION_LIFECYCLE_REJECTED,
+    BINDING_ATTACHED,
     BINDING_OUTPUT,
     CAPABILITY_INPUT,
     CLOSE_PAGE,
@@ -1763,7 +1764,7 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
 
 
 @pytest.mark.asyncio
-async def test_provider_direct_availability_restamps_binding_route(
+async def test_provider_direct_availability_recreates_binding_for_new_session(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1786,27 +1787,50 @@ async def test_provider_direct_availability_restamps_binding_route(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
-        _seed_action_availability(
-            manager,
-            _metadata(SetRasterImageOnAppearAction.uuid),
-        )
-        await manager.set_page(profile="default", page=0)
-        ctx = await manager.action_contexts.get("0,0")
-        assert ctx is not None
-        lease = next(iter(manager._binding_leases.values()))
-        assert lease.provider_session_id == PROVIDER_SESSION_ID
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(
+                    SetRasterImageOnAppearAction.uuid,
+                    provider_session_id="old-provider-session",
+                ),
+            )
+            await manager.set_page(profile="default", page=0)
+            ctx = await manager.action_contexts.get("0,0")
+            assert ctx is not None
+            lease = next(iter(manager._binding_leases.values()))
+            assert lease.provider_session_id == "old-provider-session"
+            await _drain_action_messages(stream)
 
-        changed = manager._action_availability_service.ingest_provider_entries(
-            provider_instance_id=PROVIDER_INSTANCE_ID,
-            provider_id=PROVIDER_ID,
-            provider_session_id="new-provider-session",
-            entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
-        )
-        await manager.on_action_availability_changed(changed)
+            changed = manager._action_availability_service.ingest_provider_entries(
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+                provider_id=PROVIDER_ID,
+                provider_session_id=PROVIDER_SESSION_ID,
+                entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
+            )
+            await manager.on_action_availability_changed(changed)
 
-        assert await manager.action_contexts.get("0,0") is ctx
-        assert lease.provider_session_id == "new-provider-session"
-        assert lease.attached
+            replacement_ctx = await manager.action_contexts.get("0,0")
+            replacement_lease = manager._binding_lease_for_control("0,0")
+            assert replacement_ctx is not None
+            assert replacement_ctx is not ctx
+            assert replacement_lease is not None
+            assert replacement_lease is not lease
+            assert replacement_lease.provider_session_id == PROVIDER_SESSION_ID
+            assert replacement_lease.attached
+            messages = await _collect_action_messages(stream)
+            created = [
+                msg
+                for msg in messages
+                if msg.message_type == ACTION_INSTANCE_CREATED
+            ]
+            attached = [
+                msg for msg in messages if msg.message_type == BINDING_ATTACHED
+            ]
+            assert len(created) == 1
+            assert len(attached) == 1
+            assert created[0].recipient_session_id == PROVIDER_SESSION_ID
+            assert attached[0].recipient_session_id == PROVIDER_SESSION_ID
 
         tg.cancel_scope.cancel()
 

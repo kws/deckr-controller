@@ -1199,23 +1199,6 @@ class DeviceManager:
     def _binding_lease_for_control(self, control_id: str) -> BindingLease | None:
         return self._attachments.binding_for_control(control_id)
 
-    def _restamp_binding_route(
-        self,
-        lease: BindingLease,
-        action_meta: ActionMetadata,
-    ) -> None:
-        action_meta = self._action_metadata_with_current_session(action_meta)
-        lease.provider_session_id = action_meta.provider_session_id
-        lease.provider_session_key = (
-            None
-            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-            else provider_session_key(action_meta)
-        )
-        lease.context.provider_session_id = lease.provider_session_id
-        self._action_instance_provider_sessions[lease.action_instance_id] = (
-            lease.provider_session_key
-        )
-
     async def _claim_binding_output_route(self, lease: BindingLease) -> None:
         if lease.raster_capability_id is None:
             return
@@ -2393,12 +2376,11 @@ class DeviceManager:
                     lease,
                     planned.action_meta,
                 ):
-                    self._restamp_binding_route(lease, planned.action_meta)
-                    if await self._activate_binding(lease):
-                        await self._refresh_binding_output(
-                            lease,
-                            reason="action_availability_changed",
-                        )
+                    await self._replace_binding_provider_session(
+                        refreshed_plan,
+                        planned,
+                        lease,
+                    )
                     continue
 
                 await self._revoke_binding(
@@ -2409,6 +2391,27 @@ class DeviceManager:
                     clear_held_input=True,
                 )
                 await self._install_planned_binding(refreshed_plan, planned)
+
+    async def _replace_binding_provider_session(
+        self,
+        plan: PagePlan,
+        planned: PlannedBinding,
+        lease: BindingLease,
+    ) -> None:
+        action_instance_id = lease.action_instance_id
+        await self._revoke_binding(
+            lease.binding_id,
+            clear_output=False,
+            notify_provider=False,
+            reason="provider_session_changed",
+            clear_held_input=True,
+        )
+        await self._destroy_action_instance(
+            action_instance_id,
+            reason="provider_session_changed",
+            notify_provider=False,
+        )
+        await self._install_planned_binding(plan, planned)
 
     def _remove_catalog_candidates(self, catalog_removed: Iterable[str]) -> None:
         keys = tuple(

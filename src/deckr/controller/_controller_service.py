@@ -53,7 +53,10 @@ from deckr.hardware.profiles import (
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
 
-from deckr.controller._action_availability import ActionAvailabilityService
+from deckr.controller._action_availability import (
+    ActionAvailabilityService,
+    ProviderActionKey,
+)
 from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
@@ -139,6 +142,10 @@ class ControllerService(BaseComponent):
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
         self._action_availability_service = action_availability_service
+        if self._action_availability_service is not None:
+            self._action_availability_service.set_availability_changed_callback(
+                self._handle_internal_action_availability_changed
+            )
         self._start_soon: Callable | None = None
         self._render_backend = render_backend
         self._session_id = endpoint.session_id
@@ -233,6 +240,21 @@ class ControllerService(BaseComponent):
         logger.debug(
             "Action availability handoff type=%s changed_keys=%s devices=%s",
             msg.message_type,
+            len(changed_keys),
+            len(controller_contexts),
+        )
+        for ctrl_ctx in controller_contexts:
+            await ctrl_ctx.on_action_availability_changed(changed_keys)
+
+    async def _handle_internal_action_availability_changed(
+        self,
+        changed_keys: frozenset[ProviderActionKey],
+    ) -> None:
+        if not changed_keys:
+            return
+        controller_contexts = await self._controller_contexts.values()
+        logger.debug(
+            "Internal action availability handoff changed_keys=%s devices=%s",
             len(changed_keys),
             len(controller_contexts),
         )
@@ -831,6 +853,9 @@ class ControllerService(BaseComponent):
                     concord=self._concord,
                     start_soon=ctx.tg.start_soon,
                 ),
+            )
+            self._action_availability_service.set_availability_changed_callback(
+                self._handle_internal_action_availability_changed
             )
         if self._action_availability_service is not None:
             await self._action_availability_service.start(ctx.tg, ctx.stopping)
