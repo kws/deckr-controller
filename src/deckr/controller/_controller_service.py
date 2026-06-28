@@ -80,6 +80,18 @@ CLAIM_HEARTBEAT_SECONDS = DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS
 _STATE_RECONCILE_SECONDS = 15.0
 _STATE_NOTIFICATION_BATCH_SECONDS = 0.05
 _WATCH_RETRY_SECONDS = 1.0
+_HARDWARE_CLAIM_TERMINAL_STATUSES = frozenset(
+    {
+        ContractValidityStatus.CANCELLED,
+        ContractValidityStatus.MISSING_CONTRACT,
+        ContractValidityStatus.INVALID_CONTRACT,
+        ContractValidityStatus.INVALID_TOKEN,
+        ContractValidityStatus.MISSING_TOKEN,
+        ContractValidityStatus.GENERATION_MISMATCH,
+        ContractValidityStatus.SESSION_MISMATCH,
+        ContractValidityStatus.TERMS_HASH_MISMATCH,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,11 +436,11 @@ class ControllerService(BaseComponent):
                     if not owned.live:
                         await self._connect_owned_claim(owned, None)
                     continue
-                if self._pending_hardware_claim_validity(owned, validity):
+                if self._pending_hardware_claim_validity(validity):
                     continue
-                await self._revoke_owned_claim(
+                await self._revoke_terminal_owned_claim(
                     owned,
-                    cancel_contract=True,
+                    validity=validity,
                     reason=f"hardware claim invalid during {reason}: {validity.status}",
                 )
                 continue
@@ -442,16 +454,15 @@ class ControllerService(BaseComponent):
                     await self._refresh_live_descriptor(owned, candidate)
                 continue
 
-            if owned.live:
-                if validity.status == ContractValidityStatus.UNAVAILABLE:
-                    continue
-
-            if not owned.live and self._pending_hardware_claim_validity(owned, validity):
+            if validity.status == ContractValidityStatus.UNAVAILABLE:
                 continue
 
-            await self._revoke_owned_claim(
+            if not owned.live and self._pending_hardware_claim_validity(validity):
+                continue
+
+            await self._revoke_terminal_owned_claim(
                 owned,
-                cancel_contract=True,
+                validity=validity,
                 reason=f"hardware claim invalid during {reason}: {validity.status}",
             )
 
@@ -664,12 +675,34 @@ class ControllerService(BaseComponent):
 
     def _pending_hardware_claim_validity(
         self,
-        owned: OwnedHardwareClaim,
         validity: ContractValidity,
     ) -> bool:
-        return (
-            validity.status == ContractValidityStatus.NOT_YET_FULFILLED
-            and str(controller_address(self._controller_id)) in validity.tokens
+        return validity.status == ContractValidityStatus.NOT_YET_FULFILLED
+
+    async def _revoke_terminal_owned_claim(
+        self,
+        owned: OwnedHardwareClaim,
+        *,
+        validity: ContractValidity,
+        reason: str,
+        current_sessions: Mapping[str, str] | None = None,
+    ) -> None:
+        if validity.status not in _HARDWARE_CLAIM_TERMINAL_STATUSES:
+            return
+        try:
+            exact = await self._concord.validate_exact(
+                owned.contract,
+                current_sessions=current_sessions or owned.current_sessions,
+            )
+        except ConcordUnavailable:
+            return
+        owned.agreement._validity = exact  # noqa: SLF001
+        if exact.status not in _HARDWARE_CLAIM_TERMINAL_STATUSES:
+            return
+        await self._revoke_owned_claim(
+            owned,
+            cancel_contract=True,
+            reason=reason,
         )
 
     async def _rematch_owned_claim_if_needed(

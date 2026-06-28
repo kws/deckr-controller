@@ -560,6 +560,112 @@ async def test_pending_hardware_claim_stays_pending_when_hot_refresh_unavailable
 
 
 @pytest.mark.asyncio
+async def test_pending_hardware_claim_with_candidate_survives_unavailable_refresh(
+    monkeypatch,
+):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
+        await _advertise_hardware(beacon, session_id="manager-session")
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        owned = next(iter(controller._owned_claims.values()))
+
+        async def unavailable_refresh() -> ContractValidity:
+            return ContractValidity(ContractValidityStatus.UNAVAILABLE)
+
+        async def fail_validate_exact(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("validate_exact should not run for unavailable refresh")
+
+        monkeypatch.setattr(owned.agreement, "refresh", unavailable_refresh)
+        monkeypatch.setattr(concord, "validate_exact", fail_validate_exact)
+
+        await controller._reconcile_hardware_current_state(
+            reason="test candidate unavailable hot refresh claim"
+        )
+
+        live = controller._device_registry.get("config-room-a")
+        assert live is None
+        assert next(iter(controller._owned_claims.values())).claim_id == owned.claim_id
+
+
+@pytest.mark.asyncio
+async def test_hardware_claim_terminal_status_requires_exact_confirmation(monkeypatch):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
+        await _advertise_hardware(beacon, session_id="manager-session")
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        owned = next(iter(controller._owned_claims.values()))
+
+        async def terminal_refresh() -> ContractValidity:
+            return ContractValidity(ContractValidityStatus.MISSING_TOKEN)
+
+        async def exact_pending(*args, **kwargs) -> ContractValidity:  # noqa: ANN002, ANN003
+            return ContractValidity(ContractValidityStatus.NOT_YET_FULFILLED)
+
+        monkeypatch.setattr(owned.agreement, "refresh", terminal_refresh)
+        monkeypatch.setattr(concord, "validate_exact", exact_pending)
+
+        await controller._reconcile_hardware_current_state(
+            reason="test stale terminal hot refresh claim"
+        )
+
+        assert next(iter(controller._owned_claims.values())).claim_id == owned.claim_id
+        assert (await concord.validate(owned.contract)).status != (
+            ContractValidityStatus.CANCELLED
+        )
+
+
+@pytest.mark.asyncio
+async def test_hardware_claim_terminal_status_cancels_when_exact_confirmed(
+    monkeypatch,
+):
+    async with _running_controller(config_service=MemoryConfigService(_config())) as (
+        controller,
+        beacon,
+        concord,
+    ):
+        await _advertise_hardware(beacon, session_id="manager-session")
+
+        with anyio.fail_after(1):
+            while not controller._owned_claims:
+                await anyio.sleep(0.01)
+        owned = next(iter(controller._owned_claims.values()))
+        exact_calls = 0
+
+        async def terminal_refresh() -> ContractValidity:
+            return ContractValidity(ContractValidityStatus.MISSING_TOKEN)
+
+        async def exact_terminal(*args, **kwargs) -> ContractValidity:  # noqa: ANN002, ANN003
+            nonlocal exact_calls
+            exact_calls += 1
+            return ContractValidity(ContractValidityStatus.MISSING_TOKEN)
+
+        monkeypatch.setattr(owned.agreement, "refresh", terminal_refresh)
+        monkeypatch.setattr(concord, "validate_exact", exact_terminal)
+
+        await controller._reconcile_hardware_current_state(
+            reason="test confirmed terminal hot refresh claim"
+        )
+
+        assert exact_calls == 1
+        assert (await concord.validate(owned.contract)).status == (
+            ContractValidityStatus.CANCELLED
+        )
+        assert next(iter(controller._owned_claims.values())).claim_id != owned.claim_id
+
+
+@pytest.mark.asyncio
 async def test_hardware_claim_stays_pending_until_manager_token_attaches():
     async with _running_controller(config_service=MemoryConfigService(_config())) as (
         controller,
