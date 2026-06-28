@@ -135,20 +135,32 @@ class MemoryLaneSubstrate:
         bucket = self.kv_buckets.get(policy.bucket)
         if bucket is None:
             bucket = MemoryJsonKvBucket(
-                bucket=policy.bucket, buffer_size=self._buffer_size
+                bucket=policy.bucket,
+                buffer_size=self._buffer_size,
+                ttl_seconds=policy.ttl_seconds,
             )
             self.kv_buckets[policy.bucket] = bucket
         return bucket
 
 
 class MemoryJsonKvBucket:
-    def __init__(self, *, bucket: str, buffer_size: int = 100) -> None:
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        buffer_size: int = 100,
+        ttl_seconds: float | None = None,
+    ) -> None:
         self.bucket = bucket
         self._buffer_size = buffer_size
+        self._ttl_seconds = ttl_seconds
         self._revision = 0
         self._entries: dict[str, KvEntry] = {}
         self._watchers: dict[anyio.abc.ObjectSendStream[KvChange | None], str] = {}
         self._lock = anyio.Lock()
+
+    async def ttl_seconds(self) -> float | None:
+        return self._ttl_seconds
 
     async def get(self, key: str) -> KvEntry | None:
         async with self._lock:

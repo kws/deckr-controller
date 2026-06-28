@@ -598,18 +598,26 @@ class ControllerService(BaseComponent):
         *,
         current_sessions: Mapping[str, str] | None = None,
     ) -> ContractValidity:
-        try:
-            await owned.agreement.refresh()
-        except ConcordConflict:
-            pass
         sessions = current_sessions or owned.current_sessions
         try:
-            validity = await self._concord.validate_exact(
-                owned.contract,
-                current_sessions=sessions,
-            )
-        except ConcordUnavailable:
-            return ContractValidity(ContractValidityStatus.UNAVAILABLE)
+            validity = await owned.agreement.refresh()
+        except ConcordConflict:
+            try:
+                validity = await self._concord.validate(
+                    owned.contract,
+                    current_sessions=sessions,
+                )
+            except ConcordUnavailable:
+                return ContractValidity(ContractValidityStatus.UNAVAILABLE)
+        else:
+            if current_sessions is not None:
+                try:
+                    validity = await self._concord.validate(
+                        owned.contract,
+                        current_sessions=sessions,
+                    )
+                except ConcordUnavailable:
+                    return ContractValidity(ContractValidityStatus.UNAVAILABLE)
         owned.agreement._validity = validity  # noqa: SLF001
         return validity
 

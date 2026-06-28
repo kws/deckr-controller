@@ -113,6 +113,43 @@ async def test_terminal_provider_session_status_retires_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_session_refresh_uses_cached_concord_validation(monkeypatch) -> None:
+    bus = _actions_bus()
+    concord = _concord(bus)
+    manager = _manager(concord, bus)
+    action = _action()
+    key = provider_session_key(action)
+    assert key is not None
+
+    async with anyio.create_task_group() as tg:
+        concord.start(tg)
+        pending = await manager.prepare(action)
+        assert pending is not None
+        assert pending.ready is False
+        session = manager._sessions[key]
+
+        provider = action_provider_address(PROVIDER_INSTANCE_ID)
+        await concord._attach(  # noqa: SLF001
+            session.contract,
+            provider,
+            PROVIDER_SESSION_ID,
+            token_id="provider-token",
+        )
+        await concord.wait_current()
+
+        async def fail_validate_exact(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("validate_exact should not run during refresh")
+
+        monkeypatch.setattr(concord, "validate_exact", fail_validate_exact)
+        snapshot = (await manager.refresh_many((key,)))[key]
+
+        assert snapshot.ready is True
+        assert snapshot.terminal is False
+        assert snapshot.status == ContractValidityStatus.VALID
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_provider_session_ready_after_concord_token_cache_rebuild() -> None:
     bus = _actions_bus()
     concord = _concord(bus)

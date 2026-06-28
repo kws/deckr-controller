@@ -201,18 +201,17 @@ class ActionProviderSessionManager:
                 return _retired_snapshot(key)
             return _missing_snapshot(key)
         try:
-            await session.agreement.refresh()
+            validity = await session.agreement.refresh()
         except ConcordConflict:
-            pass
-        session.controller_token = session.agreement.local_token
-        try:
-            validity = await self._concord.validate_exact(
-                session.contract,
-                current_sessions=session.current_sessions,
-            )
-        except ConcordUnavailable:
-            validity = ContractValidity(ContractValidityStatus.UNAVAILABLE)
+            try:
+                validity = await self._concord.validate(
+                    session.contract,
+                    current_sessions=session.current_sessions,
+                )
+            except ConcordUnavailable:
+                validity = ContractValidity(ContractValidityStatus.UNAVAILABLE)
         session.agreement._validity = validity  # noqa: SLF001
+        session.controller_token = session.agreement.local_token
         if _terminal_session_status(validity.status):
             reason = _terminal_session_reason(validity)
             await self._cancel_key_unlocked(

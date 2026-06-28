@@ -523,7 +523,7 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
 
 
 @pytest.mark.asyncio
-async def test_pending_hardware_claim_connects_from_exact_validity_when_hot_refresh_unavailable(
+async def test_pending_hardware_claim_stays_pending_when_hot_refresh_unavailable(
     monkeypatch,
 ):
     async with _running_controller(config_service=MemoryConfigService(_config())) as (
@@ -551,13 +551,12 @@ async def test_pending_hardware_claim_connects_from_exact_validity_when_hot_refr
         monkeypatch.setattr(owned.agreement, "refresh", unavailable_refresh)
 
         await controller._reconcile_hardware_current_state(
-            reason="test exact-valid hot-unavailable claim"
+            reason="test unavailable hot refresh claim"
         )
 
         live = controller._device_registry.get("config-room-a")
-        assert live is not None
-        assert live.ref == DeviceRef(managerId="room-a", deviceId="deck")
-        assert live.manager_session_id == "manager-session"
+        assert live is None
+        assert next(iter(controller._owned_claims.values())).claim_id == owned.claim_id
 
 
 @pytest.mark.asyncio
