@@ -218,7 +218,6 @@ class ActionProviderSessionManager:
                 key,
                 reason=reason,
             )
-            self._retired_provider_session_ids.add(key.provider_session_id)
             return ProviderSessionSnapshot(
                 key=key,
                 ready=False,

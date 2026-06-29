@@ -83,7 +83,7 @@ async def test_not_yet_fulfilled_provider_session_remains_nonterminal_pending() 
 
 
 @pytest.mark.asyncio
-async def test_terminal_provider_session_status_retires_session() -> None:
+async def test_terminal_provider_session_status_allows_successor_contract() -> None:
     bus = _actions_bus()
     concord = _concord(bus)
     manager = _manager(concord, bus)
@@ -92,6 +92,7 @@ async def test_terminal_provider_session_status_retires_session() -> None:
     assert key is not None
     await manager.prepare(action)
     session = next(iter(manager._sessions.values()))
+    old_generation = session.contract.generation
 
     assert await concord.cancel(
         session.contract,
@@ -106,10 +107,32 @@ async def test_terminal_provider_session_status_retires_session() -> None:
     assert snapshot.reason == "provider_stopped"
     assert manager._sessions == {}
 
+    successor = await manager.prepare(action)
+    assert successor is not None
+    assert successor.ready is False
+    assert successor.terminal is False
+    assert successor.status == ContractValidityStatus.NOT_YET_FULFILLED
+    assert manager._sessions[key].contract.generation == old_generation + 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_provider_session_retire_blocks_reuse() -> None:
+    bus = _actions_bus()
+    concord = _concord(bus)
+    manager = _manager(concord, bus)
+    action = _action()
+    key = provider_session_key(action)
+    assert key is not None
+
+    await manager.prepare(action)
+    await manager.retire(key, reason="provider_session_replaced")
+
     retired = await manager.prepare(action)
     assert retired is not None
+    assert retired.ready is False
     assert retired.terminal is True
     assert retired.reason == "provider_session_retired"
+    assert manager._sessions == {}
 
 
 @pytest.mark.asyncio
