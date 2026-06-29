@@ -92,6 +92,7 @@ async def test_terminal_provider_session_status_allows_successor_contract() -> N
     assert key is not None
     await manager.prepare(action)
     session = next(iter(manager._sessions.values()))
+    old_contract_id = session.contract.contract_id
     old_generation = session.contract.generation
 
     assert await concord.cancel(
@@ -112,7 +113,9 @@ async def test_terminal_provider_session_status_allows_successor_contract() -> N
     assert successor.ready is False
     assert successor.terminal is False
     assert successor.status == ContractValidityStatus.NOT_YET_FULFILLED
-    assert manager._sessions[key].contract.generation == old_generation + 1
+    assert old_generation == 1
+    assert manager._sessions[key].contract.contract_id != old_contract_id
+    assert manager._sessions[key].contract.generation == 1
 
 
 @pytest.mark.asyncio

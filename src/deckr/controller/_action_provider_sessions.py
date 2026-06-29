@@ -22,7 +22,6 @@ from deckr.contracts.messages import controller_address
 from deckr.profiles import (
     ACTION_PROVIDER_SESSION_PROFILE_ID,
     ActionProviderSessionTerms,
-    action_provider_session_contract_id,
 )
 
 from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
@@ -150,10 +149,6 @@ class ActionProviderSessionManager:
                 participants=(controller_endpoint, provider_endpoint),
                 local_participant=controller_endpoint,
                 local_session_id=self._controller_session_id,
-                stable_contract_id=action_provider_session_contract_id(
-                    controller_endpoint,
-                    provider_endpoint,
-                ),
                 terms=ActionProviderSessionTerms(
                     sessionId=key.provider_session_id,
                     controllerEndpoint=controller_endpoint,
