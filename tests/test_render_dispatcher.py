@@ -10,6 +10,7 @@ import os
 import signal
 import time
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -483,6 +484,7 @@ async def test_observing_render_backend_records_success(tmp_path: Path):
     assert record["bindingId"] == "binding-1"
     assert record["renderGeneration"] == 7
     assert record["bindingOutputGeneration"] == 3
+    assert record["overlayGeneration"] is None
     assert record["providerInstanceId"] == "provider-instance"
     assert record["providerId"] == "dev.deckr.clock"
     assert record["actionId"] == "dev.deckr.clock.action.digital"
@@ -519,6 +521,36 @@ async def test_observing_render_backend_records_error(tmp_path: Path):
     record = _read_observations(path)[0]
     assert record["frameSha256"] is None
     assert record["error"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_observing_render_backend_records_overlay_generation(
+    tmp_path: Path,
+):
+    path = tmp_path / "render.jsonl"
+    backend = ObservingRenderBackend(
+        ImmediateBackend(),
+        controller_id="controller-main",
+        options=RenderObservationOptions(path=path),
+    )
+    request = _request_with_graph({"output": {"params": {"title": "Overlay"}}})
+    assert request.source is not None
+    request = replace(
+        request,
+        source=replace(
+            request.source,
+            command_type="bindingOverlay",
+            content_kind="overlay:ok",
+            overlay_generation=2,
+        ),
+    )
+
+    await backend.render(request)
+
+    record = _read_observations(path)[0]
+    assert record["commandType"] == "bindingOverlay"
+    assert record["contentKind"] == "overlay:ok"
+    assert record["overlayGeneration"] == 2
 
 
 @pytest.mark.asyncio

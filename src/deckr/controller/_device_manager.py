@@ -232,6 +232,27 @@ def _binding_output_render_source(
     )
 
 
+def _binding_overlay_render_source(
+    binding: BindingMetadata,
+    msg: DeckrMessage,
+    *,
+    command_type: str,
+    overlay_generation: int,
+) -> RenderSource:
+    return RenderSource(
+        provider_instance_id=binding.provider_instance_id,
+        provider_id=binding.provider_id,
+        action_id=binding.action_id,
+        action_instance_id=binding.action_instance_id,
+        action_message_id=msg.message_id,
+        action_causation_id=msg.causation_id,
+        trace=_message_trace_payload(msg),
+        command_type=command_type,
+        binding_output_generation=binding.output_generation,
+        overlay_generation=overlay_generation,
+    )
+
+
 def _find_control_surface(
     device: DeviceDescriptor,
     control_id: str,
@@ -3166,13 +3187,17 @@ class DeviceManager:
         if msg_type == BINDING_OVERLAY:
             if authorization.binding is not None:
                 body = BindingOverlayBody.model_validate(payload)
-                await self._handle_binding_overlay(authorization.binding, body)
+                await self._handle_binding_overlay(authorization.binding, body, msg)
             return
 
         if msg_type == BINDING_OVERLAY_CLEAR:
             if authorization.binding is not None:
                 body = BindingOverlayClearBody.model_validate(payload)
-                await self._handle_binding_overlay_clear(authorization.binding, body)
+                await self._handle_binding_overlay_clear(
+                    authorization.binding,
+                    body,
+                    msg,
+                )
             return
 
         page_session = authorization.page_session
@@ -3318,6 +3343,7 @@ class DeviceManager:
         self,
         lease: BindingLease,
         body: BindingOverlayBody,
+        msg: DeckrMessage,
     ) -> None:
         if not self._attachments.binding_output_authorized(lease):
             logger.warning(
@@ -3338,6 +3364,12 @@ class DeviceManager:
             overlay_id=body.overlay_id,
             generation=body.generation,
             binding_output_generation=body.binding.output_generation,
+            source=_binding_overlay_render_source(
+                body.binding,
+                msg,
+                command_type=BINDING_OVERLAY,
+                overlay_generation=body.generation,
+            ),
         )
         if not ok:
             logger.info(
@@ -3350,6 +3382,7 @@ class DeviceManager:
         self,
         lease: BindingLease,
         body: BindingOverlayClearBody,
+        msg: DeckrMessage,
     ) -> None:
         if not self._attachments.binding_output_authorized(lease):
             logger.warning(
@@ -3366,6 +3399,12 @@ class DeviceManager:
             overlay_id=body.overlay_id,
             generation=body.generation,
             binding_output_generation=body.binding.output_generation,
+            source=_binding_overlay_render_source(
+                body.binding,
+                msg,
+                command_type=BINDING_OVERLAY_CLEAR,
+                overlay_generation=body.generation,
+            ),
         )
         if not ok:
             logger.info(

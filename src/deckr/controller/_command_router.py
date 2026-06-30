@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -240,6 +241,7 @@ class CommandRouter:
         overlay_id: str | None,
         generation: int,
         binding_output_generation: int,
+        source: RenderSource | None = None,
     ) -> bool:
         if binding_output_generation < self._store.base_output_generation:
             return False
@@ -266,7 +268,7 @@ class CommandRouter:
             overlay_id=overlay_id,
             generation=generation,
         )
-        await self._render()
+        await self._render(source=_source_with_content_kind(source, self._store))
         if resolved_duration is not None:
             self._start_soon(
                 self._clear_overlay_after,
@@ -282,6 +284,7 @@ class CommandRouter:
         overlay_id: str | None,
         generation: int,
         binding_output_generation: int,
+        source: RenderSource | None = None,
     ) -> bool:
         if binding_output_generation < self._store.base_output_generation:
             return False
@@ -295,7 +298,10 @@ class CommandRouter:
 
         self._store.overlay_generation = generation
         self._store.overlay = None
-        await self._render(clear_when_empty=True)
+        await self._render(
+            clear_when_empty=True,
+            source=_source_with_content_kind(source, self._store),
+        )
         return True
 
     async def _clear_overlay_after(
@@ -384,3 +390,12 @@ class CommandRouter:
         if not self._settings_hydrated:
             await self.hydrate_settings()
         return SimpleNamespace(**self._store.settings)
+
+
+def _source_with_content_kind(
+    source: RenderSource | None,
+    store: ControlStateStore,
+) -> RenderSource | None:
+    if source is None:
+        return None
+    return replace(source, content_kind=_store_content_kind(store))

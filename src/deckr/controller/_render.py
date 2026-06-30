@@ -62,6 +62,7 @@ class RenderSource:
     command_type: str | None = None
     content_kind: str | None = None
     binding_output_generation: int | None = None
+    overlay_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

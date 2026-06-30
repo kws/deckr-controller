@@ -1570,6 +1570,140 @@ async def test_binding_overlay_renders_and_expires(
 
 
 @pytest.mark.asyncio
+async def test_binding_overlay_and_clear_source_reaches_render_request(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    from deckr.actions.messages import BINDING_OVERLAY, BINDING_OVERLAY_CLEAR
+
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async def wait_for_render_count(count: int) -> None:
+        with anyio.fail_after(5.0):
+            while len(render_backend.calls) < count:
+                await anyio.sleep(0.01)
+
+    async def release_and_wait_for_frame(count: int) -> None:
+        render_backend.release(render_backend.calls[-1])
+        with anyio.fail_after(5.0):
+            while command_service.set_raster_frame.call_count < count:
+                await anyio.sleep(0.01)
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+        binding = ctx.metadata.model_copy(update={"output_generation": 1})
+
+        base_msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OUTPUT,
+            {
+                "binding": binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "capability": {
+                    "deviceRef": {
+                        "managerId": "manager-main",
+                        "deviceId": "test-device",
+                    },
+                    "controlId": "0,0",
+                    "capabilityId": "raster.bitmap",
+                },
+                "commandType": "set_frame",
+                "params": {"image": _solid_key_image()},
+                "generation": 1,
+            },
+        )
+        await manager.handle_command(base_msg)
+        await wait_for_render_count(1)
+        base_request = render_backend.requests[-1]
+        await release_and_wait_for_frame(1)
+
+        overlay_msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OVERLAY,
+            {
+                "binding": binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "template": "ok",
+                "title": "OK",
+                "durationSeconds": 30.0,
+                "overlayId": "save-feedback",
+                "generation": 1,
+            },
+        )
+        await manager.handle_command(overlay_msg)
+        await wait_for_render_count(2)
+        overlay_request = render_backend.requests[-1]
+        await release_and_wait_for_frame(2)
+
+        clear_msg = await _action_command_for_active_binding(
+            manager,
+            BINDING_OVERLAY_CLEAR,
+            {
+                "binding": binding.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "overlayId": "save-feedback",
+                "generation": 2,
+            },
+        )
+        await manager.handle_command(clear_msg)
+        await wait_for_render_count(3)
+        clear_request = render_backend.requests[-1]
+        await release_and_wait_for_frame(3)
+        tg.cancel_scope.cancel()
+
+    assert base_request.source is not None
+    assert base_request.source.command_type == "set_frame"
+    assert base_request.source.content_kind == "invariant_graph"
+    assert base_request.source.overlay_generation is None
+
+    assert overlay_request.source is not None
+    assert overlay_request.source.command_type == BINDING_OVERLAY
+    assert overlay_request.source.content_kind == "overlay:ok"
+    assert overlay_request.source.overlay_generation == 1
+    assert overlay_request.source.binding_output_generation == 1
+    assert overlay_request.source.action_message_id == overlay_msg.message_id
+
+    assert clear_request.source is not None
+    assert clear_request.source.command_type == BINDING_OVERLAY_CLEAR
+    assert clear_request.source.content_kind == "invariant_graph"
+    assert clear_request.source.overlay_generation == 2
+    assert clear_request.source.binding_output_generation == 1
+    assert clear_request.source.action_message_id == clear_msg.message_id
+
+
+@pytest.mark.asyncio
 async def test_binding_without_live_provider_session_remains_pending(
     device_config_set_raster_image,
 ):

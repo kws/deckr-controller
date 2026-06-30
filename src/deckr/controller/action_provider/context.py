@@ -208,6 +208,7 @@ class ControlContext:
         overlay_id: str | None,
         generation: int,
         binding_output_generation: int,
+        source: RenderSource | None = None,
     ) -> bool:
         return await self._router.show_overlay(
             template=template,
@@ -217,6 +218,7 @@ class ControlContext:
             overlay_id=overlay_id,
             generation=generation,
             binding_output_generation=binding_output_generation,
+            source=source,
         )
 
     async def clear_overlay(
@@ -225,9 +227,11 @@ class ControlContext:
         overlay_id: str | None,
         generation: int,
         binding_output_generation: int,
+        source: RenderSource | None = None,
     ) -> bool:
         return await self._router.clear_overlay(
             overlay_id=overlay_id,
             generation=generation,
             binding_output_generation=binding_output_generation,
+            source=source,
         )
