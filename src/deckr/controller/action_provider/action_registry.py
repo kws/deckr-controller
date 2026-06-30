@@ -23,7 +23,7 @@ from deckr.profiles import (
 )
 from deckr.substrates.nats_kv import KvUnavailable
 
-from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
+from deckr.controller._stop_aware import sleep_until_stopping
 from deckr.controller.action_provider.builtin import (
     BuiltinAction,
     BuiltinRegistry,
@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 
 _STATE_RECONCILE_SECONDS = 15.0
 _STATE_NOTIFICATION_BATCH_SECONDS = 0.05
-_WATCH_RETRY_SECONDS = 1.0
 
 
 def _qualified_id(provider_instance_id: str, action_uuid: str) -> str:
@@ -220,7 +219,7 @@ class ActionRegistry(BaseComponent):
 
         self._directory.start(ctx.tg)
         start_soon(self._close_directory_on_stopping, ctx.stopping)
-        start_soon(self._advertisement_loop, ctx.stopping)
+        start_soon(self._directory_snapshot_loop, ctx.stopping)
         start_soon(self._notification_reconciliation_loop, ctx.stopping)
         start_soon(self._reconciliation_loop, ctx.stopping)
 
@@ -235,23 +234,13 @@ class ActionRegistry(BaseComponent):
         await stopping.wait()
         await self._directory.aclose()
 
-    async def _advertisement_loop(self, stopping: anyio.Event) -> None:
-        while not stopping.is_set():
-            try:
-                async with (
-                    self._beacon.watch(ACTIONS_FEATURE_ID) as stream,
-                    cancel_on_stopping(stopping),
-                ):
-                    async for event in stream:
-                        await self._reconcile_notifications.request(
-                            f"actions beacon {event.event_type.value} {event.key}"
-                        )
-            except KvUnavailable:
-                logger.warning(
-                    "Action Beacon advertisements unavailable; retrying",
-                    exc_info=True,
-                )
-                await sleep_until_stopping(stopping, _WATCH_RETRY_SECONDS)
+    async def _directory_snapshot_loop(self, stopping: anyio.Event) -> None:
+        async for _records in self._directory.watch_records():
+            if stopping.is_set():
+                return
+            await self._reconcile_notifications.request(
+                "actions Beacon directory snapshot"
+            )
 
     async def _reconciliation_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():

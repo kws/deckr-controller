@@ -140,7 +140,6 @@ class ControllerService(BaseComponent):
     ):
         super().__init__()
         self._endpoint = endpoint
-        self._beacon = beacon
         self._concord = concord
         self._device_registry = DeviceRouteRegistry()
         self._config_service = config_service
@@ -332,20 +331,13 @@ class ControllerService(BaseComponent):
                 elif isinstance(event, hw_messages.CommandRejectedMessage):
                     await ctrl_ctx.on_command_rejected(event)
 
-    async def _hardware_beacon_loop(self, stopping: anyio.Event) -> None:
-        while not stopping.is_set():
-            try:
-                async with (
-                    self._beacon.watch(HARDWARE_FEATURE_ID) as stream,
-                    cancel_on_stopping(stopping),
-                ):
-                    async for event in stream:
-                        await self._hardware_reconcile_notifications.request(
-                            f"hardware Beacon {event.event_type.value} {event.key}"
-                        )
-            except KvUnavailable:
-                logger.warning("Hardware Beacon advertisements unavailable; retrying")
-                await sleep_until_stopping(stopping, _WATCH_RETRY_SECONDS)
+    async def _hardware_directory_snapshot_loop(self, stopping: anyio.Event) -> None:
+        async for _records in self._hardware_directory.watch_records():
+            if stopping.is_set():
+                return
+            await self._hardware_reconcile_notifications.request(
+                "hardware Beacon directory snapshot"
+            )
 
     async def _hardware_reconciliation_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():
@@ -890,7 +882,7 @@ class ControllerService(BaseComponent):
         ctx.tg.start_soon(self._close_hardware_directory_on_stopping, ctx.stopping)
         ctx.tg.start_soon(self._actions_subscription_loop, ctx.stopping)
         ctx.tg.start_soon(self._hardware_input_loop, ctx.stopping)
-        ctx.tg.start_soon(self._hardware_beacon_loop, ctx.stopping)
+        ctx.tg.start_soon(self._hardware_directory_snapshot_loop, ctx.stopping)
         ctx.tg.start_soon(self._hardware_claim_event_loop, ctx.stopping)
         ctx.tg.start_soon(
             self._hardware_notification_reconciliation_loop,

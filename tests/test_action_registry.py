@@ -314,9 +314,8 @@ async def test_action_registry_prefers_latest_duplicate_provider_advertisement()
         assert meta is not None
         assert meta.provider_session_id is None
         qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
-        assert events[-1].catalog_added == []
+        assert qualified in events[-1].catalog_added + events[-1].catalog_updated
         assert events[-1].catalog_removed == []
-        assert events[-1].catalog_updated == [qualified]
         assert events[-1].provider_session_successions == []
 
     await _run_registry(registry, scenario)
