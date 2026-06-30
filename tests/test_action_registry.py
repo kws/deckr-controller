@@ -130,28 +130,25 @@ async def test_action_registry_uses_beacon_actions_as_catalog_candidate_source()
 
 
 @pytest.mark.asyncio
-async def test_action_registry_uses_exact_beacon_fallback_when_cache_unavailable(
+async def test_action_registry_raises_when_beacon_directory_is_stale(
     monkeypatch,
 ):
     bus = _state_bus()
     beacon = _beacon(bus)
     registry = _registry(beacon)
-    await _advertise_actions(beacon)
 
-    def unavailable_candidates(feature_id: str):
-        assert feature_id == ACTIONS_FEATURE_ID
-        raise KvUnavailable("cache unavailable")
+    class StaleDirectory:
+        def records(self):
+            raise KvUnavailable("directory stale")
 
-    monkeypatch.setattr(beacon, "candidates", unavailable_candidates)
+    exact_scan = MagicMock(side_effect=AssertionError("exact Beacon scan used"))
+    monkeypatch.setattr(beacon, "candidates_exact", exact_scan, raising=False)
+    registry._directory = StaleDirectory()
 
-    await registry._reconcile_current_state(reason="test exact fallback")
+    with pytest.raises(KvUnavailable):
+        await registry._reconcile_current_state(reason="test stale directory")
 
-    meta = await registry.get_action(ACTION_UUID)
-    assert meta is not None
-    assert meta.provider_session_id is None
-    candidate = registry.provider_session_candidate(PROVIDER_INSTANCE_ID, PROVIDER_ID)
-    assert candidate is not None
-    assert candidate.provider_session_id == "session-1"
+    exact_scan.assert_not_called()
 
 
 @pytest.mark.asyncio

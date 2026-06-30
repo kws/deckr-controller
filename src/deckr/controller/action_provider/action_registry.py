@@ -12,7 +12,7 @@ from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
 from deckr.actions.messages import ActionDescriptor
-from deckr.beacon import Beacon, Candidate
+from deckr.beacon import Beacon, BeaconDirectory, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.models import thaw_json
 from deckr.core.util.anyio import CoalescedTrigger
@@ -56,6 +56,12 @@ class _BeaconAction:
     descriptor: ActionDescriptor
 
 
+@dataclass(frozen=True, slots=True)
+class _ActionsAdvertisement:
+    candidate: Candidate
+    payload: ActionsBeaconPayload
+
+
 class ActionRegistry(BaseComponent):
     """Resolve builtin actions and provider actions advertised through Beacon."""
 
@@ -71,6 +77,12 @@ class ActionRegistry(BaseComponent):
         super().__init__(name="ActionRegistry")
         del controller_id
         self._beacon = beacon
+        self._directory = BeaconDirectory(
+            beacon,
+            ACTIONS_FEATURE_ID,
+            _parse_actions_advertisement,
+            log_label="ActionRegistry",
+        )
         self._on_catalog_changed = on_catalog_changed
         self._builtin_registry = BuiltinRegistry()
         self._builtin_action_registry: dict[str, ActionDescriptor] = {}
@@ -206,6 +218,8 @@ class ActionRegistry(BaseComponent):
             if descriptor:
                 self._builtin_action_registry[action_uuid] = descriptor
 
+        self._directory.start(ctx.tg)
+        start_soon(self._close_directory_on_stopping, ctx.stopping)
         start_soon(self._advertisement_loop, ctx.stopping)
         start_soon(self._notification_reconciliation_loop, ctx.stopping)
         start_soon(self._reconciliation_loop, ctx.stopping)
@@ -214,7 +228,12 @@ class ActionRegistry(BaseComponent):
         self._action_registry.clear()
         self._builtin_action_registry.clear()
         self._advertisements.clear()
+        await self._directory.aclose()
         await self._reconcile_notifications.aclose()
+
+    async def _close_directory_on_stopping(self, stopping: anyio.Event) -> None:
+        await stopping.wait()
+        await self._directory.aclose()
 
     async def _advertisement_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():
@@ -274,26 +293,23 @@ class ActionRegistry(BaseComponent):
             await self._reconcile_current_state_locked(reason=reason)
 
     async def _reconcile_current_state_locked(self, *, reason: str) -> None:
-        try:
-            candidates = self._beacon.candidates(ACTIONS_FEATURE_ID)
-        except KvUnavailable:
-            candidates = await self._beacon.candidates_exact(ACTIONS_FEATURE_ID)
-        next_candidates: dict[str, tuple[Candidate, ActionsBeaconPayload]] = {}
+        next_candidates: dict[str, _ActionsAdvertisement] = {}
 
-        for candidate in candidates:
-            payload = _valid_actions_payload(candidate)
-            if payload is None:
-                continue
+        for advertisement in self._directory.records():
+            payload = advertisement.payload
             provider_instance_id = payload.provider_instance_id
             if not _is_allowed_provider_instance_id(provider_instance_id):
                 continue
             current = next_candidates.get(provider_instance_id)
-            if current is None or candidate.revision > current[0].revision:
-                next_candidates[provider_instance_id] = (candidate, payload)
+            if (
+                current is None
+                or advertisement.candidate.revision > current.candidate.revision
+            ):
+                next_candidates[provider_instance_id] = advertisement
 
         next_advertisements = {
-            provider_instance_id: payload
-            for provider_instance_id, (_candidate, payload) in next_candidates.items()
+            provider_instance_id: advertisement.payload
+            for provider_instance_id, advertisement in next_candidates.items()
         }
 
         affected_providers = set(self._advertisements) | set(next_advertisements)
@@ -419,3 +435,10 @@ def _valid_actions_payload(candidate: Candidate) -> ActionsBeaconPayload | None:
             "Ignoring invalid actions Beacon advertisement %s", candidate.key
         )
         return None
+
+
+def _parse_actions_advertisement(candidate: Candidate) -> _ActionsAdvertisement | None:
+    payload = _valid_actions_payload(candidate)
+    if payload is None:
+        return None
+    return _ActionsAdvertisement(candidate=candidate, payload=payload)

@@ -41,7 +41,10 @@ from deckr.hardware.descriptors import (
 from deckr.hardware.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
 from deckr.substrates.nats_kv import KvUnavailable
 
-from deckr.controller._controller_service import ControllerService
+from deckr.controller._controller_service import (
+    ControllerService,
+    _parse_hardware_candidate,
+)
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._hardware_service import (
@@ -264,31 +267,30 @@ def _beacon(bus: LaneHarness) -> Beacon:
 
 
 @pytest.mark.asyncio
-async def test_hardware_candidates_use_exact_beacon_fallback_when_cache_unavailable():
-    class ExactFallbackBeacon:
-        def __init__(self) -> None:
-            self.reads = 0
-            self.exact_reads = 0
+async def test_hardware_candidates_use_directory_records():
+    class Directory:
+        def records(self):
+            return _parse_hardware_candidate(_hardware_candidate())
 
-        def candidates(self, feature_id: str):
-            assert feature_id == HARDWARE_FEATURE_ID
-            self.reads += 1
-            raise KvUnavailable("stale")
-
-        async def candidates_exact(self, feature_id: str):
-            assert feature_id == HARDWARE_FEATURE_ID
-            self.exact_reads += 1
-            return (_hardware_candidate(),)
-
-    beacon = ExactFallbackBeacon()
     controller = ControllerService.__new__(ControllerService)
-    controller._beacon = beacon
+    controller._hardware_directory = Directory()
 
     candidates = await ControllerService._hardware_candidates_from_beacon(controller)
 
     assert set(candidates) == {("room-a", "deck")}
-    assert beacon.reads == 1
-    assert beacon.exact_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_hardware_candidates_raise_when_directory_is_stale():
+    class StaleDirectory:
+        def records(self):
+            raise KvUnavailable("directory stale")
+
+    controller = ControllerService.__new__(ControllerService)
+    controller._hardware_directory = StaleDirectory()
+
+    with pytest.raises(KvUnavailable):
+        await ControllerService._hardware_candidates_from_beacon(controller)
 
 
 def _concord(bus: LaneHarness) -> Concord:
@@ -492,6 +494,7 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
     async with anyio.create_task_group() as tg:
         beacon.start(tg)
         concord.start(tg)
+        controller._hardware_directory.start(tg)
         await _advertise_hardware(
             beacon,
             manager_id="room-a",
@@ -504,6 +507,14 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
             session_id="live-session",
             advertisement_id="hardware_manager_mirabox-rust-001",
         )
+        with anyio.fail_after(1):
+            while True:
+                try:
+                    if len(controller._hardware_directory.records()) >= 2:
+                        break
+                except KvUnavailable:
+                    pass
+                await anyio.sleep(0.01)
 
         await controller._reconcile_hardware_current_state(
             reason="test duplicate beacon"

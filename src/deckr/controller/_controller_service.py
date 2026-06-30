@@ -17,7 +17,7 @@ from deckr.actions.messages import (
     action_message_for_controller,
     subject_config_id,
 )
-from deckr.beacon import Beacon, Candidate
+from deckr.beacon import Beacon, BeaconDirectory, Candidate
 from deckr.components import BaseComponent, RunContext
 from deckr.concord import (
     DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS,
@@ -167,6 +167,12 @@ class ControllerService(BaseComponent):
             tuple[str, tuple[tuple[str, str], ...]],
         ] = {}
         self._hardware_candidates: dict[tuple[str, str], HardwareCandidate] = {}
+        self._hardware_directory = BeaconDirectory(
+            beacon,
+            HARDWARE_FEATURE_ID,
+            _parse_hardware_candidate,
+            log_label="ControllerHardware",
+        )
         self._hardware_reconcile_lock = anyio.Lock()
         self._hardware_reconcile_notifications = CoalescedTrigger(
             batch_interval=_STATE_NOTIFICATION_BATCH_SECONDS
@@ -481,40 +487,18 @@ class ControllerService(BaseComponent):
     async def _hardware_candidates_from_beacon(
         self,
     ) -> dict[tuple[str, str], HardwareCandidate]:
-        try:
-            beacon_candidates = self._beacon.candidates(HARDWARE_FEATURE_ID)
-        except KvUnavailable:
-            beacon_candidates = await self._beacon.candidates_exact(HARDWARE_FEATURE_ID)
         candidates: dict[tuple[str, str], HardwareCandidate] = {}
-        for candidate in beacon_candidates:
-            payload = _valid_hardware_payload(candidate)
-            if payload is None:
-                continue
-            for device_id, item in payload.devices.items():
-                if item.device_ref.device_id != device_id:
-                    continue
-                hardware_candidate = HardwareCandidate(
-                    advertisement_key=candidate.key,
-                    advertisement_id=candidate.advertisement.advertisement_id,
-                    advertisement_endpoint=candidate.advertisement.endpoint,
-                    advertisement_session_id=candidate.advertisement.session_id,
-                    advertisement_revision=candidate.revision,
-                    advertisement_refresh_seq=candidate.advertisement.refresh_seq,
-                    payload=payload,
-                    ref=item.device_ref,
-                    device=item.descriptor,
-                    labels=payload.labels,
+        for hardware_candidate in self._hardware_directory.records():
+            key = _ref_key(hardware_candidate.ref)
+            selected = candidates.get(key)
+            if selected is not None:
+                _log_duplicate_hardware_candidate(
+                    hardware_candidate.ref,
+                    selected=selected,
+                    skipped=hardware_candidate,
                 )
-                key = _ref_key(item.device_ref)
-                selected = candidates.get(key)
-                if selected is not None:
-                    _log_duplicate_hardware_candidate(
-                        item.device_ref,
-                        selected=selected,
-                        skipped=hardware_candidate,
-                    )
-                    continue
-                candidates[key] = hardware_candidate
+                continue
+            candidates[key] = hardware_candidate
         return candidates
 
     async def _try_claim_hardware_candidate(
@@ -902,6 +886,8 @@ class ControllerService(BaseComponent):
             await self._action_availability_service.start(ctx.tg, ctx.stopping)
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
+        self._hardware_directory.start(ctx.tg)
+        ctx.tg.start_soon(self._close_hardware_directory_on_stopping, ctx.stopping)
         ctx.tg.start_soon(self._actions_subscription_loop, ctx.stopping)
         ctx.tg.start_soon(self._hardware_input_loop, ctx.stopping)
         ctx.tg.start_soon(self._hardware_beacon_loop, ctx.stopping)
@@ -915,6 +901,7 @@ class ControllerService(BaseComponent):
     async def stop(self):
         if self._stopping is not None:
             self._stopping.set()
+        await self._hardware_directory.aclose()
         await self._hardware_reconcile_notifications.aclose()
         for live in self._device_registry.all():
             await self._disconnect_live(
@@ -930,6 +917,13 @@ class ControllerService(BaseComponent):
             await self._action_availability_service.aclose()
         if self._render_backend is not None:
             await self._render_backend.aclose()
+
+    async def _close_hardware_directory_on_stopping(
+        self,
+        stopping: anyio.Event,
+    ) -> None:
+        await stopping.wait()
+        await self._hardware_directory.aclose()
 
     async def _release_owned_claims(self) -> None:
         for owned in tuple(self._owned_claims.values()):
@@ -1061,6 +1055,32 @@ def _valid_hardware_payload(candidate: Candidate) -> HardwareBeaconPayload | Non
             candidate.key,
         )
         return None
+
+
+def _parse_hardware_candidate(candidate: Candidate) -> tuple[HardwareCandidate, ...]:
+    payload = _valid_hardware_payload(candidate)
+    if payload is None:
+        return ()
+
+    hardware_candidates: list[HardwareCandidate] = []
+    for device_id, item in payload.devices.items():
+        if item.device_ref.device_id != device_id:
+            continue
+        hardware_candidates.append(
+            HardwareCandidate(
+                advertisement_key=candidate.key,
+                advertisement_id=candidate.advertisement.advertisement_id,
+                advertisement_endpoint=candidate.advertisement.endpoint,
+                advertisement_session_id=candidate.advertisement.session_id,
+                advertisement_revision=candidate.revision,
+                advertisement_refresh_seq=candidate.advertisement.refresh_seq,
+                payload=payload,
+                ref=item.device_ref,
+                device=item.descriptor,
+                labels=payload.labels,
+            )
+        )
+    return tuple(hardware_candidates)
 
 
 def _log_duplicate_hardware_candidate(
