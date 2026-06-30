@@ -25,7 +25,7 @@ from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
 from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._hardware_service import HardwareCommandService
-from deckr.controller._render import RenderService
+from deckr.controller._render import RenderService, RenderSource
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
 from deckr.controller.action_provider.builtin._context import ControllerActionContext
@@ -180,9 +180,17 @@ class ControlContext:
         )
 
     async def set_raster_image(
-        self, image: str, *, generation: int | None = None
+        self,
+        image: str,
+        *,
+        generation: int | None = None,
+        source: RenderSource | None = None,
     ) -> None:
-        await self._router.set_raster_image(image, generation=generation)
+        await self._router.set_raster_image(
+            image,
+            generation=generation,
+            source=source,
+        )
 
     async def clear_raster(self, *, generation: int | None = None) -> None:
         await self._router.clear(generation=generation)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
 import os
 import signal
@@ -28,12 +30,17 @@ from deckr.controller._render import (
     RenderRequest,
     RenderResult,
     RenderService,
+    RenderSource,
     render_request_to_jpeg,
 )
 from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderDispatcher,
     ThreadRenderBackend,
+)
+from deckr.controller._render_observation import (
+    ObservingRenderBackend,
+    RenderObservationOptions,
 )
 from deckr.controller.invariant.recipes import STATUS_OVERLAY_STYLES
 
@@ -61,10 +68,12 @@ class ControlledBackend:
 
     def __init__(self):
         self.calls: list[int] = []
+        self.requests: list[RenderRequest] = []
         self._events: dict[int, anyio.Event] = {}
 
     async def render(self, request: RenderRequest) -> RenderResult:
         self.calls.append(request.generation)
+        self.requests.append(request)
         event = self._events.setdefault(request.generation, anyio.Event())
         await event.wait()
         return RenderResult(
@@ -97,6 +106,71 @@ def _solid_request() -> RenderRequest:
         image_format=RenderImageFormat(width=72, height=72),
         graph=dump_graph_to_dict(graph, output="output"),
     )
+
+
+class ImmediateBackend:
+    def __init__(
+        self,
+        *,
+        frame: bytes | None = b"frame",
+        error: str | None = None,
+    ):
+        self.frame = frame
+        self.error = error
+        self.closed = False
+        self.calls: list[RenderRequest] = []
+
+    async def render(self, request: RenderRequest) -> RenderResult:
+        self.calls.append(request)
+        return RenderResult(
+            context_id=request.context_id,
+            binding_id=request.binding_id,
+            control_id=request.control_id,
+            generation=request.generation,
+            frame=self.frame,
+            error=self.error,
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _request_with_graph(graph: dict) -> RenderRequest:
+    return RenderRequest(
+        config_id="device-1",
+        context_id="ctx-1",
+        binding_id="binding-1",
+        control_id="0,0",
+        generation=7,
+        image_format=RenderImageFormat(width=72, height=64),
+        graph=graph,
+        context={"setting": "value"},
+        source=RenderSource(
+            provider_instance_id="provider-instance",
+            provider_id="dev.deckr.clock",
+            action_id="dev.deckr.clock.action.digital",
+            action_instance_id="action-instance",
+            action_message_id="message-1",
+            action_causation_id="cause-1",
+            trace={"traceParent": "00-abc"},
+            command_type="set_frame",
+            content_kind="invariant_graph",
+            binding_output_generation=3,
+        ),
+    )
+
+
+def _json_hash(value) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _frame_hash(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _read_observations(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
 
 
 def _custom_graph() -> SubGraphNode:
@@ -197,6 +271,35 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
             "raster.bitmap",
             b"frame-3",
         )
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_render_dispatcher_stamps_config_id_into_requests():
+    command_service = FakeHardwareCommandService()
+    backend = ControlledBackend()
+    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
+
+    async with anyio.create_task_group() as tg:
+        dispatcher = RenderDispatcher(
+            command_service=command_service,
+            config_id="dev",
+            backend=backend,
+            start_soon=tg.start_soon,
+        )
+        await dispatcher.submit_request(
+            control_id="0,0",
+            context_id="ctx",
+            request=_solid_request(),
+            output=output,
+        )
+
+        with anyio.fail_after(1.0):
+            while not backend.requests:
+                await anyio.sleep(0.01)
+
+        assert backend.requests[0].config_id == "dev"
+        backend.release(1)
         tg.cancel_scope.cancel()
 
 
@@ -353,6 +456,124 @@ async def test_thread_render_backend_skips_http_image_fetch_failures(
     assert result.frame is None
     assert result.error == "timed out"
     assert "image fetch failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_observing_render_backend_records_success(tmp_path: Path):
+    path = tmp_path / "render.jsonl"
+    delegate = ImmediateBackend(frame=b"jpeg-bytes")
+    backend = ObservingRenderBackend(
+        delegate,
+        controller_id="controller-main",
+        options=RenderObservationOptions(path=path),
+    )
+    request = _request_with_graph({"b": 2, "a": 1})
+
+    result = await backend.render(request)
+
+    assert result.frame == b"jpeg-bytes"
+    records = _read_observations(path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["event"] == "render.result"
+    assert record["controllerId"] == "controller-main"
+    assert record["configId"] == "device-1"
+    assert record["controlId"] == "0,0"
+    assert record["contextId"] == "ctx-1"
+    assert record["bindingId"] == "binding-1"
+    assert record["renderGeneration"] == 7
+    assert record["bindingOutputGeneration"] == 3
+    assert record["providerInstanceId"] == "provider-instance"
+    assert record["providerId"] == "dev.deckr.clock"
+    assert record["actionId"] == "dev.deckr.clock.action.digital"
+    assert record["actionInstanceId"] == "action-instance"
+    assert record["actionMessageId"] == "message-1"
+    assert record["actionCausationId"] == "cause-1"
+    assert record["trace"] == {"traceParent": "00-abc"}
+    assert record["commandType"] == "set_frame"
+    assert record["contentKind"] == "invariant_graph"
+    assert record["graphSha256"] == _json_hash({"b": 2, "a": 1})
+    assert record["frameSha256"] == _frame_hash(b"jpeg-bytes")
+    assert record["encoding"] == "jpeg"
+    assert record["width"] == 72
+    assert record["height"] == 64
+    assert record["durationMs"] >= 0
+    assert record["error"] is None
+    assert "graph" not in record
+    assert "context" not in record
+
+
+@pytest.mark.asyncio
+async def test_observing_render_backend_records_error(tmp_path: Path):
+    path = tmp_path / "render.jsonl"
+    backend = ObservingRenderBackend(
+        ImmediateBackend(frame=None, error="boom"),
+        controller_id="controller-main",
+        options=RenderObservationOptions(path=path),
+    )
+
+    result = await backend.render(_request_with_graph({"output": "value"}))
+
+    assert result.frame is None
+    assert result.error == "boom"
+    record = _read_observations(path)[0]
+    assert record["frameSha256"] is None
+    assert record["error"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_observing_render_backend_can_include_graph_and_context(
+    tmp_path: Path,
+):
+    path = tmp_path / "render.jsonl"
+    backend = ObservingRenderBackend(
+        ImmediateBackend(),
+        controller_id="controller-main",
+        options=RenderObservationOptions(
+            path=path,
+            include_graph=True,
+            include_context=True,
+        ),
+    )
+    request = _request_with_graph({"output": {"params": {"title": "Clock"}}})
+
+    await backend.render(request)
+
+    record = _read_observations(path)[0]
+    assert record["graph"] == request.graph
+    assert record["context"] == request.context
+
+
+@pytest.mark.asyncio
+async def test_observing_render_backend_graph_hash_is_key_order_stable(
+    tmp_path: Path,
+):
+    path = tmp_path / "render.jsonl"
+    backend = ObservingRenderBackend(
+        ImmediateBackend(),
+        controller_id="controller-main",
+        options=RenderObservationOptions(path=path),
+    )
+
+    await backend.render(_request_with_graph({"b": 2, "a": 1}))
+    await backend.render(_request_with_graph({"a": 1, "b": 2}))
+
+    first, second = _read_observations(path)
+    assert first["graphSha256"] == second["graphSha256"]
+
+
+@pytest.mark.asyncio
+async def test_observing_render_backend_delegates_close(tmp_path: Path):
+    delegate = ImmediateBackend()
+    backend = ObservingRenderBackend(
+        delegate,
+        controller_id="controller-main",
+        options=RenderObservationOptions(path=tmp_path / "render.jsonl"),
+    )
+
+    await backend.aclose()
+
+    assert delegate.closed is True
 
 
 @pytest.mark.asyncio

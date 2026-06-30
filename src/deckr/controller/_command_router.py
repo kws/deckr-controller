@@ -9,7 +9,7 @@ import anyio
 from deckr.actions.messages import SettingsTargetRef
 from deckr.contracts.models import thaw_json
 
-from deckr.controller._render import RenderService, resolve
+from deckr.controller._render import RenderService, RenderSource, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore, RenderOverlay
 from deckr.controller.invariant.recipes import (
@@ -113,7 +113,12 @@ class CommandRouter:
         self._settings_target = settings_target
         self._settings_hydrated = False
 
-    async def _render(self, *, clear_when_empty: bool = False) -> None:
+    async def _render(
+        self,
+        *,
+        clear_when_empty: bool = False,
+        source: RenderSource | None = None,
+    ) -> None:
         if self._image_format is None or self._output is None:
             return
         model = resolve(self._store)
@@ -123,6 +128,7 @@ class CommandRouter:
             context_id=self._store.context_id,
             binding_id=self._store.binding_id,
             control_id=self._output.control_id,
+            source=source,
         )
         if request is None and clear_when_empty:
             generation = await self._render_dispatcher.clear_control(
@@ -186,7 +192,11 @@ class CommandRouter:
         await self._render()
 
     async def set_raster_image(
-        self, image: str, *, generation: int | None = None
+        self,
+        image: str,
+        *,
+        generation: int | None = None,
+        source: RenderSource | None = None,
     ) -> None:
         previous_generation = self._store.base_output_generation
         if not self._accept_base_generation(generation):
@@ -198,7 +208,7 @@ class CommandRouter:
             or self._store.base_output_generation > previous_generation
         ):
             self._store.overlay = None
-        await self._render()
+        await self._render(source=source)
 
     async def clear(self, *, generation: int | None = None) -> None:
         previous_generation = self._store.base_output_generation

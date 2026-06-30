@@ -239,6 +239,7 @@ class RenderDispatcher:
 
             request = replace(
                 request,
+                config_id=self._config_id,
                 context_id=context_id,
                 binding_id=binding_id,
                 control_id=control_id,

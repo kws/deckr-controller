@@ -27,6 +27,15 @@ from deckr.controller._config_document import (
     parse_controller_config,
 )
 from deckr.controller._controller_service import ControllerService
+from deckr.controller._render_dispatcher import (
+    ProcessPoolRenderBackend,
+    RenderBackend,
+    ThreadRenderBackend,
+)
+from deckr.controller._render_observation import (
+    ObservingRenderBackend,
+    RenderObservationOptions,
+)
 from deckr.controller._runtime_support import (
     build_config_service,
     build_settings_service,
@@ -115,6 +124,10 @@ class ControllerRuntimeService(BaseComponent):
                 action_provider=action_registry.get_action,
                 availability_service=action_availability_service,
             )
+            render_backend = _build_render_backend(
+                self._runtime.config,
+                controller_id=self._runtime.controller_id,
+            )
 
             controller_service = ControllerService(
                 endpoint=self._endpoint,
@@ -125,6 +138,7 @@ class ControllerRuntimeService(BaseComponent):
                 controller_id=self._runtime.controller_id,
                 action_registry=action_registry,
                 action_availability_service=action_availability_service,
+                render_backend=render_backend,
             )
             await self._component_manager.add_component(controller_service)
         except BaseException:
@@ -159,6 +173,37 @@ def build_controller_runtime(
         config=config,
         controller_id=controller_id,
     )
+
+
+def _build_render_backend(
+    config: ControllerRuntimeConfig,
+    *,
+    controller_id: str,
+) -> RenderBackend | None:
+    render = config.render
+    if render is None:
+        return None
+
+    if render.backend == "thread":
+        backend: RenderBackend = ThreadRenderBackend()
+    else:
+        backend = ProcessPoolRenderBackend()
+
+    observation = render.observation
+    if observation is not None and observation.enabled:
+        if observation.path is None:
+            raise ValueError("render observation path is required when enabled")
+        backend = ObservingRenderBackend(
+            backend,
+            controller_id=controller_id,
+            options=RenderObservationOptions(
+                path=observation.path,
+                include_graph=observation.include_graph,
+                include_context=observation.include_context,
+            ),
+        )
+
+    return backend
 
 
 def component_factory(context: ComponentContext):

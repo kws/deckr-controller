@@ -126,7 +126,7 @@ from deckr.controller._navigation_service import (
     PageTransition,
     StaticPageRef,
 )
-from deckr.controller._render import RenderModel, RenderService
+from deckr.controller._render import RenderModel, RenderService, RenderSource
 from deckr.controller._render_dispatcher import (
     RenderBackend,
     RenderDispatcher,
@@ -193,6 +193,43 @@ def _binding_output_image_source(params: Mapping[str, Any]) -> str | None:
     if encoding in {"jpeg", "png"}:
         return f"data:image/{encoding};base64,{image}"
     return None
+
+
+def _image_source_content_kind(image_source: str) -> str:
+    if image_source.startswith("data:application/vnd.invariant.graph"):
+        return "invariant_graph"
+    if image_source.startswith("data:"):
+        return "data_image"
+    if image_source.startswith(("http://", "https://")):
+        return "remote_image"
+    return "image"
+
+
+def _message_trace_payload(msg: DeckrMessage) -> dict[str, Any] | None:
+    if msg.trace is None:
+        return None
+    return msg.trace.model_dump(by_alias=True, exclude_none=True, mode="json")
+
+
+def _binding_output_render_source(
+    body: BindingOutputBody,
+    msg: DeckrMessage,
+    *,
+    image_source: str,
+) -> RenderSource:
+    binding = body.binding
+    return RenderSource(
+        provider_instance_id=binding.provider_instance_id,
+        provider_id=binding.provider_id,
+        action_id=binding.action_id,
+        action_instance_id=binding.action_instance_id,
+        action_message_id=msg.message_id,
+        action_causation_id=msg.causation_id,
+        trace=_message_trace_payload(msg),
+        command_type=body.command_type,
+        content_kind=_image_source_content_kind(image_source),
+        binding_output_generation=body.generation,
+    )
 
 
 def _find_control_surface(
@@ -3123,7 +3160,7 @@ class DeviceManager:
         if msg_type == BINDING_OUTPUT:
             if authorization.binding is not None:
                 body = BindingOutputBody.model_validate(payload)
-                await self._handle_binding_output(authorization.binding, body)
+                await self._handle_binding_output(authorization.binding, body, msg)
             return
 
         if msg_type == BINDING_OVERLAY:
@@ -3192,6 +3229,7 @@ class DeviceManager:
         self,
         lease: BindingLease,
         body: BindingOutputBody,
+        msg: DeckrMessage,
     ) -> None:
         if not self._attachments.binding_output_authorized(lease):
             logger.warning(
@@ -3269,7 +3307,12 @@ class DeviceManager:
                 lease.binding_id,
             )
             return
-        await lease.context.set_raster_image(image_source, generation=body.generation)
+        source = _binding_output_render_source(body, msg, image_source=image_source)
+        await lease.context.set_raster_image(
+            image_source,
+            generation=body.generation,
+            source=source,
+        )
 
     async def _handle_binding_overlay(
         self,

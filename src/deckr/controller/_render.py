@@ -49,6 +49,22 @@ class RenderImageFormat:
 
 
 @dataclass(frozen=True, slots=True)
+class RenderSource:
+    """Diagnostic source metadata for a render request."""
+
+    provider_instance_id: str | None = None
+    provider_id: str | None = None
+    action_id: str | None = None
+    action_instance_id: str | None = None
+    action_message_id: str | None = None
+    action_causation_id: str | None = None
+    trace: dict[str, Any] | None = None
+    command_type: str | None = None
+    content_kind: str | None = None
+    binding_output_generation: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RenderRequest:
     """Serialized render payload suitable for thread/process backends."""
 
@@ -57,8 +73,10 @@ class RenderRequest:
     generation: int
     image_format: RenderImageFormat
     graph: dict[str, Any]
+    config_id: str = ""
     context: dict[str, Any] = field(default_factory=dict)
     binding_id: str | None = None
+    source: RenderSource | None = None
     delay_ms: int = 0
 
 
@@ -241,10 +259,12 @@ def build_render_request(
     model: RenderModel,
     image_format: RasterImageFormat,
     *,
+    config_id: str = "",
     context_id: str = "",
     binding_id: str | None = None,
     control_id: str = "",
     generation: int = 0,
+    source: RenderSource | None = None,
 ) -> RenderRequest | None:
     """Convert a RenderModel to a serialized render request."""
 
@@ -253,6 +273,7 @@ def build_render_request(
         return None
 
     return RenderRequest(
+        config_id=config_id,
         context_id=context_id,
         binding_id=binding_id,
         control_id=control_id,
@@ -260,6 +281,7 @@ def build_render_request(
         image_format=_to_render_image_format(image_format),
         graph=_document_to_wire(document),
         context=document.context,
+        source=source,
     )
 
 
@@ -310,16 +332,20 @@ class RenderService:
         model: RenderModel,
         image_format: RasterImageFormat,
         *,
+        config_id: str = "",
         context_id: str = "",
         binding_id: str | None = None,
         control_id: str = "",
         generation: int = 0,
+        source: RenderSource | None = None,
     ) -> RenderRequest | None:
         return build_render_request(
             model,
             image_format,
+            config_id=config_id,
             context_id=context_id,
             binding_id=binding_id,
             control_id=control_id,
             generation=generation,
+            source=source,
         )

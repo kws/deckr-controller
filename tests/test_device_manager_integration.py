@@ -1354,6 +1354,18 @@ async def test_key_press_renders_to_device(
         with anyio.fail_after(5.0):
             while not render_backend.calls:
                 await anyio.sleep(0.01)
+        request = render_backend.requests[-1]
+        assert request.config_id == "test-device"
+        assert request.source is not None
+        assert request.source.provider_instance_id == PROVIDER_INSTANCE_ID
+        assert request.source.provider_id == PROVIDER_ID
+        assert request.source.action_id == SetRasterImageOnAppearAction.uuid
+        assert request.source.action_instance_id == ctx.action_instance_id
+        assert request.source.action_message_id == msg.message_id
+        assert request.source.action_causation_id is None
+        assert request.source.command_type == "set_frame"
+        assert request.source.content_kind == "data_image"
+        assert request.source.binding_output_generation == 1
         render_backend.release(render_backend.calls[-1])
         with anyio.fail_after(5.0):
             while command_service.set_raster_frame.call_count <= baseline_calls:

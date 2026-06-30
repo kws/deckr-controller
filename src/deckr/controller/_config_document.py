@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from deckr.core.config import ConfigDocument
 from deckr.core.config import load_config_document as load_core_config
@@ -68,8 +68,26 @@ class DeviceConfigSection(_StrictModel):
             raise ValueError("device_config may configure either file or materialized")
 
 
+class RenderObservationSection(_StrictModel):
+    enabled: bool = False
+    sink: Literal["jsonl"] = "jsonl"
+    path: Path | None = None
+    include_graph: bool = False
+    include_context: bool = False
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.enabled and self.path is None:
+            raise ValueError("render observation path is required when enabled")
+
+
+class RenderSection(_StrictModel):
+    backend: Literal["process_pool", "thread"] = "process_pool"
+    observation: RenderObservationSection | None = None
+
+
 class ControllerRuntimeConfig(_StrictModel):
     device_config: DeviceConfigSection | None = None
+    render: RenderSection | None = None
 
 
 def _resolve_path(path: Path, *, base_dir: Path) -> Path:
@@ -86,6 +104,15 @@ def _resolve_controller_paths(
     if controller.device_config and controller.device_config.file:
         controller.device_config.file.path = _resolve_path(
             controller.device_config.file.path,
+            base_dir=base_dir,
+        )
+    if (
+        controller.render is not None
+        and controller.render.observation is not None
+        and controller.render.observation.path is not None
+    ):
+        controller.render.observation.path = _resolve_path(
+            controller.render.observation.path,
             base_dir=base_dir,
         )
 
