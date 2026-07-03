@@ -342,8 +342,13 @@ class ControllerService(BaseComponent):
     async def _hardware_reconciliation_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():
             try:
+                await self._hardware_directory.wait_current()
+                if stopping.is_set():
+                    return
                 await self._reconcile_hardware_current_state(reason="broker snapshot")
             except (ConcordUnavailable, KvUnavailable):
+                if stopping.is_set():
+                    return
                 logger.warning(
                     "Hardware current state unavailable; reconciliation will retry",
                     exc_info=True,

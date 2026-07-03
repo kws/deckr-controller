@@ -245,8 +245,13 @@ class ActionRegistry(BaseComponent):
     async def _reconciliation_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():
             try:
+                await self._directory.wait_current()
+                if stopping.is_set():
+                    return
                 await self._reconcile_current_state(reason="broker snapshot")
             except KvUnavailable:
+                if stopping.is_set():
+                    return
                 logger.warning(
                     "Action Beacon advertisements unavailable; reconciliation will retry",
                     exc_info=True,
