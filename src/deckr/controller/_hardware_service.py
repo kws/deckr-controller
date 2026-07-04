@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import HARDWARE_MESSAGES_LANE, hardware_manager_address
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.capabilities import (
@@ -33,6 +34,7 @@ class LiveDeviceRoute:
     config_id: str
     ref: DeviceRef
     device: DeviceDescriptor
+    contract: ContractPointer
     manager_session_id: str | None = None
 
 
@@ -49,6 +51,7 @@ class DeviceRouteRegistry:
         config_id: str,
         ref: DeviceRef,
         device: DeviceDescriptor,
+        contract: ContractPointer,
         manager_session_id: str | None = None,
     ) -> LiveDeviceRoute:
         self.disconnect_config(config_id)
@@ -56,6 +59,7 @@ class DeviceRouteRegistry:
             config_id=config_id,
             ref=ref,
             device=device,
+            contract=contract,
             manager_session_id=manager_session_id,
         )
         self._devices_by_config[config_id] = live
@@ -67,6 +71,7 @@ class DeviceRouteRegistry:
         *,
         ref: DeviceRef,
         device: DeviceDescriptor,
+        contract: ContractPointer | None = None,
         manager_session_id: str | None = None,
     ) -> LiveDeviceRoute | None:
         config_id = self._config_by_ref.get(_ref_key(ref))
@@ -77,6 +82,7 @@ class DeviceRouteRegistry:
             config_id=config_id,
             ref=ref,
             device=device,
+            contract=contract if contract is not None else current.contract,
             manager_session_id=manager_session_id
             if manager_session_id is not None
             else (current.manager_session_id if current is not None else None),
@@ -130,12 +136,14 @@ class HardwareCommandService:
         config_id: str,
         ref: DeviceRef,
         device: DeviceDescriptor,
+        contract: ContractPointer,
         manager_session_id: str | None = None,
     ) -> None:
         self._devices_by_config_id[config_id] = LiveDeviceRoute(
             config_id=config_id,
             ref=ref,
             device=device,
+            contract=contract,
             manager_session_id=manager_session_id,
         )
 
@@ -260,6 +268,7 @@ class HardwareCommandService:
             message_type=hw_messages.CONTROL_COMMAND,
             body=hw_messages.hardware_body_to_dict(body),
             subject=hw_messages.hardware_subject_for_capability(ref),
+            contract=live.contract,
         )
 
 

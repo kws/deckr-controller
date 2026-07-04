@@ -16,6 +16,7 @@ from deckr.actions.messages import (
     action_message,
     context_subject,
 )
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import controller_address
 from deckr.contracts.models import thaw_json
 from deckr.hardware.descriptors import DeviceDescriptor
@@ -59,6 +60,7 @@ class ControlContext:
         settings_service: SettingsService | None,
         context_settings_target: SettingsTargetRef | None,
         provider_session_id: str | None,
+        contract: ContractPointer | None,
         *,
         profile_id: str,
         page_id: str,
@@ -72,6 +74,7 @@ class ControlContext:
         self.provider_instance_id = provider_instance_id
         self.provider_id = provider_id
         self.provider_session_id = provider_session_id
+        self.contract = contract
         self.action_uuid = action_uuid
         self.action_instance_id = metadata.action_instance_id
         self.binding_id = metadata.binding_id
@@ -145,6 +148,7 @@ class ControlContext:
                 binding_id=self.binding_id,
                 page_session_id=self.page_session_id,
             ),
+            contract=self.contract,
         )
         await send_with_endpoint_identity(self._actions_bus, msg)
 

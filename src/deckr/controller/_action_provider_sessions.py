@@ -18,6 +18,7 @@ from deckr.concord import (
     ContractValidityStatus,
     ParticipantHandle,
 )
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import controller_address
 from deckr.profiles import (
     ACTION_PROVIDER_SESSION_PROFILE_ID,
@@ -65,6 +66,13 @@ class ProviderSessionLease:
     @property
     def contract(self) -> ContractHandle:
         return self.agreement.contract
+
+    @property
+    def contract_pointer(self) -> ContractPointer:
+        return ContractPointer(
+            contractId=self.contract.contract_id,
+            generation=self.contract.generation,
+        )
 
 
 class ActionProviderSessionManager:
@@ -225,6 +233,12 @@ class ActionProviderSessionManager:
     def cached_ready(self, key: ProviderSessionKey) -> bool:
         session = self._sessions.get(key)
         return session is not None and _snapshot(session).ready
+
+    def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer | None:
+        session = self._sessions.get(key)
+        if session is None:
+            return None
+        return session.contract_pointer
 
     async def valid(
         self,

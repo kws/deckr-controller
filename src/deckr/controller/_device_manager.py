@@ -57,6 +57,7 @@ from deckr.actions.messages import (
     subject_page_session_id,
     subject_provider_instance_id,
 )
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import (
     DeckrMessage,
     controller_address,
@@ -1038,6 +1039,35 @@ class DeviceManager:
             for lease in self._binding_leases.values()
         )
 
+    def _contract_pointer_for_provider_session_key(
+        self,
+        key: ProviderSessionKey | None,
+    ) -> ContractPointer | None:
+        return self._action_availability_service.contract_pointer(key)
+
+    def _provider_session_key_for_session(
+        self,
+        *,
+        provider_instance_id: str,
+        provider_id: str,
+        provider_session_id: str | None,
+    ) -> ProviderSessionKey | None:
+        if provider_session_id is None:
+            return None
+        return ProviderSessionKey(
+            provider_instance_id=provider_instance_id,
+            provider_id=provider_id,
+            provider_session_id=provider_session_id,
+        )
+
+    def _message_contract_authorized(
+        self,
+        msg: DeckrMessage,
+        key: ProviderSessionKey | None,
+    ) -> bool:
+        expected = self._contract_pointer_for_provider_session_key(key)
+        return expected is not None and msg.contract == expected
+
     def _provider_lifecycle_recovery_key(
         self,
         lease: BindingLease,
@@ -1440,6 +1470,18 @@ class DeviceManager:
     ) -> None:
         if metadata.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
+        contract = self._contract_pointer_for_provider_session_key(
+            provider_session_key_for_action
+        )
+        if contract is None:
+            logger.warning(
+                "Skipping action instance create without live provider-session "
+                "contract config=%s actionInstance=%s provider=%s",
+                self.config_id,
+                metadata.action_instance_id,
+                metadata.provider_instance_id,
+            )
+            return
         msg = action_message(
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
@@ -1461,6 +1503,7 @@ class DeviceManager:
                 config_id=metadata.config_id,
                 action_instance_id=metadata.action_instance_id,
             ),
+            contract=contract,
         )
         await send_with_endpoint_identity(self._actions_bus, msg)
 
@@ -1540,6 +1583,18 @@ class DeviceManager:
             or not notify_provider
         ):
             return
+        contract = self._contract_pointer_for_provider_session_key(
+            provider_session_key_for_action
+        )
+        if contract is None:
+            logger.warning(
+                "Skipping action instance destroy without live provider-session "
+                "contract config=%s actionInstance=%s provider=%s",
+                self.config_id,
+                metadata.action_instance_id,
+                provider_instance_id,
+            )
+            return
         msg = action_message(
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
@@ -1558,6 +1613,7 @@ class DeviceManager:
                 config_id=self.config_id,
                 action_instance_id=metadata.action_instance_id,
             ),
+            contract=contract,
         )
         await send_with_endpoint_identity(self._actions_bus, msg)
 
@@ -1612,6 +1668,22 @@ class DeviceManager:
             if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
             else provider_session_key(action_meta)
         )
+        contract = self._contract_pointer_for_provider_session_key(session_key)
+        if (
+            action_meta.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
+            and contract is None
+        ):
+            logger.warning(
+                "Binding unresolved without live provider-session contract "
+                "profile=%s page=%s control=%s action=%s provider=%s session=%s",
+                profile_id,
+                page_id,
+                binding.control_id,
+                binding.action_uuid,
+                action_meta.provider_instance_id,
+                provider_session_id,
+            )
+            return False
         settings_target = (
             self._build_settings_target_for_binding(
                 action_instance_id=action_instance_id,
@@ -1694,6 +1766,7 @@ class DeviceManager:
             settings_service=self._settings_service,
             context_settings_target=settings_target,
             provider_session_id=provider_session_id,
+            contract=contract,
             profile_id=profile_id,
             page_id=page_id,
             builtin_action=builtin_action,
@@ -1804,6 +1877,22 @@ class DeviceManager:
     ) -> None:
         if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
+        contract = self._contract_pointer_for_provider_session_key(
+            self._provider_session_key_for_session(
+                provider_instance_id=session.owner_provider_instance_id,
+                provider_id=session.owner_provider_id,
+                provider_session_id=session.owner_provider_session_id,
+            )
+        )
+        if contract is None:
+            logger.warning(
+                "Skipping page open without live provider-session contract "
+                "config=%s pageSession=%s provider=%s",
+                self.config_id,
+                session.page_session_id,
+                session.owner_provider_instance_id,
+            )
+            return
         msg = action_message(
             sender=controller_address(self._controller_id),
             sender_session_id=self._actions_bus.session_id,
@@ -1822,6 +1911,7 @@ class DeviceManager:
                 page_session_id=session.page_session_id,
             ),
             causation_id=causation_id,
+            contract=contract,
         )
         try:
             await send_with_endpoint_identity(self._actions_bus, msg)
@@ -1840,6 +1930,22 @@ class DeviceManager:
         causation_id: str | None = None,
     ) -> None:
         if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return
+        contract = self._contract_pointer_for_provider_session_key(
+            self._provider_session_key_for_session(
+                provider_instance_id=session.owner_provider_instance_id,
+                provider_id=session.owner_provider_id,
+                provider_session_id=session.owner_provider_session_id,
+            )
+        )
+        if contract is None:
+            logger.warning(
+                "Skipping page close without live provider-session contract "
+                "config=%s pageSession=%s provider=%s",
+                self.config_id,
+                session.page_session_id,
+                session.owner_provider_instance_id,
+            )
             return
         msg = action_message(
             sender=controller_address(self._controller_id),
@@ -1860,6 +1966,7 @@ class DeviceManager:
                 page_session_id=session.page_session_id,
             ),
             causation_id=causation_id,
+            contract=contract,
         )
         try:
             await send_with_endpoint_identity(self._actions_bus, msg)
@@ -2691,6 +2798,14 @@ class DeviceManager:
                     msg.sender_session_id,
                 )
                 return None
+            if not self._message_contract_authorized(msg, lease.provider_session_key):
+                logger.warning(
+                    "Ignoring action command %s from provider session %s without "
+                    "matching Concord contract",
+                    msg.message_type,
+                    msg.sender_session_id,
+                )
+                return None
             if (
                 action_instance_id is not None
                 and action_instance_id != lease.action_instance_id
@@ -2738,6 +2853,21 @@ class DeviceManager:
             if msg.sender_session_id != session.owner_provider_session_id:
                 logger.warning(
                     "Ignoring page action command %s from stale provider session %s",
+                    msg.message_type,
+                    msg.sender_session_id,
+                )
+                return None
+            if not self._message_contract_authorized(
+                msg,
+                self._provider_session_key_for_session(
+                    provider_instance_id=session.owner_provider_instance_id,
+                    provider_id=session.owner_provider_id,
+                    provider_session_id=session.owner_provider_session_id,
+                ),
+            ):
+                logger.warning(
+                    "Ignoring page action command %s from provider session %s "
+                    "without matching Concord contract",
                     msg.message_type,
                     msg.sender_session_id,
                 )
@@ -2794,6 +2924,7 @@ class DeviceManager:
     async def _provider_settings_authorized(
         self,
         *,
+        msg: DeckrMessage,
         sender_provider_instance_id: str,
         sender_session_id: str | None,
         target: SettingsTargetRef,
@@ -2809,6 +2940,19 @@ class DeviceManager:
             logger.warning(
                 "Ignoring provider settings command from %s without sender session",
                 sender_provider_instance_id,
+            )
+            return False
+        session_key = self._provider_session_key_for_session(
+            provider_instance_id=sender_provider_instance_id,
+            provider_id=target.provider_id,
+            provider_session_id=sender_session_id,
+        )
+        if not self._message_contract_authorized(msg, session_key):
+            logger.warning(
+                "Ignoring provider settings command from %s without matching "
+                "Concord provider-session contract %s",
+                sender_provider_instance_id,
+                sender_session_id,
             )
             return False
         if not await self._action_availability_service.provider_session_valid(
@@ -2847,7 +2991,11 @@ class DeviceManager:
         if stored is None or not _action_instance_matches_metadata(stored, metadata):
             return False
         key = self._action_instance_provider_sessions.get(metadata.action_instance_id)
-        return key is not None and msg.sender_session_id == key.provider_session_id
+        return (
+            key is not None
+            and msg.sender_session_id == key.provider_session_id
+            and self._message_contract_authorized(msg, key)
+        )
 
     async def _settings_snapshot_for_command(
         self,
@@ -3094,6 +3242,7 @@ class DeviceManager:
                 return
             if settings_target.scope == "action_provider_instance":
                 if not await self._provider_settings_authorized(
+                    msg=msg,
                     sender_provider_instance_id=sender_provider_instance_id,
                     sender_session_id=msg.sender_session_id,
                     target=settings_target,

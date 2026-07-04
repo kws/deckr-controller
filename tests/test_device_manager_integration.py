@@ -40,6 +40,7 @@ from deckr.concord import (
     Concord,
     ContractValidityStatus,
 )
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import DeckrMessage, controller_address
 from deckr.contracts.models import thaw_json
 from deckr.hardware import messages as hw_messages
@@ -95,6 +96,18 @@ PROVIDER_INSTANCE_ID = "python"
 PROVIDER_ID = "test.provider"
 PROVIDER_ADDR = action_provider_address(PROVIDER_INSTANCE_ID)
 PROVIDER_SESSION_ID = "action-provider-session"
+
+
+def _contract_pointer_for_provider_session(
+    provider_session_id: str = PROVIDER_SESSION_ID,
+    *,
+    provider_instance_id: str = PROVIDER_INSTANCE_ID,
+    provider_id: str = PROVIDER_ID,
+) -> ContractPointer:
+    return ContractPointer(
+        contractId=f"provider-session:{provider_instance_id}:{provider_id}:{provider_session_id}",
+        generation=1,
+    )
 
 
 def _actions_bus() -> LaneHarness:
@@ -165,6 +178,13 @@ class ReadyProviderSessions:
     def cached_ready(self, key: ProviderSessionKey) -> bool:
         return True
 
+    def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer:
+        return _contract_pointer_for_provider_session(
+            key.provider_session_id,
+            provider_instance_id=key.provider_instance_id,
+            provider_id=key.provider_id,
+        )
+
     async def valid(self, **kwargs) -> bool:
         raise AssertionError(f"unexpected provider-session valid call: {kwargs}")
 
@@ -204,6 +224,7 @@ def _action_command(
     action_instance_id: str,
     binding_id: str,
     page_session_id: str | None = None,
+    contract: ContractPointer | None = None,
 ) -> DeckrMessage:
     return action_message(
         sender=PROVIDER_ADDR,
@@ -220,6 +241,7 @@ def _action_command(
             binding_id=binding_id,
             page_session_id=page_session_id,
         ),
+        contract=contract or _contract_pointer_for_provider_session(),
     )
 
 
@@ -243,6 +265,7 @@ def _provider_settings_command(
     *,
     sender_provider_instance_id: str = PROVIDER_INSTANCE_ID,
     settings: dict | None = None,
+    contract: ContractPointer | None = None,
 ) -> DeckrMessage:
     body: dict = {"target": target.to_dict()}
     if settings is not None:
@@ -255,6 +278,11 @@ def _provider_settings_command(
         body=body,
         subject=action_provider_instance_subject(
             sender_provider_instance_id,
+            provider_id=target.provider_id,
+        ),
+        contract=contract
+        or _contract_pointer_for_provider_session(
+            provider_instance_id=sender_provider_instance_id,
             provider_id=target.provider_id,
         ),
     )
@@ -299,6 +327,16 @@ def _seed_action_availability(
     manager: DeviceManager,
     *metadatas: ActionMetadata,
 ) -> None:
+    if (
+        getattr(manager._action_availability_service, "_provider_sessions", None)
+        is None
+        and any(
+            metadata.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
+            and metadata.provider_session_id is not None
+            for metadata in metadatas
+        )
+    ):
+        manager._action_availability_service._provider_sessions = ReadyProviderSessions()
     for metadata in metadatas:
         manager._action_availability.record_available(metadata)
 
@@ -364,6 +402,7 @@ def _action_instance_command(
     action_instance_id: str,
     config_id: str = "test-device",
     sender_session_id: str = PROVIDER_SESSION_ID,
+    contract: ContractPointer | None = None,
 ) -> DeckrMessage:
     return action_message(
         sender=PROVIDER_ADDR,
@@ -378,6 +417,8 @@ def _action_instance_command(
             config_id=config_id,
             action_instance_id=action_instance_id,
         ),
+        contract=contract
+        or _contract_pointer_for_provider_session(sender_session_id),
     )
 
 
@@ -390,6 +431,7 @@ def _page_session_command(
     action_instance_id: str,
     config_id: str = "test-device",
     sender_session_id: str = PROVIDER_SESSION_ID,
+    contract: ContractPointer | None = None,
 ) -> DeckrMessage:
     return action_message(
         sender=PROVIDER_ADDR,
@@ -405,6 +447,8 @@ def _page_session_command(
             action_instance_id=action_instance_id,
             page_session_id=session_id,
         ),
+        contract=contract
+        or _contract_pointer_for_provider_session(sender_session_id),
     )
 
 
@@ -827,7 +871,7 @@ async def _prepare_provider_settings_session(
     concord: Concord,
     *,
     provider_id: str = "dev.deckr.clock",
-) -> None:
+) -> ContractPointer:
     snapshot = await provider_sessions.prepare(
         _metadata("provider-settings", provider_id=provider_id)
     )
@@ -838,6 +882,7 @@ async def _prepare_provider_settings_session(
         participant=PROVIDER_ADDR,
         session_id=PROVIDER_SESSION_ID,
     )
+    return session.contract_pointer
 
 
 async def _next_action_message(
@@ -1089,7 +1134,7 @@ async def test_provider_settings_patch_after_beacon_loss_uses_concord_session():
         action_bus,
         lambda fn, *a, **k: None,
     )
-    await _prepare_provider_settings_session(provider_sessions, concord)
+    contract = await _prepare_provider_settings_session(provider_sessions, concord)
     registry = MagicMock()
     registry.provider_session_id.return_value = None
     registry.provider_instance_provides_provider.return_value = False
@@ -1106,6 +1151,7 @@ async def test_provider_settings_patch_after_beacon_loss_uses_concord_session():
                 SETTINGS_PATCH,
                 _provider_settings_target(),
                 settings={"timezone": "Europe/Amsterdam"},
+                contract=contract,
             )
         )
         reply = await _next_action_message(stream)
@@ -1145,6 +1191,38 @@ async def test_provider_settings_patch_from_non_owning_provider_is_ignored():
     assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
         "timezone": "UTC"
     }
+    registry.provider_instance_provides_provider.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_provider_settings_wrong_contract_skips_session_validation():
+    config_service = MemoryConfigService(_provider_settings_config())
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    manager = _provider_settings_device_manager(
+        config_service=config_service,
+        actions_bus=action_bus,
+        registry=registry,
+        provider_sessions=ReadyProviderSessions(),
+    )
+
+    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+        await manager.handle_command(
+            _provider_settings_command(
+                SETTINGS_PATCH,
+                _provider_settings_target(),
+                settings={"timezone": "Europe/Amsterdam"},
+                contract=ContractPointer(contractId="wrong-contract", generation=1),
+            )
+        )
+        await _assert_no_action_message(stream)
+
+    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
+        "timezone": "UTC"
+    }
+    registry.provider_session_id.assert_not_called()
     registry.provider_instance_provides_provider.assert_not_called()
 
 
@@ -1195,7 +1273,7 @@ async def test_provider_settings_rejects_invalid_concord_session():
         action_bus,
         lambda fn, *a, **k: None,
     )
-    await _prepare_provider_settings_session(provider_sessions, concord)
+    contract = await _prepare_provider_settings_session(provider_sessions, concord)
     session = next(iter(provider_sessions._sessions.values()))
     await concord.cancel(
         session.contract, participant=CONTROLLER_ADDR, reason="test invalid"
@@ -1216,6 +1294,7 @@ async def test_provider_settings_rejects_invalid_concord_session():
                 SETTINGS_PATCH,
                 _provider_settings_target(),
                 settings={"timezone": "Europe/Amsterdam"},
+                contract=contract,
             )
         )
         await _assert_no_action_message(stream)
@@ -5086,6 +5165,7 @@ async def test_provider_direct_availability_resolves_candidate_control(
             actions_bus=_actions_session(action_bus),
             start_soon=start_soon,
         )
+        manager._action_availability_service._provider_sessions = ReadyProviderSessions()
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
 

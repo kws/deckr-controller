@@ -31,6 +31,7 @@ from deckr.concord import (
     ContractValidityStatus,
     ParticipantHandle,
 )
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import (
     ACTIONS_LANE,
     HARDWARE_MESSAGES_LANE,
@@ -122,6 +123,13 @@ class OwnedHardwareClaim:
     @property
     def contract(self) -> ContractHandle:
         return self.agreement.contract
+
+    @property
+    def contract_pointer(self) -> ContractPointer:
+        return ContractPointer(
+            contractId=self.contract.contract_id,
+            generation=self.contract.generation,
+        )
 
 
 class ControllerService(BaseComponent):
@@ -332,17 +340,19 @@ class ControllerService(BaseComponent):
                     await ctrl_ctx.on_command_rejected(event)
 
     async def _hardware_directory_snapshot_loop(self, stopping: anyio.Event) -> None:
-        async for _records in self._hardware_directory.watch_records():
-            if stopping.is_set():
-                return
-            await self._hardware_reconcile_notifications.request(
-                "hardware Beacon directory snapshot"
-            )
+        async with cancel_on_stopping(stopping):
+            async for _records in self._hardware_directory.watch_records():
+                if stopping.is_set():
+                    return
+                await self._hardware_reconcile_notifications.request(
+                    "hardware Beacon directory snapshot"
+                )
 
     async def _hardware_reconciliation_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():
             try:
-                await self._hardware_directory.wait_current()
+                async with cancel_on_stopping(stopping):
+                    await self._hardware_directory.wait_current()
                 if stopping.is_set():
                     return
                 await self._reconcile_hardware_current_state(reason="broker snapshot")
@@ -642,6 +652,7 @@ class ControllerService(BaseComponent):
             config_id=owned.config_id,
             ref=owned.ref,
             device=device,
+            contract=owned.contract_pointer,
             manager_session_id=manager_session_id,
         )
         owned.device = device
@@ -650,6 +661,7 @@ class ControllerService(BaseComponent):
             config_id=owned.config_id,
             ref=owned.ref,
             device=device,
+            contract=owned.contract_pointer,
             manager_session_id=manager_session_id,
         )
         await self.on_device_connected(live, initial_config=config)
@@ -747,6 +759,7 @@ class ControllerService(BaseComponent):
             config_id=next_config.id,
             ref=owned.ref,
             device=candidate.device,
+            contract=owned.contract_pointer,
             manager_session_id=candidate.payload.session_id,
         )
         owned.live = True
@@ -754,6 +767,7 @@ class ControllerService(BaseComponent):
             config_id=next_config.id,
             ref=owned.ref,
             device=candidate.device,
+            contract=owned.contract_pointer,
             manager_session_id=candidate.payload.session_id,
         )
         await self.on_device_connected(live, initial_config=next_config)
@@ -774,6 +788,7 @@ class ControllerService(BaseComponent):
         updated = self._device_registry.update_descriptor(
             ref=owned.ref,
             device=candidate.device,
+            contract=owned.contract_pointer,
             manager_session_id=candidate.payload.session_id,
         )
         if updated is None:
@@ -783,6 +798,7 @@ class ControllerService(BaseComponent):
             config_id=updated.config_id,
             ref=updated.ref,
             device=updated.device,
+            contract=updated.contract,
             manager_session_id=updated.manager_session_id,
         )
         ctrl_ctx = await self._controller_contexts.get(updated.config_id)

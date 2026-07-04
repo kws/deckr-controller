@@ -23,7 +23,7 @@ from deckr.profiles import (
 )
 from deckr.substrates.nats_kv import KvUnavailable
 
-from deckr.controller._stop_aware import sleep_until_stopping
+from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
 from deckr.controller.action_provider.builtin import (
     BuiltinAction,
     BuiltinRegistry,
@@ -235,17 +235,19 @@ class ActionRegistry(BaseComponent):
         await self._directory.aclose()
 
     async def _directory_snapshot_loop(self, stopping: anyio.Event) -> None:
-        async for _records in self._directory.watch_records():
-            if stopping.is_set():
-                return
-            await self._reconcile_notifications.request(
-                "actions Beacon directory snapshot"
-            )
+        async with cancel_on_stopping(stopping):
+            async for _records in self._directory.watch_records():
+                if stopping.is_set():
+                    return
+                await self._reconcile_notifications.request(
+                    "actions Beacon directory snapshot"
+                )
 
     async def _reconciliation_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():
             try:
-                await self._directory.wait_current()
+                async with cancel_on_stopping(stopping):
+                    await self._directory.wait_current()
                 if stopping.is_set():
                     return
                 await self._reconcile_current_state(reason="broker snapshot")

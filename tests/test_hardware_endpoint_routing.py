@@ -25,6 +25,7 @@ from deckr.concord import (
     ContractValidity,
     ContractValidityStatus,
 )
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import (
     TraceContext,
     controller_address,
@@ -54,6 +55,7 @@ from deckr.controller._hardware_service import (
 from deckr.controller.config import DeviceConfig, DeviceConfigMatch, Page, Profile
 
 CONTROLLER_ID = "controller-main"
+CONTRACT = ContractPointer(contractId="hardware-contract-1", generation=1)
 
 
 @pytest.mark.asyncio
@@ -74,6 +76,7 @@ async def test_send_with_endpoint_identity_restamps_sender_and_preserves_metadat
         control_id="0,0",
         params={},
         recipient_session_id=manager_endpoint.session_id,
+        contract=CONTRACT,
     ).model_copy(
         update={
             "ttl_ms": 1234,
@@ -422,17 +425,29 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
     ref_a = DeviceRef(manager_id="room-a", device_id="deck")
     ref_b = DeviceRef(manager_id="room-b", device_id="deck")
 
-    registry.connect(config_id="config-room-a", ref=ref_a, device=_device("deck", "a"))
-    registry.connect(config_id="config-room-b", ref=ref_b, device=_device("deck", "b"))
+    registry.connect(
+        config_id="config-room-a",
+        ref=ref_a,
+        device=_device("deck", "a"),
+        contract=CONTRACT,
+    )
+    registry.connect(
+        config_id="config-room-b",
+        ref=ref_b,
+        device=_device("deck", "b"),
+        contract=ContractPointer(contractId="hardware-contract-2", generation=1),
+    )
     command_service.register_device(
         config_id="config-room-a",
         ref=ref_a,
         device=_device("deck", "a"),
+        contract=CONTRACT,
     )
     command_service.register_device(
         config_id="config-room-b",
         ref=ref_b,
         device=_device("deck", "b"),
+        contract=ContractPointer(contractId="hardware-contract-2", generation=1),
     )
 
     async with (

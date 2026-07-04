@@ -20,4 +20,5 @@ async def send_with_endpoint_identity(
         ttl_ms=message.ttl_ms,
         causation_id=message.causation_id,
         trace=message.trace,
+        contract=message.contract,
     )

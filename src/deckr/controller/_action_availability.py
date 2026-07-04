@@ -33,6 +33,7 @@ from deckr.actions.messages import (
     ActionInterestUpdateBody,
     action_provider_instance_subject,
 )
+from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import ACTIONS_LANE, DeckrMessage
 from deckr.lanes import EndpointSession
 
@@ -114,6 +115,8 @@ class ActionProviderSessionPreparer(Protocol):
         self,
         actions: Iterable[ActionMetadata],
     ) -> Mapping[object, object]: ...
+
+    def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer | None: ...
 
     async def valid(
         self,
@@ -1152,6 +1155,20 @@ class ActionAvailabilityService:
                 exc_info=True,
             )
             return False
+
+    def contract_pointer(
+        self,
+        key: ProviderSessionKey | None,
+    ) -> ContractPointer | None:
+        if key is None:
+            return None
+        provider_sessions = self._provider_sessions
+        if provider_sessions is None:
+            return None
+        contract_pointer = getattr(provider_sessions, "contract_pointer", None)
+        if not callable(contract_pointer):
+            return None
+        return contract_pointer(key)
 
     def _provider_session_changed(self) -> None:
         self._last_request_at_by_provider.clear()
