@@ -83,6 +83,8 @@ from deckr.controller._action_availability import (
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
     ActionAvailabilityService,
+    ActionAvailabilitySource,
+    ActionAvailabilityState,
     ActionPlanningSnapshot,
     ProviderActionKey,
 )
@@ -859,7 +861,34 @@ class DeviceManager:
         self,
         action_meta: ActionMetadata,
     ) -> ActionMetadata:
-        return action_meta
+        if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return action_meta
+        intent = ActionIntentKey(
+            action_uuid=action_meta.uuid,
+            provider_instance_id=action_meta.provider_instance_id,
+            provider_labels=tuple(sorted((action_meta.provider_labels or {}).items())),
+        )
+        record = self._action_availability.record_for_intent(
+            intent,
+            now=self._clock(),
+        )
+        if (
+            record is None
+            or record.source != ActionAvailabilitySource.PROVIDER_DIRECT
+            or record.metadata is None
+            or self._action_availability.state_for(record.key, now=self._clock())
+            != ActionAvailabilityState.AVAILABLE
+            or record.metadata.provider_session_id is None
+        ):
+            return action_meta
+        current = record.metadata
+        if (
+            current.uuid != action_meta.uuid
+            or current.provider_instance_id != action_meta.provider_instance_id
+            or current.provider_id != action_meta.provider_id
+        ):
+            return action_meta
+        return current
 
     def _sync_top_frame_state(self) -> None:
         frame = self._page_frames[-1] if self._page_frames else None
@@ -2694,19 +2723,76 @@ class DeviceManager:
         reason: str = "provider_session_changed",
     ) -> None:
         action_instance_id = lease.action_instance_id
+        preserve_page_owner = self._lease_is_active_dynamic_page_owner(
+            lease,
+            planned.action_meta,
+        )
         await self._revoke_binding(
             lease.binding_id,
             clear_output=False,
-            notify_provider=False,
+            notify_provider=True,
             reason=reason,
             clear_held_input=True,
         )
-        await self._destroy_action_instance(
-            action_instance_id,
-            reason=reason,
-            notify_provider=False,
-        )
+        if preserve_page_owner and planned.action_meta is not None:
+            self._move_dynamic_page_owner_provider_session(planned.action_meta)
+            self._action_instance_provider_sessions[action_instance_id] = (
+                provider_session_key(planned.action_meta)
+            )
+        else:
+            await self._destroy_action_instance(
+                action_instance_id,
+                reason=reason,
+                notify_provider=True,
+            )
         await self._install_planned_binding(plan, planned)
+
+    def _lease_is_active_dynamic_page_owner(
+        self,
+        lease: BindingLease,
+        action_meta: ActionMetadata | None,
+    ) -> bool:
+        session = self._dynamic_page_session
+        return (
+            session is not None
+            and action_meta is not None
+            and lease.page_session_id == session.page_session_id
+            and lease.action_instance_id == session.action_instance_id
+            and action_meta.uuid == session.owner_action_uuid
+            and action_meta.provider_instance_id == session.owner_provider_instance_id
+        )
+
+    def _move_dynamic_page_owner_provider_session(
+        self,
+        action_meta: ActionMetadata,
+    ) -> None:
+        session = self._dynamic_page_session
+        if session is None:
+            return
+        if (
+            action_meta.uuid != session.owner_action_uuid
+            or action_meta.provider_instance_id
+            != session.owner_provider_instance_id
+        ):
+            return
+        if (
+            action_meta.provider_id == session.owner_provider_id
+            and action_meta.provider_session_id == session.owner_provider_session_id
+        ):
+            return
+        logger.info(
+            "Moving dynamic page owner provider session config=%s pageSession=%s "
+            "action=%s provider=%s oldSession=%s newSession=%s",
+            self.config_id,
+            session.page_session_id,
+            session.owner_action_uuid,
+            session.owner_provider_instance_id,
+            session.owner_provider_session_id,
+            action_meta.provider_session_id,
+        )
+        session.owner_provider_id = action_meta.provider_id
+        session.owner_provider_session_id = action_meta.provider_session_id
+        session.owner_action_meta = action_meta
 
     def _remove_catalog_candidates(self, catalog_removed: Iterable[str]) -> None:
         keys = tuple(

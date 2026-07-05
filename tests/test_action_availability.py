@@ -166,6 +166,16 @@ class _FakeProviderSessions:
             if action.provider_session_id is not None
         }
 
+    async def refresh_many(self, keys):
+        return {
+            key: SimpleNamespace(
+                key=key,
+                ready=self.ready,
+                terminal=self.terminal,
+            )
+            for key in keys
+        }
+
     async def valid(self, **kwargs) -> bool:
         self.valid_calls.append(kwargs)
         return self.ready and not self.terminal
@@ -1237,10 +1247,10 @@ async def test_service_reconcile_marks_invalid_provider_session_unavailable():
         controller_session_id=action_bus.session_id,
         actions_bus=action_bus.endpoint().session,
         manager=_FakeActionProviderManager(metadata),
-        provider_sessions=_FakeProviderSessions(ready=False),
+        provider_sessions=_FakeProviderSessions(ready=False, terminal=True),
         start_soon=None,
     )
-    service.cache.record_available(metadata, intent=intent, now=0.0)
+    service.cache.record_available(metadata, intent=intent, now=service._clock())
 
     changed = await service.reconcile_provider_sessions()
 
@@ -1250,6 +1260,39 @@ async def test_service_reconcile_marks_invalid_provider_session_unavailable():
     assert record.state == ActionAvailabilityState.UNAVAILABLE
     assert record.reason == PROVIDER_SESSION_INVALID_REASON
     assert service.planning_snapshot((intent,)).unavailable == frozenset({intent})
+
+
+@pytest.mark.asyncio
+async def test_service_reconcile_preserves_nonterminal_provider_session_unavailable():
+    metadata = _metadata(
+        "action.alpha",
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        provider_session_id="negotiating-session",
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    intent = _intent("action.alpha", provider_instance_id="provider-alpha")
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=_FakeActionProviderManager(metadata),
+        provider_sessions=_FakeProviderSessions(ready=False, terminal=False),
+        start_soon=None,
+    )
+    service.cache.record_available(metadata, intent=intent, now=service._clock())
+
+    changed = await service.reconcile_provider_sessions()
+
+    assert changed == frozenset()
+    record = service.cache.record_for(key)
+    assert record is not None
+    assert record.state == ActionAvailabilityState.AVAILABLE
+    assert service.planning_snapshot((intent,)).metadata[intent] == metadata
 
 
 def test_provider_direct_available_after_invalid_session_requires_lifecycle_recovery():
@@ -1320,7 +1363,7 @@ async def test_provider_session_change_reconciles_and_notifies_invalid_records()
         controller_session_id=action_bus.session_id,
         actions_bus=action_bus.endpoint().session,
         manager=_FakeActionProviderManager(metadata),
-        provider_sessions=_FakeProviderSessions(ready=False),
+        provider_sessions=_FakeProviderSessions(ready=False, terminal=True),
         start_soon=lambda fn, *args: scheduled.append((fn, args)),
         on_availability_changed=lambda keys: notified.append(keys),
     )

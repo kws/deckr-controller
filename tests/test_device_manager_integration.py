@@ -11,8 +11,10 @@ from conftest import LaneHarness
 from deckr.actions.endpoints import BUILTIN_ACTION_PROVIDER_ID, action_provider_address
 from deckr.actions.messages import (
     ACTION_INSTANCE_CREATED,
+    ACTION_INSTANCE_DESTROYED,
     ACTION_LIFECYCLE_REJECTED,
     BINDING_ATTACHED,
+    BINDING_DETACHED,
     BINDING_OUTPUT,
     CAPABILITY_INPUT,
     CLOSE_PAGE,
@@ -2026,6 +2028,7 @@ async def test_provider_direct_availability_recreates_binding_for_new_session(
             assert ctx is not None
             lease = next(iter(manager._binding_leases.values()))
             assert lease.provider_session_id == "old-provider-session"
+            assert lease.attached
             await _drain_action_messages(stream)
 
             changed = manager._action_availability_service.ingest_provider_entries(
@@ -2205,11 +2208,23 @@ async def test_provider_direct_availability_recovers_same_session_after_invalida
                 for msg in messages
                 if msg.message_type == ACTION_INSTANCE_CREATED
             ]
+            destroyed = [
+                msg
+                for msg in messages
+                if msg.message_type == ACTION_INSTANCE_DESTROYED
+            ]
             attached = [
                 msg for msg in messages if msg.message_type == BINDING_ATTACHED
             ]
+            detached = [
+                msg for msg in messages if msg.message_type == BINDING_DETACHED
+            ]
             assert len(created) == 1
+            assert len(destroyed) == 1
             assert len(attached) == 1
+            assert len(detached) == 1
+            assert destroyed[0].recipient_session_id == PROVIDER_SESSION_ID
+            assert detached[0].recipient_session_id == PROVIDER_SESSION_ID
             assert created[0].recipient_session_id == PROVIDER_SESSION_ID
             assert attached[0].recipient_session_id == PROVIDER_SESSION_ID
 
@@ -2613,6 +2628,102 @@ async def test_provider_session_terminal_cleanup_no_longer_revokes_bindings(
             assert manager._binding_leases
             assert manager._held_input_bindings
             await _assert_no_action_message(stream)
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_page_owner_moves_to_successor_provider_session(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+    successor_session_id = "new-provider-session"
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            owner_ctx = await manager.action_contexts.get("0,0")
+            assert owner_ctx is not None
+            await _drain_action_messages(stream)
+
+            await manager.open_page(
+                descriptor=_dynamic_page("dynamic-page", "1,0"),
+                context_id=owner_ctx.id,
+            )
+            session = manager._dynamic_page_session
+            assert session is not None
+            child_ctx = await manager.action_contexts.get("1,0")
+            assert child_ctx is not None
+            child_lease = manager._binding_lease_for_control("1,0")
+            assert child_lease is not None
+            action_instance = manager._action_instances[session.action_instance_id]
+            assert session.owner_provider_session_id == PROVIDER_SESSION_ID
+            await _drain_action_messages(stream)
+
+            changed = manager._action_availability_service.ingest_provider_entries(
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+                provider_id=PROVIDER_ID,
+                provider_session_id=successor_session_id,
+                entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
+            )
+            await manager.on_action_availability_changed(changed)
+
+            replacement_child_ctx = await manager.action_contexts.get("1,0")
+            assert replacement_child_ctx is not None
+            assert replacement_child_ctx is not child_ctx
+            assert replacement_child_ctx.provider_session_id == successor_session_id
+            replacement_lease = manager._binding_lease_for_control("1,0")
+            assert replacement_lease is not None
+            assert replacement_lease is not child_lease
+            assert replacement_lease.provider_session_id == successor_session_id
+            assert manager._dynamic_page_session is session
+            assert session.owner_provider_session_id == successor_session_id
+            assert manager._action_instances[session.action_instance_id] is action_instance
+            action_session = manager._action_instance_provider_sessions[
+                session.action_instance_id
+            ]
+            assert action_session is not None
+            assert action_session.provider_session_id == successor_session_id
+
+            await manager.handle_command(
+                _page_session_command(
+                    CLOSE_PAGE,
+                    {},
+                    session_id=session.page_session_id,
+                    context_id=session.context_id,
+                    action_instance_id=session.action_instance_id,
+                    sender_session_id=successor_session_id,
+                    contract=_contract_pointer_for_provider_session(
+                        successor_session_id
+                    ),
+                )
+            )
+
+            assert manager._dynamic_page_session is None
+            restored_ctx = await manager.action_contexts.get("0,0")
+            assert restored_ctx is not None
+            assert restored_ctx.provider_session_id == successor_session_id
 
         tg.cancel_scope.cancel()
 

@@ -227,13 +227,12 @@ class BindingPlanner:
         outcomes: list[BindingPlanOutcome] = []
         validation_errors: list[ValidationError] = []
         effective_action_metadata = dict(action_metadata)
-        effective_action_metadata[
-            ActionIntentKey(
-                action_uuid=page_session.owner_action_uuid,
-                provider_instance_id=page_session.owner_provider_instance_id,
-                provider_labels=(),
-            )
-        ] = page_session.owner_action_meta
+        owner_intent = ActionIntentKey(
+            action_uuid=page_session.owner_action_uuid,
+            provider_instance_id=page_session.owner_provider_instance_id,
+            provider_labels=(),
+        )
+        effective_action_metadata.setdefault(owner_intent, page_session.owner_action_meta)
 
         for child in entry.bindings:
             binding = self._dynamic_page_child_binding(

@@ -117,6 +117,11 @@ class ActionProviderSessionPreparer(Protocol):
         actions: Iterable[ActionMetadata],
     ) -> Mapping[object, object]: ...
 
+    async def refresh_many(
+        self,
+        keys: Iterable[ProviderSessionKey],
+    ) -> Mapping[ProviderSessionKey, object]: ...
+
     def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer | None: ...
 
     async def valid(
@@ -1164,6 +1169,25 @@ class ActionAvailabilityService:
             )
             return False
 
+    async def _provider_session_snapshot(
+        self,
+        key: ProviderSessionKey,
+    ) -> object | None:
+        provider_sessions = self._provider_sessions
+        if provider_sessions is None:
+            return None
+        try:
+            snapshots = await provider_sessions.refresh_many((key,))
+        except Exception:
+            logger.warning(
+                "Could not refresh action provider session for %s/%s",
+                key.provider_instance_id,
+                key.provider_id,
+                exc_info=True,
+            )
+            return None
+        return snapshots.get(key)
+
     async def _await_provider_session_valid(
         self,
         *,
@@ -1234,11 +1258,15 @@ class ActionAvailabilityService:
                 and record.reason == PROVIDER_SESSION_INVALID_REASON
             ):
                 continue
-            if await self.provider_session_valid(
-                provider_instance_id=metadata.provider_instance_id,
-                provider_id=metadata.provider_id,
-                provider_session_id=metadata.provider_session_id,
-            ):
+            session_key = ProviderSessionKey(
+                metadata.provider_instance_id,
+                metadata.provider_id,
+                metadata.provider_session_id,
+            )
+            snapshot = await self._provider_session_snapshot(session_key)
+            if snapshot is not None and getattr(snapshot, "ready", False):
+                continue
+            if snapshot is None or not getattr(snapshot, "terminal", False):
                 continue
             mapped_intent = self._mapped_intent_for_key(record.key)
             old_state = self.cache.state_for(record.key, now=now)
