@@ -53,6 +53,7 @@ class DynamicPageSession:
     owner_provider_instance_id: str
     owner_provider_id: str
     owner_provider_session_id: str | None
+    owner_action_meta: ActionMetadata
     owner_profile: str
     owner_page: int
     timeout_ms: int
@@ -225,6 +226,14 @@ class BindingPlanner:
         planned: list[PlannedBinding] = []
         outcomes: list[BindingPlanOutcome] = []
         validation_errors: list[ValidationError] = []
+        effective_action_metadata = dict(action_metadata)
+        effective_action_metadata[
+            ActionIntentKey(
+                action_uuid=page_session.owner_action_uuid,
+                provider_instance_id=page_session.owner_provider_instance_id,
+                provider_labels=(),
+            )
+        ] = page_session.owner_action_meta
 
         for child in entry.bindings:
             binding = self._dynamic_page_child_binding(
@@ -281,7 +290,7 @@ class BindingPlanner:
                     child=child,
                     binding=resolved.binding,
                 ),
-                action_metadata=action_metadata,
+                action_metadata=effective_action_metadata,
                 action_status=action_status or {},
                 retained_plan=retained_plan,
                 page_session_id=page_session.page_session_id,

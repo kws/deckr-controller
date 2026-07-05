@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROVIDER_REVALIDATION_SECONDS = 60.0
 DEFAULT_STALE_GRACE_SECONDS = 5 * 60.0
+DEFAULT_PROVIDER_SESSION_VALIDATION_WAIT_SECONDS = 5.0
 PROVIDER_SESSION_INVALID_REASON = "provider_session_invalid"
 _HASH_SIZE = 12
 
@@ -757,6 +758,9 @@ class ActionAvailabilityService:
         cache: ActionAvailabilityCache | None = None,
         clock: Callable[[], float] | None = None,
         revalidation_interval_seconds: float = DEFAULT_PROVIDER_REVALIDATION_SECONDS,
+        provider_session_validation_wait_seconds: float = (
+            DEFAULT_PROVIDER_SESSION_VALIDATION_WAIT_SECONDS
+        ),
     ) -> None:
         self.controller_id = controller_id
         self.controller_session_id = controller_session_id
@@ -767,6 +771,9 @@ class ActionAvailabilityService:
         self._clock = clock or time.monotonic
         self._start_soon = start_soon
         self._revalidation_interval_seconds = revalidation_interval_seconds
+        self._provider_session_validation_wait_seconds = (
+            provider_session_validation_wait_seconds
+        )
         self._interest_by_config: dict[str, ActionInterestSnapshot] = {}
         self._last_interest_wire_by_provider: dict[
             str,
@@ -967,10 +974,11 @@ class ActionAvailabilityService:
                 msg.sender,
             )
             return frozenset()
-        if not await self.provider_session_valid(
+        if not await self._await_provider_session_valid(
             provider_instance_id=body.provider_instance_id,
             provider_id=body.provider_id,
             provider_session_id=msg.sender_session_id,
+            message_type=msg.message_type,
         ):
             logger.warning(
                 "Ignoring availability message %s from provider %s without valid "
@@ -1155,6 +1163,42 @@ class ActionAvailabilityService:
                 exc_info=True,
             )
             return False
+
+    async def _await_provider_session_valid(
+        self,
+        *,
+        provider_instance_id: str,
+        provider_id: str,
+        provider_session_id: str | None,
+        message_type: str,
+    ) -> bool:
+        if await self.provider_session_valid(
+            provider_instance_id=provider_instance_id,
+            provider_id=provider_id,
+            provider_session_id=provider_session_id,
+        ):
+            return True
+        wait_seconds = self._provider_session_validation_wait_seconds
+        if wait_seconds <= 0:
+            return False
+        logger.debug(
+            "Awaiting Concord provider-session validation for availability "
+            "message type=%s provider=%s provider_id=%s provider_session=%s",
+            message_type,
+            provider_instance_id,
+            provider_id,
+            provider_session_id,
+        )
+        with anyio.move_on_after(wait_seconds):
+            while True:
+                await anyio.sleep(0.05)
+                if await self.provider_session_valid(
+                    provider_instance_id=provider_instance_id,
+                    provider_id=provider_id,
+                    provider_session_id=provider_session_id,
+                ):
+                    return True
+        return False
 
     def contract_pointer(
         self,

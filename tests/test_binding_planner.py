@@ -131,6 +131,7 @@ def _dynamic_session() -> DynamicPageSession:
         owner_provider_instance_id=PROVIDER_INSTANCE_ID,
         owner_provider_id=PROVIDER_ID,
         owner_provider_session_id=PROVIDER_SESSION_ID,
+        owner_action_meta=_metadata("action.owner"),
         owner_profile="default",
         owner_page=0,
         timeout_ms=60_000,
@@ -188,7 +189,6 @@ def test_static_structural_validation_failure_has_invalid_outcome_and_no_plan():
 def test_dynamic_self_child_uses_owner_action_and_instance_id():
     planner = _planner()
     session = _dynamic_session()
-    owner_metadata = _metadata("action.owner")
     entry = DynamicPageCommand(
         pageId="dynamic-page",
         bindings=(
@@ -205,7 +205,7 @@ def test_dynamic_self_child_uses_owner_action_and_instance_id():
         entry,
         device=_device("0,0"),
         page_session=session,
-        action_metadata={_intent("action.owner"): owner_metadata},
+        action_metadata={_intent("action.owner"): _metadata("action.owner")},
     )
 
     assert result.plan is not None
@@ -214,9 +214,38 @@ def test_dynamic_self_child_uses_owner_action_and_instance_id():
     assert planned.binding.action_uuid == session.owner_action_uuid
     assert planned.binding.provider_instance_id == session.owner_provider_instance_id
     assert planned.action_instance_id == session.action_instance_id
-    assert planned.action_meta is owner_metadata
+    assert planned.action_meta is session.owner_action_meta
     assert planned.item_key == "item-0"
     assert planned.handler == "open"
+
+
+def test_dynamic_self_child_uses_owner_session_when_catalog_is_pending():
+    planner = _planner()
+    session = _dynamic_session()
+    entry = DynamicPageCommand(
+        pageId="dynamic-page",
+        bindings=(
+            PageChildBindingDescriptor(
+                controlId="0,0",
+                target=PageChildBindingTarget(kind="self"),
+            ),
+        ),
+    )
+
+    result = planner.build_dynamic_page_plan(
+        entry,
+        device=_device("0,0"),
+        page_session=session,
+        action_metadata={},
+        action_status={
+            _intent(session.owner_action_uuid): BindingPlanStatus.PENDING,
+        },
+    )
+
+    assert result.plan is not None
+    planned = result.plan.bindings[0]
+    assert planned.status == BindingPlanStatus.BOUND
+    assert planned.action_meta is session.owner_action_meta
 
 
 def test_explicit_dynamic_child_uses_child_metadata_and_stable_instance_id():

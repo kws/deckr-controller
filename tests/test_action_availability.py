@@ -174,6 +174,18 @@ class _FakeProviderSessions:
         self.closed = True
 
 
+class _SequencedProviderSessions(_FakeProviderSessions):
+    def __init__(self, results: list[bool]) -> None:
+        super().__init__()
+        self._results = list(results)
+
+    async def valid(self, **kwargs) -> bool:
+        self.valid_calls.append(kwargs)
+        if self._results:
+            return self._results.pop(0)
+        return True
+
+
 async def _next_action_message(stream, *, timeout: float = 1.0) -> DeckrMessage:
     with anyio.fail_after(timeout):
         return await anext(stream)
@@ -991,6 +1003,7 @@ async def test_service_ignores_provider_snapshot_without_valid_session():
         ),
         provider_sessions=_FakeProviderSessions(ready=False),
         start_soon=None,
+        provider_session_validation_wait_seconds=0.0,
     )
     key = ProviderActionKey("provider-alpha", "action.alpha")
 
@@ -1017,6 +1030,56 @@ async def test_service_ignores_provider_snapshot_without_valid_session():
 
     assert await service.handle_availability_message(snapshot) == frozenset()
     assert service.cache.record_for(key) is None
+
+
+@pytest.mark.asyncio
+async def test_service_waits_for_provider_snapshot_session_validation():
+    action_bus = LaneHarness(
+        ACTIONS_LANE,
+        default_endpoint=controller_address(CONTROLLER_ID),
+    )
+    provider_address = action_provider_address("provider-alpha")
+    provider_endpoint = action_bus.endpoint(provider_address)
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=action_bus.session_id,
+        actions_bus=action_bus.endpoint().session,
+        manager=_FakeActionProviderManager(
+            provider_sessions={"provider-alpha": provider_endpoint.session_id}
+        ),
+        provider_sessions=_SequencedProviderSessions([False, True]),
+        start_soon=None,
+        provider_session_validation_wait_seconds=0.2,
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+
+    snapshot = await provider_endpoint.send(
+        lane=ACTIONS_LANE,
+        recipient=controller_address(CONTROLLER_ID),
+        subject=action_provider_instance_subject(
+            "provider-alpha",
+            provider_id="provider.test",
+        ),
+        message_type=ACTION_AVAILABILITY_SNAPSHOT,
+        body=ActionAvailabilitySnapshotBody(
+            providerInstanceId="provider-alpha",
+            providerId="provider.test",
+            entries=(
+                ActionAvailabilityEntry(
+                    actionId="action.alpha",
+                    status="available",
+                    descriptor=ActionDescriptor(actionId="action.alpha", name="Alpha"),
+                ),
+            ),
+        ).to_dict(),
+    )
+
+    assert await service.handle_availability_message(snapshot) == frozenset({key})
+    record = service.cache.record_for(key)
+    assert record is not None
+    assert record.state == ActionAvailabilityState.AVAILABLE
+    assert record.metadata is not None
+    assert record.metadata.provider_session_id == provider_endpoint.session_id
 
 
 def test_service_logs_unchanged_provider_snapshot(caplog):

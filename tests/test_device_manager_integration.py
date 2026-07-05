@@ -2062,6 +2062,75 @@ async def test_provider_direct_availability_recreates_binding_for_new_session(
 
 
 @pytest.mark.asyncio
+async def test_provider_direct_pending_preserves_attached_binding(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
+    registry.provider_instance_provides_provider.return_value = True
+    action_bus = _actions_bus()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            ctx = await manager.action_contexts.get("0,0")
+            lease = manager._binding_lease_for_control("0,0")
+            assert ctx is not None
+            assert lease is not None
+            assert lease.attached
+            await _drain_action_messages(stream)
+            manager._render_pending_to_control = AsyncMock()
+
+            changed = manager._action_availability_service.ingest_provider_entries(
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+                provider_id=PROVIDER_ID,
+                provider_session_id=PROVIDER_SESSION_ID,
+                entries=(
+                    ActionAvailabilityEntry(
+                        actionId=SetRasterImageOnAppearAction.uuid,
+                        status="probing",
+                        reason="successor_lease_negotiating",
+                    ),
+                ),
+            )
+            assert changed == frozenset(
+                {
+                    ProviderActionKey(
+                        PROVIDER_INSTANCE_ID,
+                        SetRasterImageOnAppearAction.uuid,
+                    )
+                }
+            )
+            await manager.on_action_availability_changed(changed)
+
+            assert await manager.action_contexts.get("0,0") is ctx
+            assert manager._binding_lease_for_control("0,0") is lease
+            assert lease.attached
+            manager._render_pending_to_control.assert_not_awaited()
+            await _assert_no_action_message(stream)
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_provider_direct_availability_recovers_same_session_after_invalidated(
     device_config_set_raster_image,
 ):
@@ -4573,7 +4642,7 @@ async def test_action_lifecycle_rejected_page_session_resource_unavailable_repla
 
 
 @pytest.mark.asyncio
-async def test_stale_lifecycle_rejection_from_current_session_retries_binding(
+async def test_stale_lifecycle_rejection_from_current_session_recovers_binding(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -4634,7 +4703,7 @@ async def test_stale_lifecycle_rejection_from_current_session_retries_binding(
             assert len(attached) == 1
             assert created[0].recipient_session_id == PROVIDER_SESSION_ID
             assert attached[0].recipient_session_id == PROVIDER_SESSION_ID
-            assert lease.stale_lifecycle_retries == 1
+            assert lease.stale_lifecycle_recoveries == 1
 
             await manager.handle_command(msg)
             await _assert_no_action_message(stream)

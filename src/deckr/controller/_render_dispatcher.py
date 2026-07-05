@@ -27,6 +27,7 @@ class ControlOutput(Protocol):
 
 
 logger = logging.getLogger(__name__)
+MAX_ACTIVE_RENDERS_PER_CONTROL = 2
 
 
 def _init_render_worker() -> None:
@@ -38,6 +39,10 @@ def _init_render_worker() -> None:
     """
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+class RenderWorkerImageFetchError(Exception):
+    """Pickle-safe wrapper for image fetch failures raised inside render workers."""
 
 
 def default_render_workers() -> int:
@@ -123,7 +128,7 @@ class ProcessPoolRenderBackend:
                 generation=request.generation,
                 frame=frame,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, RenderWorkerImageFetchError) as exc:
             logger.warning(
                 "Process render skipped after image fetch failed for %s:%s gen=%s: %s",
                 request.context_id,
@@ -170,7 +175,14 @@ async def _run_in_process_pool(
     """
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, render_request_to_jpeg, request)
+    return await loop.run_in_executor(executor, _render_request_to_jpeg_worker, request)
+
+
+def _render_request_to_jpeg_worker(request: RenderRequest) -> bytes:
+    try:
+        return render_request_to_jpeg(request)
+    except httpx.HTTPError as exc:
+        raise RenderWorkerImageFetchError(str(exc)) from None
 
 
 @dataclass(slots=True)
@@ -179,7 +191,7 @@ class _ControlRenderState:
     context_id: str | None = None
     binding_id: str | None = None
     output: ControlOutput | None = None
-    running: bool = False
+    active_render_count: int = 0
     pending_request: RenderRequest | None = None
     io_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
@@ -245,32 +257,34 @@ class RenderDispatcher:
                 control_id=control_id,
                 generation=generation,
             )
-            if state.running:
+            if state.active_render_count >= MAX_ACTIVE_RENDERS_PER_CONTROL:
                 replaced_pending = state.pending_request is not None
                 state.pending_request = request
                 logger.debug(
                     "Render dispatcher request queued config=%s control=%s "
-                    "binding=%s context=%s generation=%s running=True "
-                    "replaced_pending=%s",
+                    "binding=%s context=%s generation=%s active=%s "
+                    "replaced_pending=%s start_now=False",
                     self._config_id,
                     control_id,
                     binding_id,
                     context_id,
                     generation,
+                    state.active_render_count,
                     replaced_pending,
                 )
             else:
-                state.running = True
+                state.active_render_count += 1
                 self._start_soon(self._run_control, control_id, request)
                 logger.debug(
                     "Render dispatcher request queued config=%s control=%s "
-                    "binding=%s context=%s generation=%s running=False "
-                    "replaced_pending=False",
+                    "binding=%s context=%s generation=%s active=%s "
+                    "replaced_pending=False start_now=True",
                     self._config_id,
                     control_id,
                     binding_id,
                     context_id,
                     generation,
+                    state.active_render_count,
                 )
             return generation
 
@@ -327,7 +341,7 @@ class RenderDispatcher:
                     return
                 next_request = state.pending_request
                 if next_request is None:
-                    state.running = False
+                    state.active_render_count = max(0, state.active_render_count - 1)
                     return
                 state.pending_request = None
             current = next_request

@@ -1507,7 +1507,7 @@ class DeviceManager:
         )
         await send_with_endpoint_identity(self._actions_bus, msg)
 
-    async def _retry_binding_lifecycle(
+    async def _recover_binding_lifecycle(
         self,
         lease: BindingLease,
         *,
@@ -1515,7 +1515,7 @@ class DeviceManager:
     ) -> None:
         if lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        if lease.stale_lifecycle_retries >= 1:
+        if lease.stale_lifecycle_recoveries >= 1:
             logger.info(
                 "Ignoring repeated stale lifecycle rejection config=%s control=%s "
                 "action=%s provider=%s binding=%s reason=%s",
@@ -1530,9 +1530,9 @@ class DeviceManager:
         metadata = self._action_instances.get(lease.action_instance_id)
         if metadata is None:
             return
-        lease.stale_lifecycle_retries += 1
+        lease.stale_lifecycle_recoveries += 1
         logger.info(
-            "Retrying binding lifecycle config=%s control=%s action=%s "
+            "Recovering binding lifecycle config=%s control=%s action=%s "
             "provider=%s binding=%s reason=%s",
             self.config_id,
             lease.control_id,
@@ -1550,7 +1550,7 @@ class DeviceManager:
             await lease.context.on_binding_attached()
         if scope.cancel_called:
             logger.warning(
-                "Binding lifecycle retry timed out config=%s control=%s action=%s "
+                "Binding lifecycle recovery timed out config=%s control=%s action=%s "
                 "provider=%s binding=%s timeout=%ss",
                 self.config_id,
                 lease.control_id,
@@ -2305,6 +2305,12 @@ class DeviceManager:
             owner_provider_session_id = owner_lease.provider_session_id
             action_instance_id = owner_lease.action_instance_id
             settings_target = owner_lease.settings_target
+            owner_action_meta = ActionMetadata(
+                uuid=owner_action_uuid,
+                provider_instance_id=owner_provider_instance_id,
+                provider_id=owner_provider_id,
+                provider_session_id=owner_provider_session_id,
+            )
 
             page_id = descriptor.page_id or make_dynamic_page_id()
             descriptor = DynamicPageCommand(
@@ -2324,6 +2330,7 @@ class DeviceManager:
                 owner_provider_instance_id=owner_provider_instance_id,
                 owner_provider_id=owner_provider_id,
                 owner_provider_session_id=owner_provider_session_id,
+                owner_action_meta=owner_action_meta,
                 owner_profile=owner_profile,
                 owner_page=owner_page,
                 timeout_ms=timeout_ms,
@@ -2583,10 +2590,36 @@ class DeviceManager:
 
             for planned in refreshed_plan.bindings:
                 lease = self._binding_lease_for_control(planned.control_id)
-                if planned.status in {
-                    BindingPlanStatus.PENDING,
-                    BindingPlanStatus.UNAVAILABLE,
-                }:
+                if planned.status == BindingPlanStatus.PENDING:
+                    if lease is not None:
+                        logger.debug(
+                            "Preserving existing binding during pending action "
+                            "availability config=%s page=%s control=%s action=%s "
+                            "provider=%s binding=%s",
+                            self.config_id,
+                            refreshed_plan.page_id,
+                            planned.control_id,
+                            (
+                                planned.action_meta.uuid
+                                if planned.action_meta is not None
+                                else planned.binding.action_uuid
+                            ),
+                            lease.provider_instance_id,
+                            lease.binding_id,
+                        )
+                        continue
+                    control = _find_control_surface(
+                        self.device,
+                        planned.control_id,
+                        raster_capability_id=_selected_raster_capability_id(
+                            planned.binding
+                        ),
+                    )
+                    if control is not None:
+                        await self._render_pending_to_control(control)
+                    continue
+
+                if planned.status == BindingPlanStatus.UNAVAILABLE:
                     if lease is not None:
                         await self._revoke_binding(
                             lease.binding_id,
@@ -2602,10 +2635,7 @@ class DeviceManager:
                         ),
                     )
                     if control is not None:
-                        if planned.status == BindingPlanStatus.PENDING:
-                            await self._render_pending_to_control(control)
-                        else:
-                            await self._render_unavailable_to_control(control)
+                        await self._render_unavailable_to_control(control)
                     continue
 
                 if lease is None:
@@ -2769,7 +2799,7 @@ class DeviceManager:
         if binding_id is not None:
             lease = self._binding_leases.get(binding_id)
             if lease is None or lease.context_id != context_id:
-                logger.warning(
+                logger.debug(
                     "Ignoring action command %s from %s for inactive binding %s",
                     msg.message_type,
                     msg.sender,
@@ -3157,7 +3187,7 @@ class DeviceManager:
         ):
             logger.warning("Ignoring stale lifecycle rejection for mismatched binding")
             return
-        await self._retry_binding_lifecycle(
+        await self._recover_binding_lifecycle(
             lease,
             reason="stale_lifecycle_rejected",
         )

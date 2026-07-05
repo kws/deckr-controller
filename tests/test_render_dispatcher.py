@@ -37,7 +37,9 @@ from deckr.controller._render import (
 from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
     RenderDispatcher,
+    RenderWorkerImageFetchError,
     ThreadRenderBackend,
+    _render_request_to_jpeg_worker,
 )
 from deckr.controller._render_observation import (
     ObservingRenderBackend,
@@ -252,13 +254,14 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
         )
 
         with anyio.fail_after(1.0):
-            while backend.calls != [1]:
+            while backend.calls != [1, 2]:
                 await anyio.sleep(0.01)
 
-        backend.release(1)
+        backend.release(2)
         with anyio.fail_after(1.0):
-            while backend.calls != [1, 3]:
+            while backend.calls != [1, 2, 3]:
                 await anyio.sleep(0.01)
+        command_service.set_raster_frame.assert_not_awaited()
 
         backend.release(3)
         with anyio.fail_after(1.0):
@@ -272,6 +275,9 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
             "raster.bitmap",
             b"frame-3",
         )
+        backend.release(1)
+        await anyio.sleep(0.05)
+        command_service.set_raster_frame.assert_awaited_once()
         tg.cancel_scope.cancel()
 
 
@@ -380,6 +386,38 @@ async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
         tg.cancel_scope.cancel()
 
 
+@pytest.mark.asyncio
+async def test_render_dispatcher_preserves_existing_frame_when_render_returns_none():
+    command_service = FakeHardwareCommandService()
+    backend = ImmediateBackend(frame=None, error="image fetch failed")
+    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
+    output.last_frame = b"previous-frame"
+
+    async with anyio.create_task_group() as tg:
+        dispatcher = RenderDispatcher(
+            command_service=command_service,
+            config_id="dev",
+            backend=backend,
+            start_soon=tg.start_soon,
+        )
+        await dispatcher.submit_request(
+            control_id="0,0",
+            context_id="ctx",
+            request=_solid_request(),
+            output=output,
+        )
+
+        with anyio.fail_after(1.0):
+            while not backend.calls:
+                await anyio.sleep(0.01)
+        await anyio.sleep(0.05)
+
+        assert output.last_frame == b"previous-frame"
+        command_service.set_raster_frame.assert_not_awaited()
+        command_service.clear_raster.assert_not_awaited()
+        tg.cancel_scope.cancel()
+
+
 @pytest.mark.parametrize(
     ("model", "case_id"),
     [
@@ -457,6 +495,28 @@ async def test_thread_render_backend_skips_http_image_fetch_failures(
     assert result.frame is None
     assert result.error == "timed out"
     assert "image fetch failed" in caplog.text
+
+
+def test_render_worker_wraps_http_image_fetch_failures(monkeypatch):
+    def fail_render(request):
+        del request
+        response = httpx.Response(
+            503,
+            request=httpx.Request("GET", "http://127.0.0.1/image.png"),
+        )
+        raise httpx.HTTPStatusError(
+            "503 Service Unavailable",
+            request=response.request,
+            response=response,
+        )
+
+    monkeypatch.setattr(
+        "deckr.controller._render_dispatcher.render_request_to_jpeg",
+        fail_render,
+    )
+
+    with pytest.raises(RenderWorkerImageFetchError, match="503 Service Unavailable"):
+        _render_request_to_jpeg_worker(_solid_request())
 
 
 @pytest.mark.asyncio
