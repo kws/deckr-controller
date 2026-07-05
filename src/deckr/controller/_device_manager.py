@@ -2082,7 +2082,7 @@ class DeviceManager:
     ) -> PageCommit:
         arriving = plan.entry
         preserve_output_control_ids = (
-            frozenset(planned.control_id for planned in plan.bindings)
+            self._preserved_output_control_ids(plan)
             if preserve_rebound_outputs
             else frozenset()
         )
@@ -2096,6 +2096,25 @@ class DeviceManager:
                 f"{self._describe_page_entry(arriving)}"
             ),
         )
+
+    def _preserved_output_control_ids(self, plan: PagePlan) -> frozenset[str]:
+        preserved: set[str] = set()
+        for planned in plan.bindings:
+            lease = self._binding_lease_for_control(planned.control_id)
+            if lease is None or planned.action_meta is None:
+                continue
+            action_meta = self._action_metadata_with_current_session(
+                planned.action_meta
+            )
+            if (
+                _lease_matches_action(lease, action_meta)
+                and lease.action_instance_id == planned.action_instance_id
+                and lease.page_session_id == planned.page_session_id
+                and lease.item_key == planned.item_key
+                and lease.handler == planned.handler
+            ):
+                preserved.add(planned.control_id)
+        return frozenset(preserved)
 
     async def _apply_page_commit(self, commit: PageCommit) -> None:
         plan = commit.plan

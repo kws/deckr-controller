@@ -232,7 +232,11 @@ class BindingPlanner:
             provider_instance_id=page_session.owner_provider_instance_id,
             provider_labels=(),
         )
-        effective_action_metadata.setdefault(owner_intent, page_session.owner_action_meta)
+        if owner_intent not in (action_status or {}):
+            effective_action_metadata.setdefault(
+                owner_intent,
+                page_session.owner_action_meta,
+            )
 
         for child in entry.bindings:
             binding = self._dynamic_page_child_binding(

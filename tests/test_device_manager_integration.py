@@ -3260,6 +3260,66 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
 
 
 @pytest.mark.asyncio
+async def test_close_dynamic_page_clears_rebound_control_with_different_action(
+    device_config_set_raster_image, persistence_tmp_dir
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, **_: _metadata(uuid)
+    )
+    command_service = FakeHardwareCommandService()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+            _metadata(NoopAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        owner_ctx = await manager.action_contexts.get("0,0")
+        assert owner_ctx is not None
+
+        await manager.open_page(
+            descriptor=_dynamic_page_with_action_child(
+                "dynamic-page",
+                "0,0",
+                action_id=NoopAction.uuid,
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+            ),
+            context_id=owner_ctx.id,
+        )
+        dynamic_ctx = await manager.action_contexts.get("0,0")
+        assert dynamic_ctx is not None
+        assert dynamic_ctx.action_uuid == NoopAction.uuid
+        session = manager._dynamic_page_session
+        assert session is not None
+
+        command_service.clear_raster.reset_mock()
+        await manager.close_page(context_id=session.context_id)
+
+        assert any(
+            call.args[1] == "0,0"
+            for call in command_service.clear_raster.await_args_list
+        )
+        restored_ctx = await manager.action_contexts.get("0,0")
+        assert restored_ctx is not None
+        assert restored_ctx.action_uuid == SetRasterImageOnAppearAction.uuid
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
 async def test_action_availability_refresh_repaints_existing_binding_output(
     device_config_set_raster_image, persistence_tmp_dir, caplog
 ):
