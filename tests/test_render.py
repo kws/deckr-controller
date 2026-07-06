@@ -1,10 +1,15 @@
 """Tests for the controller raster render pipeline."""
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Lock
+
 import httpx
 import pytest
 from invariant import Node, dump_graph_data_uri
 from invariant.params import ref
 
+import deckr.controller.invariant.executor as executor_module
 import deckr.controller.invariant.ops.fetch_url as fetch_url_module
 from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import (
@@ -97,6 +102,33 @@ def test_graph_uri_query_context_is_literal_when_bound_to_render_graph():
     result = get_executor().execute({"src": render_node.node}, ["src"], context=context)
 
     assert result["src"] == "${canvas.width}"
+
+
+def test_get_executor_builds_singleton_once_under_concurrent_calls(monkeypatch):
+    monkeypatch.setattr(executor_module, "_EXECUTOR", None)
+    sentinel = object()
+    barrier = Barrier(8)
+    call_lock = Lock()
+    calls = 0
+
+    def fake_build_executor():
+        nonlocal calls
+        with call_lock:
+            calls += 1
+        time.sleep(0.02)
+        return sentinel
+
+    def call_get_executor(_index: int):
+        barrier.wait(timeout=1.0)
+        return executor_module.get_executor()
+
+    monkeypatch.setattr(executor_module, "build_executor", fake_build_executor)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(call_get_executor, range(8)))
+
+    assert results == [sentinel] * 8
+    assert calls == 1
 
 
 def test_fetch_image_url_http_uses_bounded_timeout(monkeypatch):

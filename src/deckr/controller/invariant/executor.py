@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Lock
 
 import invariant_gfx
 from invariant import Executor, OpRegistry
@@ -40,6 +41,7 @@ def build_executor(*, cache_dir: Path | str | None = None) -> Executor:
 
 
 _EXECUTOR: Executor | None = None
+_EXECUTOR_LOCK = Lock()
 
 
 def get_executor() -> Executor:
@@ -47,5 +49,7 @@ def get_executor() -> Executor:
 
     global _EXECUTOR
     if _EXECUTOR is None:
-        _EXECUTOR = build_executor()
+        with _EXECUTOR_LOCK:
+            if _EXECUTOR is None:
+                _EXECUTOR = build_executor()
     return _EXECUTOR
