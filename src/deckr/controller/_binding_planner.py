@@ -232,11 +232,23 @@ class BindingPlanner:
             provider_instance_id=page_session.owner_provider_instance_id,
             provider_labels=(),
         )
-        if owner_intent not in (action_status or {}):
-            effective_action_metadata.setdefault(
-                owner_intent,
-                page_session.owner_action_meta,
+        owner_action_meta = page_session.owner_action_meta
+        provided_owner_meta = effective_action_metadata.get(owner_intent)
+        if action_status and (
+            action_status.get(owner_intent) == BindingPlanStatus.UNAVAILABLE
+        ):
+            effective_action_metadata.pop(owner_intent, None)
+        elif (
+            provided_owner_meta is not None
+            and (
+                provided_owner_meta.provider_id != page_session.owner_provider_id
+                or provided_owner_meta.provider_session_id
+                != page_session.owner_provider_session_id
             )
+        ):
+            effective_action_metadata[owner_intent] = provided_owner_meta
+        else:
+            effective_action_metadata[owner_intent] = owner_action_meta
 
         for child in entry.bindings:
             binding = self._dynamic_page_child_binding(
