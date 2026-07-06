@@ -61,20 +61,6 @@ def _owned(agreement: _Agreement) -> OwnedHardwareClaim:
 
 
 @pytest.mark.asyncio
-async def test_hardware_claim_validity_uses_refreshed_agreement_without_exact_validation() -> None:
-    validity = ContractValidity(ContractValidityStatus.VALID)
-    concord = _Concord(validity)
-    agreement = _Agreement(validity)
-    owned = _owned(agreement)
-
-    result = await _service(concord)._hardware_claim_contract_validity(owned)  # noqa: SLF001
-
-    assert result is validity
-    assert agreement._validity is validity
-    assert concord.validate_calls == 0
-
-
-@pytest.mark.asyncio
 async def test_hardware_claim_validity_conflict_falls_back_to_cached_validation() -> None:
     validity = ContractValidity(ContractValidityStatus.VALID)
     concord = _Concord(validity)

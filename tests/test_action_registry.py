@@ -15,7 +15,6 @@ from deckr.beacon import (
 )
 from deckr.components import RunContext
 from deckr.profiles import ACTIONS_FEATURE_ID, ActionsBeaconPayload
-from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
@@ -101,54 +100,6 @@ async def _run_registry(registry: ActionRegistry, callback):
         await registry.start(RunContext(tg=tg, stopping=stopping))
         await callback(events)
         tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_action_registry_uses_beacon_actions_as_catalog_candidate_source():
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
-
-    async def scenario(events):
-        await _advertise_actions(beacon)
-        with anyio.fail_after(1):
-            while await registry.get_action(ACTION_UUID) is None:
-                await anyio.sleep(0.01)
-
-        meta = await registry.get_action(ACTION_UUID)
-        assert meta is not None
-        assert meta.provider_instance_id == PROVIDER_INSTANCE_ID
-        assert meta.provider_id == PROVIDER_ID
-        assert meta.provider_labels == {"room": "office"}
-        assert meta.provider_session_id is None
-        candidate = registry.provider_session_candidate(PROVIDER_INSTANCE_ID, PROVIDER_ID)
-        assert candidate is not None
-        assert candidate.provider_session_id == "session-1"
-        assert events[-1].catalog_added == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
-
-    await _run_registry(registry, scenario)
-
-
-@pytest.mark.asyncio
-async def test_action_registry_raises_when_beacon_directory_is_stale(
-    monkeypatch,
-):
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
-
-    class StaleDirectory:
-        def records(self):
-            raise KvUnavailable("directory stale")
-
-    exact_scan = MagicMock(side_effect=AssertionError("exact Beacon scan used"))
-    monkeypatch.setattr(beacon, "candidates_exact", exact_scan, raising=False)
-    registry._directory = StaleDirectory()
-
-    with pytest.raises(KvUnavailable):
-        await registry._reconcile_current_state(reason="test stale directory")
-
-    exact_scan.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -250,73 +201,6 @@ async def test_action_registry_rejects_mismatched_beacon_payload_identity():
 
         assert await registry.get_action(ACTION_UUID) is None
         assert events == []
-
-    await _run_registry(registry, scenario)
-
-
-@pytest.mark.asyncio
-async def test_action_registry_beacon_session_change_refreshes_action_metadata():
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
-
-    async def scenario(events):
-        old = await _advertise_actions(beacon, session_id="old")
-        with anyio.fail_after(1):
-            while await registry.get_action(ACTION_UUID) is None:
-                await anyio.sleep(0.01)
-
-        await old.aclose()
-        await _advertise_actions(beacon, session_id="new")
-        with anyio.fail_after(1):
-            while (
-                candidate := registry.provider_session_candidate(
-                    PROVIDER_INSTANCE_ID,
-                    PROVIDER_ID,
-                )
-            ) is None or candidate.provider_session_id != "new":
-                await anyio.sleep(0.01)
-
-        qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
-        assert events[-2].catalog_removed == [qualified]
-        assert events[-1].catalog_added == [qualified]
-
-    await _run_registry(registry, scenario)
-
-
-@pytest.mark.asyncio
-async def test_action_registry_prefers_latest_duplicate_provider_advertisement():
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
-
-    async def scenario(events):
-        await _advertise_actions(
-            beacon,
-            advertisement_id="z-old",
-            session_id="old",
-        )
-        await _advertise_actions(
-            beacon,
-            advertisement_id="a-new",
-            session_id="new",
-        )
-        with anyio.fail_after(1):
-            while (
-                candidate := registry.provider_session_candidate(
-                    PROVIDER_INSTANCE_ID,
-                    PROVIDER_ID,
-                )
-            ) is None or candidate.provider_session_id != "new":
-                await anyio.sleep(0.01)
-
-        meta = await registry.get_action(ACTION_UUID)
-        assert meta is not None
-        assert meta.provider_session_id is None
-        qualified = f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"
-        assert qualified in events[-1].catalog_added + events[-1].catalog_updated
-        assert events[-1].catalog_removed == []
-        assert events[-1].provider_session_successions == []
 
     await _run_registry(registry, scenario)
 

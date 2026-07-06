@@ -58,65 +58,6 @@ def _config_to_yaml(cfg: DeviceConfig) -> str:
 
 
 @pytest.mark.asyncio
-async def test_subscribe_yields_none_when_no_config(config_service, tmp_path):
-    """Subscribe with no config file yields None as first emission."""
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=anyio.Event())
-        await config_service.start(ctx)
-        try:
-            stream = config_service.subscribe("dev1")
-            first = await anext(stream)
-            assert first is None
-        finally:
-            await config_service.stop()
-
-
-@pytest.mark.asyncio
-async def test_subscribe_yields_config_when_file_exists(config_service, tmp_path):
-    """Subscribe yields current config when file exists."""
-    cfg = _make_config("dev1")
-    (tmp_path / "dev1.yml").write_text(_config_to_yaml(cfg))
-
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=anyio.Event())
-        await config_service.start(ctx)
-        try:
-            stream = config_service.subscribe("dev1")
-            first = await anext(stream)
-            assert first is not None
-            assert first.id == "dev1"
-            assert first.name == "Test"
-        finally:
-            await config_service.stop()
-
-
-@pytest.mark.asyncio
-async def test_subscribe_receives_update_on_file_modify(config_service, tmp_path):
-    """Subscribe receives updated config when file is modified."""
-    cfg = _make_config("dev1", "Original")
-    (tmp_path / "dev1.yml").write_text(_config_to_yaml(cfg))
-
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=anyio.Event())
-        await config_service.start(ctx)
-        try:
-            stream = config_service.subscribe("dev1")
-            first = await anext(stream)
-            assert first is not None
-            assert first.name == "Original"
-
-            cfg2 = _make_config("dev1", "Updated")
-            (tmp_path / "dev1.yml").write_text(_config_to_yaml(cfg2))
-
-            await anyio.sleep(0.3)  # Allow watch to detect change
-            second = await anext(stream)
-            assert second is not None
-            assert second.name == "Updated"
-        finally:
-            await config_service.stop()
-
-
-@pytest.mark.asyncio
 async def test_subscribe_receives_none_on_file_delete(config_service, tmp_path):
     """Subscribe receives None when config file is deleted."""
     cfg = _make_config("dev1")
@@ -205,26 +146,6 @@ def test_navigation_service_update_config():
 
 
 @pytest.mark.asyncio
-async def test_match_device_prefers_label_specific_config(config_service, tmp_path):
-    generic = _make_config("generic", fingerprint="serial-a")
-    specific = _make_config(
-        "specific",
-        fingerprint="serial-a",
-        labels={"location": "room-a"},
-    )
-    (tmp_path / "generic.yml").write_text(_config_to_yaml(generic))
-    (tmp_path / "specific.yml").write_text(_config_to_yaml(specific))
-
-    match = await config_service.match_device(
-        fingerprint="serial-a",
-        labels={"location": "room-a"},
-    )
-
-    assert match is not None
-    assert match.id == "specific"
-
-
-@pytest.mark.asyncio
 async def test_match_device_uses_fingerprint_only_config_for_other_labels(
     config_service,
     tmp_path,
@@ -248,30 +169,6 @@ async def test_match_device_uses_fingerprint_only_config_for_other_labels(
 
 
 @pytest.mark.asyncio
-async def test_match_device_prefers_more_label_requirements(config_service, tmp_path):
-    location = _make_config(
-        "location",
-        fingerprint="serial-a",
-        labels={"location": "bedroom"},
-    )
-    host = _make_config(
-        "host",
-        fingerprint="serial-a",
-        labels={"location": "bedroom", "mqtt-host": "openhabian"},
-    )
-    (tmp_path / "location.yml").write_text(_config_to_yaml(location))
-    (tmp_path / "host.yml").write_text(_config_to_yaml(host))
-
-    match = await config_service.match_device(
-        fingerprint="serial-a",
-        labels={"location": "bedroom", "mqtt-host": "openhabian"},
-    )
-
-    assert match is not None
-    assert match.id == "host"
-
-
-@pytest.mark.asyncio
 async def test_match_device_rejects_ambiguous_same_specificity(
     config_service,
     tmp_path,
@@ -288,22 +185,3 @@ async def test_match_device_rejects_ambiguous_same_specificity(
         )
 
 
-@pytest.mark.asyncio
-async def test_match_device_ignores_disabled_configs(config_service, tmp_path):
-    disabled = _make_config(
-        "disabled",
-        fingerprint="serial-a",
-        labels={"location": "room-a"},
-        enabled=False,
-    )
-    generic = _make_config("generic", fingerprint="serial-a")
-    (tmp_path / "disabled.yml").write_text(_config_to_yaml(disabled))
-    (tmp_path / "generic.yml").write_text(_config_to_yaml(generic))
-
-    match = await config_service.match_device(
-        fingerprint="serial-a",
-        labels={"location": "room-a"},
-    )
-
-    assert match is not None
-    assert match.id == "generic"

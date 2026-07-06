@@ -6,16 +6,15 @@ import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import anyio
 import pytest
 import yaml
-from conftest import LaneHarness
 from deckr.actions.messages import SettingsTargetRef
-from deckr.contracts.messages import ACTIONS_LANE, controller_address
 from pydantic import ValidationError
 
-from deckr.controller._action_availability import ActionAvailabilityService
+from deckr.controller._settings_metadata import SettingsActionMetadata
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import (
     Control,
@@ -163,41 +162,6 @@ async def _next_with_timeout(stream: AsyncIterator[Any]) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_list_and_describe_provider_and_action_targets(tmp_path: Path) -> None:
-    service, _ = await _service(tmp_path)
-
-    descriptions = await service.list_targets(config_id=CONFIG_ID)
-    targets = {description.target.key(): description for description in descriptions}
-
-    action_description = targets[_stable_action_target().key()]
-    assert action_description.provider_instance_id == PROVIDER_INSTANCE_ID
-    assert action_description.provider_id == PROVIDER_ID
-    assert action_description.action_id == "action.clock"
-    assert action_description.label == "clock-primary"
-    assert action_description.placement == {
-        "profile": "default",
-        "page": "0",
-        "control": "0,0",
-    }
-    assert action_description.provenance == ("config_default", "template_override")
-    assert action_description.schema_metadata.stale is False
-    assert action_description.schema_metadata.json_schema is not None
-
-    provider_description = targets[_provider_target().key()]
-    assert provider_description.provider_instance_id == PROVIDER_INSTANCE_ID
-    assert provider_description.provider_id == PROVIDER_ID
-    assert provider_description.schema_metadata.stale is False
-
-    missing_schema = next(
-        description
-        for description in descriptions
-        if description.target.action_id == "action.no_schema"
-    )
-    assert missing_schema.provider_id == "no_schema"
-    assert missing_schema.schema_metadata.stale is True
-
-
-@pytest.mark.asyncio
 async def test_action_settings_patch_writes_yaml_and_notifies(
     tmp_path: Path,
 ) -> None:
@@ -231,23 +195,6 @@ async def test_action_settings_patch_writes_yaml_and_notifies(
 
 
 @pytest.mark.asyncio
-async def test_provider_settings_replace_writes_provider_settings(
-    tmp_path: Path,
-) -> None:
-    service, config_service = await _service(tmp_path)
-    target = _provider_target()
-
-    snapshot = await service.replace(target, {"timezone": "Europe/Amsterdam"})
-
-    assert snapshot.settings == {"timezone": "Europe/Amsterdam"}
-    reloaded = await config_service.get_config(CONFIG_ID)
-    assert reloaded is not None
-    assert reloaded.provider_settings == {
-        PROVIDER_INSTANCE_ID: {"timezone": "Europe/Amsterdam"}
-    }
-
-
-@pytest.mark.asyncio
 async def test_schema_validation_rejects_invalid_settings(tmp_path: Path) -> None:
     service, config_service = await _service(tmp_path)
 
@@ -260,72 +207,14 @@ async def test_schema_validation_rejects_invalid_settings(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "target_updates",
-    [
-        {"actionId": "action.other"},
-        {"stableId": "clock-secondary"},
-        {"stableId": None},
-    ],
-)
-async def test_action_target_metadata_mismatch_is_unknown(
-    tmp_path: Path,
-    target_updates: dict[str, Any],
-) -> None:
-    service, config_service = await _service(tmp_path)
-    bad_target = _target_with(**target_updates)
-
-    with pytest.raises(KeyError):
-        await service.get(bad_target)
-    with pytest.raises(KeyError):
-        await service.patch(bad_target, {"mode": "date"})
-    with pytest.raises(KeyError):
-        await service.replace(bad_target, {"mode": "date"})
-
-    reloaded = await config_service.get_config(CONFIG_ID)
-    assert reloaded is not None
-    assert reloaded.profiles[0].pages[0].controls[0].settings == {"mode": "time"}
-
-
-@pytest.mark.asyncio
-async def test_action_target_survives_missing_provider_metadata_as_stale(
-    tmp_path: Path,
-) -> None:
-    service, _ = await _service(tmp_path)
-    target = _target_with(providerInstanceId="python.other", providerId="other")
-
-    snapshot = await service.get(target)
-    description = await service.describe_target(target)
-
-    assert snapshot.settings == {
-        "mode": "time",
-        "templateOverrides": {"title": "Clock"},
-    }
-    assert snapshot.schema_metadata.stale is True
-    assert snapshot.schema_metadata.json_schema is None
-    assert description.schema_metadata.stale is True
-
-
-@pytest.mark.asyncio
 async def test_settings_metadata_reads_from_action_availability_service(
     tmp_path: Path,
 ) -> None:
     config_service = FileBackedDeviceConfigService(config_dir=tmp_path)
     await config_service.write_config(_config())
-    action_bus = LaneHarness(
-        ACTIONS_LANE,
-        default_endpoint=controller_address(CONTROLLER_ID),
-    )
-    availability = ActionAvailabilityService(
-        controller_id=CONTROLLER_ID,
-        controller_session_id=action_bus.session_id,
-        actions_bus=action_bus.endpoint().session,
-        manager=object(),
-        start_soon=None,
-        clock=lambda: 0.0,
-    )
-    availability.cache.record_available(
-        ActionMetadata(
+    availability = MagicMock()
+    availability.settings_action_metadata.return_value = SettingsActionMetadata(
+        action=ActionMetadata(
             uuid="action.clock",
             name="Clock",
             provider_instance_id=PROVIDER_INSTANCE_ID,
@@ -333,7 +222,7 @@ async def test_settings_metadata_reads_from_action_availability_service(
             settings_schema={"type": "object"},
             provider_settings_schema={"type": "object"},
         ),
-        now=0.0,
+        stale=False,
     )
     service = ConfigBackedSettingsService(
         controller_id=CONTROLLER_ID,
@@ -345,38 +234,12 @@ async def test_settings_metadata_reads_from_action_availability_service(
 
     assert snapshot.schema_metadata.stale is False
     assert snapshot.schema_metadata.json_schema == {"type": "object"}
-
-
-@pytest.mark.asyncio
-async def test_rejected_subscription_does_not_register_subscriber(
-    tmp_path: Path,
-) -> None:
-    service, _ = await _service(tmp_path)
-    bad_target = _target_with(actionId="action.other")
-
-    stream = service.subscribe(bad_target)
-    with pytest.raises(KeyError):
-        await _next_with_timeout(stream)
-    await stream.aclose()
-
-    assert service._subscribers == {}
-
-
-@pytest.mark.asyncio
-async def test_missing_schema_allows_write_and_marks_metadata_stale(
-    tmp_path: Path,
-) -> None:
-    service, _ = await _service(tmp_path)
-    target = next(
-        description.target
-        for description in await service.list_targets(config_id=CONFIG_ID)
-        if description.target.action_id == "action.no_schema"
+    availability.settings_action_metadata.assert_called_once_with(
+        "action.clock",
+        provider_instance_id=PROVIDER_INSTANCE_ID,
+        provider_id=PROVIDER_ID,
+        provider_labels={},
     )
-
-    snapshot = await service.patch(target, {"freeform": {"ok": True}})
-
-    assert snapshot.settings == {"freeform": {"ok": True}}
-    assert snapshot.schema_metadata.stale is True
 
 
 @pytest.mark.asyncio

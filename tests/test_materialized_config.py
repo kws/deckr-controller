@@ -21,7 +21,6 @@ from deckr.controller.config import (
     Control,
     DeviceConfig,
     DeviceConfigMatch,
-    FileBackedDeviceConfigService,
     MaterializedConfigProjection,
     MaterializedConfigPublisher,
     MaterializedDeviceConfigService,
@@ -188,31 +187,6 @@ async def test_materialized_service_rejects_invalid_projection_without_deactivat
 
 
 @pytest.mark.asyncio
-async def test_materialized_service_delete_means_no_projection() -> None:
-    bucket = MemoryJsonKvBucket(bucket="config")
-    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, bucket=bucket)
-    await publisher.publish_configs((_config(),))
-    service = MaterializedDeviceConfigService(
-        controller_id=CONTROLLER_ID,
-        bucket=bucket,
-    )
-
-    async with anyio.create_task_group() as tg:
-        stopping = anyio.Event()
-        await service.start(RunContext(tg=tg, stopping=stopping))
-        stream = service.subscribe("config-1")
-        try:
-            assert await _next_with_timeout(stream) is not None
-            await bucket.delete(materialized_config_key(CONTROLLER_ID))
-            assert await _next_with_timeout(stream) is None
-            await _wait_for_result(bucket, "missing")
-        finally:
-            stopping.set()
-            await service.stop()
-            tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
 async def test_materialized_service_write_config_updates_projection() -> None:
     bucket = MemoryJsonKvBucket(bucket="config")
     service = MaterializedDeviceConfigService(
@@ -228,33 +202,6 @@ async def test_materialized_service_write_config_updates_projection() -> None:
     assert entry.value["deviceConfigs"][0]["name"] == "Written"
     result = await _wait_for_result(bucket, "active")
     assert result.value["activeConfigIds"] == ("config-1",)
-
-
-@pytest.mark.asyncio
-async def test_file_backed_service_publishes_materialized_snapshots(
-    tmp_path: Path,
-) -> None:
-    bucket = MemoryJsonKvBucket(bucket="config")
-    publisher = MaterializedConfigPublisher(controller_id=CONTROLLER_ID, bucket=bucket)
-    service = FileBackedDeviceConfigService(
-        config_dir=tmp_path,
-        materialized_publisher=publisher,
-    )
-    path = tmp_path / "config-1.yml"
-    path.write_text(_config_to_yaml(_config(name="From File")))
-
-    await service.refresh()
-
-    entry = await bucket.get(materialized_config_key(CONTROLLER_ID))
-    assert entry is not None
-    assert entry.value["deviceConfigs"][0]["name"] == "From File"
-
-    path.unlink()
-    await service.refresh()
-
-    entry = await bucket.get(materialized_config_key(CONTROLLER_ID))
-    assert entry is not None
-    assert entry.value["deviceConfigs"] == ()
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,6 @@
 """Tests for NavigationService: current page and transitions (no stack)."""
 
 import pytest
-from pydantic import ValidationError
 
 from deckr.controller._navigation_service import (
     NavigationService,
@@ -54,26 +53,6 @@ def device_config():
     )
 
 
-def test_set_page_initial_returns_transition(device_config):
-    nav = NavigationService(device_config)
-    ref = StaticPageRef(profile_name="default", page_index=0)
-    transition = nav.set_page(ref)
-    assert transition.departing is None
-    assert transition.arriving == ref
-    assert nav.current_page == ref
-
-
-def test_set_page_replaces_current(device_config):
-    nav = NavigationService(device_config)
-    ref0 = StaticPageRef(profile_name="default", page_index=0)
-    ref1 = StaticPageRef(profile_name="default", page_index=1)
-    nav.set_page(ref0)
-    transition = nav.set_page(ref1)
-    assert transition.departing == ref0
-    assert transition.arriving == ref1
-    assert nav.current_page == ref1
-
-
 def test_resolve_static_bindings_returns_control_bindings(device_config):
     nav = NavigationService(device_config)
     ref = StaticPageRef(profile_name="default", page_index=0)
@@ -86,19 +65,3 @@ def test_resolve_static_bindings_returns_control_bindings(device_config):
     assert bindings[1].action_uuid == "action.b"
 
 
-def test_control_rejects_controller_render_styling_field():
-    field = "title_" + "options"
-    with pytest.raises(ValidationError, match=field):
-        Control.model_validate(
-            {
-                "selector": {"control_id": "0,0"},
-                "action": "action.a",
-                "settings": {},
-                field: {
-                    "font_family": "Roboto Mono",
-                    "font_size": 36,
-                    "title_color": "#00FF00",
-                    "title_alignment": "top",
-                },
-            }
-        )

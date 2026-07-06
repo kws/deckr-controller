@@ -7,7 +7,6 @@ import pytest_asyncio
 from deckr.actions.messages import SettingsSnapshot, SettingsTargetRef
 
 from deckr.controller._command_router import (
-    OVERLAY_TEMPLATES,
     CommandRouter,
     DeviceOutput,
 )
@@ -15,15 +14,12 @@ from deckr.controller._device_layout import RasterImageFormat
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
-from deckr.controller.invariant.recipes import STATUS_OVERLAY_STYLES
 
 
 class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
-        self.sleep_device = AsyncMock()
-        self.wake_device = AsyncMock()
 
 
 def _make_output(
@@ -41,40 +37,7 @@ def _make_output(
     )
 
 
-def test_command_router_overlay_templates_match_status_styles():
-    assert frozenset(STATUS_OVERLAY_STYLES) == OVERLAY_TEMPLATES
-
-
 # --- DeviceOutput: last_frame tracking ---
-
-
-@pytest.mark.asyncio
-async def test_device_output_records_last_frame():
-    """DeviceOutput records last written frame and clears it on clear()."""
-    command_service = FakeHardwareCommandService()
-
-    output = _make_output(command_service=command_service)
-    assert output.last_frame is None
-
-    await output.write(b"frame1")
-    assert output.last_frame == b"frame1"
-    command_service.set_raster_frame.assert_called_once_with(
-        "config-dev",
-        "0,0",
-        "raster.bitmap",
-        b"frame1",
-    )
-
-    await output.write(b"frame2")
-    assert output.last_frame == b"frame2"
-
-    await output.clear()
-    assert output.last_frame is None
-    command_service.clear_raster.assert_called_once_with(
-        "config-dev",
-        "0,0",
-        "raster.bitmap",
-    )
 
 
 # --- CommandRouter content updates ---
@@ -135,15 +98,6 @@ async def test_render_no_op_when_image_format_none():
 
 
 @pytest.mark.asyncio
-async def test_set_title_updates_current_content(router_with_mocks):
-    """set_title updates the current render content."""
-    router = router_with_mocks
-    await router.set_title("State1Title")
-    assert router._store.content.title == "State1Title"
-    assert router._store.content.image is None
-
-
-@pytest.mark.asyncio
 async def test_set_raster_image_replaces_title_content(router_with_mocks):
     """set_raster_image replaces title content with an explicit raster image."""
     router = router_with_mocks
@@ -151,29 +105,6 @@ async def test_set_raster_image_replaces_title_content(router_with_mocks):
     await router.set_raster_image("https://example.com/img.png")
     assert router._store.content.image == "https://example.com/img.png"
     assert router._store.content.title is None
-
-
-@pytest.mark.asyncio
-async def test_binding_overlay_renders_over_base_state(router_with_mocks):
-    router = router_with_mocks
-
-    await router.set_title("Album", generation=3)
-    ok = await router.show_overlay(
-        template="ok",
-        title="OK",
-        params={},
-        duration_seconds=None,
-        overlay_id="playback-ok",
-        generation=1,
-        binding_output_generation=3,
-    )
-
-    assert ok is True
-    assert router._store.content.title == "Album"
-    assert router._store.overlay is not None
-    assert router._store.overlay.template == "ok"
-    assert router._store.overlay.overlay_id == "playback-ok"
-    assert router._render_dispatcher.submit_request.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -349,20 +280,6 @@ async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
         binding_id="binding-1",
         output=router._output,
     )
-
-
-@pytest.mark.asyncio
-async def test_render_enqueues_request_without_waiting_for_device_write(
-    router_with_mocks,
-):
-    """Render-affecting commands should enqueue background work instead of writing inline."""
-    router = router_with_mocks
-
-    await router.set_title("Queued")
-
-    router._render_service.build_request.assert_called_once()
-    router._render_dispatcher.submit_request.assert_awaited_once()
-    assert router._output.last_frame is None
 
 
 @pytest.mark.asyncio

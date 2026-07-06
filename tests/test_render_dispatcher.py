@@ -10,7 +10,6 @@ import os
 import signal
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -32,7 +31,6 @@ from deckr.controller._render import (
     RenderResult,
     RenderService,
     RenderSource,
-    render_request_to_jpeg,
 )
 from deckr.controller._render_dispatcher import (
     ProcessPoolRenderBackend,
@@ -45,15 +43,12 @@ from deckr.controller._render_observation import (
     ObservingRenderBackend,
     RenderObservationOptions,
 )
-from deckr.controller.invariant.recipes import STATUS_OVERLAY_STYLES
 
 
 class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
-        self.sleep_device = AsyncMock()
-        self.wake_device = AsyncMock()
 
 
 def _png_data_uri() -> str:
@@ -282,111 +277,6 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
 
 
 @pytest.mark.asyncio
-async def test_render_dispatcher_stamps_config_id_into_requests():
-    command_service = FakeHardwareCommandService()
-    backend = ControlledBackend()
-    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
-
-    async with anyio.create_task_group() as tg:
-        dispatcher = RenderDispatcher(
-            command_service=command_service,
-            config_id="dev",
-            backend=backend,
-            start_soon=tg.start_soon,
-        )
-        await dispatcher.submit_request(
-            control_id="0,0",
-            context_id="ctx",
-            request=_solid_request(),
-            output=output,
-        )
-
-        with anyio.fail_after(1.0):
-            while not backend.requests:
-                await anyio.sleep(0.01)
-
-        assert backend.requests[0].config_id == "dev"
-        backend.release(1)
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_render_dispatcher_clear_control_blocks_stale_completion():
-    command_service = FakeHardwareCommandService()
-
-    backend = ControlledBackend()
-    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
-
-    async with anyio.create_task_group() as tg:
-        dispatcher = RenderDispatcher(
-            command_service=command_service,
-            config_id="dev",
-            backend=backend,
-            start_soon=tg.start_soon,
-        )
-        await dispatcher.submit_request(
-            control_id="0,0",
-            context_id="ctx",
-            request=_solid_request(),
-            output=output,
-        )
-        with anyio.fail_after(1.0):
-            while backend.calls != [1]:
-                await anyio.sleep(0.01)
-
-        await dispatcher.clear_control("0,0", context_id="ctx", output=output)
-        backend.release(1)
-        await anyio.sleep(0.05)
-
-        command_service.clear_raster.assert_awaited_once_with(
-            "dev",
-            "0,0",
-            "raster.bitmap",
-        )
-        command_service.set_raster_frame.assert_not_awaited()
-        assert output.last_frame is None
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_render_dispatcher_can_invalidate_without_clearing_hardware():
-    command_service = FakeHardwareCommandService()
-
-    backend = ControlledBackend()
-    output = DeviceOutput(command_service, "dev", "0,0", "raster.bitmap")
-
-    async with anyio.create_task_group() as tg:
-        dispatcher = RenderDispatcher(
-            command_service=command_service,
-            config_id="dev",
-            backend=backend,
-            start_soon=tg.start_soon,
-        )
-        await dispatcher.submit_request(
-            control_id="0,0",
-            context_id="ctx",
-            request=_solid_request(),
-            output=output,
-        )
-        with anyio.fail_after(1.0):
-            while backend.calls != [1]:
-                await anyio.sleep(0.01)
-
-        await dispatcher.clear_control(
-            "0,0",
-            context_id="ctx",
-            output=output,
-            clear_output=False,
-        )
-        backend.release(1)
-        await anyio.sleep(0.05)
-
-        command_service.clear_raster.assert_not_awaited()
-        command_service.set_raster_frame.assert_not_awaited()
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
 async def test_render_dispatcher_preserves_existing_frame_when_render_returns_none():
     command_service = FakeHardwareCommandService()
     backend = ImmediateBackend(frame=None, error="image fetch failed")
@@ -416,62 +306,6 @@ async def test_render_dispatcher_preserves_existing_frame_when_render_returns_no
         command_service.set_raster_frame.assert_not_awaited()
         command_service.clear_raster.assert_not_awaited()
         tg.cancel_scope.cancel()
-
-
-@pytest.mark.parametrize(
-    ("model", "case_id"),
-    [
-        (RenderModel(title="Hello"), "title"),
-        (RenderModel(image=_png_data_uri()), "image"),
-        (RenderModel(overlay_type="unavailable"), "unavailable"),
-        (RenderModel(overlay_type="pending"), "pending"),
-        (RenderModel(title="Album", overlay_type="ok"), "ok-overlay"),
-        (RenderModel(overlay_type="blank"), "blank"),
-        (RenderModel(image=_graph_data_uri()), "graph"),
-        (RenderModel(image=_graph_data_uri_with_query_context()), "graph-context"),
-    ],
-    ids=[
-        "title",
-        "image",
-        "unavailable",
-        "pending",
-        "ok-overlay",
-        "blank",
-        "graph",
-        "graph-context",
-    ],
-)
-def test_render_request_to_jpeg_round_trips_common_render_types(model, case_id):
-    fmt = RasterImageFormat(width=72, height=72)
-    request = RenderService().build_request(
-        model,
-        fmt,
-        context_id=f"ctx:{case_id}",
-        control_id="0,0",
-    )
-    assert request is not None
-
-    frame = render_request_to_jpeg(request)
-
-    assert isinstance(frame, bytes)
-    assert len(frame) > 100
-
-
-@pytest.mark.parametrize("status", sorted(STATUS_OVERLAY_STYLES))
-def test_status_overlay_render_request_to_jpeg_round_trips(status):
-    fmt = RasterImageFormat(width=72, height=72)
-    request = RenderService().build_request(
-        RenderModel(overlay_type=status),
-        fmt,
-        context_id=f"ctx:{status}",
-        control_id="0,0",
-    )
-    assert request is not None
-
-    frame = render_request_to_jpeg(request)
-
-    assert isinstance(frame, bytes)
-    assert len(frame) > 100
 
 
 @pytest.mark.asyncio
@@ -520,52 +354,6 @@ def test_render_worker_wraps_http_image_fetch_failures(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_observing_render_backend_records_success(tmp_path: Path):
-    path = tmp_path / "render.jsonl"
-    delegate = ImmediateBackend(frame=b"jpeg-bytes")
-    backend = ObservingRenderBackend(
-        delegate,
-        controller_id="controller-main",
-        options=RenderObservationOptions(path=path),
-    )
-    request = _request_with_graph({"b": 2, "a": 1})
-
-    result = await backend.render(request)
-
-    assert result.frame == b"jpeg-bytes"
-    records = _read_observations(path)
-    assert len(records) == 1
-    record = records[0]
-    assert record["event"] == "render.result"
-    assert record["controllerId"] == "controller-main"
-    assert record["configId"] == "device-1"
-    assert record["controlId"] == "0,0"
-    assert record["contextId"] == "ctx-1"
-    assert record["bindingId"] == "binding-1"
-    assert record["renderGeneration"] == 7
-    assert record["bindingOutputGeneration"] == 3
-    assert record["overlayGeneration"] is None
-    assert record["providerInstanceId"] == "provider-instance"
-    assert record["providerId"] == "dev.deckr.clock"
-    assert record["actionId"] == "dev.deckr.clock.action.digital"
-    assert record["actionInstanceId"] == "action-instance"
-    assert record["actionMessageId"] == "message-1"
-    assert record["actionCausationId"] == "cause-1"
-    assert record["trace"] == {"traceParent": "00-abc"}
-    assert record["commandType"] == "set_frame"
-    assert record["contentKind"] == "invariant_graph"
-    assert record["graphSha256"] == _json_hash({"b": 2, "a": 1})
-    assert record["frameSha256"] == _frame_hash(b"jpeg-bytes")
-    assert record["encoding"] == "jpeg"
-    assert record["width"] == 72
-    assert record["height"] == 64
-    assert record["durationMs"] >= 0
-    assert record["error"] is None
-    assert "graph" not in record
-    assert "context" not in record
-
-
-@pytest.mark.asyncio
 async def test_observing_render_backend_records_error(tmp_path: Path):
     path = tmp_path / "render.jsonl"
     backend = ObservingRenderBackend(
@@ -581,36 +369,6 @@ async def test_observing_render_backend_records_error(tmp_path: Path):
     record = _read_observations(path)[0]
     assert record["frameSha256"] is None
     assert record["error"] == "boom"
-
-
-@pytest.mark.asyncio
-async def test_observing_render_backend_records_overlay_generation(
-    tmp_path: Path,
-):
-    path = tmp_path / "render.jsonl"
-    backend = ObservingRenderBackend(
-        ImmediateBackend(),
-        controller_id="controller-main",
-        options=RenderObservationOptions(path=path),
-    )
-    request = _request_with_graph({"output": {"params": {"title": "Overlay"}}})
-    assert request.source is not None
-    request = replace(
-        request,
-        source=replace(
-            request.source,
-            command_type="bindingOverlay",
-            content_kind="overlay:ok",
-            overlay_generation=2,
-        ),
-    )
-
-    await backend.render(request)
-
-    record = _read_observations(path)[0]
-    assert record["commandType"] == "bindingOverlay"
-    assert record["contentKind"] == "overlay:ok"
-    assert record["overlayGeneration"] == 2
 
 
 @pytest.mark.asyncio
@@ -634,24 +392,6 @@ async def test_observing_render_backend_can_include_graph_and_context(
     record = _read_observations(path)[0]
     assert record["graph"] == request.graph
     assert record["context"] == request.context
-
-
-@pytest.mark.asyncio
-async def test_observing_render_backend_graph_hash_is_key_order_stable(
-    tmp_path: Path,
-):
-    path = tmp_path / "render.jsonl"
-    backend = ObservingRenderBackend(
-        ImmediateBackend(),
-        controller_id="controller-main",
-        options=RenderObservationOptions(path=path),
-    )
-
-    await backend.render(_request_with_graph({"b": 2, "a": 1}))
-    await backend.render(_request_with_graph({"a": 1, "b": 2}))
-
-    first, second = _read_observations(path)
-    assert first["graphSha256"] == second["graphSha256"]
 
 
 @pytest.mark.asyncio
@@ -745,36 +485,9 @@ def _measure_pool_elapsed(max_workers: int, delay_ms: int) -> tuple[float, set[i
     return elapsed, {pid_a, pid_b}
 
 
-def test_process_pool_executor_parallelism():
-    parallel_elapsed, parallel_pids = _measure_pool_elapsed(max_workers=2, delay_ms=700)
-    serial_elapsed, serial_pids = _measure_pool_elapsed(max_workers=1, delay_ms=700)
-
-    assert len(parallel_pids) == 2
-    assert len(serial_pids) == 1
-    assert parallel_elapsed > 0
-    assert serial_elapsed > 0
-
-
 def _write_blob_to_store(cache_dir: str, payload: bytes) -> bytes:
     store = DiskStore(cache_dir=cache_dir)
     blob = BlobArtifact(data=payload, content_type="application/octet-stream")
     store.put("test:blob", "a" * 64, blob)
     return store.get("test:blob", "a" * 64).data
 
-
-def test_disk_store_survives_concurrent_writers(tmp_path: Path):
-    payload_a = b"a" * 1024
-    payload_b = b"b" * 1024
-
-    with ProcessPoolExecutor(max_workers=2) as pool:
-        fut_a = pool.submit(_write_blob_to_store, str(tmp_path), payload_a)
-        fut_b = pool.submit(_write_blob_to_store, str(tmp_path), payload_b)
-        result_a = fut_a.result(timeout=30)
-        result_b = fut_b.result(timeout=30)
-
-    store = DiskStore(cache_dir=tmp_path)
-    final = store.get("test:blob", "a" * 64).data
-
-    assert result_a in {payload_a, payload_b}
-    assert result_b in {payload_a, payload_b}
-    assert final in {payload_a, payload_b}

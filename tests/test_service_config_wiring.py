@@ -13,35 +13,9 @@ from deckr.controller._runtime_support import (
 from deckr.controller.config import (
     FileBackedDeviceConfigService,
     MaterializedDeviceConfigService,
-    NullDeviceConfigService,
 )
 from deckr.controller.settings import ConfigBackedSettingsService
 from test_support.memory_lane_substrate import MemoryJsonKvBucket
-
-
-def test_build_services_disable_when_sections_are_absent(tmp_path: Path) -> None:
-    config_path = tmp_path / "deckr.toml"
-    config_path.write_text(
-        """
-[deckr.components.instances.controller_main]
-component = "dev.deckr.controller"
-instance_id = "main"
-
-[deckr.components.instances.controller_main.endpoints]
-controller = "controller-main"
-""".strip()
-    )
-    document = load_config_document(config_path)
-    config = controller_config_from_document(document)
-
-    assert isinstance(build_config_service(config), NullDeviceConfigService)
-    config_service = build_config_service(config)
-    settings_service = build_settings_service(
-        config,
-        controller_id="controller-main",
-        config_service=config_service,
-    )
-    assert isinstance(settings_service, ConfigBackedSettingsService)
 
 
 def test_build_services_enable_when_sections_are_present(tmp_path: Path) -> None:

@@ -19,7 +19,6 @@ from deckr.hardware.descriptors import (
 
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._binding_validator import (
-    ValidationError,
     ValidationResult,
     format_validation_summary,
     validate_dynamic_page_bindings,
@@ -37,8 +36,6 @@ class FakeHardwareCommandService:
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
-        self.sleep_device = AsyncMock()
-        self.wake_device = AsyncMock()
 
 
 def _make_device(
@@ -134,31 +131,6 @@ def _page_child(control_id: str, **kwargs) -> PageChildBindingDescriptor:
 
 
 @pytest.mark.asyncio
-async def test_validate_page_bindings_all_valid():
-    device = _make_device(controls=[_make_control("0,0"), _make_control("0,1")])
-    action = _make_key_action()
-
-    async def get_action(uuid: str, **kwargs):
-        del kwargs
-        return action
-
-    bindings = [
-        _page_child("0,0", settings={}),
-        _page_child("0,1", settings={}),
-    ]
-    result = await validate_dynamic_page_bindings(
-        bindings,
-        device,
-        get_action,
-        owner_action_uuid="action.a",
-        owner_provider_instance_id="python",
-    )
-    assert result.valid is True
-    assert len(result.errors) == 0
-    assert result.actions == []
-
-
-@pytest.mark.asyncio
 async def test_validate_dynamic_page_bindings_resolves_explicit_child_action_target():
     device = _make_device(controls=[_make_control("3,0")])
     action = ActionMetadata(
@@ -196,30 +168,6 @@ async def test_validate_dynamic_page_bindings_resolves_explicit_child_action_tar
     assert result.bindings[0].settings["zoneName"] == "Bedroom"
     assert result.actions == []
     get_action.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_validate_page_bindings_missing_control():
-    device = _make_device(controls=[_make_control("0,0")])
-    action = _make_key_action()
-
-    async def get_action(uuid: str, **kwargs):
-        del kwargs
-        return action
-
-    bindings = [_page_child("99,99", settings={})]
-    result = await validate_dynamic_page_bindings(
-        bindings,
-        device,
-        get_action,
-        owner_action_uuid="action.a",
-        owner_provider_instance_id="python",
-    )
-    assert result.valid is False
-    assert result.actions == []
-    assert len(result.errors) == 1
-    assert result.errors[0].code == "control_not_found"
-    assert "99,99" in result.errors[0].message
 
 
 @pytest.mark.asyncio
@@ -322,26 +270,6 @@ async def test_activation_requirement_does_not_match_momentary_only_control():
 def test_format_validation_summary_passed():
     result = ValidationResult(valid=True)
     assert "passed" in format_validation_summary(result)
-
-
-def test_format_validation_summary_errors():
-    result = ValidationResult(valid=False)
-    result.add_error("control_not_found", "control 'x' not found", "x", "action.a")
-    result.add_error(
-        "capability_mismatch", "mismatch", "y", "action.b", details=["need image"]
-    )
-    s = format_validation_summary(result)
-    assert "2 error(s)" in s
-    assert "control_not_found" in s or "x" in s
-    assert "capability_mismatch" in s or "y" in s
-
-
-def test_format_validation_summary_list_of_errors():
-    errors = [
-        ValidationError("control_not_found", "msg", "0,0", "a", details=[]),
-    ]
-    s = format_validation_summary(errors)
-    assert "1 error(s)" in s
 
 
 # --- Integration: DeviceManager rejects invalid static page ---

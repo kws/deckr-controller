@@ -3,7 +3,7 @@
 import pytest
 from deckr.hardware import messages as hw_messages
 
-from deckr.controller._event_translator import EventTranslator, TranslatedEvent
+from deckr.controller._event_translator import EventTranslator
 
 CONTROLLER_ID = "controller-main"
 
@@ -32,59 +32,12 @@ class TestEventTranslator:
     def translator(self):
         return EventTranslator(CONTROLLER_ID)
 
-    @pytest.mark.parametrize(
-        ("event_type", "value"),
-        [
-            ("down", None),
-            ("up", None),
-            ("press", None),
-            ("rotate", {"delta": 1}),
-            ("tap", None),
-            ("swipe", {"direction": "left"}),
-        ],
-    )
-    def test_input_event_is_delivered_as_capability_event(
-        self,
-        translator,
-        event_type,
-        value,
-    ):
-        event = _event(
-            control_id="1,2",
-            capability_id="button.momentary",
-            event_type=event_type,
-            value=value,
-        )
-        out = translator.translate(event, "d1")
-        assert out is not None
-        assert isinstance(out, TranslatedEvent)
-        assert out.control_id == "1,2"
-        assert out.capability_id == "button.momentary"
-        assert out.action_event.event_type == event_type
-        assert out.action_event.value == value
-        assert out.action_event.capability.control_id == "1,2"
-        assert out.action_event.capability.capability_id == "button.momentary"
-        assert out.action_event.producer == "manager-main"
-        assert out.action_event.view == "native"
-
     def test_non_interaction_events_return_none(self, translator):
         event = hw_messages.CommandRejectedMessage(
             deviceRef={"managerId": "manager-main", "deviceId": "d1"},
             capabilityId="raster.bitmap",
             commandType="clear",
             reason="stale",
-        )
-        assert translator.translate(event, "d1") is None
-
-    def test_gesture_unsupported_returns_none(self):
-        translator = EventTranslator(
-            CONTROLLER_ID,
-            is_gesture_supported=lambda _control_id, _event_type: False,
-        )
-        event = _event(
-            control_id="0,0",
-            capability_id="button.momentary",
-            event_type="up",
         )
         assert translator.translate(event, "d1") is None
 

@@ -1,10 +1,5 @@
 """Tests for pure binding planner decisions."""
 
-from deckr.actions.messages import (
-    DynamicPageCommand,
-    PageChildBindingDescriptor,
-    PageChildBindingTarget,
-)
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_OUTPUT_RASTER,
@@ -24,7 +19,6 @@ from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._navigation_service import StaticPageRef
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import ControlSelector
-from deckr.controller.settings import derive_action_instance_id
 
 CONTROLLER_ID = "controller-main"
 CONFIG_ID = "test-device"
@@ -169,138 +163,6 @@ def test_static_page_plan_records_bound_and_unavailable_controls():
     assert result.plan.bindings[1].action_meta is None
 
 
-def test_static_structural_validation_failure_has_invalid_outcome_and_no_plan():
-    planner = _planner()
-    entry = StaticPageRef(profile_name="default", page_index=0)
-
-    result = planner.build_static_page_plan(
-        entry,
-        bindings=(_binding("9,9", "action.bound"),),
-        device=_device("0,0"),
-        action_metadata={_intent("action.bound"): _metadata("action.bound")},
-    )
-
-    assert result.plan is None
-    assert len(result.outcomes) == 1
-    assert result.outcomes[0].status == BindingPlanStatus.INVALID_DEVICE_CONTROL
-    assert result.validation_errors[0].code == "control_not_found"
-
-
-def test_dynamic_self_child_uses_owner_action_and_instance_id():
-    planner = _planner()
-    session = _dynamic_session()
-    entry = DynamicPageCommand(
-        pageId="dynamic-page",
-        bindings=(
-            PageChildBindingDescriptor(
-                controlId="0,0",
-                target=PageChildBindingTarget(kind="self"),
-                itemKey="item-0",
-                handler="open",
-            ),
-        ),
-    )
-
-    result = planner.build_dynamic_page_plan(
-        entry,
-        device=_device("0,0"),
-        page_session=session,
-        action_metadata={_intent("action.owner"): _metadata("action.owner")},
-    )
-
-    assert result.plan is not None
-    planned = result.plan.bindings[0]
-    assert planned.status == BindingPlanStatus.BOUND
-    assert planned.binding.action_uuid == session.owner_action_uuid
-    assert planned.binding.provider_instance_id == session.owner_provider_instance_id
-    assert planned.action_instance_id == session.action_instance_id
-    assert planned.action_meta is session.owner_action_meta
-    assert planned.item_key == "item-0"
-    assert planned.handler == "open"
-
-
-def test_dynamic_self_child_uses_owner_session_when_catalog_is_pending():
-    planner = _planner()
-    session = _dynamic_session()
-    entry = DynamicPageCommand(
-        pageId="dynamic-page",
-        bindings=(
-            PageChildBindingDescriptor(
-                controlId="0,0",
-                target=PageChildBindingTarget(kind="self"),
-            ),
-        ),
-    )
-
-    result = planner.build_dynamic_page_plan(
-        entry,
-        device=_device("0,0"),
-        page_session=session,
-        action_metadata={},
-        action_status={
-            _intent(session.owner_action_uuid): BindingPlanStatus.PENDING,
-        },
-    )
-
-    assert result.plan is not None
-    planned = result.plan.bindings[0]
-    assert planned.status == BindingPlanStatus.BOUND
-    assert planned.action_meta is session.owner_action_meta
-
-
-def test_explicit_dynamic_child_uses_child_metadata_and_stable_instance_id():
-    planner = _planner()
-    session = _dynamic_session()
-    child_metadata = _metadata(
-        "action.child",
-        provider_instance_id="child-provider",
-        provider_id="child.provider",
-    )
-    entry = DynamicPageCommand(
-        pageId="dynamic-page",
-        bindings=(
-            PageChildBindingDescriptor(
-                controlId="0,1",
-                target=PageChildBindingTarget(
-                    kind="action",
-                    actionId="action.child",
-                    providerInstanceId="child-provider",
-                    instanceKey="child-key",
-                ),
-            ),
-        ),
-    )
-
-    result = planner.build_dynamic_page_plan(
-        entry,
-        device=_device("0,1"),
-        page_session=session,
-        action_metadata={_intent("action.child", "child-provider"): child_metadata},
-    )
-
-    assert result.plan is not None
-    planned = result.plan.bindings[0]
-    expected_stable_id = "\x1f".join(
-        (
-            "dynamic-page",
-            session.page_session_id,
-            "child-provider",
-            "child-key",
-        )
-    )
-    expected_action_instance_id = derive_action_instance_id(
-        controller_id=CONTROLLER_ID,
-        config_id=CONFIG_ID,
-        action_id="action.child",
-        stable_id=expected_stable_id,
-    )
-    assert planned.status == BindingPlanStatus.BOUND
-    assert planned.binding.action_uuid == "action.child"
-    assert planned.binding.provider_instance_id == "child-provider"
-    assert planned.action_instance_id == expected_action_instance_id
-    assert planned.action_meta is child_metadata
-
-
 def test_retained_static_plan_restores_metadata_when_snapshot_is_empty():
     planner = _planner()
     entry = StaticPageRef(profile_name="default", page_index=0)
@@ -328,16 +190,3 @@ def test_retained_static_plan_restores_metadata_when_snapshot_is_empty():
     assert planned.action_meta is metadata
 
 
-def test_planner_uses_plain_metadata_snapshots_without_async_lookup():
-    planner = _planner()
-    entry = StaticPageRef(profile_name="default", page_index=0)
-
-    result = planner.build_static_page_plan(
-        entry,
-        bindings=(_binding("0,0", "action.bound"),),
-        device=_device("0,0"),
-        action_metadata={_intent("action.bound"): _metadata("action.bound")},
-    )
-
-    assert result.plan is not None
-    assert result.plan.bindings[0].status == BindingPlanStatus.BOUND

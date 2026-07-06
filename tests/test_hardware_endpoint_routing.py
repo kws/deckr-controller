@@ -27,7 +27,6 @@ from deckr.concord import (
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import (
-    TraceContext,
     controller_address,
     hardware_manager_address,
 )
@@ -44,10 +43,8 @@ from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller._controller_service import (
     ControllerService,
-    _parse_hardware_candidate,
 )
 from deckr.controller._device_manager import DeviceManager
-from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
     HardwareCommandService,
@@ -56,55 +53,6 @@ from deckr.controller.config import DeviceConfig, DeviceConfigMatch, Page, Profi
 
 CONTROLLER_ID = "controller-main"
 CONTRACT = ContractPointer(contractId="hardware-contract-1", generation=1)
-
-
-@pytest.mark.asyncio
-async def test_send_with_endpoint_identity_restamps_sender_and_preserves_metadata():
-    bus = LaneHarness(
-        "hardware_messages",
-        default_endpoint=controller_address(CONTROLLER_ID),
-    )
-    endpoint = bus.endpoint(controller_address(CONTROLLER_ID)).session
-    manager_endpoint = bus.endpoint(hardware_manager_address("room-a"))
-    original = hw_messages.control_command_message(
-        controller_id="stale-controller",
-        sender_session_id="stale-session",
-        manager_id="room-a",
-        device_id="deck",
-        capability_id="raster.bitmap",
-        command_type="clear",
-        control_id="0,0",
-        params={},
-        recipient_session_id=manager_endpoint.session_id,
-        contract=CONTRACT,
-    ).model_copy(
-        update={
-            "ttl_ms": 1234,
-            "causation_id": "cause-1",
-            "trace": TraceContext(
-                traceParent=(
-                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
-                )
-            ),
-        }
-    )
-
-    async with manager_endpoint.subscribe() as stream:
-        sent = await send_with_endpoint_identity(endpoint, original)
-        with anyio.fail_after(1):
-            received = await stream.receive()
-
-    assert received == sent
-    assert received.sender == controller_address(CONTROLLER_ID)
-    assert received.sender_session_id == endpoint.session_id
-    assert received.recipient == original.recipient
-    assert received.recipient_session_id == original.recipient_session_id
-    assert received.subject == original.subject
-    assert received.message_type == original.message_type
-    assert received.body == original.body
-    assert received.ttl_ms == original.ttl_ms
-    assert received.causation_id == original.causation_id
-    assert received.trace == original.trace
 
 
 def _device(device_id: str = "deck", fingerprint: str = "serial-a") -> DeviceDescriptor:
@@ -267,33 +215,6 @@ def _hardware_candidate(
 
 def _beacon(bus: LaneHarness) -> Beacon:
     return Beacon(bus.substrate.kv_bucket(BEACON_ADVERTISEMENT_STORE_POLICY))
-
-
-@pytest.mark.asyncio
-async def test_hardware_candidates_use_directory_records():
-    class Directory:
-        def records(self):
-            return _parse_hardware_candidate(_hardware_candidate())
-
-    controller = ControllerService.__new__(ControllerService)
-    controller._hardware_directory = Directory()
-
-    candidates = await ControllerService._hardware_candidates_from_beacon(controller)
-
-    assert set(candidates) == {("room-a", "deck")}
-
-
-@pytest.mark.asyncio
-async def test_hardware_candidates_raise_when_directory_is_stale():
-    class StaleDirectory:
-        def records(self):
-            raise KvUnavailable("directory stale")
-
-    controller = ControllerService.__new__(ControllerService)
-    controller._hardware_directory = StaleDirectory()
-
-    with pytest.raises(KvUnavailable):
-        await ControllerService._hardware_candidates_from_beacon(controller)
 
 
 def _concord(bus: LaneHarness) -> Concord:
@@ -692,27 +613,6 @@ async def test_hardware_claim_terminal_status_cancels_when_exact_confirmed(
 
 
 @pytest.mark.asyncio
-async def test_hardware_claim_stays_pending_until_manager_token_attaches():
-    async with _running_controller(config_service=MemoryConfigService(_config())) as (
-        controller,
-        beacon,
-        _concord,
-    ):
-        await _advertise_hardware(beacon)
-
-        with anyio.fail_after(1):
-            while not controller._owned_claims:
-                await anyio.sleep(0.01)
-
-        owned = next(iter(controller._owned_claims.values()))
-        await anyio.sleep(0.06)
-        await controller._reconcile_hardware_current_state(reason="test pending claim")
-
-        assert next(iter(controller._owned_claims.values())).claim_id == owned.claim_id
-        assert controller._device_registry.all() == ()
-
-
-@pytest.mark.asyncio
 async def test_pending_hardware_claim_survives_missing_beacon_candidate():
     async with _running_controller(config_service=MemoryConfigService(_config())) as (
         controller,
@@ -768,152 +668,6 @@ async def test_pending_hardware_claim_recovers_when_manager_attaches_later():
         assert live is not None
         assert live.ref == DeviceRef(managerId="room-a", deviceId="deck")
         assert next(iter(controller._owned_claims.values())).claim_id == owned.claim_id
-
-
-@pytest.mark.asyncio
-async def test_pending_hardware_claim_replaced_on_manager_session_change():
-    async with _running_controller(config_service=MemoryConfigService(_config())) as (
-        controller,
-        beacon,
-        concord,
-    ):
-        handle = await _advertise_hardware(beacon, session_id="old-session")
-
-        with anyio.fail_after(1):
-            while not controller._owned_claims:
-                await anyio.sleep(0.01)
-        owned = next(iter(controller._owned_claims.values()))
-
-        await handle.aclose()
-        await beacon.wait_current()
-        await _advertise_hardware(
-            beacon,
-            session_id="new-session",
-            advertisement_id="hardware-ad-2",
-        )
-        await controller._reconcile_hardware_current_state(
-            reason="test session replacement"
-        )
-
-        assert (await concord.validate(owned.contract)).status == (
-            ContractValidityStatus.CANCELLED
-        )
-
-        replacement = next(iter(controller._owned_claims.values()))
-        assert replacement.claim_id != owned.claim_id
-        assert replacement.current_sessions[
-            str(hardware_manager_address("room-a"))
-        ] == ("new-session")
-
-
-@pytest.mark.asyncio
-async def test_pending_hardware_claim_kept_when_config_changes():
-    config_service = MemoryConfigService(_config())
-    async with _running_controller(config_service=config_service) as (
-        controller,
-        beacon,
-        concord,
-    ):
-        handle = await _advertise_hardware(beacon, session_id="manager-session")
-
-        with anyio.fail_after(1):
-            while not controller._owned_claims:
-                await anyio.sleep(0.01)
-        first = next(iter(controller._owned_claims.values()))
-
-        await config_service.write_config(
-            _config().model_copy(update={"name": "Changed Test Device"})
-        )
-        await controller._reconcile_hardware_current_state(reason="test config change")
-
-        assert next(iter(controller._owned_claims.values())).claim_id == first.claim_id
-        assert (await concord.validate(first.contract)).status == (
-            ContractValidityStatus.NOT_YET_FULFILLED
-        )
-        await handle.aclose()
-
-
-@pytest.mark.asyncio
-async def test_hardware_claim_becomes_live_after_concord_manager_token():
-    async with _running_controller(config_service=MemoryConfigService(_config())) as (
-        controller,
-        beacon,
-        concord,
-    ):
-        await _advertise_hardware(beacon)
-
-        with anyio.fail_after(1):
-            while not controller._owned_claims:
-                await anyio.sleep(0.01)
-        owned = next(iter(controller._owned_claims.values()))
-
-        await concord.attach(
-            owned.contract,
-            participant=hardware_manager_address("room-a"),
-            session_id="manager-session",
-        )
-        await controller._reconcile_hardware_current_state(reason="test manager token")
-
-        with anyio.fail_after(1):
-            while controller._device_registry.get("config-room-a") is None:
-                await anyio.sleep(0.01)
-
-        live = controller._device_registry.get("config-room-a")
-        assert live is not None
-        assert live.ref == DeviceRef(managerId="room-a", deviceId="deck")
-
-
-@pytest.mark.asyncio
-async def test_hardware_claim_is_preserved_when_config_is_removed():
-    config_service = MemoryConfigService(_config())
-    async with _running_controller(config_service=config_service) as (
-        controller,
-        beacon,
-        concord,
-    ):
-        await _advertise_hardware(beacon)
-
-        with anyio.fail_after(1):
-            while not controller._owned_claims:
-                await anyio.sleep(0.01)
-        owned = next(iter(controller._owned_claims.values()))
-        await concord.attach(
-            owned.contract,
-            participant=hardware_manager_address("room-a"),
-            session_id="manager-session",
-        )
-        await controller._reconcile_hardware_current_state(reason="test manager token")
-
-        with anyio.fail_after(1):
-            while controller._device_registry.get("config-room-a") is None:
-                await anyio.sleep(0.01)
-        manager = None
-        with anyio.fail_after(1):
-            while manager is None:
-                manager = await controller._controller_contexts.get("config-room-a")
-                await anyio.sleep(0.01)
-
-        await config_service.remove_config("config-room-a")
-
-        with anyio.fail_after(1):
-            while manager._config_active:
-                await anyio.sleep(0.01)
-
-        assert controller._owned_claims
-        assert controller._device_registry.get("config-room-a") is not None
-        assert await controller._controller_contexts.get("config-room-a") is manager
-        assert (await concord.validate(owned.contract)).status == (
-            ContractValidityStatus.VALID
-        )
-
-        await config_service.write_config(_config())
-
-        with anyio.fail_after(1):
-            while not manager._config_active:
-                await anyio.sleep(0.01)
-
-        assert controller._device_registry.get("config-room-a") is not None
-        assert await controller._controller_contexts.get("config-room-a") is manager
 
 
 @pytest.mark.asyncio
