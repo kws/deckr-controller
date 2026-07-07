@@ -30,10 +30,14 @@ from deckr.controller._action_availability import (
     PROVIDER_SESSION_INVALID_REASON,
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
+    ActionAvailabilityRecord,
     ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
+    ActionUnavailableCause,
     ProviderActionKey,
+    action_unavailable_cause,
+    unavailable_overlay_template,
 )
 from deckr.controller._action_interest import (
     ActionInterestRecord,
@@ -117,6 +121,22 @@ def _provider_session_key(action: ActionMetadata) -> ProviderSessionKey:
     )
 
 
+def _unavailable_record(
+    *,
+    reason: str | None = None,
+    metadata: ActionMetadata | None = None,
+) -> ActionAvailabilityRecord:
+    metadata = metadata or _metadata("action.alpha", provider_instance_id="provider-a")
+    return ActionAvailabilityRecord(
+        key=ProviderActionKey(metadata.provider_instance_id, metadata.uuid),
+        state=ActionAvailabilityState.UNAVAILABLE,
+        source=ActionAvailabilitySource.PROVIDER_DIRECT,
+        updated_at=0.0,
+        metadata=metadata,
+        reason=reason,
+    )
+
+
 def _provider_sessions_mock(
     *,
     prepare_ready: bool = True,
@@ -158,6 +178,63 @@ def _provider_sessions_mock(
         return_value=valid if isinstance(valid, bool) else None,
     )
     return provider_sessions
+
+
+@pytest.mark.parametrize(
+    ("record", "live_contract", "cause", "template"),
+    [
+        (None, None, ActionUnavailableCause.MISSING, "unavailable_missing"),
+        (
+            _unavailable_record(reason="openhab_service_unavailable"),
+            None,
+            ActionUnavailableCause.SERVICE,
+            "unavailable_service",
+        ),
+        (
+            _unavailable_record(reason="demo_service_unavailable"),
+            None,
+            ActionUnavailableCause.SERVICE,
+            "unavailable_service",
+        ),
+        (
+            _unavailable_record(reason=PROVIDER_SESSION_INVALID_REASON),
+            None,
+            ActionUnavailableCause.SESSION,
+            "unavailable_session",
+        ),
+        (
+            _unavailable_record(reason="resource_unavailable"),
+            None,
+            ActionUnavailableCause.REJECTED,
+            "unavailable_rejected",
+        ),
+        (
+            _unavailable_record(reason="account_disconnected"),
+            None,
+            ActionUnavailableCause.UNKNOWN,
+            "unavailable_unknown",
+        ),
+        (
+            _unavailable_record(),
+            False,
+            ActionUnavailableCause.SESSION,
+            "unavailable_session",
+        ),
+    ],
+)
+def test_action_unavailable_cause_maps_records_to_overlay_templates(
+    record,
+    live_contract,
+    cause,
+    template,
+):
+    mapped = action_unavailable_cause(
+        record,
+        has_live_provider_session_contract=live_contract,
+    )
+
+    assert mapped == cause
+    assert unavailable_overlay_template(mapped) == template
 
 
 def _availability_message(

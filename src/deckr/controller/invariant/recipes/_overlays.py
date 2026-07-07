@@ -32,6 +32,31 @@ STATUS_OVERLAY_STYLES: dict[str, StatusOverlayStyle] = {
         COLOR_SLATE,
         "Unavailable",
     ),
+    "unavailable_missing": StatusOverlayStyle(
+        "lucide:circle-slash",
+        COLOR_SLATE,
+        "Missing",
+    ),
+    "unavailable_service": StatusOverlayStyle(
+        "lucide:wifi-off",
+        COLOR_SLATE,
+        "Service",
+    ),
+    "unavailable_session": StatusOverlayStyle(
+        "lucide:unplug",
+        COLOR_SLATE,
+        "Session",
+    ),
+    "unavailable_rejected": StatusOverlayStyle(
+        "lucide:triangle-alert",
+        COLOR_AMBER,
+        "Rejected",
+    ),
+    "unavailable_unknown": StatusOverlayStyle(
+        "lucide:circle-alert",
+        COLOR_SLATE,
+        "Unavailable",
+    ),
     "pending": StatusOverlayStyle("lucide:circle-ellipsis", COLOR_BLUE, "Pending"),
     "loading": StatusOverlayStyle("lucide:circle-dashed", COLOR_BLUE, "Loading"),
     "unknown": StatusOverlayStyle(

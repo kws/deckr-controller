@@ -61,6 +61,10 @@ class RenderSource:
     trace: dict[str, Any] | None = None
     command_type: str | None = None
     content_kind: str | None = None
+    availability_cause: str | None = None
+    availability_state: str | None = None
+    availability_source: str | None = None
+    availability_reason: str | None = None
     binding_output_generation: int | None = None
     overlay_generation: int | None = None
 

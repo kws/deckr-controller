@@ -82,11 +82,15 @@ from pydantic import ValidationError
 from deckr.controller._action_availability import (
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
+    ActionAvailabilityRecord,
     ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
     ActionPlanningSnapshot,
+    ActionUnavailableCause,
     ProviderActionKey,
+    action_unavailable_cause,
+    unavailable_overlay_template,
 )
 from deckr.controller._action_interest import (
     ActionInterestSnapshot,
@@ -339,6 +343,14 @@ class PageCommit:
     transition_reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class _UnavailableFallbackRender:
+    template: str
+    cause: ActionUnavailableCause
+    record: ActionAvailabilityRecord | None
+    state: ActionAvailabilityState | None
+
+
 def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
     return f"{provider_instance_id}::{action_uuid}"
 
@@ -520,9 +532,26 @@ class DeviceManager:
     ) -> None:
         tg.start_soon(self._page_timeout_loop, stopping)
 
-    async def _render_unavailable_to_control(self, control: ControlSurface) -> None:
+    async def _render_unavailable_to_control(
+        self,
+        control: ControlSurface,
+        *,
+        planned: PlannedBinding,
+        page_id: str,
+    ) -> None:
         """Render a not-available overlay to an output-capable control."""
-        await self._render_status_to_control(control, overlay_type="unavailable")
+        fallback = self._unavailable_fallback_render(planned)
+        self._log_unavailable_fallback_render(
+            control,
+            planned=planned,
+            page_id=page_id,
+            fallback=fallback,
+        )
+        await self._render_status_to_control(
+            control,
+            overlay_type=fallback.template,
+            source=self._unavailable_fallback_render_source(planned, fallback),
+        )
 
     async def _render_pending_to_control(self, control: ControlSurface) -> None:
         """Render a pending overlay to an output-capable control."""
@@ -533,6 +562,7 @@ class DeviceManager:
         control: ControlSurface,
         *,
         overlay_type: str,
+        source: RenderSource | None = None,
     ) -> None:
         if control.image_format is None or control.raster_capability_id is None:
             return
@@ -548,8 +578,10 @@ class DeviceManager:
         request = render_service.build_request(
             model,
             control.image_format,
+            config_id=self.config_id,
             context_id=context_id,
             control_id=control.id,
+            source=source,
         )
         await self._render_dispatcher.submit_request(
             control_id=control.id,
@@ -557,6 +589,116 @@ class DeviceManager:
             request=request,
             output=output,
         )
+
+    def _unavailable_fallback_render(
+        self,
+        planned: PlannedBinding,
+    ) -> _UnavailableFallbackRender:
+        intent = self._binding_planner.resolved_action_intent_key(planned.binding)
+        now = self._clock()
+        record = self._action_availability.record_for_intent(intent, now=now)
+        state = (
+            self._action_availability.state_for(record.key, now=now)
+            if record is not None
+            else None
+        )
+        cause = action_unavailable_cause(
+            record,
+            has_live_provider_session_contract=(
+                self._planned_binding_has_live_provider_session_contract(planned)
+            ),
+        )
+        return _UnavailableFallbackRender(
+            template=unavailable_overlay_template(cause),
+            cause=cause,
+            record=record,
+            state=state,
+        )
+
+    def _planned_binding_has_live_provider_session_contract(
+        self,
+        planned: PlannedBinding,
+    ) -> bool | None:
+        action_meta = planned.action_meta
+        if action_meta is None:
+            return None
+        if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return True
+        session_key = provider_session_key(action_meta)
+        return self._contract_pointer_for_provider_session_key(session_key) is not None
+
+    def _log_unavailable_fallback_render(
+        self,
+        control: ControlSurface,
+        *,
+        planned: PlannedBinding,
+        page_id: str,
+        fallback: _UnavailableFallbackRender,
+    ) -> None:
+        record = fallback.record
+        selected_provider_key = (
+            (
+                record.key.provider_instance_id,
+                record.key.action_uuid,
+            )
+            if record is not None
+            else None
+        )
+        logger.info(
+            "Controller unavailable fallback render config=%s page=%s control=%s "
+            "action=%s provider=%s selected_provider_key=%s "
+            "availability_state=%s availability_source=%s reason=%s cause=%s "
+            "template=%s",
+            self.config_id,
+            page_id,
+            control.id,
+            planned.binding.action_uuid,
+            self._unavailable_fallback_provider_instance(planned, record),
+            selected_provider_key,
+            fallback.state.value if fallback.state is not None else None,
+            record.source.value if record is not None else None,
+            record.reason if record is not None else None,
+            fallback.cause.value,
+            fallback.template,
+        )
+
+    def _unavailable_fallback_render_source(
+        self,
+        planned: PlannedBinding,
+        fallback: _UnavailableFallbackRender,
+    ) -> RenderSource:
+        record = fallback.record
+        metadata = record.metadata if record is not None else None
+        if metadata is None:
+            metadata = planned.action_meta
+        return RenderSource(
+            provider_instance_id=self._unavailable_fallback_provider_instance(
+                planned,
+                record,
+            ),
+            provider_id=metadata.provider_id if metadata is not None else None,
+            action_id=planned.binding.action_uuid,
+            action_instance_id=planned.action_instance_id,
+            command_type="controller_fallback",
+            content_kind=f"overlay:{fallback.template}",
+            availability_cause=fallback.cause.value,
+            availability_state=(
+                fallback.state.value if fallback.state is not None else None
+            ),
+            availability_source=record.source.value if record is not None else None,
+            availability_reason=record.reason if record is not None else None,
+        )
+
+    def _unavailable_fallback_provider_instance(
+        self,
+        planned: PlannedBinding,
+        record: ActionAvailabilityRecord | None,
+    ) -> str | None:
+        if record is not None:
+            return record.key.provider_instance_id
+        if planned.action_meta is not None:
+            return planned.action_meta.provider_instance_id
+        return planned.binding.provider_instance_id
 
     def _find_profile(self, profile_name: str) -> Profile:
         for profile in self.config.profiles:
@@ -2180,7 +2322,11 @@ class DeviceManager:
                 if planned.status == BindingPlanStatus.PENDING:
                     await self._render_pending_to_control(control)
                 else:
-                    await self._render_unavailable_to_control(control)
+                    await self._render_unavailable_to_control(
+                        control,
+                        planned=planned,
+                        page_id=plan.page_id,
+                    )
             return False
         ok = await self._try_resolve_binding(
             planned.binding,
@@ -2201,7 +2347,11 @@ class DeviceManager:
             raster_capability_id=_selected_raster_capability_id(planned.binding),
         )
         if control is not None:
-            await self._render_unavailable_to_control(control)
+            await self._render_unavailable_to_control(
+                control,
+                planned=planned,
+                page_id=plan.page_id,
+            )
         return False
 
     async def _set_page_locked(
@@ -2683,7 +2833,11 @@ class DeviceManager:
                         ),
                     )
                     if control is not None:
-                        await self._render_unavailable_to_control(control)
+                        await self._render_unavailable_to_control(
+                            control,
+                            planned=planned,
+                            page_id=refreshed_plan.page_id,
+                        )
                     continue
 
                 if lease is None:

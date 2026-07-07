@@ -82,6 +82,14 @@ class ActionAvailabilityState(StrEnum):
     EXPIRED = "expired"
 
 
+class ActionUnavailableCause(StrEnum):
+    MISSING = "missing"
+    SERVICE = "service"
+    SESSION = "session"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class ActionAvailabilityRecord:
     key: ProviderActionKey
@@ -105,6 +113,80 @@ class ActionPlanningSnapshot:
     metadata: Mapping[ActionIntentKey, ActionMetadata]
     pending: frozenset[ActionIntentKey]
     unavailable: frozenset[ActionIntentKey]
+
+
+UNAVAILABLE_OVERLAY_TEMPLATE_BY_CAUSE: Mapping[ActionUnavailableCause, str] = {
+    ActionUnavailableCause.MISSING: "unavailable_missing",
+    ActionUnavailableCause.SERVICE: "unavailable_service",
+    ActionUnavailableCause.SESSION: "unavailable_session",
+    ActionUnavailableCause.REJECTED: "unavailable_rejected",
+    ActionUnavailableCause.UNKNOWN: "unavailable_unknown",
+}
+
+_SERVICE_UNAVAILABLE_REASONS = frozenset(
+    {
+        "service_unavailable",
+        "openhab_service_unavailable",
+        "sonos_service_unavailable",
+    }
+)
+_SESSION_UNAVAILABLE_REASONS = frozenset(
+    {
+        PROVIDER_SESSION_INVALID_REASON,
+        "provider_session_unavailable",
+        "missing_provider_session_contract",
+    }
+)
+_REJECTED_UNAVAILABLE_REASONS = frozenset(
+    {
+        "action_not_available",
+        "resource_unavailable",
+        "provider_not_ready",
+        "internal_error",
+    }
+)
+
+
+def action_unavailable_cause(
+    record: ActionAvailabilityRecord | None,
+    *,
+    has_live_provider_session_contract: bool | None = None,
+) -> ActionUnavailableCause:
+    """Classify the controller fallback overlay for an unavailable action."""
+
+    reason = record.reason if record is not None else None
+    if _service_unavailable_reason(reason):
+        return ActionUnavailableCause.SERVICE
+    if reason in _SESSION_UNAVAILABLE_REASONS:
+        return ActionUnavailableCause.SESSION
+    if has_live_provider_session_contract is False:
+        return ActionUnavailableCause.SESSION
+    if reason in _REJECTED_UNAVAILABLE_REASONS:
+        return ActionUnavailableCause.REJECTED
+    if record is None:
+        return ActionUnavailableCause.MISSING
+    if _metadata_missing_provider_session(record.metadata):
+        return ActionUnavailableCause.SESSION
+    return ActionUnavailableCause.UNKNOWN
+
+
+def unavailable_overlay_template(cause: ActionUnavailableCause) -> str:
+    return UNAVAILABLE_OVERLAY_TEMPLATE_BY_CAUSE[cause]
+
+
+def _service_unavailable_reason(reason: str | None) -> bool:
+    return reason is not None and (
+        reason in _SERVICE_UNAVAILABLE_REASONS
+        or reason.endswith("_service_unavailable")
+    )
+
+
+def _metadata_missing_provider_session(metadata: ActionMetadata | None) -> bool:
+    return (
+        metadata is not None
+        and metadata.provider_instance_id not in RESERVED_BUILTIN_PROVIDER_IDS
+        and metadata.provider_session_id is None
+    )
 
 
 class ActionProviderSessionPreparer(Protocol):

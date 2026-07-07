@@ -29,6 +29,11 @@ OVERLAY_TEMPLATE_DEFAULT_SECONDS = {
     "ok": 1.2,
     "error": 2.0,
     "unavailable": 2.0,
+    "unavailable_missing": 2.0,
+    "unavailable_service": 2.0,
+    "unavailable_session": 2.0,
+    "unavailable_rejected": 2.0,
+    "unavailable_unknown": 2.0,
     "unknown": 2.0,
 }
 OVERLAY_TEMPLATES = frozenset(STATUS_OVERLAY_STYLES)

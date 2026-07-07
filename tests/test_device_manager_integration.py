@@ -753,6 +753,17 @@ class ControlledFrameBackend:
         return
 
 
+async def _wait_for_render_request(
+    render_backend: ControlledFrameBackend,
+    *,
+    after: int = 0,
+):
+    with anyio.fail_after(5.0):
+        while len(render_backend.requests) <= after:
+            await anyio.sleep(0.01)
+    return render_backend.requests[-1]
+
+
 class SetRasterImageOnAppearAction:
     """Minimal action that sets a graph-backed raster image on will_appear."""
 
@@ -1234,6 +1245,233 @@ def device_config_set_raster_image():
             )
         ],
     )
+
+
+@pytest.mark.asyncio
+async def test_missing_action_renders_missing_unavailable_fallback():
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(return_value=None)
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+
+        await manager.set_page(profile="default", page=0)
+        request = await _wait_for_render_request(render_backend)
+        assert request.source is not None
+        assert request.source.command_type == "controller_fallback"
+        assert request.source.content_kind == "overlay:unavailable_missing"
+        assert request.source.availability_cause == "missing"
+        assert request.source.availability_reason is None
+        render_backend.release(request.generation)
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_provider_direct_service_unavailable_renders_service_fallback():
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(return_value=None)
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                settings={},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        metadata = _metadata(
+            ACTION_X_UUID,
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+        )
+        manager._action_availability.record_unavailable(
+            ProviderActionKey(PROVIDER_INSTANCE_ID, ACTION_X_UUID),
+            metadata=metadata,
+            reason="sonos_service_unavailable",
+        )
+
+        await manager.set_page(profile="default", page=0)
+        request = await _wait_for_render_request(render_backend)
+        assert request.source is not None
+        assert request.source.content_kind == "overlay:unavailable_service"
+        assert request.source.availability_cause == "service"
+        assert request.source.availability_state == "unavailable"
+        assert request.source.availability_source == "provider_direct"
+        assert request.source.availability_reason == "sonos_service_unavailable"
+        render_backend.release(request.generation)
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_provider_session_invalidation_renders_session_fallback(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        lease = manager._binding_lease_for_control("0,0")
+        assert lease is not None
+        key = manager._action_availability_service.record_lifecycle_unavailable(
+            provider_instance_id=PROVIDER_INSTANCE_ID,
+            provider_id=PROVIDER_ID,
+            provider_session_id=PROVIDER_SESSION_ID,
+            action_uuid=SetRasterImageOnAppearAction.uuid,
+            reason=PROVIDER_SESSION_INVALID_REASON,
+            intent=manager._planned_intent_for_lease(lease),
+        )
+
+        await manager.on_action_availability_changed(frozenset({key}))
+        request = await _wait_for_render_request(render_backend)
+        assert request.source is not None
+        assert request.source.content_kind == "overlay:unavailable_session"
+        assert request.source.availability_cause == "session"
+        assert request.source.availability_reason == PROVIDER_SESSION_INVALID_REASON
+        render_backend.release(request.generation)
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_lifecycle_rejection_renders_rejected_fallback(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    command_service = FakeHardwareCommandService()
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=command_service,
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        await manager.set_page(profile="default", page=0)
+        ctx = await manager.action_contexts.get("0,0")
+        assert ctx is not None
+
+        msg = await _action_command_for_active_binding(
+            manager,
+            ACTION_LIFECYCLE_REJECTED,
+            {
+                "targetKind": "binding",
+                "binding": ctx.metadata.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                    mode="json",
+                ),
+                "reason": "provider_not_ready",
+            },
+        )
+        await manager.handle_command(msg)
+
+        request = await _wait_for_render_request(render_backend)
+        assert request.source is not None
+        assert request.source.content_kind == "overlay:unavailable_rejected"
+        assert request.source.availability_cause == "rejected"
+        assert request.source.availability_reason == "provider_not_ready"
+        render_backend.release(request.generation)
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio
@@ -3811,4 +4049,3 @@ async def test_unrelated_availability_change_does_not_rebuild_current_page(
         command_service.clear_raster.assert_not_awaited()
         assert await manager.action_contexts.get("0,0") is ctx_before
         tg.cancel_scope.cancel()
-

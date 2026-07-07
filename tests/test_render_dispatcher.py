@@ -10,6 +10,7 @@ import os
 import signal
 import time
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -395,6 +396,44 @@ async def test_observing_render_backend_can_include_graph_and_context(
 
 
 @pytest.mark.asyncio
+async def test_observing_render_backend_records_availability_source_metadata(
+    tmp_path: Path,
+):
+    path = tmp_path / "render.jsonl"
+    backend = ObservingRenderBackend(
+        ImmediateBackend(),
+        controller_id="controller-main",
+        options=RenderObservationOptions(path=path),
+    )
+    request = _request_with_graph({"output": "value"})
+    assert request.source is not None
+    request = replace(
+        request,
+        binding_id=None,
+        source=replace(
+            request.source,
+            command_type="controller_fallback",
+            content_kind="overlay:unavailable_service",
+            availability_cause="service",
+            availability_state="unavailable",
+            availability_source="provider_direct",
+            availability_reason="sonos_service_unavailable",
+        ),
+    )
+
+    await backend.render(request)
+
+    record = _read_observations(path)[0]
+    assert record["bindingId"] is None
+    assert record["commandType"] == "controller_fallback"
+    assert record["contentKind"] == "overlay:unavailable_service"
+    assert record["availabilityCause"] == "service"
+    assert record["availabilityState"] == "unavailable"
+    assert record["availabilitySource"] == "provider_direct"
+    assert record["availabilityReason"] == "sonos_service_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_observing_render_backend_delegates_close(tmp_path: Path):
     delegate = ImmediateBackend()
     backend = ObservingRenderBackend(
@@ -490,4 +529,3 @@ def _write_blob_to_store(cache_dir: str, payload: bytes) -> bytes:
     blob = BlobArtifact(data=payload, content_type="application/octet-stream")
     store.put("test:blob", "a" * 64, blob)
     return store.get("test:blob", "a" * 64).data
-

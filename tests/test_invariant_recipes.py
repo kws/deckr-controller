@@ -38,6 +38,21 @@ def test_legacy_status_overlay_helpers_delegate_to_status_styles():
     )
 
 
+def test_cause_specific_unavailable_overlay_styles_resolve_icons_and_titles():
+    expected = {
+        "unavailable_missing": ("lucide:circle-slash", "Missing"),
+        "unavailable_service": ("lucide:wifi-off", "Service"),
+        "unavailable_session": ("lucide:unplug", "Session"),
+        "unavailable_rejected": ("lucide:triangle-alert", "Rejected"),
+        "unavailable_unknown": ("lucide:circle-alert", "Unavailable"),
+    }
+
+    for template, (icon, title) in expected.items():
+        style = STATUS_OVERLAY_STYLES[template]
+        assert style.icon == icon
+        assert style.title == title
+
+
 def test_title_card_top_and_bottom_alignment() -> None:
     top = title_card("Top", title_alignment="top")
     bottom = title_card("Bottom", title_alignment="bottom")
