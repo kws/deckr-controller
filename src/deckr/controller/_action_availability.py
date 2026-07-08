@@ -35,7 +35,10 @@ from deckr.services import (
 )
 
 from deckr.controller._action_interest import ActionInterestSnapshot
-from deckr.controller._action_provider_sessions import ProviderSessionKey
+from deckr.controller._action_provider_sessions import (
+    ProviderSessionKey,
+    provider_session_key,
+)
 from deckr.controller._binding_planner import ActionIntentKey
 from deckr.controller._settings_metadata import SettingsActionMetadata
 from deckr.controller.action_provider.events import ActionCatalogChangedEvent
@@ -847,6 +850,15 @@ def _metadata_requires_provider_session_revalidation(
     )
 
 
+def _contract_pointer_matches(
+    left: ContractPointer | None,
+    right: ContractPointer | None,
+) -> bool:
+    if left is None or right is None:
+        return left is right
+    return left.contract_id == right.contract_id and left.generation == right.generation
+
+
 def _availability_state_for_entry(
     entry: ActionAvailabilityEntry,
 ) -> ActionAvailabilityState:
@@ -1476,16 +1488,20 @@ class ActionAvailabilityService:
                                                     payload
                                                 )
                                             )
-                                            changed = self.ingest_service_view_payload(
-                                                view,
-                                                service_id=service_id,
+                                            changed = set(
+                                                self.ingest_service_view_payload(
+                                                    view,
+                                                    service_id=service_id,
+                                                )
                                             )
-                                            await self._prepare_provider_sessions_for_view(
-                                                view
+                                            changed.update(
+                                                await self._prepare_provider_sessions_for_view(
+                                                    view
+                                                )
                                             )
                                         if changed:
                                             await self._notify_availability_changed(
-                                                changed
+                                                frozenset(changed)
                                             )
                                 except ServiceUnavailable as exc:
                                     if service_unavailable_ends_service_use(exc):
@@ -1530,20 +1546,26 @@ class ActionAvailabilityService:
     async def _prepare_provider_sessions_for_view(
         self,
         view: ActionAvailabilityViewPayload,
-    ) -> None:
+    ) -> frozenset[ProviderActionKey]:
         provider_sessions = self._provider_sessions
         if provider_sessions is None:
-            return
-        actions = [
-            record.metadata
+            return frozenset()
+        records = [
+            record
             for record in self.cache.service_view_records()
             if record.key.provider_instance_id == view.provider_instance_id
             and record.state == ActionAvailabilityState.AVAILABLE
             and record.metadata is not None
             and _metadata_requires_provider_session_revalidation(record.metadata)
         ]
-        if not actions:
-            return
+        if not records:
+            return frozenset()
+        actions = [record.metadata for record in records]
+        previous_contracts = {
+            record.key: self.contract_pointer(provider_session_key(record.metadata))
+            for record in records
+            if record.metadata is not None
+        }
         try:
             await provider_sessions.prepare_many(actions)
         except Exception:
@@ -1555,6 +1577,33 @@ class ActionAvailabilityService:
                 view.provider_session_id,
                 exc_info=True,
             )
+            return frozenset()
+        changed: set[ProviderActionKey] = set()
+        for record in records:
+            if record.metadata is None:
+                continue
+            session_key = provider_session_key(record.metadata)
+            current_contract = self.contract_pointer(session_key)
+            previous_contract = previous_contracts.get(record.key)
+            if _contract_pointer_matches(previous_contract, current_contract):
+                continue
+            changed.add(record.key)
+            logger.info(
+                "Action availability provider session contract changed "
+                "provider=%s provider_id=%s action=%s provider_session=%s "
+                "old_contract=%s new_contract=%s",
+                record.metadata.provider_instance_id,
+                record.metadata.provider_id,
+                record.metadata.uuid,
+                record.metadata.provider_session_id,
+                (
+                    previous_contract.contract_id
+                    if previous_contract is not None
+                    else None
+                ),
+                current_contract.contract_id if current_contract is not None else None,
+            )
+        return frozenset(changed)
 
     async def _mark_unavailable_and_notify(
         self,

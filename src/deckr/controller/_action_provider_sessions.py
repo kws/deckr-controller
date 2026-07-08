@@ -143,7 +143,10 @@ class ActionProviderSessionManager:
             return _retired_snapshot(key)
         existing = self._sessions.get(key)
         if existing is not None:
-            return await self._refresh_unlocked(key)
+            snapshot = await self._refresh_unlocked(key)
+            if snapshot.terminal:
+                return await self._ensure_unlocked(action, key=key)
+            return snapshot
 
         provider_endpoint = action_provider_address(action.provider_instance_id)
         controller_endpoint = controller_address(self._controller_id)

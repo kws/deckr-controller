@@ -192,6 +192,15 @@ class ReadyProviderSessions:
         raise AssertionError(f"unexpected provider-session valid call: {kwargs}")
 
 
+class MutableContractProviderSessions(ReadyProviderSessions):
+    def __init__(self, contract: ContractPointer) -> None:
+        super().__init__()
+        self.contract = contract
+
+    def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer:
+        return self.contract
+
+
 class TemporarilyUnavailableProviderSessions(ReadyProviderSessions):
     def __init__(self) -> None:
         super().__init__()
@@ -2157,6 +2166,82 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
             assert detached[0].recipient_session_id == PROVIDER_SESSION_ID
             assert created[0].recipient_session_id == PROVIDER_SESSION_ID
             assert attached[0].recipient_session_id == PROVIDER_SESSION_ID
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_provider_session_contract_change_replaces_matching_binding(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    action_bus = _actions_bus()
+    first_contract = ContractPointer(contractId="provider-session-contract-1", generation=1)
+    next_contract = ContractPointer(contractId="provider-session-contract-2", generation=1)
+    provider_sessions = MutableContractProviderSessions(first_contract)
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        manager._action_availability_service._provider_sessions = provider_sessions
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+            )
+            await manager.set_page(profile="default", page=0)
+            ctx = await manager.action_contexts.get("0,0")
+            lease = manager._binding_lease_for_control("0,0")
+            assert ctx is not None
+            assert lease is not None
+            assert lease.context.contract == first_contract
+            await _drain_action_messages(stream)
+
+            provider_sessions.contract = next_contract
+            await manager.on_action_availability_changed(
+                {
+                    ProviderActionKey(
+                        PROVIDER_INSTANCE_ID,
+                        SetRasterImageOnAppearAction.uuid,
+                    )
+                }
+            )
+
+            replacement_ctx = await manager.action_contexts.get("0,0")
+            replacement_lease = manager._binding_lease_for_control("0,0")
+            assert replacement_ctx is not None
+            assert replacement_ctx is not ctx
+            assert replacement_lease is not None
+            assert replacement_lease is not lease
+            assert replacement_lease.provider_session_id == PROVIDER_SESSION_ID
+            assert replacement_lease.context.contract == next_contract
+            assert replacement_lease.attached
+
+            messages = await _collect_action_messages(stream)
+            created = [
+                msg
+                for msg in messages
+                if msg.message_type == ACTION_INSTANCE_CREATED
+            ]
+            attached = [
+                msg for msg in messages if msg.message_type == BINDING_ATTACHED
+            ]
+            assert len(created) == 1
+            assert len(attached) == 1
+            assert created[0].contract == next_contract
+            assert attached[0].contract == next_contract
 
         tg.cancel_scope.cancel()
 

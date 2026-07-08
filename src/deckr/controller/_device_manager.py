@@ -378,6 +378,15 @@ def _lease_matches_action_ignoring_session(
     )
 
 
+def _contract_pointer_matches(
+    left: ContractPointer | None,
+    right: ContractPointer | None,
+) -> bool:
+    if left is None or right is None:
+        return left is right
+    return left.contract_id == right.contract_id and left.generation == right.generation
+
+
 def _binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
     return (
         binding.provider_instance_id == lease.provider_instance_id
@@ -1315,6 +1324,21 @@ class DeviceManager:
             return None
         return key
 
+    def _lease_uses_current_provider_session_contract(
+        self,
+        lease: BindingLease,
+    ) -> bool:
+        if lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return True
+        current = self._current_provider_session_contract_for_lease(lease)
+        return _contract_pointer_matches(current, lease.context.contract)
+
+    def _current_provider_session_contract_for_lease(
+        self,
+        lease: BindingLease,
+    ) -> ContractPointer | None:
+        return self._contract_pointer_for_provider_session_key(lease.provider_session_key)
+
     def _lifecycle_rejection_is_terminal(
         self,
         body: ActionLifecycleRejectedBody,
@@ -1349,6 +1373,31 @@ class DeviceManager:
             reason=reason,
             intent=self._planned_intent_for_lease(lease),
             now=self._clock(),
+        )
+
+    async def _recover_binding_provider_session_contract(
+        self,
+        lease: BindingLease,
+        *,
+        reason: str,
+    ) -> None:
+        if (
+            self._lease_uses_current_provider_session_contract(lease)
+            or self._current_provider_session_contract_for_lease(lease) is None
+        ):
+            return
+        logger.info(
+            "Recovering binding with stale provider-session contract config=%s "
+            "control=%s action=%s provider=%s binding=%s reason=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.binding_id,
+            reason,
+        )
+        await self.on_action_availability_changed(
+            (ProviderActionKey(lease.provider_instance_id, lease.action_uuid),)
         )
 
     def _record_lifecycle_unavailable_for_action_instance(
@@ -2946,6 +2995,19 @@ class DeviceManager:
                     continue
 
                 if _lease_matches_action(lease, planned.action_meta):
+                    if not self._lease_uses_current_provider_session_contract(lease):
+                        if (
+                            self._current_provider_session_contract_for_lease(lease)
+                            is None
+                        ):
+                            continue
+                        await self._replace_binding_provider_session(
+                            refreshed_plan,
+                            planned,
+                            lease,
+                            reason="provider_session_contract_changed",
+                        )
+                        continue
                     recovery_key = self._provider_lifecycle_recovery_key(
                         lease,
                         planned.action_meta,
@@ -3200,6 +3262,10 @@ class DeviceManager:
                 msg,
                 lease.provider_session_key,
             ):
+                await self._recover_binding_provider_session_contract(
+                    lease,
+                    reason=f"{msg.message_type}_contract_mismatch",
+                )
                 logger.warning(
                     "Ignoring action command %s from provider session %s without "
                     "matching Concord contract",

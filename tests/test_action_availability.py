@@ -1195,6 +1195,64 @@ async def test_provider_session_ready_transition_notifies_and_unlocks_planning()
 
 
 @pytest.mark.asyncio
+async def test_service_view_prepare_reports_provider_session_contract_change():
+    metadata = _metadata(
+        "action.alpha",
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        provider_session_id="negotiating-session",
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    actions_bus = _actions_bus()
+    provider_sessions = _provider_sessions_mock()
+    first_contract = ContractPointer(contractId="provider-session-contract-1", generation=1)
+    next_contract = ContractPointer(contractId="provider-session-contract-2", generation=1)
+    contract_state = {"value": first_contract}
+
+    async def prepare_many(actions):
+        contract_state["value"] = next_contract
+        return {
+            _provider_session_key(action): SimpleNamespace(
+                key=_provider_session_key(action),
+                ready=True,
+                terminal=False,
+            )
+            for action in tuple(actions)
+        }
+
+    provider_sessions.prepare_many = AsyncMock(side_effect=prepare_many)
+    provider_sessions.contract_pointer.side_effect = (
+        lambda _key: contract_state["value"]
+    )
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        actions_bus=actions_bus,
+        manager=MagicMock(),
+        provider_sessions=provider_sessions,
+        start_soon=None,
+    )
+    service.cache.record_available(metadata, now=0.0)
+    view = ActionAvailabilityViewPayload(
+        providerInstanceId="provider-alpha",
+        providerEndpoint=action_provider_address("provider-alpha"),
+        providerId="provider.test",
+        providerSessionId="negotiating-session",
+        entries=(
+            ActionAvailabilityEntry(
+                actionId="action.alpha",
+                status="available",
+                descriptor=ActionDescriptor(actionId="action.alpha"),
+            ),
+        ),
+    )
+
+    changed = await service._prepare_provider_sessions_for_view(view)
+
+    assert changed == frozenset({key})
+
+
+@pytest.mark.asyncio
 async def test_provider_session_change_reconciles_and_notifies_invalid_records():
     metadata = _metadata(
         "action.alpha",
