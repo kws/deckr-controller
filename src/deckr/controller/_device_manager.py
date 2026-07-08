@@ -153,7 +153,7 @@ BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS = 1.0
 SETTINGS_SNAPSHOT_TIMEOUT_SECONDS = 1.0
 DETACH_NOTIFY_TIMEOUT_SECONDS = 1.0
 _ACTION_METADATA_UNSET: Any = object()
-_SETTINGS_COMMAND_TYPES = frozenset(
+_SETTINGS_REQUEST_TYPES = frozenset(
     {
         SETTINGS_REQUEST,
     }
@@ -3306,7 +3306,7 @@ class DeviceManager:
         target_data = payload.get("target")
         if not isinstance(target_data, Mapping):
             logger.warning(
-                "Ignoring invalid settings command %s from %s without target object",
+                "Ignoring invalid settings request %s from %s without target object",
                 msg_type,
                 sender,
             )
@@ -3332,14 +3332,14 @@ class DeviceManager:
     ) -> bool:
         if target.provider_instance_id != sender_provider_instance_id:
             logger.warning(
-                "Ignoring provider settings command from %s for provider instance %s",
+                "Ignoring provider settings request from %s for provider instance %s",
                 sender_provider_instance_id,
                 target.provider_instance_id,
             )
             return False
         if sender_session_id is None:
             logger.warning(
-                "Ignoring provider settings command from %s without sender session",
+                "Ignoring provider settings request from %s without sender session",
                 sender_provider_instance_id,
             )
             return False
@@ -3354,7 +3354,7 @@ class DeviceManager:
             provider_session_id=sender_session_id,
         ):
             logger.warning(
-                "Ignoring provider settings command from %s without valid Concord "
+                "Ignoring provider settings request from %s without valid Concord "
                 "provider session %s",
                 sender_provider_instance_id,
                 sender_session_id,
@@ -3362,7 +3362,7 @@ class DeviceManager:
             return False
         if not await self._message_contract_authorized(msg, session_key):
             logger.warning(
-                "Ignoring provider settings command from %s without matching "
+                "Ignoring provider settings request from %s without matching "
                 "Concord provider-session contract %s",
                 sender_provider_instance_id,
                 sender_session_id,
@@ -3398,7 +3398,7 @@ class DeviceManager:
             and await self._message_contract_authorized(msg, key)
         )
 
-    async def _settings_snapshot_for_command(
+    async def _settings_snapshot_for_request(
         self,
         *,
         msg_type: str,
@@ -3414,7 +3414,7 @@ class DeviceManager:
                 return None
         except (KeyError, ValidationError, ValueError):
             logger.warning(
-                "Ignoring invalid settings command %s for target %s",
+                "Ignoring invalid settings request %s for target %s",
                 msg_type,
                 target.key(),
                 exc_info=True,
@@ -3617,7 +3617,7 @@ class DeviceManager:
                 subject=msg.subject,
             )
 
-        if msg_type in _SETTINGS_COMMAND_TYPES:
+        if msg_type in _SETTINGS_REQUEST_TYPES:
             sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
             if sender_provider_instance_id is None:
                 return
@@ -3630,7 +3630,7 @@ class DeviceManager:
                 return
             if settings_target.config_id != self.config_id:
                 logger.warning(
-                    "Ignoring settings command %s from %s for config %s on manager config %s",
+                    "Ignoring settings request %s from %s for config %s on manager config %s",
                     msg_type,
                     msg.sender,
                     settings_target.config_id,
@@ -3645,7 +3645,7 @@ class DeviceManager:
                     target=settings_target,
                 ):
                     return
-                snapshot_body = await self._settings_snapshot_for_command(
+                snapshot_body = await self._settings_snapshot_for_request(
                     msg_type=msg_type,
                     target=settings_target,
                     payload=payload,
@@ -3748,7 +3748,7 @@ class DeviceManager:
 
         page_session = authorization.page_session
         if page_session is not None:
-            if msg_type in _SETTINGS_COMMAND_TYPES:
+            if msg_type in _SETTINGS_REQUEST_TYPES:
                 if (
                     self._settings_service is None
                     or page_session.settings_target is None
@@ -3759,10 +3759,10 @@ class DeviceManager:
                     return
                 if target.key() != page_session.settings_target.key():
                     logger.warning(
-                        "Ignoring settings command for mismatched page target"
+                        "Ignoring settings request for mismatched page target"
                     )
                     return
-                snapshot_body = await self._settings_snapshot_for_command(
+                snapshot_body = await self._settings_snapshot_for_request(
                     msg_type=msg_type,
                     target=target,
                     payload=payload,
@@ -3775,7 +3775,7 @@ class DeviceManager:
         if lease is None:
             return
 
-        if msg_type in _SETTINGS_COMMAND_TYPES:
+        if msg_type in _SETTINGS_REQUEST_TYPES:
             if self._settings_service is None or lease.settings_target is None:
                 return
             target = settings_target
@@ -3783,10 +3783,10 @@ class DeviceManager:
                 return
             if target.key() != lease.settings_target.key():
                 logger.warning(
-                    "Ignoring settings command for mismatched binding target"
+                    "Ignoring settings request for mismatched binding target"
                 )
                 return
-            snapshot_body = await self._settings_snapshot_for_command(
+            snapshot_body = await self._settings_snapshot_for_request(
                 msg_type=msg_type,
                 target=target,
                 payload=payload,

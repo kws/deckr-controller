@@ -262,7 +262,7 @@ def _provider_settings_target(
     )
 
 
-def _provider_settings_command(
+def _provider_settings_request(
     message_type: str,
     target: SettingsTargetRef,
     *,
@@ -291,7 +291,7 @@ def _provider_settings_command(
     )
 
 
-def _raw_provider_settings_command(
+def _raw_provider_settings_message(
     message_type: str,
     target: SettingsTargetRef,
     *,
@@ -1111,7 +1111,7 @@ async def test_provider_settings_request_after_beacon_loss_uses_concord_session(
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(
-            _provider_settings_command(
+            _provider_settings_request(
                 SETTINGS_REQUEST,
                 _provider_settings_target(),
                 contract=contract,
@@ -1143,7 +1143,7 @@ async def test_provider_settings_request_from_non_owning_provider_is_ignored():
 
     async with action_bus.subscribe(action_provider_address("other")) as stream:
         await manager.handle_command(
-            _provider_settings_command(
+            _provider_settings_request(
                 SETTINGS_REQUEST,
                 _provider_settings_target(),
                 sender_provider_instance_id="other",
@@ -1180,7 +1180,7 @@ async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(
-            _provider_settings_command(
+            _provider_settings_request(
                 SETTINGS_REQUEST,
                 _provider_settings_target("other"),
             )
@@ -1221,7 +1221,7 @@ async def test_provider_settings_rejects_invalid_concord_session():
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(
-            _provider_settings_command(
+            _provider_settings_request(
                 SETTINGS_REQUEST,
                 _provider_settings_target(),
                 contract=contract,
@@ -1237,7 +1237,7 @@ async def test_provider_settings_rejects_invalid_concord_session():
 
 
 @pytest.mark.asyncio
-async def test_raw_settings_mutation_commands_are_ignored_without_crashing():
+async def test_raw_settings_mutation_messages_are_ignored_without_crashing():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
     registry = MagicMock()
@@ -1250,12 +1250,12 @@ async def test_raw_settings_mutation_commands_are_ignored_without_crashing():
     )
 
     target = _provider_settings_target()
-    patch = _raw_provider_settings_command(
+    patch = _raw_provider_settings_message(
         UNSUPPORTED_SETTINGS_PATCH,
         target,
         settings={"timezone": "Europe/Amsterdam"},
     )
-    replace = _raw_provider_settings_command(
+    replace = _raw_provider_settings_message(
         UNSUPPORTED_SETTINGS_REPLACE,
         target,
         settings={"timezone": "Europe/Amsterdam"},

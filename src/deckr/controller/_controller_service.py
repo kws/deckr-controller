@@ -192,7 +192,7 @@ class ControllerService(BaseComponent):
                 ).target.config_id
             except ValueError:
                 logger.warning(
-                    "Ignoring invalid settings command %s from %s",
+                    "Ignoring invalid settings request %s from %s",
                     msg.message_type,
                     msg.sender,
                     exc_info=True,
