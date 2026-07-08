@@ -6,9 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import pytest
 from deckr.actions.endpoints import action_provider_address
-from deckr.actions.messages import (
-    SETTINGS_PATCH,
-)
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import (
     ACTIONS_LANE,
@@ -145,7 +142,7 @@ async def test_action_command_ignores_invalid_settings_body_and_missing_subject(
 
     await service._handle_action_command(
         _action_message(
-            SETTINGS_PATCH,
+            "settingsPatch",
             body={"target": {"not": "valid"}},
         )
     )

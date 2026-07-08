@@ -38,7 +38,9 @@ Once a device is claimed by the controller, the controller owns:
 * device clear/sleep/wake policy
 * recovery from action-provider loss
 
-Action providers may **request** dynamic pages, output updates, overlays, settings updates, or page closure. They do not own the device’s navigation state.
+Action providers may **request** dynamic pages, output updates, overlays,
+settings snapshots, or page closure. They do not own the device’s navigation
+state or controller settings persistence.
 
 The controller may accept an action provider’s dynamic page descriptor, but once accepted, that descriptor becomes a controller-owned page frame. The device runtime must be able to close that frame by timeout or navigation even if the originating provider disappears.
 

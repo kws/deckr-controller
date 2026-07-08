@@ -185,7 +185,7 @@ letting provider liveness own device state.
 | Remove provider-session validity as layout authority | Done | Provider-session gating removal | Session invalidity alone does not clear pages or revoke device state. |
 | Define lifecycle rejection handling policy | Partial | Availability states | Retryable/unavailable rejections render unavailable without destroying layout. |
 | Define explicit input cancel message or event | Done | Provider API agreement | Providers can distinguish `cancel` from physical `up`. |
-| Audit provider settings authorization | Partial | Settings target model | Settings commands require correct provider identity but do not depend on binding sessions. |
+| Audit provider settings authorization | Partial | Settings target model | Settings snapshot requests require correct provider identity but do not depend on binding sessions. |
 
 ### 8. Regression Tests and Invariants
 

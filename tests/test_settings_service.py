@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import re
-from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock
 
-import anyio
 import pytest
-import yaml
 from deckr.actions.messages import SettingsTargetRef
 from pydantic import ValidationError
 
@@ -156,60 +151,52 @@ def _provider_target(
     )
 
 
-def _target_with(**updates: Any) -> SettingsTargetRef:
-    data = _stable_action_target().to_dict()
-    data.update(updates)
-    return SettingsTargetRef.model_validate(data)
-
-
-async def _next_with_timeout(stream: AsyncIterator[Any]) -> Any:
-    with anyio.fail_after(1):
-        return await anext(stream)
-
-
 @pytest.mark.asyncio
-async def test_action_settings_patch_writes_yaml_and_notifies(
+async def test_action_settings_get_reads_config_snapshot(
     tmp_path: Path,
 ) -> None:
     service, _ = await _service(tmp_path)
-    target = _stable_action_target()
 
-    stream = service.subscribe(target)
-    initial = await _next_with_timeout(stream)
-    assert initial.settings == {
+    snapshot = await service.get(_stable_action_target())
+
+    assert snapshot.settings == {
         "mode": "time",
         "templateOverrides": {"title": "Clock"},
     }
-
-    patched = await service.patch(
-        target,
-        {"mode": "date", "templateOverrides": {"title": "Today"}},
-    )
-    assert patched.settings == {
-        "mode": "date",
-        "templateOverrides": {"title": "Today"},
+    assert snapshot.provenance == ("config_default", "template_override")
+    assert snapshot.schema_metadata.json_schema == {
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string"},
+            "templateOverrides": {"type": "object"},
+        },
+        "additionalProperties": False,
     }
-
-    emitted = await _next_with_timeout(stream)
-    assert emitted.settings == patched.settings
-    await stream.aclose()
-
-    data = yaml.safe_load((tmp_path / f"{CONFIG_ID}.yml").read_text())
-    control = data["profiles"][0]["pages"][0]["controls"][0]
-    assert control["settings"] == {"mode": "date"}
-    assert control["template_overrides"] == {"title": "Today"}
 
 
 @pytest.mark.asyncio
-async def test_schema_validation_rejects_invalid_settings(tmp_path: Path) -> None:
-    service, config_service = await _service(tmp_path)
+async def test_provider_settings_get_reads_config_snapshot(tmp_path: Path) -> None:
+    service, _ = await _service(tmp_path)
 
-    with pytest.raises(ValueError, match="settings failed schema validation"):
-        await service.patch(_stable_action_target(), {"mode": 42})
+    snapshot = await service.get(_provider_target())
 
-    reloaded = await config_service.get_config(CONFIG_ID)
-    assert reloaded is not None
-    assert reloaded.profiles[0].pages[0].controls[0].settings == {"mode": "time"}
+    assert snapshot.settings == {"timezone": "UTC"}
+    assert snapshot.provenance == ("config_default",)
+    assert snapshot.schema_metadata.json_schema == {
+        "type": "object",
+        "properties": {"timezone": {"type": "string"}},
+        "additionalProperties": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_settings_service_does_not_expose_mutation_api(tmp_path: Path) -> None:
+    service, _ = await _service(tmp_path)
+
+    assert not hasattr(service, "patch")
+    assert not hasattr(service, "replace")
+    assert not hasattr(service, "subscribe")
+    assert not hasattr(service, "ensure_service_managed_id")
 
 
 @pytest.mark.asyncio
@@ -249,44 +236,6 @@ async def test_settings_metadata_reads_from_action_availability_service(
 
 
 @pytest.mark.asyncio
-async def test_service_managed_id_insertion_uses_managed_id_and_stable_identity(
-    tmp_path: Path,
-) -> None:
-    service, config_service = await _service(tmp_path)
-    old_target = next(
-        description.target
-        for description in await service.list_targets(config_id=CONFIG_ID)
-        if description.target.action_id == "action.no_schema"
-    )
-    old_action_instance_id = old_target.action_instance_id
-
-    new_target = await service.ensure_service_managed_id(old_target)
-
-    assert new_target.stable_id is not None
-    assert re.fullmatch(r"managed-[0-9a-f]{12}", new_target.stable_id)
-    assert new_target.action_instance_id != old_action_instance_id
-    assert new_target.action_instance_id == derive_action_instance_id(
-        controller_id=CONTROLLER_ID,
-        config_id=CONFIG_ID,
-        action_id="action.no_schema",
-        stable_id=new_target.stable_id,
-    )
-    for forbidden in (
-        "context_id",
-        "binding_id",
-        "page_session_id",
-        "device_id",
-        "transport_id",
-        "manager-local",
-    ):
-        assert forbidden not in new_target.key()
-
-    reloaded = await config_service.get_config(CONFIG_ID)
-    assert reloaded is not None
-    assert reloaded.profiles[0].pages[0].controls[1].id == new_target.stable_id
-
-
-@pytest.mark.asyncio
 async def test_selector_only_action_target_uses_static_config_position(
     tmp_path: Path,
 ) -> None:
@@ -308,31 +257,6 @@ async def test_selector_only_action_target_uses_static_config_position(
         selector_control_id=None,
         control_index=2,
     )
-
-
-@pytest.mark.asyncio
-async def test_service_managed_id_insertion_handles_selector_only_control(
-    tmp_path: Path,
-) -> None:
-    service, config_service = await _service(tmp_path)
-    old_target = next(
-        description.target
-        for description in await service.list_targets(config_id=CONFIG_ID)
-        if description.label == "Selector Only"
-    )
-
-    new_target = await service.ensure_service_managed_id(old_target)
-
-    assert new_target.stable_id is not None
-    assert new_target.action_instance_id == derive_action_instance_id(
-        controller_id=CONTROLLER_ID,
-        config_id=CONFIG_ID,
-        action_id="action.no_schema",
-        stable_id=new_target.stable_id,
-    )
-    reloaded = await config_service.get_config(CONFIG_ID)
-    assert reloaded is not None
-    assert reloaded.profiles[0].pages[0].controls[2].id == new_target.stable_id
 
 
 def test_duplicate_explicit_control_ids_are_rejected() -> None:

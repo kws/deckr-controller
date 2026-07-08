@@ -71,7 +71,7 @@ class PlannedBinding:
     status: BindingPlanStatus
     action_meta: ActionMetadata | None
     page_session_id: str | None
-    persist_settings: bool
+    settings_target_enabled: bool
     item_key: str | None = None
     handler: str | None = None
     child: PageChildBindingDescriptor | None = None
@@ -194,7 +194,7 @@ class BindingPlanner:
                 action_status=action_status or {},
                 retained_plan=retained_plan,
                 page_session_id=None,
-                persist_settings=True,
+                settings_target_enabled=True,
             )
             planned.append(planned_binding)
             outcomes.append(self._binding_outcome(planned_binding))
@@ -312,7 +312,7 @@ class BindingPlanner:
                 action_status=action_status or {},
                 retained_plan=retained_plan,
                 page_session_id=page_session.page_session_id,
-                persist_settings=False,
+                settings_target_enabled=False,
                 item_key=child.item_key,
                 handler=child.handler,
                 child=child,
@@ -366,7 +366,7 @@ class BindingPlanner:
         action_status: Mapping[ActionIntentKey, BindingPlanStatus],
         retained_plan: PagePlan | None,
         page_session_id: str | None,
-        persist_settings: bool,
+        settings_target_enabled: bool,
         item_key: str | None = None,
         handler: str | None = None,
         child: PageChildBindingDescriptor | None = None,
@@ -392,7 +392,7 @@ class BindingPlanner:
             status=status,
             action_meta=action_meta,
             page_session_id=page_session_id,
-            persist_settings=persist_settings,
+            settings_target_enabled=settings_target_enabled,
             item_key=item_key,
             handler=handler,
             child=child,

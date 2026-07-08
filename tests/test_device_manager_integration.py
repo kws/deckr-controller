@@ -21,7 +21,6 @@ from deckr.actions.messages import (
     OPEN_PAGE,
     PAGE_SESSION_CLOSED,
     REPLACE_PAGE,
-    SETTINGS_PATCH,
     SETTINGS_REQUEST,
     SETTINGS_SNAPSHOT,
     ActionAvailabilityEntry,
@@ -43,7 +42,7 @@ from deckr.concord import (
     ContractValidityStatus,
 )
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import DeckrMessage, controller_address
+from deckr.contracts.messages import DeckrMessage, controller_address, endpoint_target
 from deckr.contracts.models import thaw_json
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import (
@@ -90,10 +89,7 @@ from deckr.controller.action_provider.provider import (
     ActionProviderSessionCandidate,
 )
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
-from deckr.controller.settings import (
-    ConfigBackedSettingsService,
-    derive_static_action_instance_id,
-)
+from deckr.controller.settings import ConfigBackedSettingsService
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
@@ -101,6 +97,8 @@ PROVIDER_INSTANCE_ID = "python"
 PROVIDER_ID = "test.provider"
 PROVIDER_ADDR = action_provider_address(PROVIDER_INSTANCE_ID)
 PROVIDER_SESSION_ID = "action-provider-session"
+UNSUPPORTED_SETTINGS_PATCH = "settingsPatch"
+UNSUPPORTED_SETTINGS_REPLACE = "settingsReplace"
 
 
 def _contract_pointer_for_provider_session(
@@ -285,6 +283,36 @@ def _provider_settings_command(
             sender_provider_instance_id,
             provider_id=target.provider_id,
         ),
+        contract=contract
+        or _contract_pointer_for_provider_session(
+            provider_instance_id=sender_provider_instance_id,
+            provider_id=target.provider_id,
+        ),
+    )
+
+
+def _raw_provider_settings_command(
+    message_type: str,
+    target: SettingsTargetRef,
+    *,
+    sender_provider_instance_id: str = PROVIDER_INSTANCE_ID,
+    settings: dict | None = None,
+    contract: ContractPointer | None = None,
+) -> DeckrMessage:
+    body: dict = {"target": target.to_dict()}
+    if settings is not None:
+        body["settings"] = settings
+    return DeckrMessage(
+        lane="actions",
+        messageType=message_type,
+        sender=action_provider_address(sender_provider_instance_id),
+        senderSessionId=PROVIDER_SESSION_ID,
+        recipient=endpoint_target(CONTROLLER_ADDR),
+        subject=action_provider_instance_subject(
+            sender_provider_instance_id,
+            provider_id=target.provider_id,
+        ),
+        body=body,
         contract=contract
         or _contract_pointer_for_provider_session(
             provider_instance_id=sender_provider_instance_id,
@@ -1061,7 +1089,7 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
 
 
 @pytest.mark.asyncio
-async def test_provider_settings_patch_after_beacon_loss_uses_concord_session():
+async def test_provider_settings_request_after_beacon_loss_uses_concord_session():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
     concord = _concord(action_bus)
@@ -1084,24 +1112,24 @@ async def test_provider_settings_patch_after_beacon_loss_uses_concord_session():
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(
             _provider_settings_command(
-                SETTINGS_PATCH,
+                SETTINGS_REQUEST,
                 _provider_settings_target(),
-                settings={"timezone": "Europe/Amsterdam"},
                 contract=contract,
             )
         )
         reply = await _next_action_message(stream)
 
     assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "Europe/Amsterdam"
+        "timezone": "UTC"
     }
     assert reply.message_type == SETTINGS_SNAPSHOT
+    assert reply.body["settings"] == {"timezone": "UTC"}
     registry.provider_session_id.assert_not_called()
     registry.provider_instance_provides_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_provider_settings_patch_from_non_owning_provider_is_ignored():
+async def test_provider_settings_request_from_non_owning_provider_is_ignored():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
     registry = MagicMock()
@@ -1116,10 +1144,9 @@ async def test_provider_settings_patch_from_non_owning_provider_is_ignored():
     async with action_bus.subscribe(action_provider_address("other")) as stream:
         await manager.handle_command(
             _provider_settings_command(
-                SETTINGS_PATCH,
+                SETTINGS_REQUEST,
                 _provider_settings_target(),
                 sender_provider_instance_id="other",
-                settings={"timezone": "Europe/Amsterdam"},
             )
         )
         await _assert_no_action_message(stream)
@@ -1195,9 +1222,8 @@ async def test_provider_settings_rejects_invalid_concord_session():
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
         await manager.handle_command(
             _provider_settings_command(
-                SETTINGS_PATCH,
+                SETTINGS_REQUEST,
                 _provider_settings_target(),
-                settings={"timezone": "Europe/Amsterdam"},
                 contract=contract,
             )
         )
@@ -1211,7 +1237,7 @@ async def test_provider_settings_rejects_invalid_concord_session():
 
 
 @pytest.mark.asyncio
-async def test_malformed_settings_commands_are_ignored_without_crashing():
+async def test_raw_settings_mutation_commands_are_ignored_without_crashing():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
     registry = MagicMock()
@@ -1224,21 +1250,20 @@ async def test_malformed_settings_commands_are_ignored_without_crashing():
     )
 
     target = _provider_settings_target()
-    valid = _provider_settings_command(
-        SETTINGS_PATCH,
+    patch = _raw_provider_settings_command(
+        UNSUPPORTED_SETTINGS_PATCH,
         target,
         settings={"timezone": "Europe/Amsterdam"},
     )
-    malformed_target = valid.model_copy(
-        update={"body": {"target": "not-a-target", "settings": {}}}
-    )
-    malformed_settings = valid.model_copy(
-        update={"body": {"target": target.to_dict(), "settings": "not-an-object"}}
+    replace = _raw_provider_settings_command(
+        UNSUPPORTED_SETTINGS_REPLACE,
+        target,
+        settings={"timezone": "Europe/Amsterdam"},
     )
 
     async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-        await manager.handle_command(malformed_target)
-        await manager.handle_command(malformed_settings)
+        await manager.handle_command(patch)
+        await manager.handle_command(replace)
         await _assert_no_action_message(stream)
 
     assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
@@ -1303,8 +1328,9 @@ def _settings_reload_selector_only_config() -> DeviceConfig:
     )
 
 
+
 @pytest.mark.asyncio
-async def test_action_settings_patch_hard_reloads_active_component():
+async def test_raw_action_settings_patch_for_active_binding_is_ignored():
     config_service = MemoryConfigService(_settings_reload_config())
     device = _make_mock_device()
     action_bus = _actions_bus()
@@ -1338,309 +1364,38 @@ async def test_action_settings_patch_hard_reloads_active_component():
             assert old_ctx is not None
             assert old_ctx.settings == {"label": "old"}
             assert old_ctx.settings_target is not None
-            old_binding_id = old_ctx.binding_id
-            old_context_id = old_ctx.id
-            action_instance_id = old_ctx.action_instance_id
             await _drain_action_messages(stream)
 
             await manager.handle_command(
-                _action_command(
-                    SETTINGS_PATCH,
-                    {
+                DeckrMessage(
+                    lane="actions",
+                    messageType=UNSUPPORTED_SETTINGS_PATCH,
+                    sender=PROVIDER_ADDR,
+                    senderSessionId=PROVIDER_SESSION_ID,
+                    recipient=endpoint_target(CONTROLLER_ADDR),
+                    subject=context_subject(
+                        old_ctx.id,
+                        provider_instance_id=PROVIDER_INSTANCE_ID,
+                        provider_id=PROVIDER_ID,
+                        config_id="test-device",
+                        action_instance_id=old_ctx.action_instance_id,
+                        binding_id=old_ctx.binding_id,
+                    ),
+                    body={
                         "target": old_ctx.settings_target.to_dict(),
                         "settings": {"label": "new", "extra": True},
                     },
-                    context_id=old_ctx.id,
-                    action_instance_id=old_ctx.action_instance_id,
-                    binding_id=old_ctx.binding_id,
+                    contract=_contract_pointer_for_provider_session(),
                 )
             )
 
             new_ctx = await manager.action_contexts.get("0,0")
-            assert new_ctx is not None
-            assert new_ctx is not old_ctx
-            assert new_ctx.action_instance_id == action_instance_id
-            assert new_ctx.binding_id != old_binding_id
-            assert new_ctx.id != old_context_id
-            assert new_ctx.settings == {"label": "new", "extra": True}
+            assert new_ctx is old_ctx
+            assert new_ctx.settings == {"label": "old"}
             assert config_service.config.profiles[0].pages[0].controls[0].settings == {
-                "label": "new",
-                "extra": True,
+                "label": "old"
             }
-
-            messages = await _collect_action_messages(stream)
-            types = [message.message_type for message in messages]
-            assert SETTINGS_SNAPSHOT in types
-            assert BINDING_DETACHED in types
-            assert ACTION_INSTANCE_DESTROYED in types
-            assert ACTION_INSTANCE_CREATED in types
-            assert BINDING_ATTACHED in types
-
-            detached = next(
-                message
-                for message in messages
-                if message.message_type == BINDING_DETACHED
-            )
-            destroyed = next(
-                message
-                for message in messages
-                if message.message_type == ACTION_INSTANCE_DESTROYED
-            )
-            created = [
-                message
-                for message in messages
-                if message.message_type == ACTION_INSTANCE_CREATED
-            ][-1]
-            attached = [
-                message for message in messages if message.message_type == BINDING_ATTACHED
-            ][-1]
-            assert detached.body["reason"] == "settings_changed"
-            assert destroyed.body["reason"] == "settings_changed"
-            assert created.body["metadata"]["actionInstanceId"] == action_instance_id
-            assert created.body["metadata"]["contextId"] == new_ctx.id
-            assert created.body["settings"] == {"label": "new", "extra": True}
-            assert attached.body["binding"]["bindingId"] == new_ctx.binding_id
-            assert attached.body["settings"] == {"label": "new", "extra": True}
-
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_action_settings_patch_hard_reloads_selector_only_control():
-    config_service = MemoryConfigService(_settings_reload_selector_only_config())
-    device = _make_mock_device(controls=[_make_control("0,0")])
-    action_bus = _actions_bus()
-    registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
-    )
-
-    async with anyio.create_task_group() as tg:
-        manager = DeviceManager(
-            controller_id=CONTROLLER_ID,
-            device=device,
-            hardware_ref=_hardware_ref(device),
-            command_service=FakeHardwareCommandService(),
-            config=config_service.config,
-            manager=registry,
-            actions_bus=_actions_session(action_bus),
-            start_soon=tg.start_soon,
-            settings_service=ConfigBackedSettingsService(
-                controller_id=CONTROLLER_ID,
-                config_service=config_service,
-            ),
-        )
-        _seed_action_availability(
-            manager,
-            _metadata(SetRasterImageOnAppearAction.uuid),
-        )
-        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-            await manager.set_page(profile="default", page=0)
-            old_ctx = await manager.action_contexts.get("0,0")
-            assert old_ctx is not None
-            assert old_ctx.settings_target is not None
-            assert old_ctx.settings_target.stable_id is None
-            assert old_ctx.action_instance_id == derive_static_action_instance_id(
-                controller_id=CONTROLLER_ID,
-                config_id="test-device",
-                action_id=SetRasterImageOnAppearAction.uuid,
-                profile_id="default",
-                page_id="0",
-                control_index=0,
-            )
-            await _drain_action_messages(stream)
-
-            await manager.handle_command(
-                _action_command(
-                    SETTINGS_PATCH,
-                    {
-                        "target": old_ctx.settings_target.to_dict(),
-                        "settings": {"label": "new"},
-                    },
-                    context_id=old_ctx.id,
-                    action_instance_id=old_ctx.action_instance_id,
-                    binding_id=old_ctx.binding_id,
-                )
-            )
-
-            new_ctx = await manager.action_contexts.get("0,0")
-            assert new_ctx is not None
-            assert new_ctx is not old_ctx
-            assert new_ctx.action_instance_id == old_ctx.action_instance_id
-            assert new_ctx.settings == {"label": "new"}
-            assert config_service.config.profiles[0].pages[0].controls[0].settings == {
-                "label": "new"
-            }
-
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_stale_output_from_old_binding_is_rejected_after_settings_reload():
-    config_service = MemoryConfigService(_settings_reload_config())
-    device = _make_mock_device()
-    action_bus = _actions_bus()
-    registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
-    )
-    render_backend = ControlledFrameBackend()
-
-    async with anyio.create_task_group() as tg:
-        manager = DeviceManager(
-            controller_id=CONTROLLER_ID,
-            device=device,
-            hardware_ref=_hardware_ref(device),
-            command_service=FakeHardwareCommandService(),
-            config=config_service.config,
-            manager=registry,
-            actions_bus=_actions_session(action_bus),
-            start_soon=tg.start_soon,
-            render_backend=render_backend,
-            settings_service=ConfigBackedSettingsService(
-                controller_id=CONTROLLER_ID,
-                config_service=config_service,
-            ),
-        )
-        _seed_action_availability(
-            manager,
-            _metadata(SetRasterImageOnAppearAction.uuid),
-        )
-        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-            await manager.set_page(profile="default", page=0)
-            old_ctx = await manager.action_contexts.get("0,0")
-            assert old_ctx is not None
-            assert old_ctx.settings_target is not None
-            old_binding = old_ctx.metadata.model_copy(update={"output_generation": 1})
-            await _drain_action_messages(stream)
-
-            await manager.handle_command(
-                _action_command(
-                    SETTINGS_PATCH,
-                    {
-                        "target": old_ctx.settings_target.to_dict(),
-                        "settings": {"label": "new"},
-                    },
-                    context_id=old_ctx.id,
-                    action_instance_id=old_ctx.action_instance_id,
-                    binding_id=old_ctx.binding_id,
-                )
-            )
-            await _drain_action_messages(stream)
-
-            await manager.handle_command(
-                _action_command(
-                    BINDING_OUTPUT,
-                    {
-                        "binding": old_binding.model_dump(
-                            by_alias=True,
-                            exclude_none=True,
-                            mode="json",
-                        ),
-                        "capability": {
-                            "deviceRef": {
-                                "managerId": "manager-main",
-                                "deviceId": "test-device",
-                            },
-                            "controlId": "0,0",
-                            "capabilityId": "raster.bitmap",
-                        },
-                        "commandType": "set_frame",
-                        "params": {"image": _solid_key_image()},
-                        "generation": 1,
-                    },
-                    context_id=old_ctx.id,
-                    action_instance_id=old_ctx.action_instance_id,
-                    binding_id=old_ctx.binding_id,
-                )
-            )
-            assert render_backend.requests == []
-
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_action_settings_patch_closes_owned_dynamic_page_before_reload():
-    config_service = MemoryConfigService(_settings_reload_config())
-    device = _make_mock_device()
-    action_bus = _actions_bus()
-    registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
-    )
-
-    async with anyio.create_task_group() as tg:
-        manager = DeviceManager(
-            controller_id=CONTROLLER_ID,
-            device=device,
-            hardware_ref=_hardware_ref(device),
-            command_service=FakeHardwareCommandService(),
-            config=config_service.config,
-            manager=registry,
-            actions_bus=_actions_session(action_bus),
-            start_soon=tg.start_soon,
-            settings_service=ConfigBackedSettingsService(
-                controller_id=CONTROLLER_ID,
-                config_service=config_service,
-            ),
-        )
-        _seed_action_availability(
-            manager,
-            _metadata(SetRasterImageOnAppearAction.uuid),
-        )
-        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-            await manager.set_page(profile="default", page=0)
-            owner_ctx = await manager.action_contexts.get("0,0")
-            assert owner_ctx is not None
-            assert owner_ctx.settings_target is not None
-            target = owner_ctx.settings_target
-            await _drain_action_messages(stream)
-
-            session = await manager.open_page(
-                descriptor=_dynamic_page("dynamic-page", "1,0"),
-                context_id=owner_ctx.id,
-            )
-            assert session is not None
-            assert await manager.action_contexts.get("1,0") is not None
-            assert await manager.action_contexts.get("0,0") is None
-            await _drain_action_messages(stream)
-
-            await manager.handle_command(
-                _page_session_command(
-                    SETTINGS_PATCH,
-                    {
-                        "target": target.to_dict(),
-                        "settings": {"label": "from-page"},
-                    },
-                    session_id=session.page_session_id,
-                    context_id=session.context_id,
-                    action_instance_id=session.action_instance_id,
-                )
-            )
-
-            restored_ctx = await manager.action_contexts.get("0,0")
-            assert restored_ctx is not None
-            assert restored_ctx.settings == {"label": "from-page"}
-            assert restored_ctx.action_instance_id == owner_ctx.action_instance_id
-            assert restored_ctx.id != owner_ctx.id
-            assert await manager.action_contexts.get("1,0") is None
-            assert manager._dynamic_page_session is None
-
-            messages = await _collect_action_messages(stream)
-            closed = [
-                message
-                for message in messages
-                if message.message_type == PAGE_SESSION_CLOSED
-            ]
-            assert len(closed) == 1
-            assert closed[0].body["reason"] == "settings_changed"
-            created = [
-                message
-                for message in messages
-                if message.message_type == ACTION_INSTANCE_CREATED
-            ]
-            assert created[-1].body["metadata"]["contextId"] == restored_ctx.id
-            assert created[-1].body["settings"] == {"label": "from-page"}
+            await _assert_no_action_message(stream)
 
         tg.cancel_scope.cancel()
 
@@ -4325,12 +4080,12 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
                             Control(
                                 selector={"control_id": "0,0"},
                                 action=NoopAction.uuid,
-                                settings={},
+                                settings={"control_marker": "A"},
                             ),
                             Control(
                                 selector={"control_id": "1,0"},
                                 action=NoopAction.uuid,
-                                settings={},
+                                settings={"control_marker": "B"},
                             ),
                         ]
                     )
@@ -4365,20 +4120,16 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
         await anyio.sleep(0.05)
         control_a = await manager.action_contexts.get("0,0")
         control_b = await manager.action_contexts.get("1,0")
-        await control_a.controller_context.set_settings({"control_marker": "A"})
-        await control_b.controller_context.set_settings({"control_marker": "B"})
-
-        await manager.set_page(profile="default", page=0)
-        control_a_reload = await manager.action_contexts.get("0,0")
-        control_b_reload = await manager.action_contexts.get("1,0")
-        settings_a = await control_a_reload.controller_context.get_settings()
-        settings_b = await control_b_reload.controller_context.get_settings()
+        assert control_a is not None
+        assert control_b is not None
+        settings_a = await control_a.controller_context.get_settings()
+        settings_b = await control_b.controller_context.get_settings()
         assert settings_a.control_marker == "A"
         assert settings_b.control_marker == "B"
 
 
 @pytest.mark.asyncio
-async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir):
+async def test_config_reload_replaces_read_only_settings_snapshot(persistence_tmp_dir):
     device = _make_mock_device()
     registry = MagicMock()
     registry.get_action = AsyncMock(return_value=_metadata(NoopAction.uuid))
@@ -4451,11 +4202,6 @@ async def test_config_reload_clears_runtime_settings_overlay(persistence_tmp_dir
         settings = await ctx.controller_context.get_settings()
         assert settings.label == "from-config"
         assert settings.nested == {"role": {"page": "root"}}
-
-        await ctx.controller_context.set_settings({"label": "runtime", "extra": True})
-        runtime_settings = await ctx.controller_context.get_settings()
-        assert runtime_settings.label == "runtime"
-        assert runtime_settings.extra is True
 
         await manager._on_config_changed(reloaded_config)
         reloaded_ctx = await manager.action_contexts.get("0,0")

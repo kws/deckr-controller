@@ -6,11 +6,7 @@ from uuid import uuid4
 import anyio
 from deckr.actions.messages import (
     COMMAND_MESSAGE_TYPES,
-    SETTINGS_PATCH,
-    SETTINGS_REPLACE,
     SETTINGS_REQUEST,
-    SettingsPatchBody,
-    SettingsReplaceBody,
     SettingsRequestBody,
     action_message_for_controller,
     subject_config_id,
@@ -189,18 +185,11 @@ class ControllerService(BaseComponent):
         if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
         config_id = subject_config_id(msg.subject)
-        if config_id is None and msg.message_type in {
-            SETTINGS_REQUEST,
-            SETTINGS_PATCH,
-            SETTINGS_REPLACE,
-        }:
-            body_type = {
-                SETTINGS_REQUEST: SettingsRequestBody,
-                SETTINGS_PATCH: SettingsPatchBody,
-                SETTINGS_REPLACE: SettingsReplaceBody,
-            }[msg.message_type]
+        if config_id is None and msg.message_type == SETTINGS_REQUEST:
             try:
-                config_id = body_type.model_validate(msg.body).target.config_id
+                config_id = SettingsRequestBody.model_validate(
+                    msg.body
+                ).target.config_id
             except ValueError:
                 logger.warning(
                     "Ignoring invalid settings command %s from %s",

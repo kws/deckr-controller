@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 from deckr.actions.messages import BindingMetadata, DynamicPageCommand
 
 from deckr.controller._command_router import CommandRouter
-from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
     from deckr.controller._device_manager import DeviceManager
@@ -21,13 +20,11 @@ class ControllerActionContext:
         manager: "DeviceManager",
         context_id: str,
         binding_metadata: BindingMetadata,
-        settings_service: SettingsService | None = None,
     ):
         self._router = router
         self._manager = manager
         self._context_id = context_id
         self.binding_metadata = binding_metadata
-        self._settings_service = settings_service
         self._page_session_context_id: str | None = None
 
     async def set_title(self, text: str) -> None:
@@ -35,9 +32,6 @@ class ControllerActionContext:
 
     async def set_raster_image(self, image: str) -> None:
         await self._router.set_raster_image(image)
-
-    async def set_settings(self, settings: dict) -> SimpleNamespace:
-        return await self._router.set_settings(settings)
 
     async def get_settings(self) -> SimpleNamespace:
         return await self._router.get_settings()

@@ -7,8 +7,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
-from deckr.actions.messages import SettingsTargetRef
-from deckr.contracts.models import thaw_json
 
 from deckr.controller._render import RenderService, RenderSource, resolve
 from deckr.controller._render_dispatcher import RenderDispatcher
@@ -17,7 +15,6 @@ from deckr.controller.invariant.recipes import (
     STATUS_OVERLAY_STYLES,
     UNKNOWN_STATUS_OVERLAY,
 )
-from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
     from deckr.controller._device_layout import RasterImageFormat
@@ -37,7 +34,6 @@ OVERLAY_TEMPLATE_DEFAULT_SECONDS = {
     "unknown": 2.0,
 }
 OVERLAY_TEMPLATES = frozenset(STATUS_OVERLAY_STYLES)
-SETTINGS_HYDRATE_TIMEOUT_SECONDS = 0.25
 
 
 def _store_content_kind(store: ControlStateStore) -> str:
@@ -105,9 +101,6 @@ class CommandRouter:
         output: DeviceOutput | None,
         image_format: "RasterImageFormat | None",
         start_soon: Callable,
-        *,
-        settings_service: SettingsService | None = None,
-        settings_target: SettingsTargetRef | None = None,
     ):
         self._store = store
         self._render_service = render_service
@@ -115,9 +108,6 @@ class CommandRouter:
         self._output = output
         self._image_format = image_format
         self._start_soon = start_soon
-        self._settings_service = settings_service
-        self._settings_target = settings_target
-        self._settings_hydrated = False
 
     async def _render(
         self,
@@ -331,69 +321,7 @@ class CommandRouter:
         self._store.base_output_generation = generation
         return True
 
-    async def hydrate_settings(self) -> None:
-        """Load live runtime settings into store. Precedence: config, then runtime overlay."""
-        if self._settings_hydrated:
-            return
-
-        if self._settings_service is not None and self._settings_target is not None:
-            snapshot = None
-            with anyio.move_on_after(SETTINGS_HYDRATE_TIMEOUT_SECONDS) as scope:
-                try:
-                    snapshot = await self._settings_service.get(self._settings_target)
-                except KeyError:
-                    snapshot = None
-                except Exception:
-                    logger.exception(
-                        "Failed to hydrate runtime settings for context %s target=%s",
-                        self._store.context_id,
-                        self._settings_target.key(),
-                    )
-                    snapshot = None
-            if scope.cancel_called:
-                logger.warning(
-                    "Runtime settings hydrate timed out for context %s target=%s timeout=%ss",
-                    self._store.context_id,
-                    self._settings_target.key(),
-                    SETTINGS_HYDRATE_TIMEOUT_SECONDS,
-                )
-            if snapshot is not None:
-                merged = dict(thaw_json(self._store.settings))
-                merged.update(snapshot.settings)
-                self._store.settings = merged
-
-        self._settings_hydrated = True
-
-    async def set_settings(self, settings: dict) -> SimpleNamespace:
-        """Merge settings into the live runtime overlay."""
-        if not self._settings_hydrated:
-            await self.hydrate_settings()
-
-        candidate = dict(thaw_json(self._store.settings))
-        candidate.update(dict(thaw_json(settings)))
-
-        merged = candidate
-        if self._settings_service is not None and self._settings_target is not None:
-            try:
-                snapshot = await self._settings_service.patch(
-                    self._settings_target,
-                    settings,
-                )
-                merged = dict(thaw_json(snapshot.settings))
-            except Exception:
-                logger.exception(
-                    "Failed to update runtime settings for context %s",
-                    self._store.context_id,
-                )
-                raise
-
-        self._store.settings = merged
-        self._settings_hydrated = True
-        return SimpleNamespace(**self._store.settings)
-
     async def get_settings(self) -> SimpleNamespace:
-        if not self._settings_hydrated:
-            await self.hydrate_settings()
         return SimpleNamespace(**self._store.settings)
 
 

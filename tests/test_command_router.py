@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from deckr.actions.messages import SettingsSnapshot, SettingsTargetRef
 
 from deckr.controller._command_router import (
     CommandRouter,
@@ -283,9 +282,9 @@ async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
 
 
 @pytest.mark.asyncio
-async def test_get_settings_hydrates_from_runtime_overlay():
+async def test_get_settings_returns_seeded_config_snapshot():
     store = ControlStateStore(context_id="dev.slot0")
-    store.settings = {"default_only": "x"}
+    store.settings = {"default_only": "x", "runtime": 42}
 
     render_service = MagicMock(spec=RenderService)
     render_service.build_request = MagicMock(return_value=object())
@@ -294,31 +293,6 @@ async def test_get_settings_hydrates_from_runtime_overlay():
     output = _make_output()
     image_format = RasterImageFormat(width=72, height=72)
 
-    class FakeSettingsService:
-        def __init__(self):
-            self.calls = 0
-
-        async def get(self, target):
-            self.calls += 1
-            return SettingsSnapshot(target=target, settings={"runtime": 42})
-
-        async def patch(self, target, patch):
-            return SettingsSnapshot(
-                target=target,
-                settings={"runtime": 42, **dict(patch)},
-            )
-
-    settings_service = FakeSettingsService()
-    target = SettingsTargetRef(
-        scope="action_instance",
-        controllerId="controller-main",
-        configId="config-dev",
-        providerInstanceId="python-dev.deckr.clock",
-        providerId="dev.deckr.clock",
-        actionId="action",
-        actionInstanceId="instance-a",
-    )
-
     router = CommandRouter(
         store=store,
         render_service=render_service,
@@ -326,23 +300,17 @@ async def test_get_settings_hydrates_from_runtime_overlay():
         output=output,
         image_format=image_format,
         start_soon=lambda *args, **kwargs: None,
-        settings_service=settings_service,
-        settings_target=target,
     )
 
     settings = await router.get_settings()
     assert settings.default_only == "x"
     assert settings.runtime == 42
-    assert settings_service.calls == 1
 
-    # second read should not hit the runtime settings service again
     settings_again = await router.get_settings()
     assert settings_again.runtime == 42
-    assert settings_service.calls == 1
 
 
-@pytest.mark.asyncio
-async def test_set_settings_fail_fast_does_not_mutate_store():
+def test_command_router_does_not_expose_settings_writer():
     store = ControlStateStore(context_id="dev.slot0")
     store.settings = {"existing": 1}
 
@@ -353,22 +321,6 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
     output = _make_output()
     image_format = RasterImageFormat(width=72, height=72)
 
-    class FailingSettingsService:
-        async def get(self, target):
-            return SettingsSnapshot(target=target, settings={})
-
-        async def patch(self, target, patch):
-            raise OSError("disk full")
-
-    target = SettingsTargetRef(
-        scope="action_instance",
-        controllerId="controller-main",
-        configId="config-dev",
-        providerInstanceId="python-dev.deckr.clock",
-        providerId="dev.deckr.clock",
-        actionId="action",
-        actionInstanceId="instance-a",
-    )
     router = CommandRouter(
         store=store,
         render_service=render_service,
@@ -376,11 +328,7 @@ async def test_set_settings_fail_fast_does_not_mutate_store():
         output=output,
         image_format=image_format,
         start_soon=lambda *args, **kwargs: None,
-        settings_service=FailingSettingsService(),
-        settings_target=target,
     )
 
-    with pytest.raises(OSError):
-        await router.set_settings({"new": 2})
-
+    assert not hasattr(router, "set_settings")
     assert store.settings == {"existing": 1}

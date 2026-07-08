@@ -30,7 +30,6 @@ from deckr.controller._render import RenderService, RenderSource
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
 from deckr.controller.action_provider.builtin._context import ControllerActionContext
-from deckr.controller.settings import SettingsService
 
 if TYPE_CHECKING:
     from deckr.controller._device_manager import DeviceManager
@@ -57,7 +56,6 @@ class ControlContext:
         actions_bus: EndpointSession,
         start_soon: Callable[..., None],
         render_dispatcher: RenderDispatcher,
-        settings_service: SettingsService | None,
         context_settings_target: SettingsTargetRef | None,
         provider_session_id: str | None,
         contract: ContractPointer | None,
@@ -112,15 +110,12 @@ class ControlContext:
             output=output,
             image_format=control.image_format,
             start_soon=start_soon,
-            settings_service=settings_service,
-            settings_target=context_settings_target,
         )
         self.controller_context = ControllerActionContext(
             router=self._router,
             manager=manager,
             context_id=self.id,
             binding_metadata=metadata,
-            settings_service=settings_service,
         )
 
     @property
@@ -153,7 +148,6 @@ class ControlContext:
         await send_with_endpoint_identity(self._actions_bus, msg)
 
     async def on_binding_attached(self) -> None:
-        await self._router.hydrate_settings()
         if self._builtin_action is not None:
             await self._builtin_action.on_bind(self.controller_context)
             return
