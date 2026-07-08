@@ -210,6 +210,7 @@ def _service_descriptor(
         advertisement_profile=protocol.advertisement_profile,
         use_profile=protocol.use_profile,
         supported_operations=frozenset(protocol.operations),
+        supported_messages=protocol.messages,
         views={},
         backend_status=backend_status,
         diagnostics={},
