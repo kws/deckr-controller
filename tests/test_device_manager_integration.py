@@ -1302,7 +1302,7 @@ async def test_missing_action_renders_missing_unavailable_fallback():
 
 
 @pytest.mark.asyncio
-async def test_provider_direct_service_unavailable_renders_service_fallback():
+async def test_service_view_service_unavailable_renders_service_fallback():
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = MagicMock()
@@ -1360,7 +1360,7 @@ async def test_provider_direct_service_unavailable_renders_service_fallback():
         assert request.source.content_kind == "overlay:unavailable_service"
         assert request.source.availability_cause == "service"
         assert request.source.availability_state == "unavailable"
-        assert request.source.availability_source == "provider_direct"
+        assert request.source.availability_source == "service_view"
         assert request.source.availability_reason == "sonos_service_unavailable"
         render_backend.release(request.generation)
         tg.cancel_scope.cancel()
@@ -1816,7 +1816,7 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
 
 
 @pytest.mark.asyncio
-async def test_provider_direct_pending_preserves_attached_binding(
+async def test_service_view_pending_preserves_attached_binding(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -1885,7 +1885,7 @@ async def test_provider_direct_pending_preserves_attached_binding(
 
 
 @pytest.mark.asyncio
-async def test_provider_direct_availability_recovers_same_session_after_invalidated(
+async def test_service_view_availability_recovers_same_session_after_invalidated(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3883,10 +3883,10 @@ ACTION_X_UUID = "test.action.x"
 
 
 @pytest.mark.asyncio
-async def test_provider_direct_availability_resolves_candidate_control(
+async def test_service_view_availability_resolves_candidate_control(
     persistence_tmp_dir,
 ):
-    """Beacon candidates render pending until provider-direct availability arrives."""
+    """Beacon candidates render pending until service-view availability arrives."""
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()

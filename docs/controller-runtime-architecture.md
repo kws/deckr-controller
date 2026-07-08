@@ -312,8 +312,7 @@ Suggested model:
 @dataclass(frozen=True)
 class ProviderActionKey:
     provider_instance_id: str
-    provider_id: str
-    action_id: str
+    action_uuid: str
 
 @dataclass
 class ActionAvailabilityRecord:
@@ -324,20 +323,21 @@ class ActionAvailabilityRecord:
         "available",
         "unavailable",
         "stale",
-        "retired",
+        "expired",
     ]
-    descriptor: ActionDescriptor | None
+    source: Literal["beacon_candidate", "service_view"]
+    updated_at: float
+    metadata: ActionMetadata | None
     reason: str | None
-    observed_at: float
-    fresh_until: float
-    stale_until: float
-    source: Literal["provider_snapshot", "provider_event", "beacon_hint"]
+    requires_provider_lifecycle_recovery: bool
 ```
 
-Availability should have two expiry layers:
-
-1. **Fresh TTL**: the period during which the provider’s answer is considered current.
-2. **Stale grace TTL**: the period during which the controller may continue using a previous answer for UI stability while revalidating.
+By default, service-view records do not age out on a controller timer. They
+remain current until the provider writes a new view, the view disappears, the
+service-use contract becomes unavailable, or provider-session lifecycle
+authority becomes invalid. Fresh/stale expiry is an optional local policy only;
+it must not reintroduce provider-direct availability queries or a periodic
+revalidation loop.
 
 Beacon-derived data can create `unknown` or `probing` candidates. It must not create authoritative `available` records by itself.
 
@@ -681,35 +681,38 @@ Do not use this model.
 
 This is the failure mode seen in the current branch: provider-session readiness is introduced directly into `_try_resolve_binding()` / `_activate_binding()` and the binding can remain pending instead of immediately giving the device a stable layout state. 
 
-## 8.3 Provider-Direct Action Availability With Long-Lived Interest
+## 8.3 Action Availability Service View With Long-Lived Interest
 
-The controller uses Beacon to find provider candidates, then talks directly to providers for action availability. The controller sends action-interest updates for actions it needs. Providers respond with direct availability snapshots/events.
+The controller uses Beacon to find internal action-availability services exposed
+by provider runtimes. It opens a termless service-use Concord contract with each
+matching service and watches that contract-fenced `actions/current` service
+view for current action descriptors and status.
 
-Interest is maintained independently of button binding and may be kept warm for hours.
+Action interest is maintained independently of button binding and may be kept
+warm for hours. It is a local controller planning signal; it is not sent over
+the action lane.
 
 ### Pros
 
-* Real-time availability comes from the provider.
+* Current availability comes from the provider-owned service view.
 * Binding remains local and non-blocking.
 * Providers can prepare expensive resources.
 * Providers can report temporary unavailability.
 * The same action can be served by multiple providers.
-* Existing UI state can remain stable while availability revalidates.
+* Existing UI state can remain stable while service views and lifecycle authority remain valid.
 * Dynamic page timeout and navigation stay device-owned.
-* Contracts, if needed, are per action/provider interest, not per button.
+* The action lane remains reserved for lifecycle and execution messages.
 
 ### Cons
 
-* Requires a new action availability protocol.
-* Requires local cache and expiry semantics.
+* Requires a controller service client and view watcher.
+* Requires local cache and missing-view semantics.
 * Requires provider selection policy.
-* Requires provider-side implementation.
+* Requires runtime-managed service-view publication in each provider runtime.
 
 ### Assessment
 
-Recommended.
-
-This should be the intended architecture.
+Current architecture.
 
 ---
 
@@ -762,8 +765,7 @@ Suggested defaults:
 ```text
 strong interest: while visible/config-active
 warm retention: 4 hours
-provider revalidation interval: 60 seconds
-availability stale grace: 5 minutes
+missing service view: provider actions unavailable
 ```
 
 The “hours” timeout is important. It prevents a provider from repeatedly tearing down and rebuilding actions while the user navigates around. But that timeout belongs to action interest, not button binding.
@@ -781,120 +783,82 @@ This contract is per provider/action interest, not per control binding.
 
 It should not block page layout. If the contract is pending, the control renders pending/unavailable while the controller continues to own the layout.
 
-Concord may be useful here only when there is a real resource commitment or exclusivity requirement. For ordinary action availability, direct provider messages plus TTL are likely simpler and better.
-
-Current policy reserves Concord for explicit resource commitments. Ordinary
-action availability uses provider-direct messages and local freshness policy.
+Concord may be useful here only when there is a real resource commitment or
+exclusivity requirement. Ordinary action availability uses the provider-scoped
+service-use contract and service view described below.
 
 ---
 
-# 10. Provider Availability Protocol Sketch
+# 10. Action Availability Service View
 
 This is intentionally protocol-level, not tied to an implementation.
 
 ## 10.1 Discovery
 
-Beacon payload says:
+Beacon advertises the provider runtime's internal availability service:
+
+```json
+{
+  "serviceId": "action-availability.python",
+  "namespace": "dev.deckr.action_availability.service",
+  "endpoint": "service:action-availability.python",
+  "sessionId": "service-session",
+  "backendStatus": "available",
+  "views": {
+    "actions": {
+      "storeName": "deckr_action_availability_service_view_v1",
+      "keyPrefix": "service.action-availability.python.actions."
+    }
+  }
+}
+```
+
+This creates service candidates only. Beacon remains discovery only and is not
+availability authority.
+
+## 10.2 Service Use
+
+The controller opens a termless service-use Concord contract with the service
+endpoint. The service view is fenced by that contract, so each controller gets
+its own authorized view entry.
+
+```text
+participants: controller:<controller-id>, service:action-availability.python
+profile: dev.deckr.action_availability.service.use.v1
+terms: null
+```
+
+## 10.3 Current View
+
+The provider runtime writes one provider-scoped `actions/current` view for every
+valid controller service-use contract:
 
 ```json
 {
   "providerInstanceId": "python",
+  "providerEndpoint": "action_provider:python",
   "providerId": "dev.deckr.python",
-  "endpoint": "action-provider:python",
-  "labels": { "runtime": "python" },
-  "actions": {
-    "clock": { "actionId": "clock", "name": "Clock" }
-  }
+  "providerSessionId": "provider-session",
+  "entries": [
+    {
+      "actionId": "clock",
+      "status": "available",
+      "descriptor": { "actionId": "clock", "name": "Clock" },
+      "reason": null
+    },
+    {
+      "actionId": "weather",
+      "status": "unavailable",
+      "descriptor": null,
+      "reason": "missing_api_key"
+    }
+  ]
 }
 ```
 
-This creates candidates only.
-
-## 10.2 Availability Request
-
-Controller to provider:
-
-```json
-{
-  "messageType": "actionAvailabilityRequest",
-  "body": {
-    "requestId": "uuid",
-    "selectors": [
-      { "actionId": "clock" }
-    ]
-  }
-}
-```
-
-## 10.3 Availability Snapshot
-
-Provider to controller:
-
-```json
-{
-  "messageType": "actionAvailabilitySnapshot",
-  "body": {
-    "requestId": "uuid",
-    "providerInstanceId": "python",
-    "providerId": "dev.deckr.python",
-    "entries": [
-      {
-        "actionId": "clock",
-        "status": "available",
-        "descriptor": { "actionId": "clock", "name": "Clock" },
-        "reason": null
-      },
-      {
-        "actionId": "weather",
-        "status": "unavailable",
-        "descriptor": null,
-        "reason": "missing_api_key"
-      }
-    ]
-  }
-}
-```
-
-## 10.4 Availability Changed
-
-Provider to controller:
-
-```json
-{
-  "messageType": "actionAvailabilityChanged",
-  "body": {
-    "providerInstanceId": "python",
-    "providerId": "dev.deckr.python",
-    "entries": [
-      {
-        "actionId": "weather",
-        "status": "available",
-        "descriptor": { "actionId": "weather", "name": "Weather" }
-      }
-    ]
-  }
-}
-```
-
-## 10.5 Interest Update
-
-Controller to provider:
-
-```json
-{
-  "messageType": "actionInterestUpdate",
-  "body": {
-    "providerInstanceId": "python",
-    "providerId": "dev.deckr.python",
-    "entries": [
-      { "actionId": "clock", "level": "strong" },
-      { "actionId": "weather", "level": "warm" }
-    ]
-  }
-}
-```
-
-The provider may use this to keep resources warm. The controller does not wait for this during binding.
+The controller treats this payload as authoritative current availability for
+planning. It uses `providerSessionId` only when preparing Concord
+action-provider lifecycle sessions; execution stays on the action lane.
 
 ---
 
@@ -953,18 +917,18 @@ The current `DeviceManager` already listens to config stream changes and clears/
 
 1. Beacon discovers a candidate provider.
 2. Availability service records the candidate.
-3. If the provider may serve needed actions, availability service queries it directly.
-4. Availability cache updates.
+3. If the provider may serve needed actions, the controller watches that provider's action availability service view.
+4. Availability cache updates when the service view changes or disappears.
 5. Affected device runtimes replan relevant controls.
 
 Device layout does not change merely because Beacon changed.
 
 ## 11.6 Provider Candidate Disappears
 
-1. Availability records from that provider become stale, not immediately fatal.
-2. Direct provider communication determines whether the provider is really gone.
-3. Existing bindings may continue during stale grace if the endpoint remains routable.
-4. If provider is confirmed unavailable, affected controls become unavailable.
+1. Beacon removal does not invalidate current service-view records.
+2. The service view remains authoritative until it changes, disappears, or its service-use contract becomes unavailable.
+3. Existing bindings may continue only while provider-session readiness and lifecycle authority remain valid.
+4. If the service view or provider session becomes invalid, affected controls become unavailable or pending according to the current record.
 5. Device pages remain intact.
 
 ## 11.7 Action Becomes Available
@@ -1074,18 +1038,22 @@ When rebinding a control:
 * if action becomes unavailable, render unavailable
 * if dynamic page closes, return to static page output without requiring provider calls
 
-## 13.3 Stale Availability
+## 13.3 Current And Stale Availability
 
-Suggested policy:
+Default policy:
 
 ```text
-fresh available: bind normally
-stale available + existing binding: keep existing binding while revalidating
-stale available + new binding: render pending until fresh availability arrives
-unknown candidate: render pending and query
-known unavailable: render unavailable
+service-view available + provider lifecycle ready: bind normally
+service-view available + provider lifecycle not ready: render pending
+service-view unavailable or missing: render unavailable
+beacon candidate only: render pending/probing, not available
 no candidate: render unavailable
 ```
+
+An optional freshness policy may mark service-view records `stale` or `expired`,
+but it is a UI planning policy, not a transport retry mechanism. Stale retention
+for an existing binding can preserve output only while the service-use contract
+and provider lifecycle authority remain valid.
 
 ---
 
@@ -1143,8 +1111,9 @@ In the intended design, a page can commit with unavailable/pending controls.
 
 This service should own:
 
-* provider candidates from Beacon
-* direct provider availability requests
+* action-availability service candidates from Beacon
+* service-use Concord leases for availability services
+* `actions/current` service-view watches
 * availability cache
 * provider selection
 * action interest TTLs
@@ -1162,7 +1131,7 @@ class BindingPlanner:
         device: DeviceDescriptor,
         config: DeviceConfig,
         frame: PageFrame,
-        availability: ActionAvailabilitySnapshot,
+        availability: ActionAvailabilityPlanningSnapshot,
         previous: DeviceRuntimeState,
     ) -> PagePlan:
         ...
@@ -1263,7 +1232,7 @@ Use this model:
 
 ```text
 Beacon = candidate provider discovery
-Provider direct protocol = real-time action availability
+Service view protocol = real-time action availability
 Action interest = long-lived provider/action need, retained for hours
 Device runtime = authoritative layout/input/rendering owner
 Config = dynamic glue and binding prerequisite

@@ -119,7 +119,7 @@ Important distinction: `PENDING` is for “we have a reason to probe or wait”;
 
 Availability is local, cached, and observed. Page binding must never synchronously wait on Beacon, provider discovery, Concord session setup, provider attach, or action handshake. The proposed architecture document already calls this out: binding, page transitions, dynamic page open/close, timeout, and input routing must not wait on provider liveness or discovery. ([GitHub][1])
 
-The current `ActionAvailabilityCache` already distinguishes Beacon candidates from provider-direct availability, and the proposed architecture describes Beacon as discovery-only rather than authoritative availability. That direction is correct. ([GitHub][3])
+The current `ActionAvailabilityCache` distinguishes Beacon service candidates from service-view availability, and the proposed architecture describes Beacon as discovery-only rather than authoritative availability. That direction is correct. ([GitHub][3])
 
 Availability states should be interpreted as follows:
 
@@ -127,12 +127,12 @@ Availability states should be interpreted as follows:
 | --------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------- |
 | `UNKNOWN`                         | `PENDING` if candidate exists, otherwise `UNAVAILABLE` | keep only if previous attachment still alive                                     |
 | `PROBING`                         | `PENDING`                                              | keep if attachment still alive                                                   |
-| `AVAILABLE` fresh provider-direct | `BOUND`                                                | `BOUND` / refresh metadata                                                       |
-| `STALE`                           | `PENDING` for new bindings                             | may remain `BOUND` during stale grace if same provider attachment is still alive |
-| `UNAVAILABLE` provider-direct     | `UNAVAILABLE`                                          | cancel inputs, detach, render unavailable                                        |
+| `AVAILABLE` service view          | `BOUND`                                                | `BOUND` / refresh metadata                                                       |
+| `STALE`                           | `PENDING` for new bindings                             | opt-in custom policy only; existing bindings may remain `BOUND` while the attachment is still alive |
+| `UNAVAILABLE` service view        | `UNAVAILABLE`                                          | cancel inputs, detach, render unavailable                                        |
 | `EXPIRED` / `RETIRED`             | `UNAVAILABLE`                                          | cancel inputs, detach, render unavailable                                        |
 
-Beacon disappearance alone must not be treated as authoritative action unavailability. Provider-direct `UNAVAILABLE`, provider session death after stale grace, terminal lifecycle rejection, or an explicit provider/catalog retirement is authoritative.
+Beacon disappearance alone must not be treated as authoritative action unavailability. Service-view `UNAVAILABLE`, missing service view, provider session death, terminal lifecycle rejection, or an explicit provider/catalog retirement is authoritative.
 
 ## 5. Action interest is not binding
 
@@ -161,7 +161,7 @@ Selection order should be deterministic:
 1. Explicit `provider_instance_id` in the binding.
 2. Existing selected provider for the same control slot, if still usable.
 3. Provider labels match, if labels are specified.
-4. Fresh provider-direct availability beats stale.
+4. Current service-view availability beats missing or stale local knowledge.
 5. Provider priority, if contract supports it.
 6. Stable lexical tie-breaker: `(provider_instance_id, provider_id, action_uuid)`.
 
@@ -303,10 +303,10 @@ then return to the frame that invoked it.
 Authoritative unavailable means one of:
 
 ```text
-provider-direct unavailable
+service-view unavailable
 provider/action retired
 provider session rejected or terminal lifecycle rejection
-stale grace expired
+custom stale grace expired
 action instance destroyed without replacement
 provider removed with no replacement after policy grace
 ```
@@ -317,7 +317,7 @@ Authoritative unavailable does **not** mean:
 Beacon candidate temporarily absent
 availability probe in flight
 metadata stale but existing owner attachment still alive
-network discovery lag without provider-direct confirmation
+network discovery lag without service-view confirmation
 ```
 
 Nested dynamic behavior:
@@ -493,7 +493,7 @@ This directly implements the behavior you described.
 
 ### 14.5 Treat provider lifecycle rejection as availability input
 
-The branch already records lifecycle-unavailable for bindings/action instances/page sessions. That is good. Make those records feed the same availability event path as provider-direct `UNAVAILABLE`, including dynamic owner close. ([GitHub][5])
+The branch already records lifecycle-unavailable for bindings/action instances/page sessions. That is good. Make those records feed the same availability event path as service-view `UNAVAILABLE`, including dynamic owner close. ([GitHub][5])
 
 ### 14.6 Make page open/close fully transactional
 
@@ -506,7 +506,7 @@ I would add these tests before rewriting more code:
 1. **Static unavailable render**: static page has three controls; one action unavailable; page renders two bound controls and one unavailable control.
 2. **Unavailable recovers**: unavailable action becomes available; same control attaches without page navigation.
 3. **Available drops**: bound action becomes unavailable; input is cancelled, attachment removed, control renders unavailable.
-4. **Beacon loss is not unavailability**: Beacon candidate disappears; existing provider-direct bound action remains bound until provider-direct/stale policy says otherwise.
+4. **Beacon loss is not unavailability**: Beacon candidate disappears; existing service-view bound action remains bound until service-view policy says otherwise.
 5. **Dynamic owner unavailable**: action opens dynamic page; owner action becomes unavailable; page closes to invoking frame.
 6. **Dynamic child unavailable**: dynamic page child action becomes unavailable; page remains open; only child control renders unavailable.
 7. **Nested dynamic owner unavailable**: A opens B, B opens C; owner of B disappears; both B and C close, static A is visible.
@@ -539,4 +539,3 @@ That model directly addresses the confusion between action availability and cont
 [6]: https://github.com/kws/deckr-controller/raw/refs/heads/project/v1-contract/src/deckr/controller/_controller_service.py "raw.githubusercontent.com"
 [7]: https://github.com/kws/deckr-controller/raw/refs/heads/project/v1-contract/src/deckr/controller/_render_dispatcher.py "raw.githubusercontent.com"
 [8]: https://github.com/kws/deckr-controller/raw/refs/heads/project/v1-contract/src/deckr/controller/_navigation_service.py "raw.githubusercontent.com"
-

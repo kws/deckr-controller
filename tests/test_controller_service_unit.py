@@ -7,7 +7,6 @@ import anyio
 import pytest
 from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import (
-    ACTION_AVAILABILITY_CHANGED,
     SETTINGS_PATCH,
 )
 from deckr.contracts.authority import ContractPointer
@@ -153,22 +152,6 @@ async def test_action_command_ignores_invalid_settings_body_and_missing_subject(
     await service._handle_action_command(_action_message("openPage"))
 
     ctx.handle_command.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_action_availability_handoff_returns_early_for_empty_changes() -> None:
-    availability = MagicMock()
-    availability.set_availability_changed_callback = MagicMock()
-    availability.handle_availability_message = AsyncMock(return_value=frozenset())
-    service = _service(availability_service=availability)
-    ctx = _manager_context()
-    await service._controller_contexts.set(CONFIG_ID, ctx)
-    message = _action_message(ACTION_AVAILABILITY_CHANGED)
-
-    await service._handle_action_availability_message(message)
-
-    availability.handle_availability_message.assert_awaited_once_with(message)
-    ctx.on_action_availability_changed.assert_not_awaited()
 
 
 @pytest.mark.asyncio

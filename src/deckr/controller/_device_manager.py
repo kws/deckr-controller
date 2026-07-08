@@ -1016,7 +1016,7 @@ class DeviceManager:
         )
         if (
             record is None
-            or record.source != ActionAvailabilitySource.PROVIDER_DIRECT
+            or record.source != ActionAvailabilitySource.SERVICE_VIEW
             or record.metadata is None
             or self._action_availability.state_for(record.key, now=self._clock())
             != ActionAvailabilityState.AVAILABLE
@@ -3236,14 +3236,6 @@ class DeviceManager:
             provider_id=target.provider_id,
             provider_session_id=sender_session_id,
         )
-        if not self._message_contract_authorized(msg, session_key):
-            logger.warning(
-                "Ignoring provider settings command from %s without matching "
-                "Concord provider-session contract %s",
-                sender_provider_instance_id,
-                sender_session_id,
-            )
-            return False
         if not await self._action_availability_service.provider_session_valid(
             provider_instance_id=sender_provider_instance_id,
             provider_id=target.provider_id,
@@ -3252,6 +3244,14 @@ class DeviceManager:
             logger.warning(
                 "Ignoring provider settings command from %s without valid Concord "
                 "provider session %s",
+                sender_provider_instance_id,
+                sender_session_id,
+            )
+            return False
+        if not self._message_contract_authorized(msg, session_key):
+            logger.warning(
+                "Ignoring provider settings command from %s without matching "
+                "Concord provider-session contract %s",
                 sender_provider_instance_id,
                 sender_session_id,
             )

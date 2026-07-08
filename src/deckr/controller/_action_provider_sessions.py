@@ -236,7 +236,7 @@ class ActionProviderSessionManager:
 
     def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer | None:
         session = self._sessions.get(key)
-        if session is None:
+        if session is None or not _snapshot(session).ready:
             return None
         return session.contract_pointer
 

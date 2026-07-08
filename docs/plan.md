@@ -26,8 +26,8 @@ availability as independent state domains:
 - Configuration determines desired bindings but does not report live action
   availability.
 - Provider discovery creates candidates only.
-- Action availability is served from a local cache populated by provider-direct
-  availability messages.
+- Action availability is served from a local cache populated by contract-fenced
+  provider service views.
 - Page planning and input routing are local, deterministic, and non-blocking.
 
 ## Current Snapshot
@@ -39,10 +39,10 @@ availability as independent state domains:
 | Provider-session gating removal | Done | Binding/page transitions no longer wait on Concord provider-session readiness; endpoint sessions remain routing and authorization metadata. |
 | Page frame model | Done | Device runtime stores explicit static/dynamic frames with cached committed plans. |
 | Held input cancellation | Done | Rebinding, revocation, dynamic close, and config removal cancel old held inputs before releases are ignored. |
-| Action availability service | Done | Local cache owns Beacon candidates, provider-direct records, freshness/stale policy, interest aggregation, provider requests, and changed-key computation. |
+| Action availability service | Done | Local cache owns Beacon service candidates, service-view records, missing-view policy, internal interest snapshots, and changed-key computation. |
 | Binding planner extraction | Done | `_binding_planner.py` owns local planning decisions and outcomes, including pending and invalid-config states. |
-| Action interest service | Done | Local tracker and controller service send provider action-interest updates for connected configs and visible page-frame interests. |
-| Provider availability protocol | Done | Shared contracts and Python provider runtime support request/snapshot/change plus interest updates. |
+| Action interest service | Done | Local tracker records connected-config and visible page-frame interests without sending availability traffic over the action lane. |
+| Provider availability protocol | Done | Shared service-view contracts and Python provider runtime publish current action availability through an internal availability service. |
 | Multiple-provider selection | Done | Deterministic fallback and sticky selected-provider retention are implemented; explicit priority metadata/config remains deferred. |
 
 ## Remaining Work
@@ -55,20 +55,20 @@ Recommended commit title:
 Polish provider selection metadata and resource contracts
 ```
 
-The provider-direct availability protocol is now implemented. Beacon remains
-candidate discovery only; providers answer availability through
-`actionAvailabilityRequest`, `actionAvailabilitySnapshot`, and
-`actionAvailabilityChanged`, while controllers publish `actionInterestUpdate`.
+The action availability service-view protocol is now implemented. Beacon remains
+candidate discovery only; providers publish current availability through a
+provider-scoped `actions/current` service view fenced by controller service-use
+contracts.
 
 Resolved decisions:
 
-- Ordinary action availability uses provider-direct messages, not Concord.
-- Concord is reserved for future explicit resource commitments or exclusivity.
+- Ordinary action availability uses service-use Concord contracts plus service
+  views.
+- Separate Concord contracts remain reserved for future explicit resource
+  commitments or exclusivity.
 - Warm interest retention defaults to 4 hours.
-- Provider revalidation defaults to 60 seconds.
-- Stale grace defaults to 5 minutes.
-- Stale availability preserves existing bindings only; new bindings render
-  pending until fresh availability arrives.
+- Missing availability service views mark provider actions unavailable without
+  clearing layout.
 - Provider priority config remains out of scope; ranking uses deterministic
   fallback without a new config schema.
 
@@ -121,17 +121,17 @@ Goal: move page planning out of mutation-heavy runtime code.
 ### 3. Introduce Action Availability Service
 
 Goal: replace Beacon-backed binding-time action lookup with a local availability
-cache fed by provider-direct state.
+cache fed by provider service views.
 
 | Task | Status | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- |
 | Define `ProviderActionKey` and availability records | Done | Provider identity contracts | Cache records include provider instance, action id, state, metadata, reason, timestamps, TTLs, and source. |
-| Feed Beacon advertisements as candidates only | Done | Existing action registry events | Beacon records `unknown` or `probing` candidates, never authoritative `available` records; tests cover candidate-only snapshots and withdrawal. |
-| Add direct availability request/snapshot messages | Done | Provider protocol update | Controller can ask providers for availability for actions of interest. |
-| Add provider availability change messages | Done | Provider protocol update | Providers can publish action availability updates without Beacon churn. |
-| Implement freshness and stale-grace expiry | Done | Clock/test helpers | Fresh, stale, and expired states transition deterministically in the local cache. |
+| Feed Beacon advertisements as candidates only | Done | Existing action registry events | Beacon discovers availability services and never supplies authoritative `available` records. |
+| Open service-use leases and watch current views | Done | Service protocol update | Controller opens service-use contracts and watches each provider service's `actions/current` view. |
+| Publish provider runtime service views | Done | Runtime protocol update | Providers publish current action availability updates without action-lane availability traffic. |
+| Implement missing-view handling | Done | Clock/test helpers | Missing or unavailable service views mark provider actions unavailable deterministically. |
 | Publish availability-change events to device runtimes | Done | Runtime subscription path | The service computes changed keys; ControllerService and DeviceManager apply scoped fanout so affected current controls replan in place. |
-| Keep stale existing bindings stable during grace | Done | Planner sticky selection | Existing bindings may remain bound during stale grace; new stale bindings render pending. |
+| Keep stale existing bindings stable for custom policies | Done | Planner sticky selection | The default service-view policy does not expire records; explicit stale/grace policies can retain existing bindings while new stale bindings render pending. |
 
 ### 4. Implement Action Interest
 
@@ -144,7 +144,7 @@ resources warm without blocking layout.
 | Compute strong interest from visible/static/dynamic pages | Done | Planner/frame state | Connected config, current static page, and dynamic page child actions are marked strongly needed. |
 | Compute warm interest from active configs and recent use | In progress | Config snapshots and retention policy | Removed strong interests are retained warm; recent-use/settings/prewarm sources remain future work. |
 | Add interest retention and expiry policy | Done | Clock/test helpers | Warm interest is retained for hours by policy and expires predictably. |
-| Send interest updates to providers | Done | Provider protocol update | Providers receive strong/warm interest updates without blocking page transitions. |
+| Keep interest local to planning | Done | Availability service update | Strong/warm interest updates remain internal and do not block page transitions. |
 | Optional action-level Concord contract | Deferred | Need/resource decision | Contracts, if added, are per provider/action interest and never a layout precondition. |
 
 ### 5. Provider Selection and Multiple Providers
@@ -220,14 +220,14 @@ Goal: make the architecture difficult to regress.
 4. Add action interest tracking.
    Landed in the local controller slice. `_action_interest.py` tracks
    strong/warm interest from connected configs and page frames before
-   provider-direct availability work.
+   service-view availability work.
 5. Connect Beacon as candidate input.
    Landed in this slice. Beacon metadata now records candidate state only;
-   provider-direct records now supply authoritative availability.
-6. Add provider-direct availability protocol.
-   Landed in this slice. Shared action-lane contracts, Python provider runtime
-   support, controller availability ingestion, interest updates, revalidation,
-   and in-place replanning are wired.
+   service-view records now supply authoritative availability.
+6. Add action availability service-view protocol.
+   Landed in this slice. Shared service contracts, Python provider runtime
+   service publishing, controller service-view ingestion, and in-place
+   replanning are wired.
 7. Implement deterministic provider selection.
    Deterministic fallback and stale-existing behavior are in place. Optional
    priority metadata/config remains future work.

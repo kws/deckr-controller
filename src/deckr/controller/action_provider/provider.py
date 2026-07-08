@@ -12,7 +12,7 @@ class ActionMetadata:
     """Metadata for an action.
 
     ``provider_session_id`` is live routing metadata. Beacon advertisements must
-    not populate it; only Concord-authorized provider-direct availability may.
+    not populate it; only the contract-fenced action availability service view may.
     """
 
     uuid: str

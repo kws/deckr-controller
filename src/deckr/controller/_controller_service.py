@@ -5,8 +5,6 @@ from uuid import uuid4
 
 import anyio
 from deckr.actions.messages import (
-    ACTION_AVAILABILITY_CHANGED,
-    ACTION_AVAILABILITY_SNAPSHOT,
     COMMAND_MESSAGE_TYPES,
     SETTINGS_PATCH,
     SETTINGS_REPLACE,
@@ -249,28 +247,6 @@ class ControllerService(BaseComponent):
         for ctrl_ctx in controller_contexts:
             await ctrl_ctx.on_action_availability_changed(changed_keys)
 
-    async def _handle_action_availability_message(self, msg: DeckrMessage) -> None:
-        if self._action_availability_service is None:
-            return
-        changed_keys = await self._action_availability_service.handle_availability_message(
-            msg
-        )
-        if not changed_keys:
-            logger.debug(
-                "Action availability handoff skipped type=%s changed_keys=0",
-                msg.message_type,
-            )
-            return
-        controller_contexts = await self._controller_contexts.values()
-        logger.debug(
-            "Action availability handoff type=%s changed_keys=%s devices=%s",
-            msg.message_type,
-            len(changed_keys),
-            len(controller_contexts),
-        )
-        for ctrl_ctx in controller_contexts:
-            await ctrl_ctx.on_action_availability_changed(changed_keys)
-
     async def _handle_internal_action_availability_changed(
         self,
         changed_keys: frozenset[ProviderActionKey],
@@ -297,12 +273,6 @@ class ControllerService(BaseComponent):
                     if not isinstance(event, DeckrMessage):
                         continue
                     if not action_message_for_controller(event, self._controller_id):
-                        continue
-                    if event.message_type in {
-                        ACTION_AVAILABILITY_SNAPSHOT,
-                        ACTION_AVAILABILITY_CHANGED,
-                    }:
-                        await self._handle_action_availability_message(event)
                         continue
                     if event.message_type in COMMAND_MESSAGE_TYPES:
                         await self._handle_action_command(event)

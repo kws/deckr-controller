@@ -416,7 +416,7 @@ async def test_observing_render_backend_records_availability_source_metadata(
             content_kind="overlay:unavailable_service",
             availability_cause="service",
             availability_state="unavailable",
-            availability_source="provider_direct",
+            availability_source="service_view",
             availability_reason="sonos_service_unavailable",
         ),
     )
@@ -429,7 +429,7 @@ async def test_observing_render_backend_records_availability_source_metadata(
     assert record["contentKind"] == "overlay:unavailable_service"
     assert record["availabilityCause"] == "service"
     assert record["availabilityState"] == "unavailable"
-    assert record["availabilitySource"] == "provider_direct"
+    assert record["availabilitySource"] == "service_view"
     assert record["availabilityReason"] == "sonos_service_unavailable"
 
 

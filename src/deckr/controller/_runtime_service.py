@@ -17,8 +17,10 @@ from deckr.components import (
     RunContext,
 )
 from deckr.concord import Concord
-from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE
+from deckr.contracts.lanes import SERVICE_LANE_CONTRACT
+from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE, SERVICES_LANE
 from deckr.lanes import EndpointSession
+from deckr.services import DeckrServices
 
 from deckr.controller._action_availability import ActionAvailabilityService
 from deckr.controller._action_provider_sessions import ActionProviderSessionManager
@@ -104,11 +106,20 @@ class ControllerRuntimeService(BaseComponent):
                 on_catalog_changed=on_catalog_changed,
             )
             await self._component_manager.add_component(action_registry)
+            services = DeckrServices(
+                endpoint=self._endpoint,
+                beacon=self._beacon,
+                concord=self._concord,
+                task_group=ctx.tg,
+                kv_bucket_for=self._context.kv_bucket,
+            )
             action_availability_service = ActionAvailabilityService(
                 controller_id=self._runtime.controller_id,
                 controller_session_id=self._endpoint.session_id,
                 actions_bus=self._endpoint,
                 manager=action_registry,
+                services=services,
+                close_services_on_aclose=True,
                 start_soon=ctx.tg.start_soon,
                 provider_sessions=ActionProviderSessionManager(
                     controller_id=self._runtime.controller_id,
@@ -215,6 +226,7 @@ def component_factory(context: ComponentContext):
     )
     context.require_lane(HARDWARE_MESSAGES_LANE)
     context.require_lane(ACTIONS_LANE)
+    context.require_lane(SERVICES_LANE)
 
     materialized_config_bucket = None
     device_config = runtime.config.device_config
@@ -236,8 +248,9 @@ def component_factory(context: ComponentContext):
 component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="dev.deckr.controller",
-        consumes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
-        publishes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE),
+        consumes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE, SERVICES_LANE),
+        publishes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE, SERVICES_LANE),
+        lane_contracts=(SERVICE_LANE_CONTRACT,),
         endpoint_slots=("controller",),
         role="controller",
     ),

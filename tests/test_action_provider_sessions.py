@@ -279,6 +279,33 @@ async def test_existing_lease_refresh_conflict_uses_concord_validation() -> None
 
 
 @pytest.mark.asyncio
+async def test_contract_pointer_is_only_exposed_for_ready_session() -> None:
+    action = _action()
+    key = provider_session_key(action)
+    assert key is not None
+    agreement = _FakeAgreement(
+        "contract-pending",
+        refresh_results=[
+            _validity(ContractValidityStatus.NOT_YET_FULFILLED),
+            _validity(ContractValidityStatus.VALID),
+        ],
+    )
+    manager = _manager(_FakeConcord([agreement]))
+
+    await manager.prepare(action)
+
+    assert manager.cached_ready(key) is False
+    assert manager.contract_pointer(key) is None
+
+    await manager.refresh_many((key,))
+
+    assert manager.cached_ready(key) is True
+    pointer = manager.contract_pointer(key)
+    assert pointer is not None
+    assert pointer.contract_id == "contract-pending"
+
+
+@pytest.mark.asyncio
 async def test_validate_unavailable_fallback_returns_nonready_snapshot() -> None:
     action = _action()
     key = provider_session_key(action)

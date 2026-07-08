@@ -126,7 +126,7 @@ def test_component_factory_requests_lanes_without_materialized_bucket(
     service = component_factory(context)
 
     assert isinstance(service, ControllerRuntimeService)
-    assert context.lanes == ["hardware_messages", "actions"]
+    assert context.lanes == ["hardware_messages", "actions", "services"]
     assert context.bucket_policies == []
     assert service._materialized_config_bucket is None
 
@@ -140,7 +140,7 @@ def test_component_factory_creates_materialized_config_bucket(tmp_path: Path) ->
     service = component_factory(context)
 
     assert isinstance(service, ControllerRuntimeService)
-    assert context.lanes == ["hardware_messages", "actions"]
+    assert context.lanes == ["hardware_messages", "actions", "services"]
     assert [policy.bucket for policy in context.bucket_policies] == [
         "controller_config"
     ]
@@ -180,9 +180,10 @@ async def test_controller_component_uses_shared_lanes() -> None:
         assert [created.name for created in result.components] == [
             "dev.deckr.controller:main"
         ]
-        assert set(result.lane_names) == {"hardware_messages", "actions"}
+        assert set(result.lane_names) == {"hardware_messages", "actions", "services"}
         assert isinstance(result.get_lane("hardware_messages"), Lane)
         assert isinstance(result.get_lane("actions"), Lane)
+        assert isinstance(result.get_lane("services"), Lane)
 
 
 @pytest.mark.asyncio
