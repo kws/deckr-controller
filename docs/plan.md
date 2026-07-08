@@ -39,7 +39,7 @@ availability as independent state domains:
 | Provider-session gating removal | Done | Binding/page transitions no longer wait on Concord provider-session readiness; endpoint sessions remain routing and authorization metadata. |
 | Page frame model | Done | Device runtime stores explicit static/dynamic frames with cached committed plans. |
 | Held input cancellation | Done | Rebinding, revocation, dynamic close, and config removal cancel old held inputs before releases are ignored. |
-| Action availability service | Done | Local cache owns Beacon service candidates, service-view records, missing-view policy, internal interest snapshots, and changed-key computation. |
+| Action availability service | Done | Local cache owns Beacon service candidates, service-view records, missing-view projection policy, internal interest snapshots, and changed-key computation. |
 | Binding planner extraction | Done | `_binding_planner.py` owns local planning decisions and outcomes, including pending and invalid-config states. |
 | Action interest service | Done | Local tracker records connected-config and visible page-frame interests without sending availability traffic over the action lane. |
 | Provider availability protocol | Done | Shared service-view contracts and Python provider runtime publish current action availability through an internal availability service. |
@@ -68,7 +68,7 @@ Resolved decisions:
   commitments or exclusivity.
 - Warm interest retention defaults to 4 hours.
 - Missing availability service views mark provider actions unavailable without
-  clearing layout.
+  clearing layout or closing the current service-use watch.
 - Provider priority config remains out of scope; ranking uses deterministic
   fallback without a new config schema.
 
@@ -129,7 +129,7 @@ cache fed by provider service views.
 | Feed Beacon advertisements as candidates only | Done | Existing action registry events | Beacon discovers availability services and never supplies authoritative `available` records. |
 | Open service-use leases and watch current views | Done | Service protocol update | Controller opens service-use contracts and watches each provider service's `actions/current` view. |
 | Publish provider runtime service views | Done | Runtime protocol update | Providers publish current action availability updates without action-lane availability traffic. |
-| Implement missing-view handling | Done | Clock/test helpers | Missing or unavailable service views mark provider actions unavailable deterministically. |
+| Implement missing-view handling | Done | Clock/test helpers | Missing service views mark provider actions unavailable deterministically while the current service-use watch stays open; service-unavailable errors still drive retry/reopen behavior. |
 | Publish availability-change events to device runtimes | Done | Runtime subscription path | The service computes changed keys; ControllerService and DeviceManager apply scoped fanout so affected current controls replan in place. |
 | Keep stale existing bindings stable for custom policies | Done | Planner sticky selection | The default service-view policy does not expire records; explicit stale/grace policies can retain existing bindings while new stale bindings render pending. |
 

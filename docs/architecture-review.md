@@ -132,7 +132,7 @@ Availability states should be interpreted as follows:
 | `UNAVAILABLE` service view        | `UNAVAILABLE`                                          | cancel inputs, detach, render unavailable                                        |
 | `EXPIRED` / `RETIRED`             | `UNAVAILABLE`                                          | cancel inputs, detach, render unavailable                                        |
 
-Beacon disappearance alone must not be treated as authoritative action unavailability. Service-view `UNAVAILABLE`, missing service view, provider session death, terminal lifecycle rejection, or an explicit provider/catalog retirement is authoritative.
+Beacon disappearance alone must not be treated as authoritative action unavailability. Service-view `UNAVAILABLE`, missing service view, provider session death, terminal lifecycle rejection, or an explicit provider/catalog retirement is authoritative for action projection. Missing service view does not close the service-use contract; the watch remains open for a later payload.
 
 ## 5. Action interest is not binding
 

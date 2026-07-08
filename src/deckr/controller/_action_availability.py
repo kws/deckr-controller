@@ -1444,54 +1444,76 @@ class ActionAvailabilityService:
         with anyio.CancelScope() as scope:
             self._service_watch_scopes[service_id] = scope
             try:
+                view_ref = action_availability_view_ref(service_id)
                 while not stopping.is_set():
                     try:
                         async with services.use(descriptor) as lease:
-                            view_ref = action_availability_view_ref(service_id)
-                            async for payload in services.watch_view(lease, view_ref):
-                                if stopping.is_set():
-                                    return
-                                if payload is None:
-                                    provider_instance_id = (
-                                        action_availability_provider_instance_id(
-                                            service_id
-                                        )
+                            while not stopping.is_set():
+                                try:
+                                    async for payload in services.watch_view(
+                                        lease,
+                                        view_ref,
+                                    ):
+                                        if stopping.is_set():
+                                            return
+                                        if payload is None:
+                                            provider_instance_id = (
+                                                action_availability_provider_instance_id(
+                                                    service_id
+                                                )
+                                            )
+                                            changed = (
+                                                self.mark_provider_service_unavailable(
+                                                    provider_instance_id,
+                                                    reason=SERVICE_VIEW_MISSING_REASON,
+                                                )
+                                                if provider_instance_id is not None
+                                                else frozenset()
+                                            )
+                                        else:
+                                            view = (
+                                                ActionAvailabilityViewPayload.model_validate(
+                                                    payload
+                                                )
+                                            )
+                                            changed = self.ingest_service_view_payload(
+                                                view,
+                                                service_id=service_id,
+                                            )
+                                            await self._prepare_provider_sessions_for_view(
+                                                view
+                                            )
+                                        if changed:
+                                            await self._notify_availability_changed(
+                                                changed
+                                            )
+                                except ServiceUnavailable as exc:
+                                    if service_unavailable_ends_service_use(exc):
+                                        raise
+                                    logger.warning(
+                                        "Action availability service view unavailable "
+                                        "service=%s code=%s message=%s diagnostics=%s",
+                                        service_id,
+                                        exc.code,
+                                        exc.message,
+                                        exc.diagnostics,
                                     )
-                                    changed = (
-                                        self.mark_provider_service_unavailable(
-                                            provider_instance_id,
-                                            reason=SERVICE_VIEW_MISSING_REASON,
-                                        )
-                                        if provider_instance_id is not None
-                                        else frozenset()
-                                    )
-                                    if changed:
-                                        await self._notify_availability_changed(changed)
                                     await anyio.sleep(_SERVICE_WATCH_RETRY_SECONDS)
-                                    break
                                 else:
-                                    view = ActionAvailabilityViewPayload.model_validate(
-                                        payload
-                                    )
-                                    changed = self.ingest_service_view_payload(
-                                        view,
-                                        service_id=service_id,
-                                    )
-                                    await self._prepare_provider_sessions_for_view(view)
-                                if changed:
-                                    await self._notify_availability_changed(changed)
+                                    break
                     except ServiceUnavailable as exc:
                         provider_instance_id = action_availability_provider_instance_id(
                             service_id
                         )
-                        if provider_instance_id is not None:
-                            changed = self.mark_provider_service_unavailable(
-                                provider_instance_id,
-                                reason=SERVICE_VIEW_UNAVAILABLE_REASON,
-                            )
-                            if changed:
-                                await self._notify_availability_changed(changed)
-                        if not service_unavailable_ends_service_use(exc):
+                        if service_unavailable_ends_service_use(exc):
+                            if provider_instance_id is not None:
+                                changed = self.mark_provider_service_unavailable(
+                                    provider_instance_id,
+                                    reason=SERVICE_VIEW_UNAVAILABLE_REASON,
+                                )
+                                if changed:
+                                    await self._notify_availability_changed(changed)
+                        else:
                             logger.warning(
                                 "Action availability service view unavailable "
                                 "service=%s code=%s message=%s diagnostics=%s",

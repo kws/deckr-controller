@@ -333,10 +333,12 @@ class ActionAvailabilityRecord:
 ```
 
 By default, service-view records do not age out on a controller timer. They
-remain current until the provider writes a new view, the view disappears, the
-service-use contract becomes unavailable, or provider-session lifecycle
-authority becomes invalid. Fresh/stale expiry is an optional local policy only;
-it must not reintroduce provider-direct availability queries or a periodic
+remain current until the provider writes a new view, the watched view is absent,
+terminal service-use loss occurs, or provider-session lifecycle authority
+becomes invalid. A missing watched view is authoritative only for the current
+availability projection; it does not close the service-use contract or force a
+successor negotiation. Fresh/stale expiry is an optional local policy only; it
+must not reintroduce provider-direct availability queries or a periodic
 revalidation loop.
 
 Beacon-derived data can create `unknown` or `probing` candidates. It must not create authoritative `available` records by itself.
@@ -765,7 +767,7 @@ Suggested defaults:
 ```text
 strong interest: while visible/config-active
 warm retention: 4 hours
-missing service view: provider actions unavailable
+missing service view: provider actions unavailable; keep watching same lease
 ```
 
 The “hours” timeout is important. It prevents a provider from repeatedly tearing down and rebuilding actions while the user navigates around. But that timeout belongs to action interest, not button binding.
@@ -918,7 +920,8 @@ The current `DeviceManager` already listens to config stream changes and clears/
 1. Beacon discovers a candidate provider.
 2. Availability service records the candidate.
 3. If the provider may serve needed actions, the controller watches that provider's action availability service view.
-4. Availability cache updates when the service view changes or disappears.
+4. Availability cache updates when the service view changes or is absent; an
+   absent view does not close the current service-use watch.
 5. Affected device runtimes replan relevant controls.
 
 Device layout does not change merely because Beacon changed.
@@ -926,7 +929,7 @@ Device layout does not change merely because Beacon changed.
 ## 11.6 Provider Candidate Disappears
 
 1. Beacon removal does not invalidate current service-view records.
-2. The service view remains authoritative until it changes, disappears, or its service-use contract becomes unavailable.
+2. The service view remains authoritative until it changes, is absent, or terminal service-use loss occurs. An absent view affects availability projection only; it does not end the service-use contract.
 3. Existing bindings may continue only while provider-session readiness and lifecycle authority remain valid.
 4. If the service view or provider session becomes invalid, affected controls become unavailable or pending according to the current record.
 5. Device pages remain intact.
@@ -1045,7 +1048,7 @@ Default policy:
 ```text
 service-view available + provider lifecycle ready: bind normally
 service-view available + provider lifecycle not ready: render pending
-service-view unavailable or missing: render unavailable
+service-view unavailable or missing: render unavailable; keep the service-use watch open unless the lease fails
 beacon candidate only: render pending/probing, not available
 no candidate: render unavailable
 ```

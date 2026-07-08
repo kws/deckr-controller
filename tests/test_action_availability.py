@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 from deckr.actions.availability import (
     ACTION_AVAILABILITY_SERVICE_PROTOCOL,
@@ -18,10 +20,11 @@ from deckr.actions.messages import (
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import service_address
-from deckr.services import ServiceBackendStatus, ServiceDescriptor
+from deckr.services import ServiceBackendStatus, ServiceDescriptor, ServiceUnavailable
 
 from deckr.controller._action_availability import (
     PROVIDER_SESSION_INVALID_REASON,
+    SERVICE_VIEW_UNAVAILABLE_REASON,
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
     ActionAvailabilityRecord,
@@ -211,6 +214,41 @@ def _service_descriptor(
         backend_status=backend_status,
         diagnostics={},
     )
+
+
+class _ServiceViewWatchServices:
+    def __init__(self) -> None:
+        self._send, self._receive = anyio.create_memory_object_stream(10)
+        self.entered = anyio.Event()
+        self.use_count = 0
+        self.closed_count = 0
+        self.lease_open = False
+        self.leases = []
+        self.watch_calls = []
+
+    async def send(self, payload) -> None:
+        await self._send.send(payload)
+
+    @asynccontextmanager
+    async def use(self, descriptor):
+        self.use_count += 1
+        lease = SimpleNamespace(descriptor=descriptor, lease_id=self.use_count)
+        self.leases.append(lease)
+        self.lease_open = True
+        self.entered.set()
+        try:
+            yield lease
+        finally:
+            self.lease_open = False
+            self.closed_count += 1
+
+    async def watch_view(self, lease, view):
+        self.watch_calls.append((lease, view))
+        while True:
+            payload = await self._receive.receive()
+            if isinstance(payload, BaseException):
+                raise payload
+            yield payload
 
 
 @pytest.mark.parametrize(
@@ -639,6 +677,302 @@ def test_missing_service_view_marks_known_provider_actions_unavailable():
     assert record is not None
     assert record.state == ActionAvailabilityState.UNAVAILABLE
     assert record.reason == "action_availability_view_missing"
+
+
+@pytest.mark.asyncio
+async def test_service_view_watch_missing_view_keeps_service_use_lease_open(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        0.01,
+    )
+    services = _ServiceViewWatchServices()
+    notify_send, notify_receive = anyio.create_memory_object_stream(10)
+    actions_bus = _actions_bus()
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        actions_bus=actions_bus,
+        manager=MagicMock(),
+        services=services,
+        start_soon=None,
+        on_availability_changed=notify_send.send,
+    )
+    service.cache.record_available(
+        _metadata(
+            "action.alpha",
+            provider_instance_id="provider-alpha",
+            provider_id="provider.test",
+        ),
+        now=0.0,
+    )
+    service_id = action_availability_service_id("provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    stopping = anyio.Event()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        with anyio.fail_after(1):
+            await services.entered.wait()
+
+        await services.send(None)
+        with anyio.fail_after(1):
+            changed = await notify_receive.receive()
+        await anyio.sleep(0.05)
+
+        assert changed == frozenset(
+            {ProviderActionKey("provider-alpha", "action.alpha")}
+        )
+        assert services.use_count == 1
+        assert services.closed_count == 0
+        assert services.lease_open is True
+        record = service.cache.record_for(
+            ProviderActionKey("provider-alpha", "action.alpha")
+        )
+        assert record is not None
+        assert record.state == ActionAvailabilityState.UNAVAILABLE
+        assert record.reason == "action_availability_view_missing"
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_service_view_watch_recovers_from_missing_view_on_same_lease(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        0.01,
+    )
+    services = _ServiceViewWatchServices()
+    notify_send, notify_receive = anyio.create_memory_object_stream(10)
+    actions_bus = _actions_bus()
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        actions_bus=actions_bus,
+        manager=MagicMock(),
+        services=services,
+        start_soon=None,
+        on_availability_changed=notify_send.send,
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    service.cache.record_available(
+        _metadata(
+            "action.alpha",
+            provider_instance_id="provider-alpha",
+            provider_id="provider.test",
+        ),
+        now=0.0,
+    )
+    service_id = action_availability_service_id("provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    payload = ActionAvailabilityViewPayload(
+        providerInstanceId="provider-alpha",
+        providerEndpoint=action_provider_address("provider-alpha"),
+        providerId="provider.test",
+        providerSessionId=PROVIDER_SESSION_ID,
+        entries=(
+            ActionAvailabilityEntry(
+                actionId="action.alpha",
+                status="available",
+                descriptor=ActionDescriptor(actionId="action.alpha", name="Alpha"),
+            ),
+        ),
+    )
+    stopping = anyio.Event()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        with anyio.fail_after(1):
+            await services.entered.wait()
+
+        await services.send(None)
+        with anyio.fail_after(1):
+            assert await notify_receive.receive() == frozenset({key})
+        await anyio.sleep(0.05)
+        await services.send(payload.to_dict())
+        with anyio.fail_after(1):
+            assert await notify_receive.receive() == frozenset({key})
+
+        assert services.use_count == 1
+        assert services.closed_count == 0
+        assert services.lease_open is True
+        assert len(services.watch_calls) == 1
+        assert services.watch_calls[0][0] is services.leases[0]
+        record = service.cache.record_for(key)
+        assert record is not None
+        assert record.state == ActionAvailabilityState.AVAILABLE
+        assert record.reason is None
+        assert record.metadata is not None
+        assert record.metadata.name == "Alpha"
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_service_view_watch_transient_unavailable_keeps_same_service_use_lease(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        0.01,
+    )
+    services = _ServiceViewWatchServices()
+    notify_send, notify_receive = anyio.create_memory_object_stream(10)
+    actions_bus = _actions_bus()
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        actions_bus=actions_bus,
+        manager=MagicMock(),
+        services=services,
+        start_soon=None,
+        on_availability_changed=notify_send.send,
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    service.cache.record_available(
+        _metadata(
+            "action.alpha",
+            provider_instance_id="provider-alpha",
+            provider_id="provider.test",
+        ),
+        now=0.0,
+    )
+    service_id = action_availability_service_id("provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    payload = ActionAvailabilityViewPayload(
+        providerInstanceId="provider-alpha",
+        providerEndpoint=action_provider_address("provider-alpha"),
+        providerId="provider.test",
+        providerSessionId=PROVIDER_SESSION_ID,
+        entries=(
+            ActionAvailabilityEntry(
+                actionId="action.alpha",
+                status="available",
+                descriptor=ActionDescriptor(actionId="action.alpha", name="Alpha"),
+            ),
+        ),
+    )
+    stopping = anyio.Event()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        with anyio.fail_after(1):
+            await services.entered.wait()
+
+        await services.send(
+            ServiceUnavailable(
+                "contract_unavailable",
+                "contract materialized view unavailable",
+            )
+        )
+        with anyio.fail_after(1):
+            while len(services.watch_calls) < 2:
+                await anyio.sleep(0.01)
+
+        with anyio.move_on_after(0.05) as scope:
+            await notify_receive.receive()
+        assert scope.cancel_called
+        assert services.use_count == 1
+        assert services.closed_count == 0
+        assert services.lease_open is True
+        assert services.watch_calls[0][0] is services.leases[0]
+        assert services.watch_calls[1][0] is services.leases[0]
+        record = service.cache.record_for(key)
+        assert record is not None
+        assert record.state == ActionAvailabilityState.AVAILABLE
+
+        await services.send(payload.to_dict())
+        with anyio.fail_after(1):
+            assert await notify_receive.receive() == frozenset({key})
+        assert services.use_count == 1
+        assert services.closed_count == 0
+        assert services.lease_open is True
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_service_view_watch_terminal_unavailable_closes_lease_and_retries(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        0.01,
+    )
+    services = _ServiceViewWatchServices()
+    notify_send, notify_receive = anyio.create_memory_object_stream(10)
+    actions_bus = _actions_bus()
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        actions_bus=actions_bus,
+        manager=MagicMock(),
+        services=services,
+        start_soon=None,
+        on_availability_changed=notify_send.send,
+    )
+    key = ProviderActionKey("provider-alpha", "action.alpha")
+    service.cache.record_available(
+        _metadata(
+            "action.alpha",
+            provider_instance_id="provider-alpha",
+            provider_id="provider.test",
+        ),
+        now=0.0,
+    )
+    service_id = action_availability_service_id("provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    stopping = anyio.Event()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        with anyio.fail_after(1):
+            await services.entered.wait()
+
+        await services.send(
+            ServiceUnavailable(
+                "contract_cancelled",
+                "service-use contract cancelled",
+            )
+        )
+        with anyio.fail_after(1):
+            assert await notify_receive.receive() == frozenset({key})
+            while services.use_count < 2:
+                await anyio.sleep(0.01)
+
+        assert services.closed_count == 1
+        assert services.lease_open is True
+        assert services.watch_calls[0][0] is services.leases[0]
+        assert services.watch_calls[1][0] is services.leases[1]
+        record = service.cache.record_for(key)
+        assert record is not None
+        assert record.state == ActionAvailabilityState.UNAVAILABLE
+        assert record.reason == SERVICE_VIEW_UNAVAILABLE_REASON
+
+        tg.cancel_scope.cancel()
 
 
 def test_service_logs_unchanged_provider_snapshot(caplog):
