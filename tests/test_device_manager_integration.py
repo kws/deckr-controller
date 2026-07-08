@@ -90,7 +90,10 @@ from deckr.controller.action_provider.provider import (
     ActionProviderSessionCandidate,
 )
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
-from deckr.controller.settings import ConfigBackedSettingsService
+from deckr.controller.settings import (
+    ConfigBackedSettingsService,
+    derive_static_action_instance_id,
+)
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_ADDR = controller_address(CONTROLLER_ID)
@@ -725,6 +728,28 @@ def _dynamic_page_with_action_child(
     )
 
 
+def _dynamic_page_with_action_children(
+    page_id: str,
+    *children: tuple[str, str],
+    provider_instance_id: str = PROVIDER_INSTANCE_ID,
+) -> DynamicPageCommand:
+    return DynamicPageCommand(
+        pageId=page_id,
+        bindings=tuple(
+            PageChildBindingDescriptor(
+                controlId=control_id,
+                target=PageChildBindingTarget(
+                    kind="action",
+                    actionId=action_id,
+                    providerInstanceId=provider_instance_id,
+                    instanceKey=control_id,
+                ),
+            )
+            for control_id, action_id in children
+        ),
+    )
+
+
 class ControlledFrameBackend:
     """Backend used by tests to control completion order without blocking commands."""
 
@@ -1219,6 +1244,405 @@ async def test_malformed_settings_commands_are_ignored_without_crashing():
     assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
         "timezone": "UTC"
     }
+
+
+def _settings_reload_config() -> DeviceConfig:
+    return DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                id="root-control",
+                                selector={"control_id": "0,0"},
+                                action=SetRasterImageOnAppearAction.uuid,
+                                settings={"label": "old"},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def _settings_reload_selector_only_config() -> DeviceConfig:
+    return DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={
+                                    "geometry": {
+                                        "x": 0,
+                                        "y": 0,
+                                        "width": 1,
+                                        "height": 1,
+                                        "unit": "grid",
+                                    }
+                                },
+                                action=SetRasterImageOnAppearAction.uuid,
+                                settings={"label": "old"},
+                            )
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_settings_patch_hard_reloads_active_component():
+    config_service = MemoryConfigService(_settings_reload_config())
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config_service.config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            settings_service=ConfigBackedSettingsService(
+                controller_id=CONTROLLER_ID,
+                config_service=config_service,
+            ),
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            await manager.set_page(profile="default", page=0)
+            old_ctx = await manager.action_contexts.get("0,0")
+            assert old_ctx is not None
+            assert old_ctx.settings == {"label": "old"}
+            assert old_ctx.settings_target is not None
+            old_binding_id = old_ctx.binding_id
+            old_context_id = old_ctx.id
+            action_instance_id = old_ctx.action_instance_id
+            await _drain_action_messages(stream)
+
+            await manager.handle_command(
+                _action_command(
+                    SETTINGS_PATCH,
+                    {
+                        "target": old_ctx.settings_target.to_dict(),
+                        "settings": {"label": "new", "extra": True},
+                    },
+                    context_id=old_ctx.id,
+                    action_instance_id=old_ctx.action_instance_id,
+                    binding_id=old_ctx.binding_id,
+                )
+            )
+
+            new_ctx = await manager.action_contexts.get("0,0")
+            assert new_ctx is not None
+            assert new_ctx is not old_ctx
+            assert new_ctx.action_instance_id == action_instance_id
+            assert new_ctx.binding_id != old_binding_id
+            assert new_ctx.id != old_context_id
+            assert new_ctx.settings == {"label": "new", "extra": True}
+            assert config_service.config.profiles[0].pages[0].controls[0].settings == {
+                "label": "new",
+                "extra": True,
+            }
+
+            messages = await _collect_action_messages(stream)
+            types = [message.message_type for message in messages]
+            assert SETTINGS_SNAPSHOT in types
+            assert BINDING_DETACHED in types
+            assert ACTION_INSTANCE_DESTROYED in types
+            assert ACTION_INSTANCE_CREATED in types
+            assert BINDING_ATTACHED in types
+
+            detached = next(
+                message
+                for message in messages
+                if message.message_type == BINDING_DETACHED
+            )
+            destroyed = next(
+                message
+                for message in messages
+                if message.message_type == ACTION_INSTANCE_DESTROYED
+            )
+            created = [
+                message
+                for message in messages
+                if message.message_type == ACTION_INSTANCE_CREATED
+            ][-1]
+            attached = [
+                message for message in messages if message.message_type == BINDING_ATTACHED
+            ][-1]
+            assert detached.body["reason"] == "settings_changed"
+            assert destroyed.body["reason"] == "settings_changed"
+            assert created.body["metadata"]["actionInstanceId"] == action_instance_id
+            assert created.body["metadata"]["contextId"] == new_ctx.id
+            assert created.body["settings"] == {"label": "new", "extra": True}
+            assert attached.body["binding"]["bindingId"] == new_ctx.binding_id
+            assert attached.body["settings"] == {"label": "new", "extra": True}
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_action_settings_patch_hard_reloads_selector_only_control():
+    config_service = MemoryConfigService(_settings_reload_selector_only_config())
+    device = _make_mock_device(controls=[_make_control("0,0")])
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config_service.config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            settings_service=ConfigBackedSettingsService(
+                controller_id=CONTROLLER_ID,
+                config_service=config_service,
+            ),
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            await manager.set_page(profile="default", page=0)
+            old_ctx = await manager.action_contexts.get("0,0")
+            assert old_ctx is not None
+            assert old_ctx.settings_target is not None
+            assert old_ctx.settings_target.stable_id is None
+            assert old_ctx.action_instance_id == derive_static_action_instance_id(
+                controller_id=CONTROLLER_ID,
+                config_id="test-device",
+                action_id=SetRasterImageOnAppearAction.uuid,
+                profile_id="default",
+                page_id="0",
+                control_index=0,
+            )
+            await _drain_action_messages(stream)
+
+            await manager.handle_command(
+                _action_command(
+                    SETTINGS_PATCH,
+                    {
+                        "target": old_ctx.settings_target.to_dict(),
+                        "settings": {"label": "new"},
+                    },
+                    context_id=old_ctx.id,
+                    action_instance_id=old_ctx.action_instance_id,
+                    binding_id=old_ctx.binding_id,
+                )
+            )
+
+            new_ctx = await manager.action_contexts.get("0,0")
+            assert new_ctx is not None
+            assert new_ctx is not old_ctx
+            assert new_ctx.action_instance_id == old_ctx.action_instance_id
+            assert new_ctx.settings == {"label": "new"}
+            assert config_service.config.profiles[0].pages[0].controls[0].settings == {
+                "label": "new"
+            }
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_stale_output_from_old_binding_is_rejected_after_settings_reload():
+    config_service = MemoryConfigService(_settings_reload_config())
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+    render_backend = ControlledFrameBackend()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config_service.config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            render_backend=render_backend,
+            settings_service=ConfigBackedSettingsService(
+                controller_id=CONTROLLER_ID,
+                config_service=config_service,
+            ),
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            await manager.set_page(profile="default", page=0)
+            old_ctx = await manager.action_contexts.get("0,0")
+            assert old_ctx is not None
+            assert old_ctx.settings_target is not None
+            old_binding = old_ctx.metadata.model_copy(update={"output_generation": 1})
+            await _drain_action_messages(stream)
+
+            await manager.handle_command(
+                _action_command(
+                    SETTINGS_PATCH,
+                    {
+                        "target": old_ctx.settings_target.to_dict(),
+                        "settings": {"label": "new"},
+                    },
+                    context_id=old_ctx.id,
+                    action_instance_id=old_ctx.action_instance_id,
+                    binding_id=old_ctx.binding_id,
+                )
+            )
+            await _drain_action_messages(stream)
+
+            await manager.handle_command(
+                _action_command(
+                    BINDING_OUTPUT,
+                    {
+                        "binding": old_binding.model_dump(
+                            by_alias=True,
+                            exclude_none=True,
+                            mode="json",
+                        ),
+                        "capability": {
+                            "deviceRef": {
+                                "managerId": "manager-main",
+                                "deviceId": "test-device",
+                            },
+                            "controlId": "0,0",
+                            "capabilityId": "raster.bitmap",
+                        },
+                        "commandType": "set_frame",
+                        "params": {"image": _solid_key_image()},
+                        "generation": 1,
+                    },
+                    context_id=old_ctx.id,
+                    action_instance_id=old_ctx.action_instance_id,
+                    binding_id=old_ctx.binding_id,
+                )
+            )
+            assert render_backend.requests == []
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_action_settings_patch_closes_owned_dynamic_page_before_reload():
+    config_service = MemoryConfigService(_settings_reload_config())
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config_service.config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+            settings_service=ConfigBackedSettingsService(
+                controller_id=CONTROLLER_ID,
+                config_service=config_service,
+            ),
+        )
+        _seed_action_availability(
+            manager,
+            _metadata(SetRasterImageOnAppearAction.uuid),
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            await manager.set_page(profile="default", page=0)
+            owner_ctx = await manager.action_contexts.get("0,0")
+            assert owner_ctx is not None
+            assert owner_ctx.settings_target is not None
+            target = owner_ctx.settings_target
+            await _drain_action_messages(stream)
+
+            session = await manager.open_page(
+                descriptor=_dynamic_page("dynamic-page", "1,0"),
+                context_id=owner_ctx.id,
+            )
+            assert session is not None
+            assert await manager.action_contexts.get("1,0") is not None
+            assert await manager.action_contexts.get("0,0") is None
+            await _drain_action_messages(stream)
+
+            await manager.handle_command(
+                _page_session_command(
+                    SETTINGS_PATCH,
+                    {
+                        "target": target.to_dict(),
+                        "settings": {"label": "from-page"},
+                    },
+                    session_id=session.page_session_id,
+                    context_id=session.context_id,
+                    action_instance_id=session.action_instance_id,
+                )
+            )
+
+            restored_ctx = await manager.action_contexts.get("0,0")
+            assert restored_ctx is not None
+            assert restored_ctx.settings == {"label": "from-page"}
+            assert restored_ctx.action_instance_id == owner_ctx.action_instance_id
+            assert restored_ctx.id != owner_ctx.id
+            assert await manager.action_contexts.get("1,0") is None
+            assert manager._dynamic_page_session is None
+
+            messages = await _collect_action_messages(stream)
+            closed = [
+                message
+                for message in messages
+                if message.message_type == PAGE_SESSION_CLOSED
+            ]
+            assert len(closed) == 1
+            assert closed[0].body["reason"] == "settings_changed"
+            created = [
+                message
+                for message in messages
+                if message.message_type == ACTION_INSTANCE_CREATED
+            ]
+            assert created[-1].body["metadata"]["contextId"] == restored_ctx.id
+            assert created[-1].body["settings"] == {"label": "from-page"}
+
+        tg.cancel_scope.cancel()
 
 
 @pytest_asyncio.fixture
@@ -2554,6 +2978,240 @@ async def test_close_dynamic_page_restores_when_close_notification_fails(
 
         assert manager._dynamic_page_session is None
         assert await manager.action_contexts.get("0,0") is not None
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_close_dynamic_page_destroys_external_action_child(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, provider_instance_id=None, **_: _metadata(
+            uuid,
+            provider_instance_id=provider_instance_id or PROVIDER_INSTANCE_ID,
+        )
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+                _metadata("test.virtual.child"),
+            )
+            await manager.set_page(profile="default", page=0)
+            owner_ctx = await manager.action_contexts.get("0,0")
+            assert owner_ctx is not None
+            await _drain_action_messages(stream)
+
+            await manager.open_page(
+                descriptor=_dynamic_page_with_action_child(
+                    "dynamic-page",
+                    "1,0",
+                    action_id="test.virtual.child",
+                    provider_instance_id=PROVIDER_INSTANCE_ID,
+                ),
+                context_id=owner_ctx.id,
+            )
+            session = manager._dynamic_page_session
+            assert session is not None
+            child_lease = manager._binding_lease_for_control("1,0")
+            assert child_lease is not None
+            child_action_instance_id = child_lease.action_instance_id
+            assert child_action_instance_id in manager._action_instances
+            await _drain_action_messages(stream)
+
+            await manager.close_page(context_id=session.context_id)
+
+            messages = await _collect_action_messages(stream)
+            destroyed = [
+                message
+                for message in messages
+                if message.message_type == ACTION_INSTANCE_DESTROYED
+                and message.body["metadata"]["actionInstanceId"]
+                == child_action_instance_id
+            ]
+            assert child_action_instance_id not in manager._action_instances
+            assert len(destroyed) == 1
+            assert destroyed[0].body["reason"] == "close"
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_replace_dynamic_page_destroys_only_removed_external_action_child(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device(
+        controls=[
+            _make_control("0,0"),
+            _make_control("1,0"),
+            _make_control("2,0"),
+        ]
+    )
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, provider_instance_id=None, **_: _metadata(
+            uuid,
+            provider_instance_id=provider_instance_id or PROVIDER_INSTANCE_ID,
+        )
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+                _metadata("test.virtual.keep"),
+                _metadata("test.virtual.drop"),
+            )
+            await manager.set_page(profile="default", page=0)
+            owner_ctx = await manager.action_contexts.get("0,0")
+            assert owner_ctx is not None
+            await _drain_action_messages(stream)
+
+            await manager.open_page(
+                descriptor=_dynamic_page_with_action_children(
+                    "dynamic-page",
+                    ("1,0", "test.virtual.keep"),
+                    ("2,0", "test.virtual.drop"),
+                ),
+                context_id=owner_ctx.id,
+            )
+            session = manager._dynamic_page_session
+            assert session is not None
+            keep_lease = manager._binding_lease_for_control("1,0")
+            drop_lease = manager._binding_lease_for_control("2,0")
+            assert keep_lease is not None
+            assert drop_lease is not None
+            keep_action_instance_id = keep_lease.action_instance_id
+            drop_action_instance_id = drop_lease.action_instance_id
+            await _drain_action_messages(stream)
+
+            await manager.replace_page(
+                descriptor=_dynamic_page_with_action_children(
+                    session.page_id,
+                    ("1,0", "test.virtual.keep"),
+                ),
+                context_id=session.context_id,
+            )
+
+            replacement_keep = manager._binding_lease_for_control("1,0")
+            assert replacement_keep is not None
+            assert replacement_keep.action_instance_id == keep_action_instance_id
+            assert keep_action_instance_id in manager._action_instances
+            assert drop_action_instance_id not in manager._action_instances
+
+            messages = await _collect_action_messages(stream)
+            destroyed_ids = [
+                message.body["metadata"]["actionInstanceId"]
+                for message in messages
+                if message.message_type == ACTION_INSTANCE_DESTROYED
+            ]
+            assert destroyed_ids == [drop_action_instance_id]
+            destroyed = next(
+                message
+                for message in messages
+                if message.message_type == ACTION_INSTANCE_DESTROYED
+            )
+            assert destroyed.body["reason"] == "page_child_removed"
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_external_action_child_owner_survives_nested_dynamic_page(
+    device_config_set_raster_image,
+):
+    device = _make_mock_device()
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, provider_instance_id=None, **_: _metadata(
+            uuid,
+            provider_instance_id=provider_instance_id or PROVIDER_INSTANCE_ID,
+        )
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+                _metadata("test.virtual.child"),
+            )
+            await manager.set_page(profile="default", page=0)
+            owner_ctx = await manager.action_contexts.get("0,0")
+            assert owner_ctx is not None
+            await _drain_action_messages(stream)
+
+            await manager.open_page(
+                descriptor=_dynamic_page_with_action_child(
+                    "first-page",
+                    "1,0",
+                    action_id="test.virtual.child",
+                    provider_instance_id=PROVIDER_INSTANCE_ID,
+                ),
+                context_id=owner_ctx.id,
+            )
+            first_session = manager._dynamic_page_session
+            assert first_session is not None
+            child_ctx = await manager.action_contexts.get("1,0")
+            assert child_ctx is not None
+            child_action_instance_id = child_ctx.action_instance_id
+            await _drain_action_messages(stream)
+
+            await manager.open_page(
+                descriptor=_dynamic_page("nested-page", "0,0"),
+                context_id=child_ctx.id,
+            )
+
+            nested_session = manager._dynamic_page_session
+            assert nested_session is not None
+            assert nested_session.page_id == "nested-page"
+            assert nested_session.page_session_id != first_session.page_session_id
+            assert nested_session.action_instance_id == child_action_instance_id
+            assert child_action_instance_id in manager._action_instances
+
+            messages = await _collect_action_messages(stream)
+            destroyed_ids = [
+                message.body["metadata"]["actionInstanceId"]
+                for message in messages
+                if message.message_type == ACTION_INSTANCE_DESTROYED
+            ]
+            assert child_action_instance_id not in destroyed_ids
         tg.cancel_scope.cancel()
 
 

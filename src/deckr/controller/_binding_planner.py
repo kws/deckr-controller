@@ -22,7 +22,10 @@ from deckr.controller._binding_resolution import (
 from deckr.controller._binding_validator import ValidationError
 from deckr.controller._navigation_service import PageStackEntry, StaticPageRef
 from deckr.controller.action_provider.provider import ActionMetadata
-from deckr.controller.settings import derive_action_instance_id
+from deckr.controller.settings import (
+    derive_action_instance_id,
+    derive_static_action_instance_id,
+)
 
 
 class BindingPlanStatus(StrEnum):
@@ -439,14 +442,15 @@ class BindingPlanner:
         entry: StaticPageRef,
         binding: ResolvedControlBinding,
     ) -> str:
-        return derive_action_instance_id(
+        return derive_static_action_instance_id(
             controller_id=self._controller_id,
             config_id=self._config_id,
             action_id=binding.action_uuid,
             stable_id=binding.stable_id,
             profile_id=entry.profile_name,
             page_id=str(entry.page_index),
-            control_id=binding.control_id,
+            selector_control_id=binding.selector.control_id,
+            identity_fallback=binding.identity_fallback,
         )
 
     def _dynamic_child_action_instance_id(

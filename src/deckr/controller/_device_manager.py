@@ -147,7 +147,7 @@ from deckr.controller.action_provider.provider import (
     ActionProviderManager,
 )
 from deckr.controller.config._data import DeviceConfig, Profile
-from deckr.controller.settings import SettingsService
+from deckr.controller.settings import SettingsService, derive_static_action_instance_id
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,7 @@ _SETTINGS_COMMAND_TYPES = frozenset(
         SETTINGS_REPLACE,
     }
 )
+_SETTINGS_MUTATION_TYPES = frozenset({SETTINGS_PATCH, SETTINGS_REPLACE})
 _IMAGE_SOURCE_SCHEMES = ("data:", "http://", "https://")
 _TERMINAL_LIFECYCLE_REJECTION_REASONS = frozenset(
     {
@@ -333,6 +334,24 @@ def _payload_kind_hash(params: Mapping[str, Any]) -> tuple[str, str | None]:
         return "empty", None
     payload = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
     return "params", hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _settings_copy(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    copied = thaw_json(value or {})
+    return dict(copied) if isinstance(copied, dict) else {}
+
+
+def _split_action_settings(
+    settings: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    copied = _settings_copy(settings)
+    raw_template_overrides = copied.pop("templateOverrides", {})
+    template_overrides = (
+        _settings_copy(raw_template_overrides)
+        if isinstance(raw_template_overrides, Mapping)
+        else {}
+    )
+    return copied, template_overrides
 
 
 @dataclass(frozen=True, slots=True)
@@ -1138,6 +1157,60 @@ class DeviceManager:
             for planned in self._current_plan.bindings
         )
 
+    def _committed_dynamic_page_plans(self) -> tuple[PagePlan, ...]:
+        return tuple(
+            frame.committed_plan
+            for frame in self._page_frames
+            if frame.page_session is not None
+        )
+
+    def _external_dynamic_page_child_action_instance_ids(
+        self,
+        plans: Iterable[PagePlan],
+    ) -> frozenset[str]:
+        action_instance_ids: set[str] = set()
+        for plan in plans:
+            if plan.page_session is None:
+                continue
+            for planned in plan.bindings:
+                child = planned.child
+                if child is None or child.target.kind == "self":
+                    continue
+                action_instance_ids.add(planned.action_instance_id)
+        return frozenset(action_instance_ids)
+
+    def _active_external_dynamic_page_child_action_instance_ids(
+        self,
+    ) -> frozenset[str]:
+        if self._current_plan is None:
+            return frozenset()
+        return self._external_dynamic_page_child_action_instance_ids(
+            (self._current_plan,)
+        )
+
+    def _active_dynamic_page_owner_action_instance_ids(self) -> frozenset[str]:
+        return frozenset(
+            frame.page_session.action_instance_id
+            for frame in self._page_frames
+            if frame.page_session is not None
+        )
+
+    async def _destroy_inactive_external_dynamic_page_children(
+        self,
+        plans: Iterable[PagePlan],
+        *,
+        reason: str,
+    ) -> None:
+        candidates = self._external_dynamic_page_child_action_instance_ids(plans)
+        if not candidates:
+            return
+        retained = (
+            self._active_external_dynamic_page_child_action_instance_ids()
+            | self._active_dynamic_page_owner_action_instance_ids()
+        )
+        for action_instance_id in sorted(candidates - retained):
+            await self._destroy_action_instance(action_instance_id, reason=reason)
+
     def _action_availability_change_affects_plan(
         self,
         changed_keys: frozenset[ProviderActionKey],
@@ -1231,11 +1304,22 @@ class DeviceManager:
             provider_session_id=provider_session_id,
         )
 
-    def _message_contract_authorized(
+    async def _message_contract_authorized(
         self,
         msg: DeckrMessage,
         key: ProviderSessionKey | None,
     ) -> bool:
+        expected = self._contract_pointer_for_provider_session_key(key)
+        if expected is not None and msg.contract == expected:
+            return True
+        if key is None or msg.contract is None:
+            return False
+        if not await self._action_availability_service.provider_session_valid(
+            provider_instance_id=key.provider_instance_id,
+            provider_id=key.provider_id,
+            provider_session_id=key.provider_session_id,
+        ):
+            return False
         expected = self._contract_pointer_for_provider_session_key(key)
         return expected is not None and msg.contract == expected
 
@@ -2154,20 +2238,24 @@ class DeviceManager:
         reason: str,
         *,
         causation_id: str | None = None,
-    ) -> None:
-        sessions = [
-            frame.page_session
+    ) -> tuple[PagePlan, ...]:
+        dynamic_frames = [
+            frame
             for frame in reversed(self._page_frames)
             if frame.page_session is not None
         ]
-        if not sessions:
-            return
-        for session in sessions:
+        if not dynamic_frames:
+            return ()
+        for frame in dynamic_frames:
+            session = frame.page_session
+            if session is None:
+                continue
             await self._emit_page_closed(
                 session,
                 reason,
                 causation_id=causation_id,
             )
+        finalized_plans = tuple(frame.committed_plan for frame in dynamic_frames)
         self._page_frames = [
             frame for frame in self._page_frames if frame.page_session is None
         ]
@@ -2176,6 +2264,7 @@ class DeviceManager:
         else:
             self._nav._current_page = None
         self._sync_top_frame_state()
+        return finalized_plans
 
     async def _execute_transition(
         self,
@@ -2369,6 +2458,7 @@ class DeviceManager:
         if not self._config_active:
             logger.info("Ignoring page transition while config %s is inactive", self.config_id)
             return False
+        previous_dynamic_plans = self._committed_dynamic_page_plans()
         dynamic_sessions_to_close = (
             [
                 frame.page_session
@@ -2380,6 +2470,12 @@ class DeviceManager:
         )
         current_frame = self._page_frames[-1] if self._page_frames else None
         departing = current_frame.entry if current_frame is not None else None
+        replace_dynamic_page = (
+            descriptor is not None
+            and page_session is not None
+            and current_frame is not None
+            and current_frame.page_session is page_session
+        )
         if descriptor is not None:
             entry: PageStackEntry = descriptor
         else:
@@ -2433,6 +2529,10 @@ class DeviceManager:
                     close_reason,
                     causation_id=causation_id,
                 )
+        await self._destroy_inactive_external_dynamic_page_children(
+            previous_dynamic_plans,
+            reason="page_child_removed" if replace_dynamic_page else close_reason,
+        )
         return True
 
     async def set_page(
@@ -2599,55 +2699,76 @@ class DeviceManager:
     ) -> None:
         """Close the active widget page and return to its owner profile page."""
         async with self._nav_lock:
-            session = self._page_control_session(context_id)
-            if session is None:
-                logger.info("No owner for dynamic page")
-                return
-            if (
-                len(self._page_frames) < 2
-                or self._page_frames[-1].page_session is not session
-            ):
-                logger.info("Dynamic page close ignored for non-top session")
-                return
-            departing_frame = self._page_frames[-1]
-            restore_frame = self._page_frames[-2]
-            restored_plan = await self._build_page_plan(
-                restore_frame.entry,
-                page_session=restore_frame.page_session,
-                retained_plan=restore_frame.committed_plan,
-                refresh_actions=False,
-            )
-            if restored_plan is None:
-                logger.warning(
-                    "Dynamic page close rejected because restore frame is invalid"
-                )
-                return
-            await self._commit_page_plan(
-                restored_plan,
-                departing=departing_frame.entry,
-                preserve_rebound_outputs=True,
-            )
-            self._page_frames.pop()
-            self._page_frames[-1] = PageFrame(
-                restore_frame.entry,
-                restore_frame.page_session,
-                restored_plan,
-            )
-            self._nav.set_page(restore_frame.entry)
-            self._sync_top_frame_state()
-            await self._emit_page_closed(
-                session,
+            await self._close_page_locked(
+                context_id=context_id,
                 reason=reason,
                 causation_id=causation_id,
             )
 
+    async def _close_page_locked(
+        self,
+        *,
+        context_id: str,
+        reason: str,
+        causation_id: str | None = None,
+    ) -> bool:
+        session = self._page_control_session(context_id)
+        if session is None:
+            logger.info("No owner for dynamic page")
+            return False
+        if (
+            len(self._page_frames) < 2
+            or self._page_frames[-1].page_session is not session
+        ):
+            logger.info("Dynamic page close ignored for non-top session")
+            return False
+        previous_dynamic_plans = self._committed_dynamic_page_plans()
+        departing_frame = self._page_frames[-1]
+        restore_frame = self._page_frames[-2]
+        restored_plan = await self._build_page_plan(
+            restore_frame.entry,
+            page_session=restore_frame.page_session,
+            retained_plan=restore_frame.committed_plan,
+            refresh_actions=False,
+        )
+        if restored_plan is None:
+            logger.warning("Dynamic page close rejected because restore frame is invalid")
+            return False
+        await self._commit_page_plan(
+            restored_plan,
+            departing=departing_frame.entry,
+            preserve_rebound_outputs=True,
+        )
+        self._page_frames.pop()
+        self._page_frames[-1] = PageFrame(
+            restore_frame.entry,
+            restore_frame.page_session,
+            restored_plan,
+        )
+        self._nav.set_page(restore_frame.entry)
+        self._sync_top_frame_state()
+        await self._emit_page_closed(
+            session,
+            reason=reason,
+            causation_id=causation_id,
+        )
+        await self._destroy_inactive_external_dynamic_page_children(
+            previous_dynamic_plans,
+            reason=reason,
+        )
+        return True
+
     async def clear_page(self, *, clear_outputs: bool = True):
         async with self._nav_lock:
             await self._cancel_all_held_inputs()
-            await self._finalize_dynamic_page(reason="clear")
+            finalized_plans = await self._finalize_dynamic_page(reason="clear")
             await self._revoke_active_bindings(
                 clear_outputs=clear_outputs,
                 reason="clear_page",
+            )
+            await self._destroy_inactive_external_dynamic_page_children(
+                finalized_plans,
+                reason="clear",
             )
             await self._destroy_all_action_instances(reason="clear")
             if clear_outputs:
@@ -2675,10 +2796,16 @@ class DeviceManager:
                 refresh_actions=False,
             )
             if not ok:
-                await self._finalize_dynamic_page(reason="device_descriptor_changed")
+                finalized_plans = await self._finalize_dynamic_page(
+                    reason="device_descriptor_changed"
+                )
                 await self._revoke_active_bindings(
                     clear_outputs=False,
                     reason="device_descriptor_changed_failed",
+                )
+                await self._destroy_inactive_external_dynamic_page_children(
+                    finalized_plans,
+                    reason="device_descriptor_changed",
                 )
                 return
             if self._page_frames and self._current_plan is not None:
@@ -2995,7 +3122,15 @@ class DeviceManager:
             self._config_active = True
             self.config = config
             self._nav.update_config(config)
-            await self._finalize_dynamic_page(reason="config_change")
+            finalized_plans = await self._finalize_dynamic_page(reason="config_change")
+            await self._revoke_active_bindings(
+                clear_outputs=False,
+                reason="config_change",
+            )
+            await self._destroy_inactive_external_dynamic_page_children(
+                finalized_plans,
+                reason="config_change",
+            )
             await self._destroy_all_action_instances(reason="config_change")
             profile = config.profiles[0]
             entry = StaticPageRef(profile_name=profile.name, page_index=0)
@@ -3087,7 +3222,10 @@ class DeviceManager:
                     msg.sender_session_id,
                 )
                 return None
-            if not self._message_contract_authorized(msg, lease.provider_session_key):
+            if not await self._message_contract_authorized(
+                msg,
+                lease.provider_session_key,
+            ):
                 logger.warning(
                     "Ignoring action command %s from provider session %s without "
                     "matching Concord contract",
@@ -3146,7 +3284,7 @@ class DeviceManager:
                     msg.sender_session_id,
                 )
                 return None
-            if not self._message_contract_authorized(
+            if not await self._message_contract_authorized(
                 msg,
                 self._provider_session_key_for_session(
                     provider_instance_id=session.owner_provider_instance_id,
@@ -3248,7 +3386,7 @@ class DeviceManager:
                 sender_session_id,
             )
             return False
-        if not self._message_contract_authorized(msg, session_key):
+        if not await self._message_contract_authorized(msg, session_key):
             logger.warning(
                 "Ignoring provider settings command from %s without matching "
                 "Concord provider-session contract %s",
@@ -3258,7 +3396,7 @@ class DeviceManager:
             return False
         return True
 
-    def _action_instance_rejection_authorized(
+    async def _action_instance_rejection_authorized(
         self,
         msg: DeckrMessage,
         *,
@@ -3283,7 +3421,7 @@ class DeviceManager:
         return (
             key is not None
             and msg.sender_session_id == key.provider_session_id
-            and self._message_contract_authorized(msg, key)
+            and await self._message_contract_authorized(msg, key)
         )
 
     async def _settings_snapshot_for_command(
@@ -3314,6 +3452,167 @@ class DeviceManager:
             return None
         return SettingsSnapshot.from_snapshot(snapshot)
 
+    def _apply_settings_snapshot_to_loaded_config(
+        self,
+        snapshot: SettingsSnapshot,
+    ) -> None:
+        target = snapshot.target
+        if target.config_id != self.config_id:
+            return
+
+        if target.scope == "action_provider_instance":
+            provider_settings = dict(self.config.provider_settings)
+            provider_settings[target.provider_instance_id] = _settings_copy(
+                snapshot.settings
+            )
+            self.config = self.config.model_copy(
+                update={"provider_settings": provider_settings}
+            )
+            self._nav.update_config(self.config)
+            self._sync_action_interest()
+            return
+
+        if target.action_instance_id is None or target.action_id is None:
+            return
+
+        profiles = list(self.config.profiles)
+        for profile_index, profile in enumerate(self.config.profiles):
+            pages = list(profile.pages)
+            for page_index, page in enumerate(profile.pages):
+                controls = list(page.controls)
+                for control_index, control in enumerate(page.controls):
+                    action_instance_id = derive_static_action_instance_id(
+                        controller_id=self._controller_id,
+                        config_id=self.config_id,
+                        action_id=control.action,
+                        stable_id=control.id,
+                        profile_id=profile.name,
+                        page_id=str(page_index),
+                        selector_control_id=control.selector.control_id,
+                        control_index=control_index,
+                    )
+                    if action_instance_id != target.action_instance_id:
+                        continue
+                    if control.action != target.action_id:
+                        return
+                    if control.id != target.stable_id:
+                        return
+                    settings, template_overrides = _split_action_settings(
+                        snapshot.settings
+                    )
+                    controls[control_index] = control.model_copy(
+                        update={
+                            "settings": settings,
+                            "template_overrides": template_overrides,
+                        }
+                    )
+                    pages[page_index] = page.model_copy(
+                        update={"controls": controls}
+                    )
+                    profiles[profile_index] = profile.model_copy(
+                        update={"pages": pages}
+                    )
+                    self.config = self.config.model_copy(
+                        update={"profiles": profiles}
+                    )
+                    self._nav.update_config(self.config)
+                    self._sync_action_interest()
+                    return
+
+    async def _reload_action_instance_for_settings_change(
+        self,
+        target: SettingsTargetRef,
+        *,
+        causation_id: str | None = None,
+    ) -> None:
+        if target.scope != "action_instance" or target.action_instance_id is None:
+            return
+        async with self._nav_lock:
+            await self._reload_action_instance_for_settings_change_locked(
+                target,
+                causation_id=causation_id,
+            )
+
+    async def _reload_action_instance_for_settings_change_locked(
+        self,
+        target: SettingsTargetRef,
+        *,
+        causation_id: str | None = None,
+    ) -> None:
+        action_instance_id = target.action_instance_id
+        if action_instance_id is None:
+            return
+
+        page_session = self._dynamic_page_session
+        if (
+            page_session is not None
+            and page_session.action_instance_id == action_instance_id
+            and page_session.settings_target is not None
+            and page_session.settings_target.key() == target.key()
+        ):
+            await self._close_page_locked(
+                context_id=page_session.context_id,
+                reason="settings_changed",
+                causation_id=causation_id,
+            )
+
+        for binding_id, lease in tuple(self._binding_leases.items()):
+            if lease.action_instance_id != action_instance_id:
+                continue
+            await self._revoke_binding(
+                binding_id,
+                clear_output=False,
+                reason="settings_changed",
+                clear_held_input=True,
+            )
+
+        await self._destroy_action_instance(
+            action_instance_id,
+            reason="settings_changed",
+        )
+
+        current_frame = self._page_frames[-1] if self._page_frames else None
+        if current_frame is None:
+            self._sync_top_frame_state()
+            return
+
+        refreshed_plan = await self._build_page_plan(
+            current_frame.entry,
+            page_session=current_frame.page_session,
+            retained_plan=current_frame.committed_plan,
+            refresh_actions=False,
+        )
+        if refreshed_plan is None:
+            logger.warning(
+                "Skipping settings-change rebind for invalid page bindings "
+                "config=%s actionInstance=%s",
+                self.config_id,
+                action_instance_id,
+            )
+            self._page_frames[-1] = PageFrame(
+                current_frame.entry,
+                current_frame.page_session,
+                current_frame.committed_plan,
+            )
+            self._sync_top_frame_state()
+            return
+
+        self._page_frames[-1] = PageFrame(
+            current_frame.entry,
+            current_frame.page_session,
+            refreshed_plan,
+        )
+        self._current_plan = refreshed_plan
+        self._planned_bindings_by_control = {
+            planned.control_id: planned for planned in refreshed_plan.bindings
+        }
+        self._sync_action_interest()
+
+        for planned in refreshed_plan.bindings:
+            if planned.action_instance_id != action_instance_id:
+                continue
+            await self._install_planned_binding(refreshed_plan, planned)
+
     async def _handle_action_lifecycle_rejected(
         self,
         msg: DeckrMessage,
@@ -3337,7 +3636,7 @@ class DeviceManager:
             metadata = body.action_instance
             if metadata is None:
                 return
-            if not self._action_instance_rejection_authorized(
+            if not await self._action_instance_rejection_authorized(
                 msg,
                 sender_provider_instance_id=sender_provider_instance_id,
                 metadata=metadata,
@@ -3543,6 +3842,8 @@ class DeviceManager:
                     payload=payload,
                 )
                 if snapshot_body is not None:
+                    if msg_type in _SETTINGS_MUTATION_TYPES:
+                        self._apply_settings_snapshot_to_loaded_config(snapshot_body)
                     await send_settings_response(snapshot_body)
                 return
 
@@ -3660,7 +3961,14 @@ class DeviceManager:
                     payload=payload,
                 )
                 if snapshot_body is not None:
+                    if msg_type in _SETTINGS_MUTATION_TYPES:
+                        self._apply_settings_snapshot_to_loaded_config(snapshot_body)
                     await send_settings_response(snapshot_body)
+                    if msg_type in _SETTINGS_MUTATION_TYPES:
+                        await self._reload_action_instance_for_settings_change(
+                            target,
+                            causation_id=msg.message_id,
+                        )
             return
 
         lease = authorization.binding
@@ -3685,8 +3993,16 @@ class DeviceManager:
             )
             if snapshot_body is None:
                 return
-            lease.context._store.settings = dict(thaw_json(snapshot_body.settings))
+            if msg_type in _SETTINGS_MUTATION_TYPES:
+                self._apply_settings_snapshot_to_loaded_config(snapshot_body)
+            else:
+                lease.context._store.settings = dict(thaw_json(snapshot_body.settings))
             await send_settings_response(snapshot_body)
+            if msg_type in _SETTINGS_MUTATION_TYPES:
+                await self._reload_action_instance_for_settings_change(
+                    target,
+                    causation_id=msg.message_id,
+                )
 
     async def _handle_binding_output(
         self,

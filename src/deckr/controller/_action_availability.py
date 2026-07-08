@@ -1465,6 +1465,10 @@ class ActionAvailabilityService:
                                         if provider_instance_id is not None
                                         else frozenset()
                                     )
+                                    if changed:
+                                        await self._notify_availability_changed(changed)
+                                    await anyio.sleep(_SERVICE_WATCH_RETRY_SECONDS)
+                                    break
                                 else:
                                     view = ActionAvailabilityViewPayload.model_validate(
                                         payload

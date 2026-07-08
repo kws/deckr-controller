@@ -22,7 +22,10 @@ from deckr.controller._settings_metadata import SettingsActionMetadata
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.config._data import Control, DeviceConfig
-from deckr.controller.settings._identity import derive_action_instance_id
+from deckr.controller.settings._identity import (
+    derive_action_instance_id,
+    derive_static_action_instance_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -449,7 +452,6 @@ class ConfigBackedSettingsService:
             for page_index, page in enumerate(profile.pages):
                 page_id = str(page_index)
                 for control_index, control in enumerate(page.controls):
-                    control_id = control.selector.control_id or str(control_index)
                     locations.append(
                         _ControlLocation(
                             profile_id=profile.name,
@@ -458,14 +460,15 @@ class ConfigBackedSettingsService:
                             page_index=page_index,
                             control_index=control_index,
                             control=control,
-                            action_instance_id=derive_action_instance_id(
+                            action_instance_id=derive_static_action_instance_id(
                                 controller_id=self._controller_id,
                                 config_id=config.id,
                                 action_id=control.action,
                                 stable_id=control.id,
                                 profile_id=profile.name,
                                 page_id=page_id,
-                                control_id=control_id,
+                                selector_control_id=control.selector.control_id,
+                                control_index=control_index,
                             ),
                         )
                     )

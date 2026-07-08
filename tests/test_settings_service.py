@@ -27,6 +27,7 @@ from deckr.controller.config import (
 from deckr.controller.settings import (
     ConfigBackedSettingsService,
     derive_action_instance_id,
+    derive_static_action_instance_id,
 )
 
 CONTROLLER_ID = "controller-main"
@@ -58,6 +59,11 @@ def _config() -> DeviceConfig:
                                 selector={"control_id": "0,1"},
                                 action="action.no_schema",
                                 settings={},
+                            ),
+                            Control(
+                                selector={"label": "Selector Only"},
+                                action="action.no_schema",
+                                settings={"mode": "fallback"},
                             ),
                         ]
                     )
@@ -278,6 +284,55 @@ async def test_service_managed_id_insertion_uses_managed_id_and_stable_identity(
     reloaded = await config_service.get_config(CONFIG_ID)
     assert reloaded is not None
     assert reloaded.profiles[0].pages[0].controls[1].id == new_target.stable_id
+
+
+@pytest.mark.asyncio
+async def test_selector_only_action_target_uses_static_config_position(
+    tmp_path: Path,
+) -> None:
+    service, _ = await _service(tmp_path)
+
+    selector_only = next(
+        description
+        for description in await service.list_targets(config_id=CONFIG_ID)
+        if description.label == "Selector Only"
+    )
+
+    assert selector_only.target.stable_id is None
+    assert selector_only.target.action_instance_id == derive_static_action_instance_id(
+        controller_id=CONTROLLER_ID,
+        config_id=CONFIG_ID,
+        action_id="action.no_schema",
+        profile_id="default",
+        page_id="0",
+        selector_control_id=None,
+        control_index=2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_managed_id_insertion_handles_selector_only_control(
+    tmp_path: Path,
+) -> None:
+    service, config_service = await _service(tmp_path)
+    old_target = next(
+        description.target
+        for description in await service.list_targets(config_id=CONFIG_ID)
+        if description.label == "Selector Only"
+    )
+
+    new_target = await service.ensure_service_managed_id(old_target)
+
+    assert new_target.stable_id is not None
+    assert new_target.action_instance_id == derive_action_instance_id(
+        controller_id=CONTROLLER_ID,
+        config_id=CONFIG_ID,
+        action_id="action.no_schema",
+        stable_id=new_target.stable_id,
+    )
+    reloaded = await config_service.get_config(CONFIG_ID)
+    assert reloaded is not None
+    assert reloaded.profiles[0].pages[0].controls[2].id == new_target.stable_id
 
 
 def test_duplicate_explicit_control_ids_are_rejected() -> None:

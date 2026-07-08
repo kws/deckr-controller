@@ -8,6 +8,7 @@ from deckr.actions.messages import DynamicPageCommand
 
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller.config._data import DeviceConfig
+from deckr.controller.settings import static_action_identity_fallback
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,11 @@ class NavigationService:
                 provider_labels=dict(c.provider_labels),
                 settings=dict(c.settings),
                 stable_id=c.id,
+                identity_fallback=static_action_identity_fallback(
+                    selector_control_id=c.selector.control_id,
+                    control_index=control_index,
+                ),
                 template_overrides=dict(c.template_overrides),
             )
-            for c in page.controls
+            for control_index, c in enumerate(page.controls)
         ]

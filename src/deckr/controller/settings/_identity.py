@@ -39,3 +39,53 @@ def derive_action_instance_id(
         )
     )
     return str(uuid.uuid5(_ACTION_INSTANCE_NAMESPACE, seed))
+
+
+def static_action_identity_fallback(
+    *,
+    selector_control_id: str | None,
+    control_index: int | str,
+) -> str:
+    """Return the config-owned fallback identity for a static control."""
+
+    return selector_control_id or str(control_index)
+
+
+def derive_static_action_instance_id(
+    *,
+    controller_id: str,
+    config_id: str,
+    action_id: str,
+    stable_id: str | None = None,
+    profile_id: str,
+    page_id: str,
+    selector_control_id: str | None = None,
+    control_index: int | str | None = None,
+    identity_fallback: str | None = None,
+) -> str:
+    if stable_id:
+        return derive_action_instance_id(
+            controller_id=controller_id,
+            config_id=config_id,
+            action_id=action_id,
+            stable_id=stable_id,
+        )
+    if identity_fallback is not None:
+        fallback = identity_fallback
+    elif selector_control_id is not None:
+        fallback = selector_control_id
+    elif control_index is not None:
+        fallback = static_action_identity_fallback(
+            selector_control_id=selector_control_id,
+            control_index=control_index,
+        )
+    else:
+        fallback = None
+    return derive_action_instance_id(
+        controller_id=controller_id,
+        config_id=config_id,
+        action_id=action_id,
+        profile_id=profile_id,
+        page_id=page_id,
+        control_id=fallback,
+    )

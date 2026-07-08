@@ -19,6 +19,7 @@ from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._navigation_service import StaticPageRef
 from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import ControlSelector
+from deckr.controller.settings import derive_static_action_instance_id
 
 CONTROLLER_ID = "controller-main"
 CONFIG_ID = "test-device"
@@ -189,4 +190,37 @@ def test_retained_static_plan_restores_metadata_when_snapshot_is_empty():
     assert planned.status == BindingPlanStatus.BOUND
     assert planned.action_meta is metadata
 
+
+def test_selector_only_static_plan_uses_config_fallback_identity():
+    planner = _planner()
+    entry = StaticPageRef(profile_name="default", page_index=0)
+    binding = ConfiguredControlBinding(
+        selector=ControlSelector(kind="key"),
+        action_uuid="action.bound",
+        provider_instance_id=PROVIDER_INSTANCE_ID,
+        provider_labels={},
+        settings={},
+        stable_id=None,
+        identity_fallback="0",
+    )
+    metadata = _metadata("action.bound")
+
+    result = planner.build_static_page_plan(
+        entry,
+        bindings=(binding,),
+        device=_device("hardware-key"),
+        action_metadata={_intent("action.bound"): metadata},
+    )
+
+    assert result.plan is not None
+    planned = result.plan.bindings[0]
+    assert planned.control_id == "hardware-key"
+    assert planned.action_instance_id == derive_static_action_instance_id(
+        controller_id=CONTROLLER_ID,
+        config_id=CONFIG_ID,
+        action_id="action.bound",
+        profile_id="default",
+        page_id="0",
+        identity_fallback="0",
+    )
 

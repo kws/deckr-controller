@@ -29,6 +29,7 @@ class ConfiguredControlBinding:
     provider_labels: Mapping[str, str]
     settings: Mapping[str, Any]
     stable_id: str | None = None
+    identity_fallback: str | None = None
     template_overrides: Mapping[str, Any] | None = None
 
     @property
@@ -46,6 +47,7 @@ class ResolvedControlBinding:
     provider_labels: Mapping[str, str]
     settings: Mapping[str, Any]
     stable_id: str | None
+    identity_fallback: str | None
     template_overrides: Mapping[str, Any] | None
     selector: ControlSelector
     input_capability_ids: frozenset[str]
@@ -121,6 +123,7 @@ def resolve_binding(
             provider_labels=binding.provider_labels,
             settings=binding.settings,
             stable_id=binding.stable_id,
+            identity_fallback=binding.identity_fallback,
             template_overrides=binding.template_overrides,
             selector=binding.selector,
             input_capability_ids=_selected_capability_ids(
@@ -174,6 +177,7 @@ def exact_control_binding(
         provider_labels=dict(provider_labels or {}),
         settings=settings,
         stable_id=None,
+        identity_fallback=control_id,
         template_overrides=None,
     )
 
