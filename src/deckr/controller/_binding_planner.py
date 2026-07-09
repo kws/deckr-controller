@@ -14,6 +14,7 @@ from deckr.actions.messages import (
 )
 from deckr.hardware.descriptors import DeviceDescriptor
 
+from deckr.controller._actions._models import ActionMetadata
 from deckr.controller._binding_resolution import (
     ConfiguredControlBinding,
     ResolvedControlBinding,
@@ -22,7 +23,6 @@ from deckr.controller._binding_resolution import (
 )
 from deckr.controller._binding_validator import ValidationError
 from deckr.controller._navigation_service import PageStackEntry, StaticPageRef
-from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.settings import (
     derive_action_instance_id,
     derive_static_action_instance_id,

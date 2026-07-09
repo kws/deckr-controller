@@ -44,7 +44,7 @@ class BuiltinAction(Protocol):
 
 
 class BuiltinRegistry:
-    """Registry of builtin actions. Resolved by controller before action provider catalogs."""
+    """Registry of builtin actions resolved locally by the controller."""
 
     def __init__(self):
         self._goto_page_action = GoToPageAction()

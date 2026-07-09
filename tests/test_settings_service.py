@@ -9,8 +9,7 @@ import pytest
 from deckr.actions.messages import SettingsTargetRef
 from pydantic import ValidationError
 
-from deckr.controller._settings_metadata import SettingsActionMetadata
-from deckr.controller.action_provider.provider import ActionMetadata
+from deckr.controller._actions import ActionMetadata, SettingsActionMetadata
 from deckr.controller.config import (
     Control,
     DeviceConfig,
@@ -200,7 +199,7 @@ async def test_settings_service_does_not_expose_mutation_api(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_settings_metadata_reads_from_action_availability_service(
+async def test_settings_metadata_reads_from_action_service(
     tmp_path: Path,
 ) -> None:
     config_service = FileBackedDeviceConfigService(config_dir=tmp_path)

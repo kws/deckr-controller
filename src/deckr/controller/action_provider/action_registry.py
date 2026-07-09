@@ -2,47 +2,36 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 
 from deckr.actions.endpoints import (
     BUILTIN_ACTION_PROVIDER_ID,
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
 from deckr.actions.messages import ActionDescriptor
-from deckr.beacon import Beacon
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.models import thaw_json
 
+from deckr.controller._actions import ActionMetadata
 from deckr.controller.action_provider.builtin import (
     BuiltinAction,
     BuiltinRegistry,
 )
-from deckr.controller.action_provider.events import ActionCatalogChangedEvent
-from deckr.controller.action_provider.provider import ActionMetadata
-
-
-def _qualified_id(provider_instance_id: str, action_uuid: str) -> str:
-    return f"{provider_instance_id}::{action_uuid}"
 
 
 class ActionRegistry(BaseComponent):
     """Resolve controller-builtin actions.
 
-    External provider actions are discovered through Action Runtime service
-    availability views and cached by ``ActionAvailabilityService``.
+    External provider actions are resolved through ``ControllerActionService``.
     """
 
     def __init__(
         self,
-        beacon: Beacon,
         *,
         controller_id: str,
-        on_catalog_changed: Callable[[ActionCatalogChangedEvent], Awaitable[None]]
-        | None = None,
-        notification_batch_interval: float = 0.05,
     ):
         super().__init__(name="ActionRegistry")
-        del beacon, controller_id, on_catalog_changed, notification_batch_interval
+        del controller_id
         self._builtin_registry = BuiltinRegistry()
         self._builtin_action_registry: dict[str, ActionDescriptor] = {}
 
@@ -86,16 +75,6 @@ class ActionRegistry(BaseComponent):
         if meta is None:
             return None
         return self._builtin_action_registry.get(meta.uuid)
-
-    def provider_instance_provides_provider(
-        self,
-        provider_instance_id: str,
-        provider_id: str,
-    ) -> bool:
-        return (
-            provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS
-            and provider_id == BUILTIN_ACTION_PROVIDER_ID
-        )
 
     def get_builtin_action(self, uuid: str) -> BuiltinAction | None:
         return self._builtin_registry.get_action(uuid)

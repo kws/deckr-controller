@@ -50,23 +50,18 @@ from invariant import Node, SubGraphNode, dump_graph_data_uri
 from invariant.params import ref
 
 from deckr.controller import _device_manager as device_manager_module
-from deckr.controller._action_availability import (
-    PROVIDER_SESSION_INVALID_REASON,
-    ActionAvailabilitySource,
-    ActionAvailabilityState,
-    ProviderActionKey,
-)
 from deckr.controller._action_interest import (
     ActionInterestSource,
     ActionInterestStrength,
 )
+from deckr.controller._actions import (
+    PROVIDER_SESSION_INVALID_REASON,
+    ActionMetadata,
+    ProviderActionKey,
+    ProviderSessionKey,
+)
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
-from deckr.controller.action_provider.events import (
-    ActionCatalogChangedEvent,
-    ProviderSessionSuccession,
-)
-from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.settings import ConfigBackedSettingsService
 
@@ -122,9 +117,16 @@ def _set_provider_runtime_lease(
         provider_instance_id=metadata.provider_instance_id,
         provider_id=metadata.provider_id,
     )
-    manager._action_availability_service._runtime_leases[
-        metadata.provider_instance_id
-    ] = _RuntimeLease(metadata, pointer)
+    manager._action_service._remember_runtime_lease(
+        ProviderSessionKey(
+            metadata.provider_instance_id,
+            metadata.provider_id,
+            metadata.provider_session_id,
+        ),
+        lease=_RuntimeLease(metadata, pointer),
+        service_id=f"action-runtime.{metadata.provider_instance_id}",
+        generation=1,
+    )
 
 
 def _actions_bus() -> LaneHarness:
@@ -205,12 +207,13 @@ def _seed_action_availability(
     *metadatas: ActionMetadata,
 ) -> None:
     if (
-        getattr(manager._action_availability_service, "_services", None) is None
+        getattr(manager._action_service, "_services", None) is None
         and not getattr(manager, "_test_runtime_send_shim", False)
     ):
 
         async def send_runtime_message(**kwargs):
             body = kwargs["body"]
+            provider_session_key = kwargs["provider_session_key"]
             target = (
                 getattr(body, "metadata", None)
                 or getattr(body, "binding", None)
@@ -219,8 +222,10 @@ def _seed_action_availability(
             assert target is not None
             await manager._actions_bus.send(
                 lane="actions",
-                recipient=action_provider_address(kwargs["provider_instance_id"]),
-                recipient_session_id=PROVIDER_SESSION_ID,
+                recipient=action_provider_address(
+                    provider_session_key.provider_instance_id
+                ),
+                recipient_session_id=provider_session_key.provider_session_id,
                 subject=context_subject(
                     target.context_id,
                     provider_instance_id=target.provider_instance_id,
@@ -233,7 +238,7 @@ def _seed_action_availability(
                 message_type=kwargs["message_type"],
                 body=body.to_dict(),
                 contract=_contract_pointer_for_provider_session(
-                    PROVIDER_SESSION_ID,
+                    provider_session_key.provider_session_id,
                     provider_instance_id=target.provider_instance_id,
                     provider_id=target.provider_id,
                 ),
@@ -244,39 +249,21 @@ def _seed_action_availability(
         manager._test_runtime_send_shim = True
     for metadata in metadatas:
         _set_provider_runtime_lease(manager, metadata)
-        manager._action_availability.record_available(metadata)
-
-
-def _catalog_event(
-    *,
-    added: list[str] | None = None,
-    removed: list[str] | None = None,
-    updated: list[str] | None = None,
-    successions: list[ProviderSessionSuccession] | None = None,
-) -> ActionCatalogChangedEvent:
-    return ActionCatalogChangedEvent(
-        catalog_added=added or [],
-        catalog_removed=removed or [],
-        catalog_updated=updated or [],
-        provider_session_successions=successions or [],
-    )
-
-
-def _provider_session_succession(
-    *,
-    provider_instance_id: str = PROVIDER_INSTANCE_ID,
-    provider_id: str = PROVIDER_ID,
-    previous_session_id: str = PROVIDER_SESSION_ID,
-    successor_session_id: str = "new-provider-session",
-    actions: list[str],
-) -> ProviderSessionSuccession:
-    return ProviderSessionSuccession(
-        provider_instance_id=provider_instance_id,
-        provider_id=provider_id,
-        previous_session_id=previous_session_id,
-        successor_session_id=successor_session_id,
-        actions=actions,
-    )
+        manager._action_service.ingest_provider_entries(
+            provider_instance_id=metadata.provider_instance_id,
+            provider_id=metadata.provider_id,
+            provider_session_id=metadata.provider_session_id,
+            entries=(
+                ActionAvailabilityEntry(
+                    actionId=metadata.uuid,
+                    status="available",
+                    descriptor=ActionDescriptor(
+                        actionId=metadata.uuid,
+                        providerId=metadata.provider_id,
+                    ),
+                ),
+            ),
+        )
 
 
 async def _action_command_for_active_binding(
@@ -838,7 +825,6 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
 
     registry = MagicMock()
     registry.get_action = get_action
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
 
     async with anyio.create_task_group() as tg:
         manager = DeviceManager(
@@ -1145,14 +1131,11 @@ async def test_service_view_service_unavailable_renders_service_fallback():
             start_soon=tg.start_soon,
             render_backend=render_backend,
         )
-        metadata = _metadata(
-            ACTION_X_UUID,
+        manager._action_service.record_lifecycle_unavailable(
             provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
-        )
-        manager._action_availability.record_unavailable(
-            ProviderActionKey(PROVIDER_INSTANCE_ID, ACTION_X_UUID),
-            metadata=metadata,
+            action_uuid=ACTION_X_UUID,
+            provider_session_id=PROVIDER_SESSION_ID,
             reason="sonos_service_unavailable",
         )
 
@@ -1200,7 +1183,7 @@ async def test_provider_session_invalidation_renders_session_fallback(
         await manager.set_page(profile="default", page=0)
         lease = manager._binding_lease_for_control("0,0")
         assert lease is not None
-        key = manager._action_availability_service.record_lifecycle_unavailable(
+        key = manager._action_service.record_lifecycle_unavailable(
             provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
             provider_session_id=PROVIDER_SESSION_ID,
@@ -1689,8 +1672,6 @@ async def test_service_view_pending_preserves_attached_binding(
     registry.get_action = AsyncMock(
         return_value=_metadata(SetRasterImageOnAppearAction.uuid)
     )
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = True
     action_bus = _actions_bus()
 
     async with anyio.create_task_group() as tg:
@@ -1718,7 +1699,7 @@ async def test_service_view_pending_preserves_attached_binding(
             await _drain_action_messages(stream)
             manager._render_pending_to_control = AsyncMock()
 
-            changed = manager._action_availability_service.ingest_provider_entries(
+            changed = manager._action_service.ingest_provider_entries(
                 provider_instance_id=PROVIDER_INSTANCE_ID,
                 provider_id=PROVIDER_ID,
                 provider_session_id=PROVIDER_SESSION_ID,
@@ -1758,8 +1739,6 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
     registry.get_action = AsyncMock(
         return_value=_metadata(SetRasterImageOnAppearAction.uuid)
     )
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = True
     action_bus = _actions_bus()
 
     async with anyio.create_task_group() as tg:
@@ -1800,7 +1779,7 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
             await _drain_action_messages(stream)
             sent_messages.clear()
 
-            key = manager._action_availability_service.record_lifecycle_unavailable(
+            key = manager._action_service.record_lifecycle_unavailable(
                 provider_instance_id=PROVIDER_INSTANCE_ID,
                 provider_id=PROVIDER_ID,
                 provider_session_id=PROVIDER_SESSION_ID,
@@ -1808,13 +1787,13 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
                 reason=PROVIDER_SESSION_INVALID_REASON,
                 intent=manager._planned_intent_for_lease(lease),
             )
-            changed = manager._action_availability_service.ingest_provider_entries(
+            changed = manager._action_service.ingest_provider_entries(
                 provider_instance_id=PROVIDER_INSTANCE_ID,
                 provider_id=PROVIDER_ID,
                 provider_session_id=PROVIDER_SESSION_ID,
                 entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
             )
-            record = manager._action_availability.record_for(key)
+            record = manager._action_service.record_for_key(key)
             assert record is not None
             assert record.requires_provider_lifecycle_recovery
 
@@ -1828,9 +1807,7 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
             assert replacement_lease is not lease
             assert replacement_lease.provider_session_id == PROVIDER_SESSION_ID
             assert replacement_lease.attached
-            assert not manager._action_availability.provider_lifecycle_recovery_required(
-                key
-            )
+            assert not manager._action_service.provider_lifecycle_recovery_required(key)
 
             await _collect_action_messages(stream)
             messages = sent_messages
@@ -2037,8 +2014,6 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
     registry.get_action = AsyncMock(
         return_value=_metadata(SetRasterImageOnAppearAction.uuid)
     )
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = True
     action_bus = _actions_bus()
     successor_session_id = "new-provider-session"
 
@@ -2077,7 +2052,7 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
             assert session.owner_provider_session_id == PROVIDER_SESSION_ID
             await _drain_action_messages(stream)
 
-            changed = manager._action_availability_service.ingest_provider_entries(
+            changed = manager._action_service.ingest_provider_entries(
                 provider_instance_id=PROVIDER_INSTANCE_ID,
                 provider_id=PROVIDER_ID,
                 provider_session_id=successor_session_id,
@@ -2132,7 +2107,7 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
 
 
 @pytest.mark.asyncio
-async def test_close_dynamic_page_restores_cached_static_plan_after_beacon_withdrawal(
+async def test_close_dynamic_page_restores_cached_static_plan_without_metadata_lookup(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -2140,8 +2115,6 @@ async def test_close_dynamic_page_restores_cached_static_plan_after_beacon_withd
     registry.get_action = AsyncMock(
         return_value=_metadata(SetRasterImageOnAppearAction.uuid)
     )
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = True
     action_bus = _actions_bus()
 
     async with anyio.create_task_group() as tg:
@@ -2172,17 +2145,10 @@ async def test_close_dynamic_page_restores_cached_static_plan_after_beacon_withd
         child_ctx = await manager.action_contexts.get("1,0")
         assert child_ctx is not None
 
-        registry.get_action.return_value = None
-        await manager.on_action_catalog_changed(
-            _catalog_event(
-                removed=[
-                    f"{PROVIDER_INSTANCE_ID}::{SetRasterImageOnAppearAction.uuid}"
-                ]
-            )
-        )
         assert manager._dynamic_page_session is session
         assert await manager.action_contexts.get("1,0") is child_ctx
 
+        registry.get_action.return_value = None
         registry.get_action.reset_mock()
         await manager.close_page(context_id=session.context_id)
 
@@ -2472,7 +2438,7 @@ async def test_held_input_cancelled_when_config_is_removed(
             assert not manager._config_active
             assert await manager.action_contexts.get("0,0") is None
             assert manager._binding_leases == {}
-            assert manager._action_availability_service._interest_by_config == {}
+            assert manager._action_service._interest_by_config == {}
 
             await manager.on_event(_hardware_input("0,0", "up", sequence=2))
             await _assert_no_action_message(stream)
@@ -3203,7 +3169,6 @@ async def test_builtin_context_replaces_and_closes_opened_dynamic_page():
 
     registry.get_action = get_action
     registry.get_builtin_action.side_effect = builtin_actions.get
-    registry.provider_session_id.return_value = None
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
@@ -3301,7 +3266,6 @@ async def test_builtin_child_context_cannot_control_parent_page_session():
 
     registry.get_action = get_action
     registry.get_builtin_action.side_effect = builtin_actions.get
-    registry.provider_session_id.return_value = None
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
@@ -3621,7 +3585,6 @@ async def test_delayed_unavailable_status_does_not_write_after_binding_restored(
     registry.get_action = AsyncMock(
         return_value=_metadata(SetRasterImageOnAppearAction.uuid)
     )
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
     command_service = FakeHardwareCommandService()
     render_backend = ControlledFrameBackend()
 
@@ -3668,7 +3631,7 @@ async def test_delayed_unavailable_status_does_not_write_after_binding_restored(
         unavailable_render = render_backend.calls[-1]
         assert render_backend.requests[-1].binding_id is None
 
-        changed = manager._action_availability_service.ingest_provider_entries(
+        changed = manager._action_service.ingest_provider_entries(
             provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
             provider_session_id=PROVIDER_SESSION_ID,
@@ -4093,7 +4056,7 @@ async def test_config_reload_replaces_read_only_settings_snapshot(persistence_tm
 
 
 class ConfigurableActionRegistry:
-    """Registry that can add/remove actions for testing catalog-change handling.
+    """Registry that can add/remove actions for testing availability replans.
 
     Uses qualified IDs (provider_instance_id::action_uuid) internally to match ActionRegistry.
     """
@@ -4124,17 +4087,6 @@ class ConfigurableActionRegistry:
                 return meta
         return None
 
-    def provider_instance_provides_provider(
-        self,
-        provider_instance_id: str,
-        provider_id: str,
-    ) -> bool:
-        return any(
-            meta.provider_instance_id == provider_instance_id
-            and meta.provider_id == provider_id
-            for meta in self._actions.values()
-        )
-
     def add_action(self, action_uuid: str, meta: ActionMetadata) -> None:
         qualified = self._qualified_id(meta.provider_instance_id, action_uuid)
         self._actions[qualified] = meta
@@ -4151,14 +4103,12 @@ ACTION_X_UUID = "test.action.x"
 
 
 @pytest.mark.asyncio
-async def test_service_view_availability_resolves_candidate_control(
+async def test_service_view_availability_resolves_unavailable_control(
     persistence_tmp_dir,
 ):
-    """Beacon candidates render pending until service-view availability arrives."""
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = ConfigurableActionRegistry()
-    # Initially no action - control will show unavailable
     config = DeviceConfig(
         id="test-device",
         name="Test Device",
@@ -4199,37 +4149,10 @@ async def test_service_view_availability_resolves_candidate_control(
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
 
-        # Control should be unavailable (no context)
         ctx_before = await manager.action_contexts.get("0,0")
         assert ctx_before is None
 
-        # Add action and notify
-        registry.add_action(
-            ACTION_X_UUID,
-            _metadata(
-                ACTION_X_UUID,
-                provider_instance_id="test-provider",
-                provider_id="test",
-            ),
-        )
-        await manager.on_action_catalog_changed(
-            _catalog_event(added=[f"test-provider::{ACTION_X_UUID}"])
-        )
-
-        key = ProviderActionKey("test-provider", ACTION_X_UUID)
-        record = manager._action_availability.record_for(key)
-        assert record is not None
-        assert record.state == ActionAvailabilityState.UNKNOWN
-        assert record.source == ActionAvailabilitySource.BEACON_CANDIDATE
-        assert await manager.action_contexts.get("0,0") is None
-        assert (
-            manager._action_availability.snapshot_for_intents(
-                manager._current_plan_action_intents()
-            )
-            == {}
-        )
-
-        changed = manager._action_availability_service.ingest_provider_entries(
+        changed = manager._action_service.ingest_provider_entries(
             provider_instance_id="test-provider",
             provider_id="test",
             provider_session_id=PROVIDER_SESSION_ID,

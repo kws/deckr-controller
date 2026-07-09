@@ -70,23 +70,25 @@ from deckr.hardware.descriptors import (
 from deckr.lanes import EndpointSession
 from pydantic import ValidationError
 
-from deckr.controller._action_availability import (
-    ActionAvailabilityCache,
-    ActionAvailabilityPolicy,
-    ActionAvailabilityRecord,
-    ActionAvailabilityService,
-    ActionAvailabilitySource,
-    ActionAvailabilityState,
-    ActionPlanningSnapshot,
-    ActionUnavailableCause,
-    ProviderActionKey,
-    action_unavailable_cause,
-    unavailable_overlay_template,
-)
 from deckr.controller._action_interest import (
     ActionInterestSnapshot,
     ActionInterestSource,
     ActionInterestTracker,
+)
+from deckr.controller._actions import (
+    ActionAvailabilityRecord,
+    ActionAvailabilitySource,
+    ActionAvailabilityState,
+    ActionMetadata,
+    ActionPlanningSnapshot,
+    ActionProviderManager,
+    ActionUnavailableCause,
+    ControllerActionService,
+    ProviderActionKey,
+    ProviderSessionKey,
+    action_unavailable_cause,
+    provider_session_key,
+    unavailable_overlay_template,
 )
 from deckr.controller._binding_planner import (
     ActionIntentKey,
@@ -119,10 +121,6 @@ from deckr.controller._navigation_service import (
     PageTransition,
     StaticPageRef,
 )
-from deckr.controller._provider_session_keys import (
-    ProviderSessionKey,
-    provider_session_key,
-)
 from deckr.controller._render import RenderModel, RenderService, RenderSource
 from deckr.controller._render_dispatcher import (
     RenderBackend,
@@ -131,11 +129,6 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.action_provider.context import ControlContext
-from deckr.controller.action_provider.events import ActionCatalogChangedEvent
-from deckr.controller.action_provider.provider import (
-    ActionMetadata,
-    ActionProviderManager,
-)
 from deckr.controller.config._data import DeviceConfig, Profile
 from deckr.controller.settings import SettingsService
 
@@ -342,15 +335,6 @@ def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
     return f"{provider_instance_id}::{action_uuid}"
 
 
-def _provider_action_key_from_catalog_id(
-    catalog_id: str,
-) -> ProviderActionKey | None:
-    provider_instance_id, separator, action_uuid = catalog_id.partition("::")
-    if not separator or not provider_instance_id or not action_uuid:
-        return None
-    return ProviderActionKey(provider_instance_id, action_uuid)
-
-
 def _lease_matches_action(lease: BindingLease, action_meta: ActionMetadata) -> bool:
     return (
         lease.action_uuid == action_meta.uuid
@@ -450,7 +434,7 @@ class DeviceManager:
         settings_service: SettingsService | None = None,
         config_stream: AsyncIterator[DeviceConfig | None] | None = None,
         clock: Callable[[], float] | None = None,
-        availability_service: ActionAvailabilityService | None = None,
+        action_service: ControllerActionService | None = None,
         page_timeout_check_interval: float = 0.25,
     ):
         self._controller_id = controller_id
@@ -487,21 +471,15 @@ class DeviceManager:
         self._current_plan: PagePlan | None = None
         self._planned_bindings_by_control: dict[str, PlannedBinding] = {}
         self._config_active = True
-        self._action_availability_service = availability_service or (
-            ActionAvailabilityService(
+        self._action_service = action_service or (
+            ControllerActionService(
                 controller_id=controller_id,
                 controller_session_id=actions_bus.session_id,
-                actions_bus=actions_bus,
                 manager=manager,
                 start_soon=None,
-                cache=ActionAvailabilityCache(
-                    policy=ActionAvailabilityPolicy(),
-                    clock=self._clock,
-                ),
                 clock=self._clock,
             )
         )
-        self._action_availability = self._action_availability_service.cache
         self._action_interest = ActionInterestTracker(clock=self._clock)
         self._binding_leases = self._attachments.binding_leases
         self._binding_by_context = self._attachments.binding_by_context
@@ -592,9 +570,9 @@ class DeviceManager:
     ) -> _UnavailableFallbackRender:
         intent = self._binding_planner.resolved_action_intent_key(planned.binding)
         now = self._clock()
-        record = self._action_availability.record_for_intent(intent, now=now)
+        record = self._action_service.record_for_intent(intent, now=now)
         state = (
-            self._action_availability.state_for(record.key, now=now)
+            self._action_service.state_for_key(record.key, now=now)
             if record is not None
             else None
         )
@@ -1044,7 +1022,7 @@ class DeviceManager:
             provider_instance_id=action_meta.provider_instance_id,
             provider_labels=tuple(sorted((action_meta.provider_labels or {}).items())),
         )
-        record = self._action_availability.record_for_intent(
+        record = self._action_service.record_for_intent(
             intent,
             now=self._clock(),
         )
@@ -1052,7 +1030,7 @@ class DeviceManager:
             record is None
             or record.source != ActionAvailabilitySource.SERVICE_VIEW
             or record.metadata is None
-            or self._action_availability.state_for(record.key, now=self._clock())
+            or self._action_service.state_for_key(record.key, now=self._clock())
             != ActionAvailabilityState.AVAILABLE
             or record.metadata.provider_session_id is None
         ):
@@ -1136,12 +1114,12 @@ class DeviceManager:
 
     def _publish_action_interest_snapshot(self, *, now: float) -> None:
         if self._config_active:
-            self._action_availability_service.update_config_interest(
+            self._action_service.update_config_interest(
                 self.config_id,
                 self._action_interest.snapshot(now=now),
             )
         else:
-            self._action_availability_service.clear_config_interest(self.config_id)
+            self._action_service.clear_config_interest(self.config_id)
 
     def _visible_action_interest_source(self) -> ActionInterestSource:
         if (
@@ -1267,7 +1245,7 @@ class DeviceManager:
             return key.provider_instance_id == intent.provider_instance_id
         if not intent.provider_labels:
             return True
-        record = self._action_availability.record_for(key)
+        record = self._action_service.record_for_key(key)
         if record is None or record.metadata is None:
             return True
         labels = record.metadata.provider_labels or {}
@@ -1280,10 +1258,10 @@ class DeviceManager:
         refresh_actions: bool,
     ) -> ActionPlanningSnapshot:
         if refresh_actions:
-            await self._action_availability_service.ensure_local_builtin_availability(
+            await self._action_service.ensure_local_builtin_availability(
                 intents
             )
-        snapshot = self._action_availability_service.planning_snapshot(
+        snapshot = self._action_service.planning_snapshot(
             intents,
             existing_provider_keys=self._existing_provider_action_keys(),
             now=self._clock(),
@@ -1302,19 +1280,19 @@ class DeviceManager:
         self,
         key: ProviderSessionKey | None,
     ) -> ContractPointer | None:
-        return self._action_availability_service.contract_pointer(key)
+        return self._action_service.current_contract(key)
 
     async def send_action_runtime_message(
         self,
         *,
-        provider_instance_id: str,
+        provider_session_key: ProviderSessionKey | None,
         message_type: str,
         body,
     ) -> bool:
-        if provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+        if provider_session_key is None:
             return False
-        return await self._action_availability_service.send_runtime_message(
-            provider_instance_id=provider_instance_id,
+        return await self._action_service.send_runtime_message(
+            provider_session_key,
             message_type=message_type,
             body=body,
         )
@@ -1340,17 +1318,6 @@ class DeviceManager:
         key: ProviderSessionKey | None,
     ) -> bool:
         expected = self._contract_pointer_for_provider_session_key(key)
-        if expected is not None and msg.contract == expected:
-            return True
-        if key is None or msg.contract is None:
-            return False
-        if not await self._action_availability_service.provider_session_valid(
-            provider_instance_id=key.provider_instance_id,
-            provider_id=key.provider_id,
-            provider_session_id=key.provider_session_id,
-        ):
-            return False
-        expected = self._contract_pointer_for_provider_session_key(key)
         return expected is not None and msg.contract == expected
 
     def _provider_lifecycle_recovery_key(
@@ -1366,7 +1333,7 @@ class DeviceManager:
             action_meta.provider_instance_id,
             action_meta.uuid,
         )
-        if not self._action_availability.provider_lifecycle_recovery_required(key):
+        if not self._action_service.provider_lifecycle_recovery_required(key):
             return None
         return key
 
@@ -1411,7 +1378,7 @@ class DeviceManager:
         *,
         reason: str,
     ) -> ProviderActionKey:
-        return self._action_availability_service.record_lifecycle_unavailable(
+        return self._action_service.record_lifecycle_unavailable(
             provider_instance_id=lease.provider_instance_id,
             provider_id=lease.provider_id,
             provider_session_id=lease.provider_session_id,
@@ -1455,7 +1422,7 @@ class DeviceManager:
         session_key = self._action_instance_provider_sessions.get(
             metadata.action_instance_id
         )
-        return self._action_availability_service.record_lifecycle_unavailable(
+        return self._action_service.record_lifecycle_unavailable(
             provider_instance_id=metadata.provider_instance_id,
             provider_id=metadata.provider_id,
             action_uuid=metadata.action_id,
@@ -1477,7 +1444,7 @@ class DeviceManager:
         *,
         reason: str,
     ) -> ProviderActionKey:
-        return self._action_availability_service.record_lifecycle_unavailable(
+        return self._action_service.record_lifecycle_unavailable(
             provider_instance_id=session.owner_provider_instance_id,
             provider_id=session.owner_provider_id,
             action_uuid=session.owner_action_uuid,
@@ -1804,7 +1771,7 @@ class DeviceManager:
             )
             return
         sent = await self.send_action_runtime_message(
-            provider_instance_id=metadata.provider_instance_id,
+            provider_session_key=provider_session_key_for_action,
             message_type=ACTION_INSTANCE_CREATED,
             body=ActionInstanceLifecycleBody(metadata=metadata),
         )
@@ -1905,7 +1872,7 @@ class DeviceManager:
             )
             return
         sent = await self.send_action_runtime_message(
-            provider_instance_id=provider_instance_id,
+            provider_session_key=provider_session_key_for_action,
             message_type=ACTION_INSTANCE_DESTROYED,
             body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
         )
@@ -2179,13 +2146,12 @@ class DeviceManager:
     ) -> None:
         if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        contract = self._contract_pointer_for_provider_session_key(
-            self._provider_session_key_for_session(
-                provider_instance_id=session.owner_provider_instance_id,
-                provider_id=session.owner_provider_id,
-                provider_session_id=session.owner_provider_session_id,
-            )
+        session_key = self._provider_session_key_for_session(
+            provider_instance_id=session.owner_provider_instance_id,
+            provider_id=session.owner_provider_id,
+            provider_session_id=session.owner_provider_session_id,
         )
+        contract = self._contract_pointer_for_provider_session_key(session_key)
         if contract is None:
             logger.warning(
                 "Skipping page open without live provider-session contract "
@@ -2197,7 +2163,7 @@ class DeviceManager:
             return
         try:
             await self.send_action_runtime_message(
-                provider_instance_id=session.owner_provider_instance_id,
+                provider_session_key=session_key,
                 message_type=PAGE_SESSION_OPENED,
                 body=PageSessionLifecycleBody(
                     pageSession=self._page_session_metadata(session)
@@ -2219,13 +2185,12 @@ class DeviceManager:
     ) -> None:
         if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return
-        contract = self._contract_pointer_for_provider_session_key(
-            self._provider_session_key_for_session(
-                provider_instance_id=session.owner_provider_instance_id,
-                provider_id=session.owner_provider_id,
-                provider_session_id=session.owner_provider_session_id,
-            )
+        session_key = self._provider_session_key_for_session(
+            provider_instance_id=session.owner_provider_instance_id,
+            provider_id=session.owner_provider_id,
+            provider_session_id=session.owner_provider_session_id,
         )
+        contract = self._contract_pointer_for_provider_session_key(session_key)
         if contract is None:
             logger.warning(
                 "Skipping page close without live provider-session contract "
@@ -2237,7 +2202,7 @@ class DeviceManager:
             return
         try:
             await self.send_action_runtime_message(
-                provider_instance_id=session.owner_provider_instance_id,
+                provider_session_key=session_key,
                 message_type=PAGE_SESSION_CLOSED,
                 body=PageSessionLifecycleBody(
                     pageSession=self._page_session_metadata(session),
@@ -2927,14 +2892,6 @@ class DeviceManager:
             event.message,
         )
 
-    async def on_action_catalog_changed(
-        self,
-        event: ActionCatalogChangedEvent,
-    ) -> None:
-        """Refresh the current page availability overlay after Beacon changes."""
-        await self._action_availability_service.ingest_catalog_changed(event)
-        await self.on_action_availability_changed()
-
     async def on_action_availability_changed(
         self,
         changed_keys: Iterable[ProviderActionKey] = (),
@@ -3081,7 +3038,7 @@ class DeviceManager:
                             lease,
                             reason="provider_session_recovered",
                         )
-                        self._action_availability.consume_provider_lifecycle_recovery(
+                        self._action_service.consume_provider_lifecycle_recovery(
                             recovery_key
                         )
                         continue
@@ -3107,7 +3064,7 @@ class DeviceManager:
                     lease.binding_id,
                     clear_output=False,
                     notify_provider=False,
-                    reason="action_catalog_changed",
+                    reason="action_availability_changed",
                     clear_held_input=True,
                 )
                 await self._install_planned_binding(refreshed_plan, planned)
@@ -3191,14 +3148,6 @@ class DeviceManager:
         session.owner_provider_id = action_meta.provider_id
         session.owner_provider_session_id = action_meta.provider_session_id
         session.owner_action_meta = action_meta
-
-    def _remove_catalog_candidates(self, catalog_removed: Iterable[str]) -> None:
-        keys = tuple(
-            key
-            for qualified in catalog_removed
-            if (key := _provider_action_key_from_catalog_id(qualified)) is not None
-        )
-        self._action_availability.remove_candidates(keys)
 
     async def _config_listener(self) -> None:
         """Consume config stream and apply changes."""

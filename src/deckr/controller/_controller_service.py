@@ -4,12 +4,6 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 import anyio
-from deckr.action_runtime import (
-    ACTION_RUNTIME_SERVICE_NAMESPACE,
-    RUNTIME_TO_CONTROLLER_MESSAGES,
-    action_runtime_body_from_service_message,
-    legacy_action_message_type,
-)
 from deckr.actions.messages import (
     COMMAND_MESSAGE_TYPES,
     subject_config_id,
@@ -49,13 +43,9 @@ from deckr.hardware.profiles import (
     hardware_payload_from_advertisement,
 )
 from deckr.lanes import EndpointSession
-from deckr.services import service_body
 from deckr.substrates.nats_kv import KvUnavailable
 
-from deckr.controller._action_availability import (
-    ActionAvailabilityService,
-    ProviderActionKey,
-)
+from deckr.controller._actions import ControllerActionService, ProviderActionKey
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
@@ -68,7 +58,6 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
 from deckr.controller.action_provider.action_registry import ActionRegistry
-from deckr.controller.action_provider.events import ActionCatalogChangedEvent
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.settings import SettingsService
 
@@ -90,36 +79,6 @@ _HARDWARE_CLAIM_TERMINAL_STATUSES = frozenset(
         ContractValidityStatus.TERMS_HASH_MISMATCH,
     }
 )
-
-
-def _action_runtime_legacy_message(msg: DeckrMessage) -> DeckrMessage | None:
-    if msg.message_type != "serviceMessage":
-        return None
-    try:
-        body = service_body(msg)
-    except (TypeError, ValueError):
-        logger.warning("Ignoring invalid Action Runtime service message", exc_info=True)
-        return None
-    if body.service_namespace != ACTION_RUNTIME_SERVICE_NAMESPACE:
-        return None
-    if body.name not in RUNTIME_TO_CONTROLLER_MESSAGES:
-        return None
-    try:
-        legacy_type = legacy_action_message_type(body.name)
-        legacy_body = action_runtime_body_from_service_message(body).to_dict()
-    except (TypeError, ValueError):
-        logger.warning(
-            "Ignoring invalid Action Runtime payload name=%s",
-            body.name,
-            exc_info=True,
-        )
-        return None
-    return msg.model_copy(
-        update={
-            "message_type": legacy_type,
-            "body": legacy_body,
-        }
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +129,7 @@ class ControllerService(BaseComponent):
         *,
         controller_id: str,
         action_registry: ActionRegistry | None = None,
-        action_availability_service: ActionAvailabilityService | None = None,
+        action_service: ControllerActionService | None = None,
         render_backend: RenderBackend | None = None,
     ):
         super().__init__()
@@ -187,9 +146,9 @@ class ControllerService(BaseComponent):
         self._controller_contexts = AsyncMap[str, DeviceManager]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
-        self._action_availability_service = action_availability_service
-        if self._action_availability_service is not None:
-            self._action_availability_service.set_availability_changed_callback(
+        self._action_service = action_service
+        if self._action_service is not None:
+            self._action_service.set_change_callback(
                 self._handle_internal_action_availability_changed
             )
         self._start_soon: Callable | None = None
@@ -229,33 +188,6 @@ class ControllerService(BaseComponent):
         if ctrl_ctx is not None:
             await ctrl_ctx.handle_command(msg)
 
-    async def handle_action_catalog_changed_event(
-        self,
-        event: ActionCatalogChangedEvent,
-    ) -> None:
-        changed_keys = frozenset()
-        if self._action_availability_service is not None:
-            changed_keys = await self._action_availability_service.ingest_catalog_changed(
-                event
-            )
-        controller_contexts = await self._controller_contexts.values()
-        logger.debug(
-            "Action catalog changed handoff changed_keys=%s devices=%s",
-            len(changed_keys),
-            len(controller_contexts),
-        )
-        logger.log(
-            logging.INFO if controller_contexts else logging.DEBUG,
-            "Applying ActionCatalogChangedEvent to %d device(s): +%s -%s ~%s successor=%s",
-            len(controller_contexts),
-            event.catalog_added,
-            event.catalog_removed,
-            event.catalog_updated,
-            event.provider_session_successions,
-        )
-        for ctrl_ctx in controller_contexts:
-            await ctrl_ctx.on_action_availability_changed(changed_keys)
-
     async def _handle_internal_action_availability_changed(
         self,
         changed_keys: frozenset[ProviderActionKey],
@@ -281,7 +213,11 @@ class ControllerService(BaseComponent):
                 try:
                     if not isinstance(event, DeckrMessage):
                         continue
-                    action_event = _action_runtime_legacy_message(event)
+                    action_event = (
+                        await self._action_service.decode_inbound_runtime_message(event)
+                        if self._action_service is not None
+                        else None
+                    )
                     if action_event is None:
                         continue
                     if action_event.message_type in COMMAND_MESSAGE_TYPES:
@@ -855,22 +791,18 @@ class ControllerService(BaseComponent):
     async def start(self, ctx: RunContext):
         self._stopping = ctx.stopping
         self._start_soon = ctx.tg.start_soon
-        if (
-            self._action_availability_service is None
-            and self._action_registry is not None
-        ):
-            self._action_availability_service = ActionAvailabilityService(
+        if self._action_service is None and self._action_registry is not None:
+            self._action_service = ControllerActionService(
                 controller_id=self._controller_id,
                 controller_session_id=self._session_id,
-                actions_bus=self._endpoint,
                 manager=self._action_registry,
                 start_soon=ctx.tg.start_soon,
             )
-            self._action_availability_service.set_availability_changed_callback(
+            self._action_service.set_change_callback(
                 self._handle_internal_action_availability_changed
             )
-        if self._action_availability_service is not None:
-            await self._action_availability_service.start(ctx.tg, ctx.stopping)
+        if self._action_service is not None:
+            await self._action_service.start(ctx.tg, ctx.stopping)
         if self._render_backend is None:
             self._render_backend = ProcessPoolRenderBackend()
         self._hardware_directory.start(ctx.tg)
@@ -900,8 +832,8 @@ class ControllerService(BaseComponent):
             await ctrl_ctx.clear_page(clear_outputs=False)
         await self._controller_contexts.clear()
         await self._release_owned_claims()
-        if self._action_availability_service is not None:
-            await self._action_availability_service.aclose()
+        if self._action_service is not None:
+            await self._action_service.aclose()
         if self._render_backend is not None:
             await self._render_backend.aclose()
 
@@ -956,7 +888,7 @@ class ControllerService(BaseComponent):
                 manager=self._action_registry,
                 actions_bus=self._endpoint,
                 start_soon=self._start_soon,
-                availability_service=self._action_availability_service,
+                action_service=self._action_service,
                 render_backend=self._render_backend,
                 settings_service=self._settings_service,
                 config_stream=stream,

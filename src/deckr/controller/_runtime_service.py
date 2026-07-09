@@ -21,7 +21,7 @@ from deckr.contracts.messages import HARDWARE_MESSAGES_LANE, SERVICES_LANE
 from deckr.lanes import EndpointSession
 from deckr.services import DeckrServices
 
-from deckr.controller._action_availability import ActionAvailabilityService
+from deckr.controller._actions import ControllerActionService
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
     parse_controller_config,
@@ -94,14 +94,8 @@ class ControllerRuntimeService(BaseComponent):
 
             controller_service: ControllerService | None = None
 
-            async def on_catalog_changed(event) -> None:
-                if controller_service is not None:
-                    await controller_service.handle_action_catalog_changed_event(event)
-
             action_registry = ActionRegistry(
-                self._beacon,
                 controller_id=self._runtime.controller_id,
-                on_catalog_changed=on_catalog_changed,
             )
             await self._component_manager.add_component(action_registry)
             services = DeckrServices(
@@ -111,10 +105,9 @@ class ControllerRuntimeService(BaseComponent):
                 task_group=ctx.tg,
                 kv_bucket_for=self._context.kv_bucket,
             )
-            action_availability_service = ActionAvailabilityService(
+            action_service = ControllerActionService(
                 controller_id=self._runtime.controller_id,
                 controller_session_id=self._endpoint.session_id,
-                actions_bus=self._endpoint,
                 manager=action_registry,
                 services=services,
                 close_services_on_aclose=True,
@@ -125,7 +118,7 @@ class ControllerRuntimeService(BaseComponent):
                 controller_id=self._runtime.controller_id,
                 config_service=config_service,
                 action_provider=action_registry.get_action,
-                availability_service=action_availability_service,
+                availability_service=action_service,
             )
             render_backend = _build_render_backend(
                 self._runtime.config,
@@ -140,7 +133,7 @@ class ControllerRuntimeService(BaseComponent):
                 settings_service=settings_service,
                 controller_id=self._runtime.controller_id,
                 action_registry=action_registry,
-                action_availability_service=action_availability_service,
+                action_service=action_service,
                 render_backend=render_backend,
             )
             await self._component_manager.add_component(controller_service)

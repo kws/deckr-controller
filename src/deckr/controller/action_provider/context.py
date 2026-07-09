@@ -18,6 +18,7 @@ from deckr.contracts.models import thaw_json
 from deckr.hardware.descriptors import DeviceDescriptor
 from deckr.lanes import EndpointSession
 
+from deckr.controller._actions import ProviderSessionKey
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
 from deckr.controller._hardware_service import HardwareCommandService
@@ -129,8 +130,17 @@ class ControlContext:
         return self._internal
 
     async def _publish(self, message_type: str, body: Mapping[str, Any] | Any) -> None:
+        provider_session_key = (
+            None
+            if self.provider_session_id is None
+            else ProviderSessionKey(
+                self.provider_instance_id,
+                self.provider_id,
+                self.provider_session_id,
+            )
+        )
         sent = await self.manager.send_action_runtime_message(
-            provider_instance_id=self.provider_instance_id,
+            provider_session_key=provider_session_key,
             message_type=message_type,
             body=body,
         )

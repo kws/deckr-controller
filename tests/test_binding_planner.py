@@ -9,6 +9,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
 )
 
+from deckr.controller._actions import ActionMetadata
 from deckr.controller._binding_planner import (
     ActionIntentKey,
     BindingPlanner,
@@ -17,7 +18,6 @@ from deckr.controller._binding_planner import (
 )
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._navigation_service import StaticPageRef
-from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import ControlSelector
 from deckr.controller.settings import derive_static_action_instance_id
 

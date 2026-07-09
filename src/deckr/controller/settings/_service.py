@@ -12,8 +12,7 @@ from deckr.actions.messages import (
 )
 from deckr.contracts.models import thaw_json
 
-from deckr.controller._settings_metadata import SettingsActionMetadata
-from deckr.controller.action_provider.provider import ActionMetadata
+from deckr.controller._actions._models import ActionMetadata, SettingsActionMetadata
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.config._data import Control, DeviceConfig
 from deckr.controller.settings._identity import (

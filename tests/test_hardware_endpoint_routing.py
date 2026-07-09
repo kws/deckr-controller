@@ -277,8 +277,6 @@ async def _running_controller(
     concord = _concord(hardware_bus)
     registry = MagicMock()
     registry.get_action = AsyncMock(return_value=None)
-    registry.provider_session_id.return_value = None
-    registry.provider_instance_provides_provider.return_value = False
     controller = ControllerService(
         endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)).session,
         beacon=beacon,
@@ -414,8 +412,6 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
     concord = _concord(hardware_bus)
     registry = MagicMock()
     registry.get_action = AsyncMock(return_value=None)
-    registry.provider_session_id.return_value = None
-    registry.provider_instance_provides_provider.return_value = False
     controller = ControllerService(
         endpoint=hardware_bus.endpoint(controller_address(CONTROLLER_ID)).session,
         beacon=beacon,

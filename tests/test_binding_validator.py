@@ -17,6 +17,7 @@ from deckr.hardware.descriptors import (
     DeviceRef,
 )
 
+from deckr.controller._actions import ActionMetadata
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._binding_validator import (
     ValidationResult,
@@ -26,7 +27,6 @@ from deckr.controller._binding_validator import (
 )
 from deckr.controller._render import RenderResult
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
-from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config import CapabilitySelector, ControlSelector
 
 CONTROLLER_ID = "controller-main"
@@ -314,8 +314,6 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
             provider_id="dev.deckr.controller.builtin",
         )
     )
-    registry.provider_session_id.return_value = "provider-session"
-    registry.provider_instance_provides_provider.return_value = True
 
     def start_soon(*args, **kwargs):
         pass
@@ -398,8 +396,6 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
     builtin_action.on_unbind = AsyncMock()
     builtin_action.on_input = AsyncMock()
     registry.get_builtin_action.return_value = builtin_action
-    registry.provider_session_id.return_value = "provider-session"
-    registry.provider_instance_provides_provider.return_value = True
 
     actions_bus = LaneHarness(
         "services",

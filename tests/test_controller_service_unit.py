@@ -54,7 +54,7 @@ class _Endpoint:
 def _service(
     *,
     endpoint: _Endpoint | None = None,
-    availability_service=None,
+    action_service=None,
 ) -> ControllerService:
     return ControllerService(
         endpoint=endpoint or _Endpoint(),
@@ -63,7 +63,7 @@ def _service(
         config_service=MagicMock(),
         settings_service=MagicMock(),
         controller_id=CONTROLLER_ID,
-        action_availability_service=availability_service,
+        action_service=action_service,
     )
 
 

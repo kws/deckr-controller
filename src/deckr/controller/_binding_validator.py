@@ -12,7 +12,7 @@ from deckr.actions.messages import PageChildBindingDescriptor
 if TYPE_CHECKING:
     from deckr.hardware.descriptors import DeviceDescriptor
 
-    from deckr.controller.action_provider.provider import ActionMetadata
+    from deckr.controller._actions._models import ActionMetadata
 
 from deckr.controller._binding_resolution import (
     ConfiguredControlBinding,

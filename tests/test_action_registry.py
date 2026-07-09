@@ -16,7 +16,7 @@ EXTERNAL_ACTION_UUID = "dev.deckr.clock.action.time"
 
 
 def _registry() -> ActionRegistry:
-    return ActionRegistry(MagicMock(), controller_id=CONTROLLER_ID)
+    return ActionRegistry(controller_id=CONTROLLER_ID)
 
 
 async def _start_registry(registry: ActionRegistry) -> None:

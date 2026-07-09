@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import anyio
 import pytest
@@ -21,23 +21,23 @@ from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import service_address
 from deckr.services import ServiceBackendStatus, ServiceDescriptor, ServiceUnavailable
 
-from deckr.controller._action_availability import (
+from deckr.controller._actions import (
     PROVIDER_SESSION_INVALID_REASON,
     SERVICE_VIEW_UNAVAILABLE_REASON,
     ActionAvailabilityCache,
     ActionAvailabilityPolicy,
     ActionAvailabilityRecord,
-    ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
+    ActionMetadata,
     ActionUnavailableCause,
+    ControllerActionService,
     ProviderActionKey,
+    ProviderSessionKey,
     action_unavailable_cause,
     unavailable_overlay_template,
 )
 from deckr.controller._binding_planner import ActionIntentKey
-from deckr.controller._provider_session_keys import ProviderSessionKey
-from deckr.controller.action_provider.provider import ActionMetadata
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_SESSION_ID = "controller-session"
@@ -72,10 +72,6 @@ def _intent(
         provider_instance_id=provider_instance_id,
         provider_labels=tuple(sorted((provider_labels or {}).items())),
     )
-
-
-def _actions_bus() -> SimpleNamespace:
-    return SimpleNamespace(send=AsyncMock())
 
 
 def _unavailable_record(
@@ -165,6 +161,33 @@ def _availability_view(
         serviceSessionId=service_session_id,
         labels=labels or {},
         entries=entries,
+    )
+
+
+def _record_service_available(
+    service: ControllerActionService,
+    metadata: ActionMetadata,
+    *,
+    now: float | None = None,
+) -> frozenset[ProviderActionKey]:
+    return service.ingest_provider_entries(
+        provider_instance_id=metadata.provider_instance_id,
+        provider_id=metadata.provider_id,
+        provider_session_id=metadata.provider_session_id,
+        provider_labels=metadata.provider_labels,
+        entries=(
+            ActionAvailabilityEntry(
+                actionId=metadata.uuid,
+                status="available",
+                descriptor=ActionDescriptor(
+                    actionId=metadata.uuid,
+                    name=metadata.name,
+                    settingsSchema=metadata.settings_schema,
+                    providerSettingsSchema=metadata.provider_settings_schema,
+                ),
+            ),
+        ),
+        now=now,
     )
 
 
@@ -278,12 +301,13 @@ def test_explicit_provider_intent_matches_only_that_provider():
 
     cache.record_available(alpha, now=0.0)
     cache.record_available(beta, now=0.0)
-    snapshot = cache.snapshot_for_intents((beta_intent, missing_intent), now=0.0)
+    snapshot = cache.planning_snapshot((beta_intent, missing_intent), now=0.0)
 
-    assert snapshot == {beta_intent: beta}
+    assert snapshot.metadata == {beta_intent: beta}
+    assert snapshot.unavailable == frozenset({missing_intent})
 
 
-def test_label_constrained_intent_ignores_unavailable_mismatch_candidate():
+def test_label_constrained_intent_ignores_unavailable_mismatch_probe():
     cache = ActionAvailabilityCache()
     unavailable = _metadata(
         "action.labelled",
@@ -308,8 +332,16 @@ def test_label_constrained_intent_ignores_unavailable_mismatch_candidate():
         now=0.0,
         intent=intent,
     )
-    cache.record_candidate(mismatch, now=0.0)
-    cache.record_candidate(match, now=0.0)
+    cache.record_probing(
+        ProviderActionKey("provider-beta", "action.labelled"),
+        metadata=mismatch,
+        now=0.0,
+    )
+    cache.record_probing(
+        ProviderActionKey("provider-gamma", "action.labelled"),
+        metadata=match,
+        now=0.0,
+    )
     snapshot = cache.planning_snapshot((intent,), now=0.0)
 
     assert snapshot.metadata == {}
@@ -318,12 +350,11 @@ def test_label_constrained_intent_ignores_unavailable_mismatch_candidate():
     assert cache.record_for_intent(intent, now=0.0).metadata is match
 
 
-def test_expired_service_view_record_stays_pending_with_live_candidate():
+def test_current_service_view_probe_is_pending():
     cache = ActionAvailabilityCache(
         policy=ActionAvailabilityPolicy(
             fresh_ttl_seconds=10.0,
             stale_grace_seconds=5.0,
-            candidate_ttl_seconds=10.0,
         )
     )
     metadata = _metadata("action.expired", provider_instance_id="provider-alpha")
@@ -334,62 +365,24 @@ def test_expired_service_view_record_stays_pending_with_live_candidate():
     )
 
     cache.record_available(metadata, now=100.0, intent=intent)
-    cache.record_candidate(metadata, now=115.0)
+    cache.record_probing(key, metadata=metadata, now=115.0, intent=intent)
     snapshot = cache.planning_snapshot(
         (intent,),
         now=116.0,
         stale_provider_keys=(key,),
     )
 
-    assert cache.state_for(key, now=116.0) == ActionAvailabilityState.EXPIRED
+    assert cache.state_for(key, now=116.0) == ActionAvailabilityState.PROBING
     assert snapshot.metadata == {}
     assert snapshot.pending == frozenset({intent})
     assert snapshot.unavailable == frozenset()
 
 
-def test_candidate_removal_clears_records_and_intent_mappings():
-    cache = ActionAvailabilityCache()
-    metadata = _metadata("action.removed", provider_instance_id="provider-alpha")
-    key = ProviderActionKey("provider-alpha", "action.removed")
-    intent = _intent(
-        "action.removed",
-        provider_instance_id="provider-alpha",
-    )
-
-    cache.record_candidate(metadata, now=0.0, intent=intent)
-
-    removed = cache.remove_candidate(key)
-
-    assert removed is not None
-    assert cache.record_for(key) is None
-    assert cache._record_keys_by_intent == {}
-    assert cache.snapshot_for_intents((intent,), now=0.0) == {}
-
-
-def test_candidate_expiry_returns_expired_and_omits_snapshot_metadata():
-    cache = ActionAvailabilityCache(
-        policy=ActionAvailabilityPolicy(candidate_ttl_seconds=10.0)
-    )
-    metadata = _metadata("action.expiring", provider_instance_id="provider-alpha")
-    key = ProviderActionKey("provider-alpha", "action.expiring")
-    intent = _intent(
-        "action.expiring",
-        provider_instance_id="provider-alpha",
-    )
-
-    cache.record_candidate(metadata, now=100.0)
-
-    assert cache.state_for(key, now=111.0) == ActionAvailabilityState.EXPIRED
-    assert cache.snapshot_for_intents((intent,), now=111.0) == {}
-
-
 def test_service_watchers_prefer_newest_duplicate_service_descriptor():
-    actions_bus = _actions_bus()
     scheduled: list[tuple[object, tuple[object, ...]]] = []
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         start_soon=lambda fn, *args: scheduled.append((fn, args)),
     )
@@ -421,17 +414,63 @@ def test_service_watchers_prefer_newest_duplicate_service_descriptor():
     assert watch_tasks == [
         (
             service._run_service_view_watch,
-            (service_id, newest, stopping),
+            (service_id, newest, 1, stopping),
         )
     ]
 
 
-def test_service_ingests_action_availability_view_payload():
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+@pytest.mark.asyncio
+async def test_descriptor_removal_preserves_active_runtime_lease():
+    scheduled: list[tuple[object, tuple[object, ...]]] = []
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
+        manager=MagicMock(),
+        services=MagicMock(),
+        start_soon=lambda fn, *args: scheduled.append((fn, args)),
+    )
+    service_id = action_runtime_service_id("provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    session_key = ProviderSessionKey(
+        "provider-alpha",
+        "provider.test",
+        "provider-session",
+    )
+    lease = _RuntimeLease(descriptor)
+    scope = anyio.CancelScope()
+
+    service._service_descriptor_keys[service_id] = (
+        str(descriptor.endpoint),
+        descriptor.session_id,
+        descriptor.backend_status.value,
+    )
+    service._service_watch_scopes[service_id] = scope
+    service._remember_runtime_lease(
+        session_key,
+        lease=lease,
+        service_id=service_id,
+        generation=1,
+    )
+
+    service._reconcile_service_watchers((), stopping=anyio.Event())
+
+    assert scope.cancel_called is False
+    assert service.current_contract(session_key) == ContractPointer(
+        contractId="provider-session-contract",
+        generation=1,
+    )
+    assert scheduled == []
+
+
+def test_service_ingests_action_availability_view_payload():
+    service = ControllerActionService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
         manager=MagicMock(),
         start_soon=None,
     )
@@ -456,7 +495,7 @@ def test_service_ingests_action_availability_view_payload():
         payload,
         service_id=service_id,
     ) == frozenset({key})
-    record = service.cache.record_for(key)
+    record = service.record_for_key(key)
     assert record is not None
     assert record.source == ActionAvailabilitySource.SERVICE_VIEW
     assert record.state == ActionAvailabilityState.AVAILABLE
@@ -480,7 +519,7 @@ def test_service_ingests_action_availability_view_payload():
     )
 
     assert changed == frozenset({key})
-    record = service.cache.record_for(key)
+    record = service.record_for_key(key)
     assert record is not None
     assert record.state == ActionAvailabilityState.UNAVAILABLE
     assert record.reason == "disabled"
@@ -494,18 +533,16 @@ def test_service_ingests_action_availability_view_payload():
     )
 
     assert changed == frozenset({key})
-    record = service.cache.record_for(key)
+    record = service.record_for_key(key)
     assert record is not None
     assert record.state == ActionAvailabilityState.UNAVAILABLE
     assert record.reason == "action_availability_view_missing"
 
 
 def test_service_view_same_action_from_multiple_providers_stays_distinct():
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         start_soon=None,
     )
@@ -558,27 +595,26 @@ def test_service_view_same_action_from_multiple_providers_stays_distinct():
 
     assert fallback_snapshot.metadata[intent].provider_instance_id == "provider-beta"
     assert fallback_snapshot.metadata[intent].name == "Beta"
-    alpha_record = service.cache.record_for(
+    alpha_record = service.record_for_key(
         ProviderActionKey("provider-alpha", "action.shared")
     )
     assert alpha_record is not None
     assert alpha_record.state == ActionAvailabilityState.UNAVAILABLE
-    assert service.cache.record_for(
+    assert service.record_for_key(
         ProviderActionKey("provider-beta", "action.shared")
     ) is not None
 
 
 def test_missing_service_view_marks_known_provider_actions_unavailable():
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         start_soon=None,
     )
     key = ProviderActionKey("provider-alpha", "action.alpha")
-    service.cache.record_available(
+    _record_service_available(
+        service,
         _metadata(
             "action.alpha",
             provider_instance_id="provider-alpha",
@@ -594,7 +630,7 @@ def test_missing_service_view_marks_known_provider_actions_unavailable():
     )
 
     assert changed == frozenset({key})
-    record = service.cache.record_for(key)
+    record = service.record_for_key(key)
     assert record is not None
     assert record.state == ActionAvailabilityState.UNAVAILABLE
     assert record.reason == "action_availability_view_missing"
@@ -605,22 +641,21 @@ async def test_service_view_watch_missing_view_keeps_service_use_lease_open(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        "deckr.controller._actions._service._SERVICE_WATCH_RETRY_SECONDS",
         0.01,
     )
     services = _ServiceViewWatchServices()
     notify_send, notify_receive = anyio.create_memory_object_stream(10)
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         services=services,
         start_soon=None,
         on_availability_changed=notify_send.send,
     )
-    service.cache.record_available(
+    _record_service_available(
+        service,
         _metadata(
             "action.alpha",
             provider_instance_id="provider-alpha",
@@ -638,7 +673,7 @@ async def test_service_view_watch_missing_view_keeps_service_use_lease_open(
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -653,7 +688,7 @@ async def test_service_view_watch_missing_view_keeps_service_use_lease_open(
         assert services.use_count == 1
         assert services.closed_count == 0
         assert services.lease_open is True
-        record = service.cache.record_for(
+        record = service.record_for_key(
             ProviderActionKey("provider-alpha", "action.alpha")
         )
         assert record is not None
@@ -668,23 +703,22 @@ async def test_service_view_watch_recovers_from_missing_view_on_same_lease(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        "deckr.controller._actions._service._SERVICE_WATCH_RETRY_SECONDS",
         0.01,
     )
     services = _ServiceViewWatchServices()
     notify_send, notify_receive = anyio.create_memory_object_stream(10)
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         services=services,
         start_soon=None,
         on_availability_changed=notify_send.send,
     )
     key = ProviderActionKey("provider-alpha", "action.alpha")
-    service.cache.record_available(
+    _record_service_available(
+        service,
         _metadata(
             "action.alpha",
             provider_instance_id="provider-alpha",
@@ -712,7 +746,7 @@ async def test_service_view_watch_recovers_from_missing_view_on_same_lease(
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -729,7 +763,7 @@ async def test_service_view_watch_recovers_from_missing_view_on_same_lease(
         assert services.lease_open is True
         assert len(services.watch_calls) == 1
         assert services.watch_calls[0][0] is services.leases[0]
-        record = service.cache.record_for(key)
+        record = service.record_for_key(key)
         assert record is not None
         assert record.state == ActionAvailabilityState.AVAILABLE
         assert record.reason is None
@@ -744,23 +778,22 @@ async def test_service_view_watch_transient_unavailable_keeps_same_service_use_l
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        "deckr.controller._actions._service._SERVICE_WATCH_RETRY_SECONDS",
         0.01,
     )
     services = _ServiceViewWatchServices()
     notify_send, notify_receive = anyio.create_memory_object_stream(10)
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         services=services,
         start_soon=None,
         on_availability_changed=notify_send.send,
     )
     key = ProviderActionKey("provider-alpha", "action.alpha")
-    service.cache.record_available(
+    _record_service_available(
+        service,
         _metadata(
             "action.alpha",
             provider_instance_id="provider-alpha",
@@ -788,7 +821,7 @@ async def test_service_view_watch_transient_unavailable_keeps_same_service_use_l
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -810,7 +843,7 @@ async def test_service_view_watch_transient_unavailable_keeps_same_service_use_l
         assert services.lease_open is True
         assert services.watch_calls[0][0] is services.leases[0]
         assert services.watch_calls[1][0] is services.leases[0]
-        record = service.cache.record_for(key)
+        record = service.record_for_key(key)
         assert record is not None
         assert record.state == ActionAvailabilityState.AVAILABLE
 
@@ -825,27 +858,26 @@ async def test_service_view_watch_transient_unavailable_keeps_same_service_use_l
 
 
 @pytest.mark.asyncio
-async def test_service_view_watch_terminal_unavailable_closes_lease_and_retries(
+async def test_service_view_watch_terminal_unavailable_closes_lease_without_retrying_descriptor(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "deckr.controller._action_availability._SERVICE_WATCH_RETRY_SECONDS",
+        "deckr.controller._actions._service._SERVICE_WATCH_RETRY_SECONDS",
         0.01,
     )
     services = _ServiceViewWatchServices()
     notify_send, notify_receive = anyio.create_memory_object_stream(10)
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         services=services,
         start_soon=None,
         on_availability_changed=notify_send.send,
     )
     key = ProviderActionKey("provider-alpha", "action.alpha")
-    service.cache.record_available(
+    _record_service_available(
+        service,
         _metadata(
             "action.alpha",
             provider_instance_id="provider-alpha",
@@ -863,7 +895,7 @@ async def test_service_view_watch_terminal_unavailable_closes_lease_and_retries(
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, stopping)
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -875,14 +907,15 @@ async def test_service_view_watch_terminal_unavailable_closes_lease_and_retries(
         )
         with anyio.fail_after(1):
             assert await notify_receive.receive() == frozenset({key})
-            while services.use_count < 2:
+            while services.closed_count < 1:
                 await anyio.sleep(0.01)
 
+        assert services.use_count == 1
         assert services.closed_count == 1
-        assert services.lease_open is True
+        assert services.lease_open is False
         assert services.watch_calls[0][0] is services.leases[0]
-        assert services.watch_calls[1][0] is services.leases[1]
-        record = service.cache.record_for(key)
+        assert len(services.watch_calls) == 1
+        record = service.record_for_key(key)
         assert record is not None
         assert record.state == ActionAvailabilityState.UNAVAILABLE
         assert record.reason == SERVICE_VIEW_UNAVAILABLE_REASON
@@ -890,16 +923,75 @@ async def test_service_view_watch_terminal_unavailable_closes_lease_and_retries(
         tg.cancel_scope.cancel()
 
 
+@pytest.mark.asyncio
+async def test_service_view_watch_rejects_mismatched_payload_provider(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "deckr.controller._actions._service._SERVICE_WATCH_RETRY_SECONDS",
+        0.01,
+    )
+    services = _ServiceViewWatchServices()
+    notify_send, notify_receive = anyio.create_memory_object_stream(10)
+    service = ControllerActionService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        manager=MagicMock(),
+        services=services,
+        start_soon=None,
+        on_availability_changed=notify_send.send,
+    )
+    service_id = action_runtime_service_id("provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    stopping = anyio.Event()
+    mismatched_key = ProviderSessionKey(
+        "provider-beta",
+        "provider.test",
+        "provider-session",
+    )
+    payload = _availability_view(
+        "provider-beta",
+        entries=(
+            ActionAvailabilityEntry(
+                actionId="action.beta",
+                status="available",
+                descriptor=ActionDescriptor(actionId="action.beta", name="Beta"),
+            ),
+        ),
+    )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
+        with anyio.fail_after(1):
+            await services.entered.wait()
+
+        await services.send(payload.to_dict())
+        await anyio.sleep(0.05)
+
+        assert service.current_contract(mismatched_key) is None
+        assert service.record_for_key(
+            ProviderActionKey("provider-beta", "action.beta")
+        ) is None
+        with anyio.move_on_after(0.05) as scope:
+            await notify_receive.receive()
+        assert scope.cancel_called
+
+        tg.cancel_scope.cancel()
+
+
 def test_service_logs_unchanged_provider_snapshot(caplog):
     caplog.set_level(
         logging.DEBUG,
-        logger="deckr.controller._action_availability",
+        logger="deckr.controller._actions._service",
     )
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         start_soon=None,
     )
@@ -944,11 +1036,9 @@ def test_service_planning_snapshot_preserves_only_existing_stale_bindings():
         clock=lambda: now,
     )
     cache.record_available(metadata, now=100.0, intent=intent)
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         start_soon=None,
         cache=cache,
@@ -996,27 +1086,25 @@ def test_service_view_available_without_runtime_lease_is_pending():
         "negotiating-session",
     )
     intent = _intent("action.alpha", provider_instance_id="provider-alpha")
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         services=MagicMock(),
         start_soon=None,
     )
-    service.cache.record_available(metadata, intent=intent, now=0.0)
+    _record_service_available(service, metadata, now=0.0)
 
     snapshot = service.planning_snapshot((intent,), now=1.0)
 
     assert snapshot.metadata == {}
     assert snapshot.pending == frozenset({intent})
     assert snapshot.unavailable == frozenset()
-    assert service.contract_pointer(session_key) is None
+    assert service.current_contract(session_key) is None
 
 
 @pytest.mark.asyncio
-async def test_matching_runtime_lease_unlocks_planning_and_contract_pointer():
+async def test_matching_runtime_lease_unlocks_planning_and_current_contract():
     metadata = _metadata(
         "action.alpha",
         provider_instance_id="provider-alpha",
@@ -1029,16 +1117,14 @@ async def test_matching_runtime_lease_unlocks_planning_and_contract_pointer():
         "negotiating-session",
     )
     intent = _intent("action.alpha", provider_instance_id="provider-alpha")
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         services=MagicMock(),
         start_soon=None,
     )
-    service._runtime_leases["provider-alpha"] = _RuntimeLease(
+    lease = _RuntimeLease(
         _service_descriptor(
             "provider-alpha",
             session_id="negotiating-session",
@@ -1047,22 +1133,25 @@ async def test_matching_runtime_lease_unlocks_planning_and_contract_pointer():
         ),
         contract_id="provider-session-contract",
     )
-    service.cache.record_available(metadata, intent=intent, now=0.0)
+    service._remember_runtime_lease(
+        session_key,
+        lease=lease,
+        service_id=action_runtime_service_id("provider-alpha"),
+        generation=1,
+    )
+    _record_service_available(service, metadata, now=0.0)
 
     planning = service.planning_snapshot((intent,))
-    valid = await service.provider_session_valid(
-        provider_instance_id="provider-alpha",
-        provider_id="provider.test",
-        provider_session_id="negotiating-session",
-    )
 
-    assert planning.metadata == {intent: metadata}
+    assert planning.metadata[intent].uuid == metadata.uuid
+    assert planning.metadata[intent].provider_instance_id == metadata.provider_instance_id
+    assert planning.metadata[intent].provider_id == metadata.provider_id
+    assert planning.metadata[intent].provider_session_id == metadata.provider_session_id
     assert planning.pending == frozenset()
-    assert service.contract_pointer(session_key) == ContractPointer(
+    assert service.current_contract(session_key) == ContractPointer(
         contractId="provider-session-contract",
         generation=1,
     )
-    assert valid is True
 
 
 @pytest.mark.asyncio
@@ -1079,16 +1168,19 @@ async def test_runtime_lease_session_mismatch_keeps_planning_pending():
         "negotiating-session",
     )
     intent = _intent("action.alpha", provider_instance_id="provider-alpha")
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         services=MagicMock(),
         start_soon=None,
     )
-    service._runtime_leases["provider-alpha"] = _RuntimeLease(
+    mismatched_key = ProviderSessionKey(
+        "provider-alpha",
+        "provider.test",
+        "different-session",
+    )
+    lease = _RuntimeLease(
         _service_descriptor(
             "provider-alpha",
             session_id="different-session",
@@ -1096,29 +1188,27 @@ async def test_runtime_lease_session_mismatch_keeps_planning_pending():
             advertisement_id="availability",
         )
     )
-    service.cache.record_available(metadata, intent=intent, now=0.0)
+    service._remember_runtime_lease(
+        mismatched_key,
+        lease=lease,
+        service_id=action_runtime_service_id("provider-alpha"),
+        generation=1,
+    )
+    _record_service_available(service, metadata, now=0.0)
 
     planning = service.planning_snapshot((intent,), now=1.0)
-    valid = await service.provider_session_valid(
-        provider_instance_id="provider-alpha",
-        provider_id="provider.test",
-        provider_session_id="negotiating-session",
-    )
 
     assert planning.metadata == {}
     assert planning.pending == frozenset({intent})
-    assert service.contract_pointer(session_key) is None
-    assert valid is False
+    assert service.current_contract(session_key) is None
 
 
 @pytest.mark.asyncio
 async def test_service_view_ingest_records_runtime_service_session():
     key = ProviderActionKey("provider-alpha", "action.alpha")
-    actions_bus = _actions_bus()
-    service = ActionAvailabilityService(
+    service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
         manager=MagicMock(),
         start_soon=None,
     )
@@ -1140,7 +1230,7 @@ async def test_service_view_ingest_records_runtime_service_session():
     )
 
     assert changed == frozenset({key})
-    record = service.cache.record_for(key)
+    record = service.record_for_key(key)
     assert record is not None
     assert record.metadata is not None
     assert record.metadata.provider_session_id == "negotiating-session"
