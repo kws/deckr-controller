@@ -18,10 +18,7 @@ from deckr.controller.action_provider.builtin import (
     BuiltinRegistry,
 )
 from deckr.controller.action_provider.events import ActionCatalogChangedEvent
-from deckr.controller.action_provider.provider import (
-    ActionMetadata,
-    ActionProviderSessionCandidate,
-)
+from deckr.controller.action_provider.provider import ActionMetadata
 
 
 def _qualified_id(provider_instance_id: str, action_uuid: str) -> str:
@@ -99,14 +96,6 @@ class ActionRegistry(BaseComponent):
             provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS
             and provider_id == BUILTIN_ACTION_PROVIDER_ID
         )
-
-    def provider_session_candidate(
-        self,
-        provider_instance_id: str,
-        provider_id: str,
-    ) -> ActionProviderSessionCandidate | None:
-        del provider_instance_id, provider_id
-        return None
 
     def get_builtin_action(self, uuid: str) -> BuiltinAction | None:
         return self._builtin_registry.get_action(uuid)

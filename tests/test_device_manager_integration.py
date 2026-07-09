@@ -31,13 +31,6 @@ from deckr.actions.messages import (
     action_message,
     context_subject,
 )
-from deckr.concord import (
-    CONCORD_CONTRACT_BUCKET_POLICY,
-    CONCORD_MAINTENANCE_BUCKET_POLICY,
-    CONCORD_TOKEN_BUCKET_POLICY,
-    Concord,
-    ContractValidityStatus,
-)
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import DeckrMessage, controller_address, endpoint_target
 from deckr.hardware import messages as hw_messages
@@ -67,22 +60,13 @@ from deckr.controller._action_interest import (
     ActionInterestSource,
     ActionInterestStrength,
 )
-from deckr.controller._action_provider_sessions import (
-    ActionProviderSessionManager,
-    ProviderSessionKey,
-    ProviderSessionSnapshot,
-    provider_session_key,
-)
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._render import RenderResult
 from deckr.controller.action_provider.events import (
     ActionCatalogChangedEvent,
     ProviderSessionSuccession,
 )
-from deckr.controller.action_provider.provider import (
-    ActionMetadata,
-    ActionProviderSessionCandidate,
-)
+from deckr.controller.action_provider.provider import ActionMetadata
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.settings import ConfigBackedSettingsService
 
@@ -107,118 +91,48 @@ def _contract_pointer_for_provider_session(
     )
 
 
+class _RuntimeLease:
+    def __init__(self, metadata: ActionMetadata, contract: ContractPointer) -> None:
+        self.descriptor = SimpleNamespace(
+            session_id=metadata.provider_session_id,
+            diagnostics={"providerId": metadata.provider_id},
+        )
+        self.contract = SimpleNamespace(
+            contract_id=contract.contract_id,
+            generation=contract.generation,
+        )
+
+    async def refresh(self) -> None:
+        return None
+
+
+def _set_provider_runtime_lease(
+    manager: DeviceManager,
+    metadata: ActionMetadata,
+    *,
+    contract: ContractPointer | None = None,
+) -> None:
+    if (
+        metadata.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+        or metadata.provider_session_id is None
+    ):
+        return
+    pointer = contract or _contract_pointer_for_provider_session(
+        metadata.provider_session_id,
+        provider_instance_id=metadata.provider_instance_id,
+        provider_id=metadata.provider_id,
+    )
+    manager._action_availability_service._runtime_leases[
+        metadata.provider_instance_id
+    ] = _RuntimeLease(metadata, pointer)
+
+
 def _actions_bus() -> LaneHarness:
     return LaneHarness("actions", default_endpoint=CONTROLLER_ADDR)
 
 
 def _actions_session(action_bus: LaneHarness) -> EndpointSession:
     return action_bus.endpoint(CONTROLLER_ADDR).session
-
-
-def _concord(bus: LaneHarness) -> Concord:
-    return Concord(
-        bus.substrate.kv_bucket(CONCORD_CONTRACT_BUCKET_POLICY),
-        bus.substrate.kv_bucket(CONCORD_TOKEN_BUCKET_POLICY),
-        bus.substrate.kv_bucket(CONCORD_MAINTENANCE_BUCKET_POLICY),
-    )
-
-
-def _provider_session_manager(
-    concord: Concord,
-    action_bus: LaneHarness,
-    start_soon,
-) -> ActionProviderSessionManager:
-    return ActionProviderSessionManager(
-        controller_id=CONTROLLER_ID,
-        controller_session_id=action_bus.session_id,
-        concord=concord,
-        start_soon=start_soon,
-    )
-
-
-class ReadyProviderSessions:
-    def __init__(self) -> None:
-        self.prepare_calls: list[tuple[ActionMetadata, ...]] = []
-        self.refresh_calls: list[tuple[ProviderSessionKey, ...]] = []
-
-    async def prepare_many(
-        self, actions
-    ) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
-        prepared = tuple(actions)
-        self.prepare_calls.append(prepared)
-        return {
-            key: ProviderSessionSnapshot(
-                key=key,
-                ready=True,
-                terminal=False,
-                status=ContractValidityStatus.VALID,
-            )
-            for action in prepared
-            if (key := provider_session_key(action)) is not None
-        }
-
-    async def refresh_many(
-        self, keys
-    ) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
-        prepared = tuple(keys)
-        self.refresh_calls.append(prepared)
-        return {
-            key: ProviderSessionSnapshot(
-                key=key,
-                ready=True,
-                terminal=False,
-                status=ContractValidityStatus.VALID,
-            )
-            for key in prepared
-        }
-
-    def cached_ready(self, key: ProviderSessionKey) -> bool:
-        return True
-
-    def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer:
-        return _contract_pointer_for_provider_session(
-            key.provider_session_id,
-            provider_instance_id=key.provider_instance_id,
-            provider_id=key.provider_id,
-        )
-
-    async def valid(self, **kwargs) -> bool:
-        raise AssertionError(f"unexpected provider-session valid call: {kwargs}")
-
-
-class MutableContractProviderSessions(ReadyProviderSessions):
-    def __init__(self, contract: ContractPointer) -> None:
-        super().__init__()
-        self.contract = contract
-
-    def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer:
-        return self.contract
-
-
-class TemporarilyUnavailableProviderSessions(ReadyProviderSessions):
-    def __init__(self) -> None:
-        super().__init__()
-        self.unavailable = False
-
-    async def refresh_many(
-        self, keys
-    ) -> dict[ProviderSessionKey, ProviderSessionSnapshot]:
-        prepared = tuple(keys)
-        self.refresh_calls.append(prepared)
-        self.unavailable = True
-        return {
-            key: ProviderSessionSnapshot(
-                key=key,
-                ready=False,
-                terminal=False,
-                status=ContractValidityStatus.UNAVAILABLE,
-                reason="provider_session_unavailable",
-            )
-            for key in prepared
-        }
-
-    def cached_ready(self, key: ProviderSessionKey) -> bool:
-        return not self.unavailable
 
 
 def _action_command(
@@ -291,16 +205,6 @@ def _seed_action_availability(
     *metadatas: ActionMetadata,
 ) -> None:
     if (
-        getattr(manager._action_availability_service, "_provider_sessions", None)
-        is None
-        and any(
-            metadata.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
-            and metadata.provider_session_id is not None
-            for metadata in metadatas
-        )
-    ):
-        manager._action_availability_service._provider_sessions = ReadyProviderSessions()
-    if (
         getattr(manager._action_availability_service, "_services", None) is None
         and not getattr(manager, "_test_runtime_send_shim", False)
     ):
@@ -339,6 +243,7 @@ def _seed_action_availability(
         manager.send_action_runtime_message = send_runtime_message
         manager._test_runtime_send_shim = True
     for metadata in metadatas:
+        _set_provider_runtime_lease(manager, metadata)
         manager._action_availability.record_available(metadata)
 
 
@@ -1963,13 +1868,12 @@ async def test_provider_session_contract_change_replaces_matching_binding(
 ):
     device = _make_mock_device()
     registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=_metadata(SetRasterImageOnAppearAction.uuid)
-    )
+    metadata = _metadata(SetRasterImageOnAppearAction.uuid)
+    registry.get_action = AsyncMock(return_value=metadata)
     action_bus = _actions_bus()
     first_contract = ContractPointer(contractId="provider-session-contract-1", generation=1)
     next_contract = ContractPointer(contractId="provider-session-contract-2", generation=1)
-    provider_sessions = MutableContractProviderSessions(first_contract)
+    current_contract = first_contract
 
     async with anyio.create_task_group() as tg:
         manager = DeviceManager(
@@ -1982,7 +1886,6 @@ async def test_provider_session_contract_change_replaces_matching_binding(
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
-        manager._action_availability_service._provider_sessions = provider_sessions
         sent_messages = []
 
         async def record_runtime_message(**kwargs):
@@ -1990,7 +1893,7 @@ async def test_provider_session_contract_change_replaces_matching_binding(
                 SimpleNamespace(
                     message_type=kwargs["message_type"],
                     recipient_session_id=PROVIDER_SESSION_ID,
-                    contract=provider_sessions.contract,
+                    contract=current_contract,
                 )
             )
             return True
@@ -2000,8 +1903,9 @@ async def test_provider_session_contract_change_replaces_matching_binding(
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             _seed_action_availability(
                 manager,
-                _metadata(SetRasterImageOnAppearAction.uuid),
+                metadata,
             )
+            _set_provider_runtime_lease(manager, metadata, contract=first_contract)
             await manager.set_page(profile="default", page=0)
             ctx = await manager.action_contexts.get("0,0")
             lease = manager._binding_lease_for_control("0,0")
@@ -2011,7 +1915,8 @@ async def test_provider_session_contract_change_replaces_matching_binding(
             await _drain_action_messages(stream)
             sent_messages.clear()
 
-            provider_sessions.contract = next_contract
+            current_contract = next_contract
+            _set_provider_runtime_lease(manager, metadata, contract=next_contract)
             await manager.on_action_availability_changed(
                 {
                     ProviderActionKey(
@@ -2177,6 +2082,13 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
                 provider_id=PROVIDER_ID,
                 provider_session_id=successor_session_id,
                 entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
+            )
+            _set_provider_runtime_lease(
+                manager,
+                _metadata(
+                    SetRasterImageOnAppearAction.uuid,
+                    provider_session_id=successor_session_id,
+                ),
             )
             await manager.on_action_availability_changed(changed)
 
@@ -4223,24 +4135,6 @@ class ConfigurableActionRegistry:
             for meta in self._actions.values()
         )
 
-    def provider_session_candidate(
-        self,
-        provider_instance_id: str,
-        provider_id: str,
-    ) -> ActionProviderSessionCandidate | None:
-        for meta in self._actions.values():
-            if (
-                meta.provider_instance_id == provider_instance_id
-                and meta.provider_id == provider_id
-                and meta.provider_session_id is not None
-            ):
-                return ActionProviderSessionCandidate(
-                    provider_instance_id=provider_instance_id,
-                    provider_id=provider_id,
-                    provider_session_id=meta.provider_session_id,
-                )
-        return None
-
     def add_action(self, action_uuid: str, meta: ActionMetadata) -> None:
         qualified = self._qualified_id(meta.provider_instance_id, action_uuid)
         self._actions[qualified] = meta
@@ -4302,7 +4196,6 @@ async def test_service_view_availability_resolves_candidate_control(
             actions_bus=_actions_session(action_bus),
             start_soon=start_soon,
         )
-        manager._action_availability_service._provider_sessions = ReadyProviderSessions()
         await manager.set_page(profile="default", page=0)
         await anyio.sleep(0.05)
 
@@ -4341,6 +4234,14 @@ async def test_service_view_availability_resolves_candidate_control(
             provider_id="test",
             provider_session_id=PROVIDER_SESSION_ID,
             entries=[_availability_entry(ACTION_X_UUID)],
+        )
+        _set_provider_runtime_lease(
+            manager,
+            _metadata(
+                ACTION_X_UUID,
+                provider_instance_id="test-provider",
+                provider_id="test",
+            ),
         )
         await manager.on_action_availability_changed(changed)
 

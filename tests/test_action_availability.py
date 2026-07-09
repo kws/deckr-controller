@@ -35,12 +35,9 @@ from deckr.controller._action_availability import (
     action_unavailable_cause,
     unavailable_overlay_template,
 )
-from deckr.controller._action_provider_sessions import ProviderSessionKey
 from deckr.controller._binding_planner import ActionIntentKey
-from deckr.controller.action_provider.provider import (
-    ActionMetadata,
-    ActionProviderSessionCandidate,
-)
+from deckr.controller._provider_session_keys import ProviderSessionKey
+from deckr.controller.action_provider.provider import ActionMetadata
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_SESSION_ID = "controller-session"
@@ -81,36 +78,6 @@ def _actions_bus() -> SimpleNamespace:
     return SimpleNamespace(send=AsyncMock())
 
 
-def _manager_with_provider_session(
-    provider_session_id: str | None = PROVIDER_SESSION_ID,
-) -> MagicMock:
-    manager = MagicMock()
-
-    def provider_session_candidate(
-        provider_instance_id: str,
-        provider_id: str,
-    ) -> ActionProviderSessionCandidate | None:
-        if provider_session_id is None:
-            return None
-        return ActionProviderSessionCandidate(
-            provider_instance_id=provider_instance_id,
-            provider_id=provider_id,
-            provider_session_id=provider_session_id,
-        )
-
-    manager.provider_session_candidate.side_effect = provider_session_candidate
-    return manager
-
-
-def _provider_session_key(action: ActionMetadata) -> ProviderSessionKey:
-    assert action.provider_session_id is not None
-    return ProviderSessionKey(
-        action.provider_instance_id,
-        action.provider_id,
-        action.provider_session_id,
-    )
-
-
 def _unavailable_record(
     *,
     reason: str | None = None,
@@ -125,61 +92,6 @@ def _unavailable_record(
         metadata=metadata,
         reason=reason,
     )
-
-
-def _provider_sessions_mock(
-    *,
-    prepare_ready: bool = True,
-    prepare_terminal: bool = False,
-    refresh_ready: bool = True,
-    refresh_terminal: bool = False,
-    cached_ready: bool | None = None,
-    valid: bool | list[bool] = True,
-) -> MagicMock:
-    provider_sessions = MagicMock()
-    provider_sessions.set_change_callback = MagicMock()
-    provider_sessions.aclose = AsyncMock()
-    cached_ready_state = {
-        "ready": refresh_ready if cached_ready is None else cached_ready,
-    }
-
-    async def prepare_many(actions):
-        cached_ready_state["ready"] = prepare_ready
-        return {
-            key: SimpleNamespace(
-                key=key,
-                ready=prepare_ready,
-                terminal=prepare_terminal,
-            )
-            for action in tuple(actions)
-            if action.provider_session_id is not None
-            for key in (_provider_session_key(action),)
-        }
-
-    async def refresh_many(keys):
-        cached_ready_state["ready"] = refresh_ready
-        return {
-            key: SimpleNamespace(
-                key=key,
-                ready=refresh_ready,
-                terminal=refresh_terminal,
-            )
-            for key in tuple(keys)
-        }
-
-    provider_sessions.prepare_many = AsyncMock(side_effect=prepare_many)
-    provider_sessions.refresh_many = AsyncMock(side_effect=refresh_many)
-    provider_sessions.cached_ready = MagicMock(
-        side_effect=lambda _key: cached_ready_state["ready"],
-    )
-    provider_sessions.contract_pointer = MagicMock(
-        return_value=ContractPointer(contractId="provider-session-contract", generation=1)
-    )
-    provider_sessions.valid = AsyncMock(
-        side_effect=list(valid) if isinstance(valid, list) else None,
-        return_value=valid if isinstance(valid, bool) else None,
-    )
-    return provider_sessions
 
 
 def _service_descriptor(
@@ -214,6 +126,26 @@ def _service_descriptor(
         backend_status=backend_status,
         diagnostics={},
     )
+
+
+class _RuntimeLease:
+    def __init__(
+        self,
+        descriptor: ServiceDescriptor,
+        *,
+        contract_id: str = "provider-session-contract",
+        generation: int = 1,
+        refresh_error: ServiceUnavailable | None = None,
+    ) -> None:
+        self.descriptor = descriptor
+        self.contract = SimpleNamespace(contract_id=contract_id, generation=generation)
+        self.refresh_error = refresh_error
+        self.refresh_calls = 0
+
+    async def refresh(self) -> None:
+        self.refresh_calls += 1
+        if self.refresh_error is not None:
+            raise self.refresh_error
 
 
 def _availability_view(
@@ -252,7 +184,10 @@ class _ServiceViewWatchServices:
     @asynccontextmanager
     async def use(self, descriptor):
         self.use_count += 1
-        lease = SimpleNamespace(descriptor=descriptor, lease_id=self.use_count)
+        lease = _RuntimeLease(
+            descriptor,
+            contract_id=f"provider-session-contract-{self.use_count}",
+        )
         self.leases.append(lease)
         self.lease_open = True
         self.entered.set()
@@ -448,24 +383,6 @@ def test_candidate_expiry_returns_expired_and_omits_snapshot_metadata():
     assert cache.snapshot_for_intents((intent,), now=111.0) == {}
 
 
-def test_service_provider_session_change_schedules_reconcile():
-    actions_bus = _actions_bus()
-    scheduled: list[object] = []
-    provider_sessions = _provider_sessions_mock()
-    service = ActionAvailabilityService(
-        controller_id=CONTROLLER_ID,
-        controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
-        manager=MagicMock(),
-        provider_sessions=provider_sessions,
-        start_soon=lambda fn, *args: scheduled.append((fn, args)),
-    )
-
-    service._provider_session_changed()
-
-    assert scheduled == [(service._provider_session_reconcile_task, ())]
-
-
 def test_service_watchers_prefer_newest_duplicate_service_descriptor():
     actions_bus = _actions_bus()
     scheduled: list[tuple[object, tuple[object, ...]]] = []
@@ -585,13 +502,11 @@ def test_service_ingests_action_availability_view_payload():
 
 def test_service_view_same_action_from_multiple_providers_stays_distinct():
     actions_bus = _actions_bus()
-    provider_sessions = _provider_sessions_mock(cached_ready=True)
     service = ActionAvailabilityService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         actions_bus=actions_bus,
         manager=MagicMock(),
-        provider_sessions=provider_sessions,
         start_soon=None,
     )
     intent = _intent("action.shared")
@@ -1068,7 +983,7 @@ def test_default_policy_keeps_service_view_records_authoritative_after_60s():
     assert snapshot.unavailable == frozenset()
 
 
-def test_service_view_available_with_unready_provider_session_is_pending():
+def test_service_view_available_without_runtime_lease_is_pending():
     metadata = _metadata(
         "action.alpha",
         provider_instance_id="provider-alpha",
@@ -1082,13 +997,12 @@ def test_service_view_available_with_unready_provider_session_is_pending():
     )
     intent = _intent("action.alpha", provider_instance_id="provider-alpha")
     actions_bus = _actions_bus()
-    provider_sessions = _provider_sessions_mock(cached_ready=False)
     service = ActionAvailabilityService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         actions_bus=actions_bus,
         manager=MagicMock(),
-        provider_sessions=provider_sessions,
+        services=MagicMock(),
         start_soon=None,
     )
     service.cache.record_available(metadata, intent=intent, now=0.0)
@@ -1099,99 +1013,102 @@ def test_service_view_available_with_unready_provider_session_is_pending():
     assert snapshot.pending == frozenset({intent})
     assert snapshot.unavailable == frozenset()
     assert service.contract_pointer(session_key) is None
-    provider_sessions.contract_pointer.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_service_reconcile_preserves_nonterminal_provider_session_as_pending():
+async def test_matching_runtime_lease_unlocks_planning_and_contract_pointer():
     metadata = _metadata(
         "action.alpha",
         provider_instance_id="provider-alpha",
         provider_id="provider.test",
         provider_session_id="negotiating-session",
     )
-    key = ProviderActionKey("provider-alpha", "action.alpha")
+    session_key = ProviderSessionKey(
+        "provider-alpha",
+        "provider.test",
+        "negotiating-session",
+    )
     intent = _intent("action.alpha", provider_instance_id="provider-alpha")
     actions_bus = _actions_bus()
-    provider_sessions = _provider_sessions_mock(
-        refresh_ready=False,
-        refresh_terminal=False,
-    )
     service = ActionAvailabilityService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         actions_bus=actions_bus,
         manager=MagicMock(),
-        provider_sessions=provider_sessions,
+        services=MagicMock(),
         start_soon=None,
     )
-    service.cache.record_available(metadata, intent=intent, now=service._clock())
-
-    changed = await service.reconcile_provider_sessions()
-
-    assert changed == frozenset()
-    provider_sessions.refresh_many.assert_awaited_once_with(
-        (
-            ProviderSessionKey(
-                "provider-alpha",
-                "provider.test",
-                "negotiating-session",
-            ),
-        )
-    )
-    record = service.cache.record_for(key)
-    assert record is not None
-    assert record.state == ActionAvailabilityState.AVAILABLE
-    planning = service.planning_snapshot((intent,))
-    assert planning.metadata == {}
-    assert planning.pending == frozenset({intent})
-    assert planning.unavailable == frozenset()
-
-
-@pytest.mark.asyncio
-async def test_provider_session_ready_transition_notifies_and_unlocks_planning():
-    metadata = _metadata(
-        "action.alpha",
-        provider_instance_id="provider-alpha",
-        provider_id="provider.test",
-        provider_session_id="negotiating-session",
-    )
-    key = ProviderActionKey("provider-alpha", "action.alpha")
-    intent = _intent("action.alpha", provider_instance_id="provider-alpha")
-    scheduled: list[tuple[object, tuple[object, ...]]] = []
-    notified: list[frozenset[ProviderActionKey]] = []
-    actions_bus = _actions_bus()
-    provider_sessions = _provider_sessions_mock(
-        cached_ready=False,
-        refresh_ready=True,
-        refresh_terminal=False,
-    )
-    service = ActionAvailabilityService(
-        controller_id=CONTROLLER_ID,
-        controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
-        manager=MagicMock(),
-        provider_sessions=provider_sessions,
-        start_soon=lambda fn, *args: scheduled.append((fn, args)),
-        on_availability_changed=lambda keys: notified.append(keys),
+    service._runtime_leases["provider-alpha"] = _RuntimeLease(
+        _service_descriptor(
+            "provider-alpha",
+            session_id="negotiating-session",
+            updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+            advertisement_id="availability",
+        ),
+        contract_id="provider-session-contract",
     )
     service.cache.record_available(metadata, intent=intent, now=0.0)
 
-    pending = service.planning_snapshot((intent,), now=1.0)
-    service._provider_session_changed()
-    reconcile = next(
-        (fn, args)
-        for fn, args in scheduled
-        if fn == service._provider_session_reconcile_task
+    planning = service.planning_snapshot((intent,))
+    valid = await service.provider_session_valid(
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        provider_session_id="negotiating-session",
     )
-    await reconcile[0](*reconcile[1])
-    ready = service.planning_snapshot((intent,), now=2.0)
 
-    assert pending.metadata == {}
-    assert pending.pending == frozenset({intent})
-    assert notified == [frozenset({key})]
-    assert ready.metadata == {intent: metadata}
-    assert ready.pending == frozenset()
+    assert planning.metadata == {intent: metadata}
+    assert planning.pending == frozenset()
+    assert service.contract_pointer(session_key) == ContractPointer(
+        contractId="provider-session-contract",
+        generation=1,
+    )
+    assert valid is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_lease_session_mismatch_keeps_planning_pending():
+    metadata = _metadata(
+        "action.alpha",
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        provider_session_id="negotiating-session",
+    )
+    session_key = ProviderSessionKey(
+        "provider-alpha",
+        "provider.test",
+        "negotiating-session",
+    )
+    intent = _intent("action.alpha", provider_instance_id="provider-alpha")
+    actions_bus = _actions_bus()
+    service = ActionAvailabilityService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        actions_bus=actions_bus,
+        manager=MagicMock(),
+        services=MagicMock(),
+        start_soon=None,
+    )
+    service._runtime_leases["provider-alpha"] = _RuntimeLease(
+        _service_descriptor(
+            "provider-alpha",
+            session_id="different-session",
+            updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+            advertisement_id="availability",
+        )
+    )
+    service.cache.record_available(metadata, intent=intent, now=0.0)
+
+    planning = service.planning_snapshot((intent,), now=1.0)
+    valid = await service.provider_session_valid(
+        provider_instance_id="provider-alpha",
+        provider_id="provider.test",
+        provider_session_id="negotiating-session",
+    )
+
+    assert planning.metadata == {}
+    assert planning.pending == frozenset({intent})
+    assert service.contract_pointer(session_key) is None
+    assert valid is False
 
 
 @pytest.mark.asyncio
@@ -1227,54 +1144,3 @@ async def test_service_view_ingest_records_runtime_service_session():
     assert record is not None
     assert record.metadata is not None
     assert record.metadata.provider_session_id == "negotiating-session"
-
-
-@pytest.mark.asyncio
-async def test_provider_session_change_reconciles_and_notifies_invalid_records():
-    metadata = _metadata(
-        "action.alpha",
-        provider_instance_id="provider-alpha",
-        provider_id="provider.test",
-        provider_session_id="stale-session",
-    )
-    key = ProviderActionKey("provider-alpha", "action.alpha")
-    scheduled: list[tuple[object, tuple[object, ...]]] = []
-    notified: list[frozenset[ProviderActionKey]] = []
-    actions_bus = _actions_bus()
-    provider_sessions = _provider_sessions_mock(
-        refresh_ready=False,
-        refresh_terminal=True,
-    )
-    service = ActionAvailabilityService(
-        controller_id=CONTROLLER_ID,
-        controller_session_id=CONTROLLER_SESSION_ID,
-        actions_bus=actions_bus,
-        manager=MagicMock(),
-        provider_sessions=provider_sessions,
-        start_soon=lambda fn, *args: scheduled.append((fn, args)),
-        on_availability_changed=lambda keys: notified.append(keys),
-    )
-    service.cache.record_available(metadata, now=0.0)
-
-    service._provider_session_changed()
-
-    reconcile = next(
-        (fn, args)
-        for fn, args in scheduled
-        if fn == service._provider_session_reconcile_task
-    )
-    await reconcile[0](*reconcile[1])
-
-    assert notified == [frozenset({key})]
-    provider_sessions.refresh_many.assert_awaited_once_with(
-        (
-            ProviderSessionKey(
-                "provider-alpha",
-                "provider.test",
-                "stale-session",
-            ),
-        )
-    )
-    record = service.cache.record_for(key)
-    assert record is not None
-    assert record.reason == PROVIDER_SESSION_INVALID_REASON

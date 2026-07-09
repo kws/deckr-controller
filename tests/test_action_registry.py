@@ -12,7 +12,6 @@ from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 CONTROLLER_ID = "controller-main"
 BUILTIN_ACTION_UUID = "dev.deckr.controller.builtin.action.go_to_page"
 EXTERNAL_PROVIDER_INSTANCE_ID = "python-dev.deckr.clock"
-EXTERNAL_PROVIDER_ID = "dev.deckr.clock"
 EXTERNAL_ACTION_UUID = "dev.deckr.clock.action.time"
 
 
@@ -84,13 +83,6 @@ async def test_action_registry_does_not_resolve_external_actions_or_labels() -> 
         await registry.get_action(
             BUILTIN_ACTION_UUID,
             provider_labels={"room": "office"},
-        )
-        is None
-    )
-    assert (
-        registry.provider_session_candidate(
-            EXTERNAL_PROVIDER_INSTANCE_ID,
-            EXTERNAL_PROVIDER_ID,
         )
         is None
     )

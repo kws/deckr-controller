@@ -88,10 +88,6 @@ from deckr.controller._action_interest import (
     ActionInterestSource,
     ActionInterestTracker,
 )
-from deckr.controller._action_provider_sessions import (
-    ProviderSessionKey,
-    provider_session_key,
-)
 from deckr.controller._binding_planner import (
     ActionIntentKey,
     BindingPlanner,
@@ -122,6 +118,10 @@ from deckr.controller._navigation_service import (
     PageStackEntry,
     PageTransition,
     StaticPageRef,
+)
+from deckr.controller._provider_session_keys import (
+    ProviderSessionKey,
+    provider_session_key,
 )
 from deckr.controller._render import RenderModel, RenderService, RenderSource
 from deckr.controller._render_dispatcher import (

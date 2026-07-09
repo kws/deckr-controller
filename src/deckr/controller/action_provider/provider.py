@@ -25,15 +25,6 @@ class ActionMetadata:
     provider_settings_schema: dict | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class ActionProviderSessionCandidate:
-    """Beacon-discovered provider runtime session for Concord negotiation only."""
-
-    provider_instance_id: str
-    provider_id: str
-    provider_session_id: str
-
-
 class ActionProviderManager(Protocol):
     """Active manager interface consumed by DeviceManager."""
 
@@ -50,9 +41,3 @@ class ActionProviderManager(Protocol):
         provider_instance_id: str,
         provider_id: str,
     ) -> bool: ...
-
-    def provider_session_candidate(
-        self,
-        provider_instance_id: str,
-        provider_id: str,
-    ) -> ActionProviderSessionCandidate | None: ...

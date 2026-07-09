@@ -10,7 +10,6 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from inspect import isawaitable
-from typing import Protocol
 
 import anyio
 from deckr.action_runtime import (
@@ -41,10 +40,10 @@ from deckr.services import (
 )
 
 from deckr.controller._action_interest import ActionInterestSnapshot
-from deckr.controller._action_provider_sessions import (
+from deckr.controller._binding_planner import ActionIntentKey
+from deckr.controller._provider_session_keys import (
     ProviderSessionKey,
 )
-from deckr.controller._binding_planner import ActionIntentKey
 from deckr.controller._settings_metadata import SettingsActionMetadata
 from deckr.controller.action_provider.events import ActionCatalogChangedEvent
 from deckr.controller.action_provider.provider import (
@@ -189,36 +188,6 @@ def _metadata_missing_provider_session(metadata: ActionMetadata | None) -> bool:
         and metadata.provider_instance_id not in RESERVED_BUILTIN_PROVIDER_IDS
         and metadata.provider_session_id is None
     )
-
-
-class ActionProviderSessionPreparer(Protocol):
-    def set_change_callback(self, callback) -> None: ...
-
-    def start(self, stopping: anyio.Event) -> None: ...
-
-    async def prepare_many(
-        self,
-        actions: Iterable[ActionMetadata],
-    ) -> Mapping[object, object]: ...
-
-    async def refresh_many(
-        self,
-        keys: Iterable[ProviderSessionKey],
-    ) -> Mapping[ProviderSessionKey, object]: ...
-
-    def contract_pointer(self, key: ProviderSessionKey) -> ContractPointer | None: ...
-
-    def cached_ready(self, key: ProviderSessionKey) -> bool: ...
-
-    async def valid(
-        self,
-        *,
-        provider_instance_id: str,
-        provider_id: str,
-        provider_session_id: str | None,
-    ) -> bool: ...
-
-    async def aclose(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -925,7 +894,6 @@ class ActionAvailabilityService:
         services: DeckrServices | None = None,
         close_services_on_aclose: bool = False,
         start_soon: Callable[..., object] | None = None,
-        provider_sessions: ActionProviderSessionPreparer | None = None,
         on_availability_changed: _AvailabilityChangedCallback | None = None,
         cache: ActionAvailabilityCache | None = None,
         clock: Callable[[], float] | None = None,
@@ -936,20 +904,14 @@ class ActionAvailabilityService:
         self.manager = manager
         self._services = services
         self._close_services_on_aclose = close_services_on_aclose
-        self._provider_sessions = provider_sessions
         self.cache = cache or ActionAvailabilityCache(clock=clock)
         self._clock = clock or time.monotonic
         self._start_soon = start_soon
         self._interest_by_config: dict[str, ActionInterestSnapshot] = {}
-        self._provider_session_reconcile_scheduled = False
         self._service_watch_scopes: dict[str, anyio.CancelScope] = {}
         self._service_descriptor_keys: dict[str, tuple[str, str, str]] = {}
         self._runtime_leases: dict[str, ServiceUseLease] = {}
         self._on_availability_changed = on_availability_changed
-        if provider_sessions is not None:
-            set_change_callback = getattr(provider_sessions, "set_change_callback", None)
-            if callable(set_change_callback):
-                set_change_callback(self._provider_session_changed)
 
     def set_availability_changed_callback(
         self,
@@ -962,11 +924,6 @@ class ActionAvailabilityService:
         tg,
         stopping,
     ) -> None:
-        provider_sessions = self._provider_sessions
-        if provider_sessions is not None:
-            start = getattr(provider_sessions, "start", None)
-            if callable(start):
-                start(stopping)
         if self._services is not None:
             tg.start_soon(self._service_directory_loop, stopping)
 
@@ -978,13 +935,6 @@ class ActionAvailabilityService:
         if self._close_services_on_aclose and self._services is not None:
             await self._services.aclose()
             self._services = None
-        provider_sessions = self._provider_sessions
-        self._provider_sessions = None
-        if provider_sessions is not None:
-            set_change_callback = getattr(provider_sessions, "set_change_callback", None)
-            if callable(set_change_callback):
-                set_change_callback(None)
-            await provider_sessions.aclose()
 
     def planning_snapshot(
         self,
@@ -1622,55 +1572,20 @@ class ActionAvailabilityService:
         provider_id: str,
         provider_session_id: str | None,
     ) -> bool:
-        provider_sessions = self._provider_sessions
-        if provider_sessions is None:
-            lease = self._runtime_leases.get(provider_instance_id)
-            if lease is None:
-                return False
-            if provider_session_id is not None and (
-                lease.descriptor.session_id != provider_session_id
-            ):
-                return False
-            if lease.descriptor.diagnostics.get("providerId") not in {None, provider_id}:
-                return False
-            try:
-                await lease.refresh()
-            except ServiceUnavailable:
-                return False
-            return True
-        try:
-            return await provider_sessions.valid(
-                provider_instance_id=provider_instance_id,
-                provider_id=provider_id,
-                provider_session_id=provider_session_id,
-            )
-        except Exception:
-            logger.warning(
-                "Could not validate action provider session for %s/%s",
-                provider_instance_id,
-                provider_id,
-                exc_info=True,
-            )
+        lease = self._runtime_leases.get(provider_instance_id)
+        if lease is None:
             return False
-
-    async def _provider_session_snapshot(
-        self,
-        key: ProviderSessionKey,
-    ) -> object | None:
-        provider_sessions = self._provider_sessions
-        if provider_sessions is None:
-            return None
+        if provider_session_id is not None and (
+            lease.descriptor.session_id != provider_session_id
+        ):
+            return False
+        if lease.descriptor.diagnostics.get("providerId") not in {None, provider_id}:
+            return False
         try:
-            snapshots = await provider_sessions.refresh_many((key,))
-        except Exception:
-            logger.warning(
-                "Could not refresh action provider session for %s/%s",
-                key.provider_instance_id,
-                key.provider_id,
-                exc_info=True,
-            )
-            return None
-        return snapshots.get(key)
+            await lease.refresh()
+        except ServiceUnavailable:
+            return False
+        return True
 
     def contract_pointer(
         self,
@@ -1678,171 +1593,37 @@ class ActionAvailabilityService:
     ) -> ContractPointer | None:
         if key is None:
             return None
-        provider_sessions = self._provider_sessions
-        if provider_sessions is None:
-            lease = self._runtime_leases.get(key.provider_instance_id)
-            if lease is None:
-                return None
-            if lease.descriptor.session_id != key.provider_session_id:
-                return None
-            return ContractPointer(
-                contractId=lease.contract.contract_id,
-                generation=lease.contract.generation,
-            )
-        if not self._provider_session_cached_ready(key):
+        lease = self._runtime_leases.get(key.provider_instance_id)
+        if lease is None:
             return None
-        contract_pointer = getattr(provider_sessions, "contract_pointer", None)
-        if not callable(contract_pointer):
+        if lease.descriptor.session_id != key.provider_session_id:
             return None
-        return contract_pointer(key)
-
-    def _provider_session_changed(self) -> None:
-        self._schedule_provider_session_reconcile()
-
-    async def reconcile_provider_sessions(self) -> frozenset[ProviderActionKey]:
-        provider_sessions = self._provider_sessions
-        if provider_sessions is None:
-            return frozenset()
-        now = self._clock()
-        changed: set[ProviderActionKey] = set()
-        for record in self.cache.service_view_records():
-            metadata = record.metadata
-            if not _metadata_requires_provider_session_revalidation(metadata):
-                continue
-            if (
-                record.state == ActionAvailabilityState.UNAVAILABLE
-                and record.reason == PROVIDER_SESSION_INVALID_REASON
-            ):
-                continue
-            session_key = ProviderSessionKey(
-                metadata.provider_instance_id,
-                metadata.provider_id,
-                metadata.provider_session_id,
-            )
-            was_ready = self._provider_session_cached_ready(session_key)
-            snapshot = await self._provider_session_snapshot(session_key)
-            if snapshot is not None and getattr(snapshot, "ready", False):
-                if not was_ready:
-                    changed.add(record.key)
-                    logger.info(
-                        "Action availability provider session ready provider=%s "
-                        "provider_id=%s action=%s provider_session=%s",
-                        metadata.provider_instance_id,
-                        metadata.provider_id,
-                        metadata.uuid,
-                        metadata.provider_session_id,
-                    )
-                continue
-            if snapshot is None or not getattr(snapshot, "terminal", False):
-                if snapshot is not None and was_ready:
-                    changed.add(record.key)
-                    logger.info(
-                        "Action availability provider session became pending "
-                        "provider=%s provider_id=%s action=%s "
-                        "provider_session=%s status=%s",
-                        metadata.provider_instance_id,
-                        metadata.provider_id,
-                        metadata.uuid,
-                        metadata.provider_session_id,
-                        getattr(snapshot, "status", None),
-                    )
-                continue
-            mapped_intent = self._mapped_intent_for_key(record.key)
-            old_state = self.cache.state_for(record.key, now=now)
-            self.cache.record_unavailable(
-                record.key,
-                metadata=metadata,
-                reason=PROVIDER_SESSION_INVALID_REASON,
-                now=now,
-                intent=mapped_intent,
-            )
-            changed.add(record.key)
-            logger.info(
-                "Action availability invalidated provider=%s provider_id=%s "
-                "action=%s provider_session=%s old_state=%s reason=%s",
-                metadata.provider_instance_id,
-                metadata.provider_id,
-                metadata.uuid,
-                metadata.provider_session_id,
-                _state_value(old_state),
-                PROVIDER_SESSION_INVALID_REASON,
-            )
-        return frozenset(changed)
-
-    def _schedule_provider_session_reconcile(self) -> None:
-        if (
-            self._provider_sessions is None
-            or self._provider_session_reconcile_scheduled
-            or self._start_soon is None
-        ):
-            return
-        self._provider_session_reconcile_scheduled = True
-        self._start_soon(self._provider_session_reconcile_task)
-
-    async def _provider_session_reconcile_task(self) -> None:
-        self._provider_session_reconcile_scheduled = False
-        try:
-            changed = await self.reconcile_provider_sessions()
-        except Exception:
-            logger.exception("Error reconciling action provider sessions")
-            return
-        if changed:
-            await self._notify_availability_changed(changed)
+        return ContractPointer(
+            contractId=lease.contract.contract_id,
+            generation=lease.contract.generation,
+        )
 
     def _ready_provider_session_keys(self) -> frozenset[ProviderSessionKey] | None:
-        provider_sessions = self._provider_sessions
-        if provider_sessions is None:
-            if self._services is None:
-                return None
-            ready: set[ProviderSessionKey] = set()
-            for record in self.cache.service_view_records():
-                metadata = record.metadata
-                if not _metadata_requires_provider_session_revalidation(metadata):
-                    continue
-                lease = self._runtime_leases.get(metadata.provider_instance_id)
-                if lease is None:
-                    continue
-                if lease.descriptor.session_id != metadata.provider_session_id:
-                    continue
-                ready.add(
-                    ProviderSessionKey(
-                        metadata.provider_instance_id,
-                        metadata.provider_id,
-                        metadata.provider_session_id,
-                    )
-                )
-            return frozenset(ready)
+        if self._services is None:
+            return None
         ready: set[ProviderSessionKey] = set()
         for record in self.cache.service_view_records():
             metadata = record.metadata
             if not _metadata_requires_provider_session_revalidation(metadata):
                 continue
-            key = ProviderSessionKey(
-                metadata.provider_instance_id,
-                metadata.provider_id,
-                metadata.provider_session_id,
+            lease = self._runtime_leases.get(metadata.provider_instance_id)
+            if lease is None:
+                continue
+            if lease.descriptor.session_id != metadata.provider_session_id:
+                continue
+            ready.add(
+                ProviderSessionKey(
+                    metadata.provider_instance_id,
+                    metadata.provider_id,
+                    metadata.provider_session_id,
+                )
             )
-            if self._provider_session_cached_ready(key):
-                ready.add(key)
         return frozenset(ready)
-
-    def _provider_session_cached_ready(self, key: ProviderSessionKey) -> bool:
-        provider_sessions = self._provider_sessions
-        if provider_sessions is None:
-            return False
-        cached_ready = getattr(provider_sessions, "cached_ready", None)
-        if not callable(cached_ready):
-            return False
-        try:
-            return bool(cached_ready(key))
-        except Exception:
-            logger.warning(
-                "Could not read cached action provider session readiness for %s/%s",
-                key.provider_instance_id,
-                key.provider_id,
-                exc_info=True,
-            )
-            return False
 
     async def _notify_availability_changed(
         self,

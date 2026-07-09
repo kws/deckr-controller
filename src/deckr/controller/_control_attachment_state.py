@@ -8,9 +8,9 @@ from typing import Any
 
 from deckr.actions.messages import SettingsTargetRef
 
-from deckr.controller._action_provider_sessions import ProviderSessionKey
 from deckr.controller._binding_planner import DynamicPageSession
 from deckr.controller._device_layout import ControlSurface
+from deckr.controller._provider_session_keys import ProviderSessionKey
 from deckr.controller.action_provider.context import ControlContext
 
 
