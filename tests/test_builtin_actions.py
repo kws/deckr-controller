@@ -26,7 +26,7 @@ def _event(event_type: str) -> CapabilityInputEvent:
 
 def _context(settings=None):
     context = SimpleNamespace()
-    context.get_settings = AsyncMock(return_value=settings or SimpleNamespace())
+    context.settings = settings or SimpleNamespace()
     context.set_title = AsyncMock()
     context.set_page = AsyncMock()
     return context
@@ -39,7 +39,6 @@ async def test_go_to_page_action_ignores_non_activation_input() -> None:
     await GoToPageAction().on_input(context, _event("down"))
 
     context.set_page.assert_not_awaited()
-    context.get_settings.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -147,6 +147,7 @@ def _request_with_graph(graph: dict) -> RenderRequest:
         source=RenderSource(
             provider_instance_id="provider-instance",
             provider_id="dev.deckr.clock",
+            provider_session_id="provider-session",
             action_id="dev.deckr.clock.action.digital",
             action_instance_id="action-instance",
             action_message_id="message-1",
@@ -393,6 +394,7 @@ async def test_observing_render_backend_can_include_graph_and_context(
     record = _read_observations(path)[0]
     assert record["graph"] == request.graph
     assert record["context"] == request.context
+    assert record["providerSessionId"] == "provider-session"
 
 
 @pytest.mark.asyncio

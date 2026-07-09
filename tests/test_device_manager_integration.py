@@ -22,17 +22,13 @@ from deckr.actions.messages import (
     OPEN_PAGE,
     PAGE_SESSION_CLOSED,
     REPLACE_PAGE,
-    SETTINGS_REQUEST,
-    SETTINGS_SNAPSHOT,
     ActionAvailabilityEntry,
     ActionDescriptor,
     CapabilityInputBody,
     DynamicPageCommand,
     PageChildBindingDescriptor,
     PageChildBindingTarget,
-    SettingsTargetRef,
     action_message,
-    action_provider_instance_subject,
     context_subject,
 )
 from deckr.concord import (
@@ -63,7 +59,6 @@ from invariant.params import ref
 from deckr.controller import _device_manager as device_manager_module
 from deckr.controller._action_availability import (
     PROVIDER_SESSION_INVALID_REASON,
-    ActionAvailabilityService,
     ActionAvailabilitySource,
     ActionAvailabilityState,
     ProviderActionKey,
@@ -97,14 +92,7 @@ PROVIDER_INSTANCE_ID = "python"
 PROVIDER_ID = "test.provider"
 PROVIDER_ADDR = action_provider_address(PROVIDER_INSTANCE_ID)
 PROVIDER_SESSION_ID = "action-provider-session"
-UNSUPPORTED_SETTINGS_PATCH = "settingsPatch"
-UNSUPPORTED_SETTINGS_REPLACE = "settingsReplace"
-_PROVIDER_SETTINGS_REQUEST_REMOVED = pytest.mark.skip(
-    reason=(
-        "provider-originated settings requests were removed; Action Runtime uses "
-        "controller-written settings views"
-    )
-)
+UNSUPPORTED_ACTION_MESSAGE = "unsupportedActionMessage"
 
 
 def _contract_pointer_for_provider_session(
@@ -260,79 +248,6 @@ def _action_command(
             page_session_id=page_session_id,
         ),
         contract=contract or _contract_pointer_for_provider_session(),
-    )
-
-
-def _provider_settings_target(
-    provider_id: str = "dev.deckr.clock",
-    *,
-    config_id: str = "test-device",
-) -> SettingsTargetRef:
-    return SettingsTargetRef(
-        scope="action_provider_instance",
-        controllerId=CONTROLLER_ID,
-        configId=config_id,
-        providerInstanceId=PROVIDER_INSTANCE_ID,
-        providerId=provider_id,
-    )
-
-
-def _provider_settings_request(
-    message_type: str,
-    target: SettingsTargetRef,
-    *,
-    sender_provider_instance_id: str = PROVIDER_INSTANCE_ID,
-    settings: dict | None = None,
-    contract: ContractPointer | None = None,
-) -> DeckrMessage:
-    body: dict = {"target": target.to_dict()}
-    if settings is not None:
-        body["settings"] = settings
-    return action_message(
-        sender=action_provider_address(sender_provider_instance_id),
-        sender_session_id=PROVIDER_SESSION_ID,
-        recipient=CONTROLLER_ADDR,
-        message_type=message_type,
-        body=body,
-        subject=action_provider_instance_subject(
-            sender_provider_instance_id,
-            provider_id=target.provider_id,
-        ),
-        contract=contract
-        or _contract_pointer_for_provider_session(
-            provider_instance_id=sender_provider_instance_id,
-            provider_id=target.provider_id,
-        ),
-    )
-
-
-def _raw_provider_settings_message(
-    message_type: str,
-    target: SettingsTargetRef,
-    *,
-    sender_provider_instance_id: str = PROVIDER_INSTANCE_ID,
-    settings: dict | None = None,
-    contract: ContractPointer | None = None,
-) -> DeckrMessage:
-    body: dict = {"target": target.to_dict()}
-    if settings is not None:
-        body["settings"] = settings
-    return DeckrMessage(
-        lane="actions",
-        messageType=message_type,
-        sender=action_provider_address(sender_provider_instance_id),
-        senderSessionId=PROVIDER_SESSION_ID,
-        recipient=endpoint_target(CONTROLLER_ADDR),
-        subject=action_provider_instance_subject(
-            sender_provider_instance_id,
-            provider_id=target.provider_id,
-        ),
-        body=body,
-        contract=contract
-        or _contract_pointer_for_provider_session(
-            provider_instance_id=sender_provider_instance_id,
-            provider_id=target.provider_id,
-        ),
     )
 
 
@@ -935,73 +850,6 @@ class MemoryConfigService:
         yield self.config
 
 
-def _provider_settings_config() -> DeviceConfig:
-    return DeviceConfig(
-        id="test-device",
-        name="Test Device",
-        match={"fingerprint": "fingerprint:test-device"},
-        provider_settings={PROVIDER_INSTANCE_ID: {"timezone": "UTC"}},
-        profiles=[Profile(name="default", pages=[Page(controls=[])])],
-    )
-
-
-def _provider_settings_device_manager(
-    *,
-    config_service: MemoryConfigService,
-    actions_bus: LaneHarness,
-    registry: MagicMock,
-    provider_sessions: ActionProviderSessionManager | None = None,
-) -> DeviceManager:
-    device = _make_mock_device()
-    actions_session = _actions_session(actions_bus)
-    availability_service = (
-        ActionAvailabilityService(
-            controller_id=CONTROLLER_ID,
-            controller_session_id=actions_session.session_id,
-            actions_bus=actions_session,
-            manager=registry,
-            start_soon=None,
-            provider_sessions=provider_sessions,
-        )
-        if provider_sessions is not None
-        else None
-    )
-    return DeviceManager(
-        controller_id=CONTROLLER_ID,
-        device=device,
-        hardware_ref=_hardware_ref(device),
-        command_service=FakeHardwareCommandService(),
-        config=config_service.config,
-        manager=registry,
-        actions_bus=actions_session,
-        start_soon=lambda fn, *a, **k: None,
-        availability_service=availability_service,
-        settings_service=ConfigBackedSettingsService(
-            controller_id=CONTROLLER_ID,
-            config_service=config_service,
-        ),
-    )
-
-
-async def _prepare_provider_settings_session(
-    provider_sessions: ActionProviderSessionManager,
-    concord: Concord,
-    *,
-    provider_id: str = "dev.deckr.clock",
-) -> ContractPointer:
-    snapshot = await provider_sessions.prepare(
-        _metadata("provider-settings", provider_id=provider_id)
-    )
-    assert snapshot is not None
-    session = next(iter(provider_sessions._sessions.values()))
-    await concord.attach(
-        session.contract,
-        participant=PROVIDER_ADDR,
-        session_id=PROVIDER_SESSION_ID,
-    )
-    return session.contract_pointer
-
-
 async def _next_action_message(
     stream: AsyncIterator[DeckrMessage],
     *,
@@ -1141,194 +989,6 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
         tg.cancel_scope.cancel()
 
 
-@pytest.mark.asyncio
-@_PROVIDER_SETTINGS_REQUEST_REMOVED
-async def test_provider_settings_request_after_beacon_loss_uses_concord_session():
-    config_service = MemoryConfigService(_provider_settings_config())
-    action_bus = _actions_bus()
-    concord = _concord(action_bus)
-    provider_sessions = _provider_session_manager(
-        concord,
-        action_bus,
-        lambda fn, *a, **k: None,
-    )
-    contract = await _prepare_provider_settings_session(provider_sessions, concord)
-    registry = MagicMock()
-    registry.provider_session_id.return_value = None
-    registry.provider_instance_provides_provider.return_value = False
-    manager = _provider_settings_device_manager(
-        config_service=config_service,
-        actions_bus=action_bus,
-        registry=registry,
-        provider_sessions=provider_sessions,
-    )
-
-    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-        await manager.handle_command(
-            _provider_settings_request(
-                SETTINGS_REQUEST,
-                _provider_settings_target(),
-                contract=contract,
-            )
-        )
-        reply = await _next_action_message(stream)
-
-    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "UTC"
-    }
-    assert reply.message_type == SETTINGS_SNAPSHOT
-    assert reply.body["settings"] == {"timezone": "UTC"}
-    registry.provider_session_id.assert_not_called()
-    registry.provider_instance_provides_provider.assert_not_called()
-
-
-@pytest.mark.asyncio
-@_PROVIDER_SETTINGS_REQUEST_REMOVED
-async def test_provider_settings_request_from_non_owning_provider_is_ignored():
-    config_service = MemoryConfigService(_provider_settings_config())
-    action_bus = _actions_bus()
-    registry = MagicMock()
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = False
-    manager = _provider_settings_device_manager(
-        config_service=config_service,
-        actions_bus=action_bus,
-        registry=registry,
-    )
-
-    async with action_bus.subscribe(action_provider_address("other")) as stream:
-        await manager.handle_command(
-            _provider_settings_request(
-                SETTINGS_REQUEST,
-                _provider_settings_target(),
-                sender_provider_instance_id="other",
-            )
-        )
-        await _assert_no_action_message(stream)
-
-    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "UTC"
-    }
-    registry.provider_instance_provides_provider.assert_not_called()
-
-
-@pytest.mark.asyncio
-@_PROVIDER_SETTINGS_REQUEST_REMOVED
-async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
-    config_service = MemoryConfigService(_provider_settings_config())
-    action_bus = _actions_bus()
-    concord = _concord(action_bus)
-    provider_sessions = _provider_session_manager(
-        concord,
-        action_bus,
-        lambda fn, *a, **k: None,
-    )
-    await _prepare_provider_settings_session(provider_sessions, concord)
-    registry = MagicMock()
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = False
-    manager = _provider_settings_device_manager(
-        config_service=config_service,
-        actions_bus=action_bus,
-        registry=registry,
-        provider_sessions=provider_sessions,
-    )
-
-    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-        await manager.handle_command(
-            _provider_settings_request(
-                SETTINGS_REQUEST,
-                _provider_settings_target("other"),
-            )
-        )
-        await _assert_no_action_message(stream)
-
-    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "UTC"
-    }
-    registry.provider_session_id.assert_not_called()
-    registry.provider_instance_provides_provider.assert_not_called()
-
-
-@pytest.mark.asyncio
-@_PROVIDER_SETTINGS_REQUEST_REMOVED
-async def test_provider_settings_rejects_invalid_concord_session():
-    config_service = MemoryConfigService(_provider_settings_config())
-    action_bus = _actions_bus()
-    concord = _concord(action_bus)
-    provider_sessions = _provider_session_manager(
-        concord,
-        action_bus,
-        lambda fn, *a, **k: None,
-    )
-    contract = await _prepare_provider_settings_session(provider_sessions, concord)
-    session = next(iter(provider_sessions._sessions.values()))
-    await concord.cancel(
-        session.contract, participant=CONTROLLER_ADDR, reason="test invalid"
-    )
-    registry = MagicMock()
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = True
-    manager = _provider_settings_device_manager(
-        config_service=config_service,
-        actions_bus=action_bus,
-        registry=registry,
-        provider_sessions=provider_sessions,
-    )
-
-    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-        await manager.handle_command(
-            _provider_settings_request(
-                SETTINGS_REQUEST,
-                _provider_settings_target(),
-                contract=contract,
-            )
-        )
-        await _assert_no_action_message(stream)
-
-    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "UTC"
-    }
-    registry.provider_session_id.assert_not_called()
-    registry.provider_instance_provides_provider.assert_not_called()
-
-
-@pytest.mark.asyncio
-@_PROVIDER_SETTINGS_REQUEST_REMOVED
-async def test_raw_settings_mutation_messages_are_ignored_without_crashing():
-    config_service = MemoryConfigService(_provider_settings_config())
-    action_bus = _actions_bus()
-    registry = MagicMock()
-    registry.provider_session_id.return_value = PROVIDER_SESSION_ID
-    registry.provider_instance_provides_provider.return_value = True
-    manager = _provider_settings_device_manager(
-        config_service=config_service,
-        actions_bus=action_bus,
-        registry=registry,
-    )
-
-    target = _provider_settings_target()
-    patch = _raw_provider_settings_message(
-        UNSUPPORTED_SETTINGS_PATCH,
-        target,
-        settings={"timezone": "Europe/Amsterdam"},
-    )
-    replace = _raw_provider_settings_message(
-        UNSUPPORTED_SETTINGS_REPLACE,
-        target,
-        settings={"timezone": "Europe/Amsterdam"},
-    )
-
-    async with action_bus.subscribe(PROVIDER_ADDR) as stream:
-        await manager.handle_command(patch)
-        await manager.handle_command(replace)
-        await _assert_no_action_message(stream)
-
-    assert config_service.config.provider_settings[PROVIDER_INSTANCE_ID] == {
-        "timezone": "UTC"
-    }
-
-
 def _settings_reload_config() -> DeviceConfig:
     return DeviceConfig(
         id="test-device",
@@ -1388,7 +1048,7 @@ def _settings_reload_selector_only_config() -> DeviceConfig:
 
 
 @pytest.mark.asyncio
-async def test_raw_action_settings_patch_for_active_binding_is_ignored():
+async def test_unsupported_action_message_for_active_binding_is_ignored():
     config_service = MemoryConfigService(_settings_reload_config())
     device = _make_mock_device()
     action_bus = _actions_bus()
@@ -1427,7 +1087,7 @@ async def test_raw_action_settings_patch_for_active_binding_is_ignored():
             await manager.handle_command(
                 DeckrMessage(
                     lane="actions",
-                    messageType=UNSUPPORTED_SETTINGS_PATCH,
+                    messageType=UNSUPPORTED_ACTION_MESSAGE,
                     sender=PROVIDER_ADDR,
                     senderSessionId=PROVIDER_SESSION_ID,
                     recipient=endpoint_target(CONTROLLER_ADDR),
@@ -2019,7 +1679,7 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
     action_bus = _actions_bus()
     monkeypatch.setattr(
         device_manager_module,
-        "SETTINGS_SNAPSHOT_TIMEOUT_SECONDS",
+        "SETTINGS_SERVICE_TIMEOUT_SECONDS",
         0.01,
     )
     manager = DeviceManager(
@@ -2048,6 +1708,71 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
     assert first.settings == {"configured": "first"}
     assert second is not None
     assert second.settings == {"configured": "second"}
+
+
+@pytest.mark.asyncio
+async def test_static_binding_lifecycle_messages_carry_settings_only_on_attach():
+    device = _make_mock_device()
+    config = DeviceConfig(
+        id="test-device",
+        name="Test Device",
+        match={"fingerprint": "fingerprint:test-device"},
+        profiles=[
+            Profile(
+                name="default",
+                pages=[
+                    Page(
+                        controls=[
+                            Control(
+                                selector={"control_id": "0,0"},
+                                action=ACTION_X_UUID,
+                                settings={"configured": "first"},
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, **_: _metadata(uuid),
+    )
+    action_bus = _actions_bus()
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=config,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(manager, _metadata(ACTION_X_UUID))
+            await manager.set_page(profile="default", page=0)
+
+            messages = await _collect_action_messages(stream)
+
+        tg.cancel_scope.cancel()
+
+    created = [
+        message
+        for message in messages
+        if message.message_type == ACTION_INSTANCE_CREATED
+    ]
+    attached = [
+        message for message in messages if message.message_type == BINDING_ATTACHED
+    ]
+    assert len(created) == 1
+    assert len(attached) == 1
+    assert "settings" not in created[0].body
+    assert "internal" not in created[0].body
+    assert attached[0].body["settings"] == {"configured": "first"}
+    assert attached[0].body["internal"] == {}
 
 
 @pytest.mark.asyncio
@@ -2965,7 +2690,7 @@ async def test_close_dynamic_page_destroys_external_action_child(
 
 
 @pytest.mark.asyncio
-async def test_replace_dynamic_page_destroys_only_removed_external_action_child(
+async def test_replace_dynamic_page_remounts_all_external_action_children(
     device_config_set_raster_image,
 ):
     device = _make_mock_device(
@@ -3035,8 +2760,9 @@ async def test_replace_dynamic_page_destroys_only_removed_external_action_child(
 
             replacement_keep = manager._binding_lease_for_control("1,0")
             assert replacement_keep is not None
-            assert replacement_keep.action_instance_id == keep_action_instance_id
-            assert keep_action_instance_id in manager._action_instances
+            assert replacement_keep.action_instance_id != keep_action_instance_id
+            assert replacement_keep.action_instance_id in manager._action_instances
+            assert keep_action_instance_id not in manager._action_instances
             assert drop_action_instance_id not in manager._action_instances
 
             messages = await _collect_action_messages(stream)
@@ -3045,14 +2771,99 @@ async def test_replace_dynamic_page_destroys_only_removed_external_action_child(
                 for message in messages
                 if message.message_type == ACTION_INSTANCE_DESTROYED
             ]
-            assert destroyed_ids == [drop_action_instance_id]
-            destroyed = next(
-                message
+            assert set(destroyed_ids) == {
+                keep_action_instance_id,
+                drop_action_instance_id,
+            }
+            destroyed_reasons = {
+                message.body["metadata"]["actionInstanceId"]: message.body["reason"]
                 for message in messages
                 if message.message_type == ACTION_INSTANCE_DESTROYED
-            )
-            assert destroyed.body["reason"] == "page_child_removed"
+            }
+            assert destroyed_reasons == {
+                keep_action_instance_id: "page_child_removed",
+                drop_action_instance_id: "page_child_removed",
+            }
         tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_page_external_child_lifecycle_attach_carries_settings(
+    device_config_set_raster_image,
+):
+    child_action_id = "test.virtual.child"
+    device = _make_mock_device(controls=[_make_control("0,0"), _make_control("1,0")])
+    action_bus = _actions_bus()
+    registry = MagicMock()
+    registry.get_action = AsyncMock(
+        side_effect=lambda uuid, provider_instance_id=None, **_: _metadata(
+            uuid,
+            provider_instance_id=provider_instance_id or PROVIDER_INSTANCE_ID,
+        )
+    )
+
+    async with anyio.create_task_group() as tg:
+        manager = DeviceManager(
+            controller_id=CONTROLLER_ID,
+            device=device,
+            hardware_ref=_hardware_ref(device),
+            command_service=FakeHardwareCommandService(),
+            config=device_config_set_raster_image,
+            manager=registry,
+            actions_bus=_actions_session(action_bus),
+            start_soon=tg.start_soon,
+        )
+        async with action_bus.subscribe(PROVIDER_ADDR) as stream:
+            _seed_action_availability(
+                manager,
+                _metadata(SetRasterImageOnAppearAction.uuid),
+                _metadata(child_action_id),
+            )
+            await manager.set_page(profile="default", page=0)
+            owner_ctx = await manager.action_contexts.get("0,0")
+            assert owner_ctx is not None
+            await _drain_action_messages(stream)
+
+            await manager.open_page(
+                descriptor=DynamicPageCommand(
+                    pageId="dynamic-page",
+                    bindings=(
+                        PageChildBindingDescriptor(
+                            controlId="1,0",
+                            target=PageChildBindingTarget(
+                                kind="action",
+                                actionId=child_action_id,
+                                providerInstanceId=PROVIDER_INSTANCE_ID,
+                                instanceKey="child",
+                            ),
+                            settings={"zoneName": "Bedroom"},
+                        ),
+                    ),
+                ),
+                context_id=owner_ctx.id,
+            )
+
+            messages = await _collect_action_messages(stream)
+
+        tg.cancel_scope.cancel()
+
+    created = [
+        message
+        for message in messages
+        if message.message_type == ACTION_INSTANCE_CREATED
+        and message.body["metadata"]["actionId"] == child_action_id
+    ]
+    attached = [
+        message
+        for message in messages
+        if message.message_type == BINDING_ATTACHED
+        and message.body["binding"]["actionId"] == child_action_id
+    ]
+    assert len(created) == 1
+    assert len(attached) == 1
+    assert "settings" not in created[0].body
+    assert attached[0].body["settings"] == {"zoneName": "Bedroom"}
+    assert attached[0].body["internal"] == {}
 
 
 @pytest.mark.asyncio
@@ -4281,8 +4092,8 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
         control_b = await manager.action_contexts.get("1,0")
         assert control_a is not None
         assert control_b is not None
-        settings_a = await control_a.controller_context.get_settings()
-        settings_b = await control_b.controller_context.get_settings()
+        settings_a = control_a.controller_context.settings
+        settings_b = control_b.controller_context.settings
         assert settings_a.control_marker == "A"
         assert settings_b.control_marker == "B"
 
@@ -4358,14 +4169,14 @@ async def test_config_reload_replaces_read_only_settings_snapshot(persistence_tm
         await manager.set_page(profile="default", page=0)
         ctx = await manager.action_contexts.get("0,0")
         assert ctx is not None
-        settings = await ctx.controller_context.get_settings()
+        settings = ctx.controller_context.settings
         assert settings.label == "from-config"
         assert settings.nested == {"role": {"page": "root"}}
 
         await manager._on_config_changed(reloaded_config)
         reloaded_ctx = await manager.action_contexts.get("0,0")
         assert reloaded_ctx is not None
-        reloaded_settings = await reloaded_ctx.controller_context.get_settings()
+        reloaded_settings = reloaded_ctx.controller_context.settings
         assert vars(reloaded_settings) == {"label": "from-reload"}
 
 

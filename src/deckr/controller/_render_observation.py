@@ -108,6 +108,7 @@ class ObservingRenderBackend:
             "overlayGeneration": _source_value(source, "overlay_generation"),
             "providerInstanceId": _source_value(source, "provider_instance_id"),
             "providerId": _source_value(source, "provider_id"),
+            "providerSessionId": _source_value(source, "provider_session_id"),
             "actionId": _source_value(source, "action_id"),
             "actionInstanceId": _source_value(source, "action_instance_id"),
             "actionMessageId": _source_value(source, "action_message_id"),

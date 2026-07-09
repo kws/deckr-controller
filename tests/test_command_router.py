@@ -281,35 +281,6 @@ async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
     )
 
 
-@pytest.mark.asyncio
-async def test_get_settings_returns_seeded_config_snapshot():
-    store = ControlStateStore(context_id="dev.slot0")
-    store.settings = {"default_only": "x", "runtime": 42}
-
-    render_service = MagicMock(spec=RenderService)
-    render_service.build_request = MagicMock(return_value=object())
-    render_dispatcher = MagicMock(spec=RenderDispatcher)
-    render_dispatcher.submit_request = AsyncMock()
-    output = _make_output()
-    image_format = RasterImageFormat(width=72, height=72)
-
-    router = CommandRouter(
-        store=store,
-        render_service=render_service,
-        render_dispatcher=render_dispatcher,
-        output=output,
-        image_format=image_format,
-        start_soon=lambda *args, **kwargs: None,
-    )
-
-    settings = await router.get_settings()
-    assert settings.default_only == "x"
-    assert settings.runtime == 42
-
-    settings_again = await router.get_settings()
-    assert settings_again.runtime == 42
-
-
 def test_command_router_does_not_expose_settings_writer():
     store = ControlStateStore(context_id="dev.slot0")
     store.settings = {"existing": 1}

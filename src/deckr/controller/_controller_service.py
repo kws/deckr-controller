@@ -12,8 +12,6 @@ from deckr.action_runtime import (
 )
 from deckr.actions.messages import (
     COMMAND_MESSAGE_TYPES,
-    SETTINGS_REQUEST,
-    SettingsRequestBody,
     subject_config_id,
 )
 from deckr.beacon import Beacon, BeaconDirectory, Candidate
@@ -220,19 +218,6 @@ class ControllerService(BaseComponent):
         if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
         config_id = subject_config_id(msg.subject)
-        if config_id is None and msg.message_type == SETTINGS_REQUEST:
-            try:
-                config_id = SettingsRequestBody.model_validate(
-                    msg.body
-                ).target.config_id
-            except ValueError:
-                logger.warning(
-                    "Ignoring invalid settings request %s from %s",
-                    msg.message_type,
-                    msg.sender,
-                    exc_info=True,
-                )
-                return
         if config_id is None:
             logger.warning(
                 "Ignoring action command %s without config subject from %s",

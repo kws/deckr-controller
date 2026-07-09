@@ -54,6 +54,7 @@ class RenderSource:
 
     provider_instance_id: str | None = None
     provider_id: str | None = None
+    provider_session_id: str | None = None
     action_id: str | None = None
     action_instance_id: str | None = None
     action_message_id: str | None = None

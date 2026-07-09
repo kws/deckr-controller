@@ -7,7 +7,6 @@ from typing import Any, Protocol
 from deckr.actions.messages import (
     SettingsProvenance,
     SettingsSchemaMetadata,
-    SettingsSnapshot,
     SettingsTargetDescription,
     SettingsTargetRef,
 )
@@ -20,6 +19,7 @@ from deckr.controller.config._data import Control, DeviceConfig
 from deckr.controller.settings._identity import (
     derive_static_action_instance_id,
 )
+from deckr.controller.settings._models import SettingsSnapshot
 
 ActionProvider = Callable[..., Awaitable[ActionMetadata | None]]
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from deckr.actions.messages import (
     DynamicPageCommand,
@@ -62,6 +63,7 @@ class DynamicPageSession:
     timeout_ms: int
     last_activity: float
     settings_target: SettingsTargetRef | None
+    generation: int = 0
 
 
 @dataclass(slots=True)
@@ -75,6 +77,7 @@ class PlannedBinding:
     item_key: str | None = None
     handler: str | None = None
     child: PageChildBindingDescriptor | None = None
+    internal: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def control_id(self) -> str:
@@ -316,6 +319,7 @@ class BindingPlanner:
                 item_key=child.item_key,
                 handler=child.handler,
                 child=child,
+                internal=child.internal,
             )
             planned.append(planned_binding)
             outcomes.append(self._binding_outcome(planned_binding))
@@ -370,6 +374,7 @@ class BindingPlanner:
         item_key: str | None = None,
         handler: str | None = None,
         child: PageChildBindingDescriptor | None = None,
+        internal: Mapping[str, Any] | None = None,
     ) -> PlannedBinding:
         action_meta = self._action_metadata_for_binding(
             action_metadata=action_metadata,
@@ -396,6 +401,7 @@ class BindingPlanner:
             item_key=item_key,
             handler=handler,
             child=child,
+            internal=dict(internal or {}),
         )
 
     def _action_metadata_for_binding(
@@ -479,6 +485,7 @@ class BindingPlanner:
             (
                 "dynamic-page",
                 page_session.page_session_id,
+                str(page_session.generation),
                 provider_key,
                 target_key,
             )

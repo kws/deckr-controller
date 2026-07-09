@@ -13,8 +13,7 @@ class GoToPageAction:
             await anyio.sleep_forever()
 
     async def on_bind(self, context: ControllerActionContext) -> None:
-        settings = await context.get_settings()
-        await context.set_title(settings.title)
+        await context.set_title(context.settings.title)
 
     async def on_unbind(self, context: ControllerActionContext, reason: str) -> None:
         del context, reason
@@ -26,8 +25,7 @@ class GoToPageAction:
     ) -> None:
         if event.event_type not in CONTROL_ACTIVATION_EVENTS:
             return
-        settings = await context.get_settings()
         await context.set_page(
-            profile=getattr(settings, "profile", "default"),
-            page=getattr(settings, "page", 0),
+            profile=getattr(context.settings, "profile", "default"),
+            page=getattr(context.settings, "page", 0),
         )

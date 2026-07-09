@@ -47,6 +47,7 @@ class ControlContext:
         action_uuid: str,
         control: ControlSurface,
         settings: Mapping[str, Any],
+        internal: Mapping[str, Any],
         manager: "DeviceManager",
         actions_bus: EndpointSession,
         start_soon: Callable[..., None],
@@ -87,6 +88,7 @@ class ControlContext:
             binding_id=metadata.binding_id,
         )
         self._store.settings = dict(thaw_json(settings))
+        self._internal = dict(thaw_json(internal))
 
         output = (
             DeviceOutput(
@@ -111,6 +113,7 @@ class ControlContext:
             manager=manager,
             context_id=self.id,
             binding_metadata=metadata,
+            settings=self._store.settings,
         )
 
     @property
@@ -120,6 +123,10 @@ class ControlContext:
     @property
     def settings(self) -> Mapping[str, Any]:
         return self._store.settings
+
+    @property
+    def internal(self) -> Mapping[str, Any]:
+        return self._internal
 
     async def _publish(self, message_type: str, body: Mapping[str, Any] | Any) -> None:
         sent = await self.manager.send_action_runtime_message(
@@ -149,6 +156,7 @@ class ControlContext:
             BindingAttachedBody(
                 binding=self.metadata,
                 settings=self._store.settings,
+                internal=self._internal,
             ),
         )
 
@@ -187,7 +195,7 @@ class ControlContext:
         await self._router.clear(generation=generation)
 
     async def refresh_raster(self) -> None:
-        await self._router.render()
+        await self._router.render(source=self._render_source("controller_refresh"))
 
     async def show_overlay(
         self,
@@ -225,4 +233,14 @@ class ControlContext:
             generation=generation,
             binding_output_generation=binding_output_generation,
             source=source,
+        )
+
+    def _render_source(self, command_type: str) -> RenderSource:
+        return RenderSource(
+            provider_instance_id=self.provider_instance_id,
+            provider_id=self.provider_id,
+            provider_session_id=self.provider_session_id,
+            action_id=self.action_uuid,
+            action_instance_id=self.action_instance_id,
+            command_type=command_type,
         )

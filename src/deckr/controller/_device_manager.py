@@ -24,8 +24,6 @@ from deckr.actions.messages import (
     PAGE_SESSION_CLOSED,
     PAGE_SESSION_OPENED,
     REPLACE_PAGE,
-    SETTINGS_REQUEST,
-    SETTINGS_SNAPSHOT,
     ActionInstanceLifecycleBody,
     ActionInstanceMetadata,
     ActionLifecycleRejectedBody,
@@ -37,7 +35,6 @@ from deckr.actions.messages import (
     MatchedCapability,
     PageSessionLifecycleBody,
     PageSessionMetadata,
-    SettingsSnapshot,
     SettingsTargetRef,
     action_body_dict,
     make_binding_id,
@@ -147,14 +144,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_WIDGET_TIMEOUT_MS = 60_000
 ACTION_INSTANCE_CREATE_TIMEOUT_SECONDS = 1.0
 BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS = 1.0
-SETTINGS_SNAPSHOT_TIMEOUT_SECONDS = 1.0
+SETTINGS_SERVICE_TIMEOUT_SECONDS = 1.0
 DETACH_NOTIFY_TIMEOUT_SECONDS = 1.0
 _ACTION_METADATA_UNSET: Any = object()
-_SETTINGS_REQUEST_TYPES = frozenset(
-    {
-        SETTINGS_REQUEST,
-    }
-)
 _IMAGE_SOURCE_SCHEMES = ("data:", "http://", "https://")
 _TERMINAL_LIFECYCLE_REJECTION_REASONS = frozenset(
     {
@@ -219,6 +211,7 @@ def _binding_output_render_source(
     return RenderSource(
         provider_instance_id=binding.provider_instance_id,
         provider_id=binding.provider_id,
+        provider_session_id=msg.sender_session_id,
         action_id=binding.action_id,
         action_instance_id=binding.action_instance_id,
         action_message_id=msg.message_id,
@@ -240,6 +233,7 @@ def _binding_overlay_render_source(
     return RenderSource(
         provider_instance_id=binding.provider_instance_id,
         provider_id=binding.provider_id,
+        provider_session_id=msg.sender_session_id,
         action_id=binding.action_id,
         action_instance_id=binding.action_instance_id,
         action_message_id=msg.message_id,
@@ -330,6 +324,8 @@ def _payload_kind_hash(params: Mapping[str, Any]) -> tuple[str, str | None]:
 class PageCommit:
     plan: PagePlan
     departing: PageStackEntry | None
+    preserve_binding_ids: frozenset[str]
+    park_binding_ids: frozenset[str]
     preserve_output_control_ids: frozenset[str]
     transition_reason: str
 
@@ -838,12 +834,23 @@ class DeviceManager:
         self,
         *,
         clear_outputs: bool = True,
+        preserve_binding_ids: frozenset[str] = frozenset(),
+        park_binding_ids: frozenset[str] = frozenset(),
         preserve_output_control_ids: frozenset[str],
         reason: str = "active_bindings",
         clear_held_input: bool = True,
     ) -> None:
         for binding_id in list(self._binding_leases):
             lease = self._binding_leases.get(binding_id)
+            if lease is not None and binding_id in preserve_binding_ids:
+                continue
+            if lease is not None and binding_id in park_binding_ids:
+                await self._park_binding(
+                    lease,
+                    reason=reason,
+                    clear_held_input=clear_held_input,
+                )
+                continue
             clear_output = clear_outputs
             if lease is not None and lease.control_id in preserve_output_control_ids:
                 clear_output = False
@@ -853,6 +860,33 @@ class DeviceManager:
                 reason=reason,
                 clear_held_input=clear_held_input,
             )
+
+    async def _park_binding(
+        self,
+        lease: BindingLease,
+        *,
+        reason: str,
+        clear_held_input: bool = True,
+    ) -> None:
+        was_active = (
+            self._attachments.active_input_lease(lease.control_id) is lease
+            or self._attachments.active_output_lease(lease.control_id) is lease
+        )
+        self._attachments.disable_binding_authority(lease)
+        logger.info(
+            "Parking binding config=%s control=%s action=%s provider=%s "
+            "binding=%s reason=%s",
+            self.config_id,
+            lease.control_id,
+            lease.action_uuid,
+            lease.provider_instance_id,
+            lease.binding_id,
+            reason,
+        )
+        if clear_held_input:
+            await self._cancel_held_inputs_for_binding(lease)
+        if was_active:
+            await self.action_contexts.delete(lease.control_id)
 
     async def _refresh_binding_output(self, lease: BindingLease, *, reason: str) -> None:
         base_output_generation = getattr(
@@ -1644,7 +1678,6 @@ class DeviceManager:
                 action_meta=action_meta,
                 action_instance_id=lease.action_instance_id,
                 context_id=lease.context_id,
-                settings=lease.context.settings,
             )
         if scope.cancel_called:
             if not had_action_instance:
@@ -1712,7 +1745,6 @@ class DeviceManager:
         action_meta: Any,
         action_instance_id: str,
         context_id: str,
-        settings: Mapping[str, Any],
     ) -> None:
         existing = self._action_instances.get(action_instance_id)
         if existing is not None and _action_instance_matches_action(
@@ -1748,7 +1780,6 @@ class DeviceManager:
         )
         await self._publish_action_instance_created(
             metadata=metadata,
-            settings=settings,
             provider_session_key_for_action=provider_session_key_for_action,
         )
 
@@ -1756,7 +1787,6 @@ class DeviceManager:
         self,
         *,
         metadata: ActionInstanceMetadata,
-        settings: Mapping[str, Any],
         provider_session_key_for_action: ProviderSessionKey | None,
     ) -> None:
         if metadata.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
@@ -1776,10 +1806,7 @@ class DeviceManager:
         sent = await self.send_action_runtime_message(
             provider_instance_id=metadata.provider_instance_id,
             message_type=ACTION_INSTANCE_CREATED,
-            body=ActionInstanceLifecycleBody(
-                metadata=metadata,
-                settings=dict(settings),
-            ),
+            body=ActionInstanceLifecycleBody(metadata=metadata),
         )
         if not sent:
             logger.warning(
@@ -1826,7 +1853,6 @@ class DeviceManager:
         )
         await self._publish_action_instance_created(
             metadata=metadata,
-            settings=lease.context.settings,
             provider_session_key_for_action=lease.provider_session_key,
         )
         with anyio.move_on_after(BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS) as scope:
@@ -1907,6 +1933,7 @@ class DeviceManager:
         settings_target_enabled: bool = True,
         item_key: str | None = None,
         handler: str | None = None,
+        internal: Mapping[str, Any] | None = None,
         action_meta: ActionMetadata | None = _ACTION_METADATA_UNSET,
     ) -> bool:
         """Resolve a binding: create ControlContext and announce the binding lease.
@@ -1971,7 +1998,7 @@ class DeviceManager:
         )
         initial_settings = dict(binding.settings)
         if self._settings_service is not None and settings_target is not None:
-            with anyio.move_on_after(SETTINGS_SNAPSHOT_TIMEOUT_SECONDS) as scope:
+            with anyio.move_on_after(SETTINGS_SERVICE_TIMEOUT_SECONDS) as scope:
                 try:
                     snapshot = await self._settings_service.get(settings_target)
                     initial_settings = dict(thaw_json(snapshot.settings))
@@ -1986,20 +2013,8 @@ class DeviceManager:
                     binding.action_uuid,
                     action_meta.provider_instance_id,
                     settings_target.key(),
-                    SETTINGS_SNAPSHOT_TIMEOUT_SECONDS,
+                    SETTINGS_SERVICE_TIMEOUT_SECONDS,
                 )
-        if (
-            settings_target is not None
-            and action_meta.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
-        ):
-            await self._action_availability_service.put_settings_view(
-                provider_instance_id=action_meta.provider_instance_id,
-                target=settings_target,
-                snapshot=SettingsSnapshot(
-                    target=settings_target,
-                    settings=initial_settings,
-                ),
-            )
         builtin_action = None
         if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
             self.manager, "get_builtin_action"
@@ -2046,6 +2061,7 @@ class DeviceManager:
             action_uuid=action_meta.uuid,
             control=control,
             settings=initial_settings,
+            internal=dict(internal or {}),
             manager=self,
             actions_bus=self._actions_bus,
             start_soon=self._start_soon,
@@ -2323,6 +2339,8 @@ class DeviceManager:
         return PageCommit(
             plan=plan,
             departing=departing,
+            preserve_binding_ids=self._preserved_binding_ids(plan),
+            park_binding_ids=self._parked_binding_ids(plan),
             preserve_output_control_ids=preserve_output_control_ids,
             transition_reason=(
                 "page_transition:"
@@ -2330,6 +2348,24 @@ class DeviceManager:
                 f"{self._describe_page_entry(arriving)}"
             ),
         )
+
+    def _preserved_binding_ids(self, plan: PagePlan) -> frozenset[str]:
+        if not isinstance(plan.entry, StaticPageRef):
+            return frozenset()
+        preserved: set[str] = set()
+        for planned in plan.bindings:
+            lease = self._matching_existing_binding_lease(plan, planned)
+            if lease is not None:
+                preserved.add(lease.binding_id)
+        return frozenset(preserved)
+
+    def _parked_binding_ids(self, plan: PagePlan) -> frozenset[str]:
+        session = plan.page_session
+        if session is None:
+            return frozenset()
+        if session.owner_binding_id not in self._binding_leases:
+            return frozenset()
+        return frozenset({session.owner_binding_id})
 
     def _preserved_output_control_ids(self, plan: PagePlan) -> frozenset[str]:
         preserved: set[str] = set()
@@ -2368,6 +2404,8 @@ class DeviceManager:
 
         if departing is not None:
             await self._revoke_active_bindings_except(
+                preserve_binding_ids=commit.preserve_binding_ids,
+                park_binding_ids=commit.park_binding_ids,
                 preserve_output_control_ids=commit.preserve_output_control_ids,
                 reason=commit.transition_reason,
             )
@@ -2418,8 +2456,14 @@ class DeviceManager:
                         control,
                         planned=planned,
                         page_id=plan.page_id,
-                    )
+                )
             return False
+        existing = self._matching_existing_binding_lease(plan, planned)
+        if existing is not None:
+            activated = await self._activate_binding(existing)
+            if activated:
+                await self._refresh_binding_output(existing, reason="binding_reused")
+            return activated
         ok = await self._try_resolve_binding(
             planned.binding,
             profile_id=plan.profile_id,
@@ -2429,6 +2473,7 @@ class DeviceManager:
             settings_target_enabled=planned.settings_target_enabled,
             item_key=planned.item_key,
             handler=planned.handler,
+            internal=planned.internal,
             action_meta=planned.action_meta,
         )
         if ok:
@@ -2445,6 +2490,37 @@ class DeviceManager:
                 page_id=plan.page_id,
             )
         return False
+
+    def _matching_existing_binding_lease(
+        self,
+        plan: PagePlan,
+        planned: PlannedBinding,
+    ) -> BindingLease | None:
+        if planned.action_meta is None:
+            return None
+        action_meta = self._action_metadata_with_current_session(planned.action_meta)
+        raster_capability_id = _selected_raster_capability_id(planned.binding)
+        for lease in tuple(self._binding_leases.values()):
+            if not lease.attached:
+                continue
+            if not _lease_matches_action(lease, action_meta):
+                continue
+            if lease.control_id != planned.control_id:
+                continue
+            if lease.action_instance_id != planned.action_instance_id:
+                continue
+            if lease.profile_id != plan.profile_id or lease.page_id != plan.page_id:
+                continue
+            if lease.page_session_id != planned.page_session_id:
+                continue
+            if lease.item_key != planned.item_key or lease.handler != planned.handler:
+                continue
+            if lease.input_capability_ids != planned.binding.input_capability_ids:
+                continue
+            if lease.raster_capability_id != raster_capability_id:
+                continue
+            return lease
+        return None
 
     async def _set_page_locked(
         self,
@@ -2489,7 +2565,11 @@ class DeviceManager:
 
         retained_plan = (
             current_frame.committed_plan
-            if current_frame is not None and current_frame.entry == entry
+            if (
+                current_frame is not None
+                and current_frame.entry == entry
+                and not replace_dynamic_page
+            )
             else None
         )
         plan = await self._build_page_plan(
@@ -2637,6 +2717,7 @@ class DeviceManager:
                 timeout_ms=timeout_ms,
                 last_activity=self._clock(),
                 settings_target=settings_target,
+                generation=0,
             )
 
             ok = await self._set_page_locked(
@@ -2685,6 +2766,7 @@ class DeviceManager:
                 pageId=current.page_id,
                 bindings=descriptor.bindings,
             )
+            current.generation += 1
             ok = await self._set_page_locked(
                 descriptor=replacement,
                 page_session=current,
@@ -3349,80 +3431,6 @@ class DeviceManager:
         )
         return None
 
-    def _settings_target_from_payload(
-        self,
-        payload: Mapping[str, Any],
-        *,
-        msg_type: str,
-        sender: object,
-    ) -> SettingsTargetRef | None:
-        target_data = payload.get("target")
-        if not isinstance(target_data, Mapping):
-            logger.warning(
-                "Ignoring invalid settings request %s from %s without target object",
-                msg_type,
-                sender,
-            )
-            return None
-        try:
-            return SettingsTargetRef.model_validate(target_data)
-        except (ValidationError, ValueError):
-            logger.warning(
-                "Ignoring invalid settings target for %s from %s",
-                msg_type,
-                sender,
-                exc_info=True,
-            )
-            return None
-
-    async def _provider_settings_authorized(
-        self,
-        *,
-        msg: DeckrMessage,
-        sender_provider_instance_id: str,
-        sender_session_id: str | None,
-        target: SettingsTargetRef,
-    ) -> bool:
-        if target.provider_instance_id != sender_provider_instance_id:
-            logger.warning(
-                "Ignoring provider settings request from %s for provider instance %s",
-                sender_provider_instance_id,
-                target.provider_instance_id,
-            )
-            return False
-        if sender_session_id is None:
-            logger.warning(
-                "Ignoring provider settings request from %s without sender session",
-                sender_provider_instance_id,
-            )
-            return False
-        session_key = self._provider_session_key_for_session(
-            provider_instance_id=sender_provider_instance_id,
-            provider_id=target.provider_id,
-            provider_session_id=sender_session_id,
-        )
-        if not await self._action_availability_service.provider_session_valid(
-            provider_instance_id=sender_provider_instance_id,
-            provider_id=target.provider_id,
-            provider_session_id=sender_session_id,
-        ):
-            logger.warning(
-                "Ignoring provider settings request from %s without valid Concord "
-                "provider session %s",
-                sender_provider_instance_id,
-                sender_session_id,
-            )
-            return False
-        if not await self._message_contract_authorized(msg, session_key):
-            logger.warning(
-                "Ignoring provider settings request from %s without matching "
-                "Concord provider-session contract %s",
-                sender_provider_instance_id,
-                sender_session_id,
-            )
-            return False
-        return True
-
     async def _action_instance_rejection_authorized(
         self,
         msg: DeckrMessage,
@@ -3450,30 +3458,6 @@ class DeviceManager:
             and msg.sender_session_id == key.provider_session_id
             and await self._message_contract_authorized(msg, key)
         )
-
-    async def _settings_snapshot_for_request(
-        self,
-        *,
-        msg_type: str,
-        target: SettingsTargetRef,
-        payload: Mapping[str, Any],
-    ) -> SettingsSnapshot | None:
-        if self._settings_service is None:
-            return None
-        try:
-            if msg_type == SETTINGS_REQUEST:
-                snapshot = await self._settings_service.get(target)
-            else:
-                return None
-        except (KeyError, ValidationError, ValueError):
-            logger.warning(
-                "Ignoring invalid settings request %s for target %s",
-                msg_type,
-                target.key(),
-                exc_info=True,
-            )
-            return None
-        return SettingsSnapshot.from_snapshot(snapshot)
 
     async def _handle_action_lifecycle_rejected(
         self,
@@ -3660,52 +3644,6 @@ class DeviceManager:
             )
             return
         msg_type = msg.message_type
-        settings_target: SettingsTargetRef | None = None
-
-        async def send_settings_response(snapshot_body: SettingsSnapshot) -> None:
-            await self._actions_bus.reply_to(
-                msg,
-                message_type=SETTINGS_SNAPSHOT,
-                body=snapshot_body.to_dict(),
-                subject=msg.subject,
-            )
-
-        if msg_type in _SETTINGS_REQUEST_TYPES:
-            sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
-            if sender_provider_instance_id is None:
-                return
-            settings_target = self._settings_target_from_payload(
-                payload,
-                msg_type=msg_type,
-                sender=msg.sender,
-            )
-            if settings_target is None:
-                return
-            if settings_target.config_id != self.config_id:
-                logger.warning(
-                    "Ignoring settings request %s from %s for config %s on manager config %s",
-                    msg_type,
-                    msg.sender,
-                    settings_target.config_id,
-                    self.config_id,
-                )
-                return
-            if settings_target.scope == "action_provider_instance":
-                if not await self._provider_settings_authorized(
-                    msg=msg,
-                    sender_provider_instance_id=sender_provider_instance_id,
-                    sender_session_id=msg.sender_session_id,
-                    target=settings_target,
-                ):
-                    return
-                snapshot_body = await self._settings_snapshot_for_request(
-                    msg_type=msg_type,
-                    target=settings_target,
-                    payload=payload,
-                )
-                if snapshot_body is not None:
-                    await send_settings_response(snapshot_body)
-                return
 
         context_id = subject_context_id(msg.subject) or ""
         if not context_id:
@@ -3799,55 +3737,12 @@ class DeviceManager:
                 )
             return
 
-        page_session = authorization.page_session
-        if page_session is not None:
-            if msg_type in _SETTINGS_REQUEST_TYPES:
-                if (
-                    self._settings_service is None
-                    or page_session.settings_target is None
-                ):
-                    return
-                target = settings_target
-                if target is None:
-                    return
-                if target.key() != page_session.settings_target.key():
-                    logger.warning(
-                        "Ignoring settings request for mismatched page target"
-                    )
-                    return
-                snapshot_body = await self._settings_snapshot_for_request(
-                    msg_type=msg_type,
-                    target=target,
-                    payload=payload,
-                )
-                if snapshot_body is not None:
-                    await send_settings_response(snapshot_body)
+        if authorization.page_session is not None:
             return
 
         lease = authorization.binding
         if lease is None:
             return
-
-        if msg_type in _SETTINGS_REQUEST_TYPES:
-            if self._settings_service is None or lease.settings_target is None:
-                return
-            target = settings_target
-            if target is None:
-                return
-            if target.key() != lease.settings_target.key():
-                logger.warning(
-                    "Ignoring settings request for mismatched binding target"
-                )
-                return
-            snapshot_body = await self._settings_snapshot_for_request(
-                msg_type=msg_type,
-                target=target,
-                payload=payload,
-            )
-            if snapshot_body is None:
-                return
-            lease.context._store.settings = dict(thaw_json(snapshot_body.settings))
-            await send_settings_response(snapshot_body)
 
     async def _handle_binding_output(
         self,

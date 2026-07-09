@@ -1,7 +1,8 @@
 """Controller action context: thin facade for builtin actions with direct access to controller."""
 
+from collections.abc import Mapping
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from deckr.actions.messages import BindingMetadata, DynamicPageCommand
 
@@ -20,11 +21,13 @@ class ControllerActionContext:
         manager: "DeviceManager",
         context_id: str,
         binding_metadata: BindingMetadata,
+        settings: Mapping[str, Any],
     ):
         self._router = router
         self._manager = manager
         self._context_id = context_id
         self.binding_metadata = binding_metadata
+        self.settings = SimpleNamespace(**settings)
         self._page_session_context_id: str | None = None
 
     async def set_title(self, text: str) -> None:
@@ -32,9 +35,6 @@ class ControllerActionContext:
 
     async def set_raster_image(self, image: str) -> None:
         await self._router.set_raster_image(image)
-
-    async def get_settings(self) -> SimpleNamespace:
-        return await self._router.get_settings()
 
     async def set_page(
         self,

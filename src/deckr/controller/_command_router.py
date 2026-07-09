@@ -3,7 +3,6 @@
 import logging
 from collections.abc import Callable
 from dataclasses import replace
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
@@ -165,9 +164,13 @@ class CommandRouter:
             request is not None,
         )
 
-    async def render(self) -> None:
+    async def render(
+        self,
+        *,
+        source: RenderSource | None = None,
+    ) -> None:
         """Trigger resolve, encode, and write after state changes."""
-        await self._render()
+        await self._render(source=_source_with_content_kind(source, self._store))
 
     async def set_title(
         self,
@@ -320,9 +323,6 @@ class CommandRouter:
             return False
         self._store.base_output_generation = generation
         return True
-
-    async def get_settings(self) -> SimpleNamespace:
-        return SimpleNamespace(**self._store.settings)
 
 
 def _source_with_content_kind(

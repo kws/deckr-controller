@@ -17,12 +17,9 @@ from deckr.action_runtime import (
     ACTION_RUNTIME_SERVICE_PROTOCOL,
     ActionRuntimeAvailabilityViewPayload,
     action_availability_view_ref,
-    action_instance_settings_view_ref,
     action_runtime_message_name,
     action_runtime_payload,
     action_runtime_provider_instance_id,
-    provider_settings_view_ref,
-    settings_view_payload,
 )
 from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
@@ -30,8 +27,6 @@ from deckr.actions.endpoints import (
 from deckr.actions.messages import (
     ActionAvailabilityEntry,
     ActionMessageBody,
-    SettingsSnapshot,
-    SettingsTargetRef,
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.lanes import EndpointSession
@@ -1367,43 +1362,6 @@ class ActionAvailabilityService:
                 "code=%s message=%s diagnostics=%s",
                 provider_instance_id,
                 name,
-                exc.code,
-                exc.message,
-                exc.diagnostics,
-            )
-            return False
-        return True
-
-    async def put_settings_view(
-        self,
-        *,
-        provider_instance_id: str,
-        target: SettingsTargetRef,
-        snapshot: SettingsSnapshot,
-    ) -> bool:
-        services = self._services
-        lease = self._runtime_leases.get(provider_instance_id)
-        if services is None or lease is None:
-            return False
-        if target.scope == "action_provider_instance":
-            view_ref = provider_settings_view_ref(lease.descriptor.service_id, target)
-        else:
-            view_ref = action_instance_settings_view_ref(
-                lease.descriptor.service_id,
-                target,
-            )
-        try:
-            await services.put_view(
-                lease,
-                view_ref,
-                settings_view_payload(snapshot),
-            )
-        except ServiceUnavailable as exc:
-            logger.warning(
-                "Could not write action runtime settings view provider=%s target=%s "
-                "code=%s message=%s diagnostics=%s",
-                provider_instance_id,
-                target.key(),
                 exc.code,
                 exc.message,
                 exc.diagnostics,

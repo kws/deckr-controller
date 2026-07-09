@@ -8,8 +8,7 @@ class NavHomeAction:
     uuid: str = "dev.deckr.controller.builtin.action.nav_home"
 
     async def on_bind(self, context: ControllerActionContext) -> None:
-        settings = await context.get_settings()
-        title = getattr(settings, "title", "Home")
+        title = getattr(context.settings, "title", "Home")
         await context.set_title(title)
 
     async def on_unbind(self, context: ControllerActionContext, reason: str) -> None:
