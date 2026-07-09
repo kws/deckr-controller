@@ -4,11 +4,16 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 import anyio
+from deckr.action_runtime import (
+    ACTION_RUNTIME_SERVICE_NAMESPACE,
+    RUNTIME_TO_CONTROLLER_MESSAGES,
+    action_runtime_body_from_service_message,
+    legacy_action_message_type,
+)
 from deckr.actions.messages import (
     COMMAND_MESSAGE_TYPES,
     SETTINGS_REQUEST,
     SettingsRequestBody,
-    action_message_for_controller,
     subject_config_id,
 )
 from deckr.beacon import Beacon, BeaconDirectory, Candidate
@@ -27,8 +32,8 @@ from deckr.concord import (
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import (
-    ACTIONS_LANE,
     HARDWARE_MESSAGES_LANE,
+    SERVICES_LANE,
     DeckrMessage,
     EndpointAddress,
     controller_address,
@@ -46,13 +51,13 @@ from deckr.hardware.profiles import (
     hardware_payload_from_advertisement,
 )
 from deckr.lanes import EndpointSession
+from deckr.services import service_body
 from deckr.substrates.nats_kv import KvUnavailable
 
 from deckr.controller._action_availability import (
     ActionAvailabilityService,
     ProviderActionKey,
 )
-from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware_service import (
     DeviceRouteRegistry,
@@ -87,6 +92,36 @@ _HARDWARE_CLAIM_TERMINAL_STATUSES = frozenset(
         ContractValidityStatus.TERMS_HASH_MISMATCH,
     }
 )
+
+
+def _action_runtime_legacy_message(msg: DeckrMessage) -> DeckrMessage | None:
+    if msg.message_type != "serviceMessage":
+        return None
+    try:
+        body = service_body(msg)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid Action Runtime service message", exc_info=True)
+        return None
+    if body.service_namespace != ACTION_RUNTIME_SERVICE_NAMESPACE:
+        return None
+    if body.name not in RUNTIME_TO_CONTROLLER_MESSAGES:
+        return None
+    try:
+        legacy_type = legacy_action_message_type(body.name)
+        legacy_body = action_runtime_body_from_service_message(body).to_dict()
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid Action Runtime payload name=%s",
+            body.name,
+            exc_info=True,
+        )
+        return None
+    return msg.model_copy(
+        update={
+            "message_type": legacy_type,
+            "body": legacy_body,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,28 +287,29 @@ class ControllerService(BaseComponent):
             await ctrl_ctx.on_action_availability_changed(changed_keys)
 
     async def _actions_subscription_loop(self, stopping: anyio.Event) -> None:
-        """Subscribe to action lane and route command messages to DeviceManagers."""
+        """Subscribe to Action Runtime service messages and route provider commands."""
         async with (
-            self._endpoint.subscribe(ACTIONS_LANE) as stream,
+            self._endpoint.subscribe(SERVICES_LANE) as stream,
             cancel_on_stopping(stopping),
         ):
             async for event in stream:
                 try:
                     if not isinstance(event, DeckrMessage):
                         continue
-                    if not action_message_for_controller(event, self._controller_id):
+                    action_event = _action_runtime_legacy_message(event)
+                    if action_event is None:
                         continue
-                    if event.message_type in COMMAND_MESSAGE_TYPES:
-                        await self._handle_action_command(event)
+                    if action_event.message_type in COMMAND_MESSAGE_TYPES:
+                        await self._handle_action_command(action_event)
                 except Exception:
                     if isinstance(event, DeckrMessage):
                         logger.exception(
-                            "Error handling action message %s from %s",
+                            "Error handling action runtime message %s from %s",
                             event.message_type,
                             event.sender,
                         )
                     else:
-                        logger.exception("Error handling action lane event")
+                        logger.exception("Error handling action runtime event")
 
     async def _hardware_input_loop(self, stopping: anyio.Event) -> None:
         async with (
@@ -844,12 +880,6 @@ class ControllerService(BaseComponent):
                 actions_bus=self._endpoint,
                 manager=self._action_registry,
                 start_soon=ctx.tg.start_soon,
-                provider_sessions=ActionProviderSessionManager(
-                    controller_id=self._controller_id,
-                    controller_session_id=self._session_id,
-                    concord=self._concord,
-                    start_soon=ctx.tg.start_soon,
-                ),
             )
             self._action_availability_service.set_availability_changed_callback(
                 self._handle_internal_action_availability_changed

@@ -14,7 +14,7 @@ from deckr.components import (
     start_components,
 )
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, MessageContractRegistry
-from deckr.contracts.messages import ACTIONS_LANE, endpoint_address
+from deckr.contracts.messages import SERVICES_LANE, endpoint_address
 from deckr.core.config import ConfigDocument
 from deckr.lanes import Lane
 from deckr.runtime import Deckr
@@ -126,7 +126,7 @@ def test_component_factory_requests_lanes_without_materialized_bucket(
     service = component_factory(context)
 
     assert isinstance(service, ControllerRuntimeService)
-    assert context.lanes == ["hardware_messages", "actions", "services"]
+    assert context.lanes == ["hardware_messages", "services"]
     assert context.bucket_policies == []
     assert service._materialized_config_bucket is None
 
@@ -140,7 +140,7 @@ def test_component_factory_creates_materialized_config_bucket(tmp_path: Path) ->
     service = component_factory(context)
 
     assert isinstance(service, ControllerRuntimeService)
-    assert context.lanes == ["hardware_messages", "actions", "services"]
+    assert context.lanes == ["hardware_messages", "services"]
     assert [policy.bucket for policy in context.bucket_policies] == [
         "controller_config"
     ]
@@ -180,19 +180,18 @@ async def test_controller_component_uses_shared_lanes() -> None:
         assert [created.name for created in result.components] == [
             "dev.deckr.controller:main"
         ]
-        assert set(result.lane_names) == {"hardware_messages", "actions", "services"}
+        assert set(result.lane_names) == {"hardware_messages", "services"}
         assert isinstance(result.get_lane("hardware_messages"), Lane)
-        assert isinstance(result.get_lane("actions"), Lane)
         assert isinstance(result.get_lane("services"), Lane)
 
 
 @pytest.mark.asyncio
-async def test_controller_runtime_keeps_actions_endpoint_open_until_children_stop() -> (
+async def test_controller_runtime_keeps_controller_endpoint_open_until_children_stop() -> (
     None
 ):
-    class BorrowedActionsEndpointComponent(BaseComponent):
+    class BorrowedEndpointComponent(BaseComponent):
         def __init__(self, endpoint) -> None:
-            super().__init__(name="borrowed-actions-endpoint")
+            super().__init__(name="borrowed-endpoint")
             self._endpoint = endpoint
             self.stop_entered = anyio.Event()
             self.release_stop = anyio.Event()
@@ -204,7 +203,7 @@ async def test_controller_runtime_keeps_actions_endpoint_open_until_children_sto
         async def stop(self) -> None:
             self.stop_entered.set()
             await self.release_stop.wait()
-            async with self._endpoint.subscribe(ACTIONS_LANE):
+            async with self._endpoint.subscribe(SERVICES_LANE):
                 self.endpoint_touched.set()
 
     lane_contracts = MessageContractRegistry(CORE_LANE_CONTRACTS.values())
@@ -235,8 +234,8 @@ async def test_controller_runtime_keeps_actions_endpoint_open_until_children_sto
             runtime_name="dev.deckr.controller:main",
             manifest=ComponentManifest(
                 component_id="dev.deckr.controller",
-                consumes=("hardware_messages", "actions"),
-                publishes=("hardware_messages", "actions"),
+                consumes=("hardware_messages", "services"),
+                publishes=("hardware_messages", "services"),
                 endpoint_slots=("controller",),
             ),
             config={},
@@ -257,7 +256,7 @@ async def test_controller_runtime_keeps_actions_endpoint_open_until_children_sto
         )
         await service.start(RunContext(tg=tg, stopping=anyio.Event()))
         assert service._endpoint is not None
-        sentinel = BorrowedActionsEndpointComponent(service._endpoint)
+        sentinel = BorrowedEndpointComponent(service._endpoint)
         await service._component_manager.add_component(sentinel)
         await service._component_manager.wait_for_state(
             sentinel,
@@ -278,7 +277,7 @@ async def test_controller_runtime_keeps_actions_endpoint_open_until_children_sto
 
         assert not stop_returned.is_set()
         assert service._endpoint is not None
-        async with service._endpoint.subscribe(ACTIONS_LANE):
+        async with service._endpoint.subscribe(SERVICES_LANE):
             pass
 
         sentinel.release_stop.set()

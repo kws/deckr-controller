@@ -13,16 +13,26 @@ from inspect import isawaitable
 from typing import Protocol
 
 import anyio
-from deckr.actions.availability import (
-    ACTION_AVAILABILITY_SERVICE_PROTOCOL,
-    ActionAvailabilityViewPayload,
-    action_availability_provider_instance_id,
+from deckr.action_runtime import (
+    ACTION_RUNTIME_SERVICE_PROTOCOL,
+    ActionRuntimeAvailabilityViewPayload,
     action_availability_view_ref,
+    action_instance_settings_view_ref,
+    action_runtime_message_name,
+    action_runtime_payload,
+    action_runtime_provider_instance_id,
+    provider_settings_view_ref,
+    settings_view_payload,
 )
 from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
 )
-from deckr.actions.messages import ActionAvailabilityEntry
+from deckr.actions.messages import (
+    ActionAvailabilityEntry,
+    ActionMessageBody,
+    SettingsSnapshot,
+    SettingsTargetRef,
+)
 from deckr.contracts.authority import ContractPointer
 from deckr.lanes import EndpointSession
 from deckr.services import (
@@ -30,6 +40,7 @@ from deckr.services import (
     ServiceBackendStatus,
     ServiceDescriptor,
     ServiceUnavailable,
+    ServiceUseLease,
     newest_service_descriptor,
     service_unavailable_ends_service_use,
 )
@@ -37,7 +48,6 @@ from deckr.services import (
 from deckr.controller._action_interest import ActionInterestSnapshot
 from deckr.controller._action_provider_sessions import (
     ProviderSessionKey,
-    provider_session_key,
 )
 from deckr.controller._binding_planner import ActionIntentKey
 from deckr.controller._settings_metadata import SettingsActionMetadata
@@ -939,6 +949,7 @@ class ActionAvailabilityService:
         self._provider_session_reconcile_scheduled = False
         self._service_watch_scopes: dict[str, anyio.CancelScope] = {}
         self._service_descriptor_keys: dict[str, tuple[str, str, str]] = {}
+        self._runtime_leases: dict[str, ServiceUseLease] = {}
         self._on_availability_changed = on_availability_changed
         if provider_sessions is not None:
             set_change_callback = getattr(provider_sessions, "set_change_callback", None)
@@ -1097,18 +1108,18 @@ class ActionAvailabilityService:
 
     def ingest_service_view_payload(
         self,
-        payload: ActionAvailabilityViewPayload | Mapping[str, object],
+        payload: ActionRuntimeAvailabilityViewPayload | Mapping[str, object],
         *,
         service_id: str | None = None,
         now: float | None = None,
     ) -> frozenset[ProviderActionKey]:
         view = (
             payload
-            if isinstance(payload, ActionAvailabilityViewPayload)
-            else ActionAvailabilityViewPayload.model_validate(payload)
+            if isinstance(payload, ActionRuntimeAvailabilityViewPayload)
+            else ActionRuntimeAvailabilityViewPayload.model_validate(payload)
         )
         if service_id is not None:
-            expected_provider = action_availability_provider_instance_id(service_id)
+            expected_provider = action_runtime_provider_instance_id(service_id)
             if (
                 expected_provider is not None
                 and expected_provider != view.provider_instance_id
@@ -1122,11 +1133,11 @@ class ActionAvailabilityService:
                 return frozenset()
         logger.debug(
             "Action availability service view received service=%s provider=%s "
-            "provider_id=%s provider_session=%s entries=%s",
+            "provider_id=%s service_session=%s entries=%s",
             service_id,
             view.provider_instance_id,
             view.provider_id,
-            view.provider_session_id,
+            view.service_session_id,
             len(view.entries),
         )
         record_now = self._now(now)
@@ -1134,7 +1145,8 @@ class ActionAvailabilityService:
             self.ingest_provider_entries(
                 provider_instance_id=view.provider_instance_id,
                 provider_id=view.provider_id,
-                provider_session_id=view.provider_session_id,
+                provider_session_id=view.service_session_id,
+                provider_labels=view.labels,
                 entries=view.entries,
                 now=record_now,
             )
@@ -1190,6 +1202,7 @@ class ActionAvailabilityService:
         provider_instance_id: str,
         provider_id: str,
         provider_session_id: str | None = None,
+        provider_labels: Mapping[str, str] | None = None,
         entries: Iterable[ActionAvailabilityEntry],
         now: float | None = None,
     ) -> frozenset[ProviderActionKey]:
@@ -1207,6 +1220,7 @@ class ActionAvailabilityService:
                 key=key,
                 provider_id=provider_id,
                 provider_session_id=provider_session_id,
+                provider_labels=provider_labels,
                 entry=entry,
             )
             mapped_intent = self._mapped_intent_for_key(key)
@@ -1324,6 +1338,79 @@ class ActionAvailabilityService:
             )
         return frozenset(changed)
 
+    async def send_runtime_message(
+        self,
+        *,
+        provider_instance_id: str,
+        message_type: str,
+        body: ActionMessageBody,
+    ) -> bool:
+        services = self._services
+        lease = self._runtime_leases.get(provider_instance_id)
+        if services is None or lease is None:
+            return False
+        name = action_runtime_message_name(message_type)
+        params, event = action_runtime_payload(name, body)
+        try:
+            await services.send(lease, name, params=params, event=event)
+        except ServiceUnavailable as exc:
+            if service_unavailable_ends_service_use(exc):
+                self._runtime_leases.pop(provider_instance_id, None)
+                changed = self.mark_provider_service_unavailable(
+                    provider_instance_id,
+                    reason=SERVICE_VIEW_UNAVAILABLE_REASON,
+                )
+                if changed:
+                    await self._notify_availability_changed(changed)
+            logger.warning(
+                "Could not send action runtime message provider=%s name=%s "
+                "code=%s message=%s diagnostics=%s",
+                provider_instance_id,
+                name,
+                exc.code,
+                exc.message,
+                exc.diagnostics,
+            )
+            return False
+        return True
+
+    async def put_settings_view(
+        self,
+        *,
+        provider_instance_id: str,
+        target: SettingsTargetRef,
+        snapshot: SettingsSnapshot,
+    ) -> bool:
+        services = self._services
+        lease = self._runtime_leases.get(provider_instance_id)
+        if services is None or lease is None:
+            return False
+        if target.scope == "action_provider_instance":
+            view_ref = provider_settings_view_ref(lease.descriptor.service_id, target)
+        else:
+            view_ref = action_instance_settings_view_ref(
+                lease.descriptor.service_id,
+                target,
+            )
+        try:
+            await services.put_view(
+                lease,
+                view_ref,
+                settings_view_payload(snapshot),
+            )
+        except ServiceUnavailable as exc:
+            logger.warning(
+                "Could not write action runtime settings view provider=%s target=%s "
+                "code=%s message=%s diagnostics=%s",
+                provider_instance_id,
+                target.key(),
+                exc.code,
+                exc.message,
+                exc.diagnostics,
+            )
+            return False
+        return True
+
     async def ensure_local_builtin_availability(
         self,
         intents: Iterable[ActionIntentKey],
@@ -1359,7 +1446,7 @@ class ActionAvailabilityService:
         services = self._services
         if services is None:
             return
-        directory = services.directory(ACTION_AVAILABILITY_SERVICE_PROTOCOL)
+        directory = services.directory(ACTION_RUNTIME_SERVICE_PROTOCOL)
         async for descriptors in directory.watch_records():
             if stopping.is_set():
                 return
@@ -1373,7 +1460,7 @@ class ActionAvailabilityService:
     ) -> None:
         candidates_by_service: dict[str, list[ServiceDescriptor]] = {}
         for descriptor in descriptors:
-            provider_instance_id = action_availability_provider_instance_id(
+            provider_instance_id = action_runtime_provider_instance_id(
                 descriptor.service_id
             )
             if provider_instance_id is None:
@@ -1388,7 +1475,7 @@ class ActionAvailabilityService:
         for service_id in sorted(set(self._service_watch_scopes) - set(active)):
             self._cancel_service_watch(
                 service_id,
-                provider_instance_id=action_availability_provider_instance_id(
+                provider_instance_id=action_runtime_provider_instance_id(
                     service_id
                 ),
                 reason=SERVICE_VIEW_UNAVAILABLE_REASON,
@@ -1400,13 +1487,13 @@ class ActionAvailabilityService:
                 continue
             self._cancel_service_watch(
                 service_id,
-                provider_instance_id=action_availability_provider_instance_id(
+                provider_instance_id=action_runtime_provider_instance_id(
                     service_id
                 ),
                 reason=SERVICE_VIEW_UNAVAILABLE_REASON,
             )
             if descriptor.backend_status == ServiceBackendStatus.UNAVAILABLE:
-                provider_instance_id = action_availability_provider_instance_id(
+                provider_instance_id = action_runtime_provider_instance_id(
                     service_id
                 )
                 if provider_instance_id is not None and self._start_soon is not None:
@@ -1434,6 +1521,11 @@ class ActionAvailabilityService:
         reason: str,
     ) -> None:
         self._service_descriptor_keys.pop(service_id, None)
+        provider_instance_id = provider_instance_id or action_runtime_provider_instance_id(
+            service_id
+        )
+        if provider_instance_id is not None:
+            self._runtime_leases.pop(provider_instance_id, None)
         scope = self._service_watch_scopes.pop(service_id, None)
         if scope is not None:
             scope.cancel()
@@ -1453,6 +1545,7 @@ class ActionAvailabilityService:
         services = self._services
         if services is None:
             return
+        provider_instance_id = action_runtime_provider_instance_id(service_id)
         with anyio.CancelScope() as scope:
             self._service_watch_scopes[service_id] = scope
             try:
@@ -1460,65 +1553,70 @@ class ActionAvailabilityService:
                 while not stopping.is_set():
                     try:
                         async with services.use(descriptor) as lease:
-                            while not stopping.is_set():
-                                try:
-                                    async for payload in services.watch_view(
-                                        lease,
-                                        view_ref,
-                                    ):
-                                        if stopping.is_set():
-                                            return
-                                        if payload is None:
-                                            provider_instance_id = (
-                                                action_availability_provider_instance_id(
-                                                    service_id
+                            if provider_instance_id is not None:
+                                self._runtime_leases[provider_instance_id] = lease
+                            try:
+                                while not stopping.is_set():
+                                    try:
+                                        async for payload in services.watch_view(
+                                            lease,
+                                            view_ref,
+                                        ):
+                                            if stopping.is_set():
+                                                return
+                                            if payload is None:
+                                                changed = (
+                                                    self.mark_provider_service_unavailable(
+                                                        provider_instance_id,
+                                                        reason=(
+                                                            SERVICE_VIEW_MISSING_REASON
+                                                        ),
+                                                    )
+                                                    if provider_instance_id is not None
+                                                    else frozenset()
                                                 )
-                                            )
-                                            changed = (
-                                                self.mark_provider_service_unavailable(
-                                                    provider_instance_id,
-                                                    reason=SERVICE_VIEW_MISSING_REASON,
+                                            else:
+                                                view = (
+                                                    ActionRuntimeAvailabilityViewPayload.model_validate(
+                                                        payload
+                                                    )
                                                 )
-                                                if provider_instance_id is not None
-                                                else frozenset()
-                                            )
-                                        else:
-                                            view = (
-                                                ActionAvailabilityViewPayload.model_validate(
-                                                    payload
+                                                changed = set(
+                                                    self.ingest_service_view_payload(
+                                                        view,
+                                                        service_id=service_id,
+                                                    )
                                                 )
-                                            )
-                                            changed = set(
-                                                self.ingest_service_view_payload(
-                                                    view,
-                                                    service_id=service_id,
+                                            if changed:
+                                                await self._notify_availability_changed(
+                                                    frozenset(changed)
                                                 )
-                                            )
-                                            changed.update(
-                                                await self._prepare_provider_sessions_for_view(
-                                                    view
-                                                )
-                                            )
-                                        if changed:
-                                            await self._notify_availability_changed(
-                                                frozenset(changed)
-                                            )
-                                except ServiceUnavailable as exc:
-                                    if service_unavailable_ends_service_use(exc):
-                                        raise
-                                    logger.warning(
-                                        "Action availability service view unavailable "
-                                        "service=%s code=%s message=%s diagnostics=%s",
-                                        service_id,
-                                        exc.code,
-                                        exc.message,
-                                        exc.diagnostics,
+                                    except ServiceUnavailable as exc:
+                                        if service_unavailable_ends_service_use(exc):
+                                            raise
+                                        logger.warning(
+                                            "Action availability service view "
+                                            "unavailable service=%s code=%s "
+                                            "message=%s diagnostics=%s",
+                                            service_id,
+                                            exc.code,
+                                            exc.message,
+                                            exc.diagnostics,
+                                        )
+                                        await anyio.sleep(_SERVICE_WATCH_RETRY_SECONDS)
+                                    else:
+                                        break
+                            finally:
+                                if provider_instance_id is not None and (
+                                    self._runtime_leases.get(provider_instance_id)
+                                    is lease
+                                ):
+                                    self._runtime_leases.pop(
+                                        provider_instance_id,
+                                        None,
                                     )
-                                    await anyio.sleep(_SERVICE_WATCH_RETRY_SECONDS)
-                                else:
-                                    break
                     except ServiceUnavailable as exc:
-                        provider_instance_id = action_availability_provider_instance_id(
+                        provider_instance_id = action_runtime_provider_instance_id(
                             service_id
                         )
                         if service_unavailable_ends_service_use(exc):
@@ -1540,70 +1638,12 @@ class ActionAvailabilityService:
                             )
                         await anyio.sleep(_SERVICE_WATCH_RETRY_SECONDS)
             finally:
+                if provider_instance_id is not None:
+                    current = self._runtime_leases.get(provider_instance_id)
+                    if current is not None and current.descriptor.service_id == service_id:
+                        self._runtime_leases.pop(provider_instance_id, None)
                 if self._service_watch_scopes.get(service_id) is scope:
                     self._service_watch_scopes.pop(service_id, None)
-
-    async def _prepare_provider_sessions_for_view(
-        self,
-        view: ActionAvailabilityViewPayload,
-    ) -> frozenset[ProviderActionKey]:
-        provider_sessions = self._provider_sessions
-        if provider_sessions is None:
-            return frozenset()
-        records = [
-            record
-            for record in self.cache.service_view_records()
-            if record.key.provider_instance_id == view.provider_instance_id
-            and record.state == ActionAvailabilityState.AVAILABLE
-            and record.metadata is not None
-            and _metadata_requires_provider_session_revalidation(record.metadata)
-        ]
-        if not records:
-            return frozenset()
-        actions = [record.metadata for record in records]
-        previous_contracts = {
-            record.key: self.contract_pointer(provider_session_key(record.metadata))
-            for record in records
-            if record.metadata is not None
-        }
-        try:
-            await provider_sessions.prepare_many(actions)
-        except Exception:
-            logger.warning(
-                "Could not prepare action provider sessions from service view "
-                "provider=%s provider_id=%s provider_session=%s",
-                view.provider_instance_id,
-                view.provider_id,
-                view.provider_session_id,
-                exc_info=True,
-            )
-            return frozenset()
-        changed: set[ProviderActionKey] = set()
-        for record in records:
-            if record.metadata is None:
-                continue
-            session_key = provider_session_key(record.metadata)
-            current_contract = self.contract_pointer(session_key)
-            previous_contract = previous_contracts.get(record.key)
-            if _contract_pointer_matches(previous_contract, current_contract):
-                continue
-            changed.add(record.key)
-            logger.info(
-                "Action availability provider session contract changed "
-                "provider=%s provider_id=%s action=%s provider_session=%s "
-                "old_contract=%s new_contract=%s",
-                record.metadata.provider_instance_id,
-                record.metadata.provider_id,
-                record.metadata.uuid,
-                record.metadata.provider_session_id,
-                (
-                    previous_contract.contract_id
-                    if previous_contract is not None
-                    else None
-                ),
-                current_contract.contract_id if current_contract is not None else None,
-            )
-        return frozenset(changed)
 
     async def _mark_unavailable_and_notify(
         self,
@@ -1626,7 +1666,20 @@ class ActionAvailabilityService:
     ) -> bool:
         provider_sessions = self._provider_sessions
         if provider_sessions is None:
-            return False
+            lease = self._runtime_leases.get(provider_instance_id)
+            if lease is None:
+                return False
+            if provider_session_id is not None and (
+                lease.descriptor.session_id != provider_session_id
+            ):
+                return False
+            if lease.descriptor.diagnostics.get("providerId") not in {None, provider_id}:
+                return False
+            try:
+                await lease.refresh()
+            except ServiceUnavailable:
+                return False
+            return True
         try:
             return await provider_sessions.valid(
                 provider_instance_id=provider_instance_id,
@@ -1669,7 +1722,15 @@ class ActionAvailabilityService:
             return None
         provider_sessions = self._provider_sessions
         if provider_sessions is None:
-            return None
+            lease = self._runtime_leases.get(key.provider_instance_id)
+            if lease is None:
+                return None
+            if lease.descriptor.session_id != key.provider_session_id:
+                return None
+            return ContractPointer(
+                contractId=lease.contract.contract_id,
+                generation=lease.contract.generation,
+            )
         if not self._provider_session_cached_ready(key):
             return None
         contract_pointer = getattr(provider_sessions, "contract_pointer", None)
@@ -1773,7 +1834,26 @@ class ActionAvailabilityService:
     def _ready_provider_session_keys(self) -> frozenset[ProviderSessionKey] | None:
         provider_sessions = self._provider_sessions
         if provider_sessions is None:
-            return None
+            if self._services is None:
+                return None
+            ready: set[ProviderSessionKey] = set()
+            for record in self.cache.service_view_records():
+                metadata = record.metadata
+                if not _metadata_requires_provider_session_revalidation(metadata):
+                    continue
+                lease = self._runtime_leases.get(metadata.provider_instance_id)
+                if lease is None:
+                    continue
+                if lease.descriptor.session_id != metadata.provider_session_id:
+                    continue
+                ready.add(
+                    ProviderSessionKey(
+                        metadata.provider_instance_id,
+                        metadata.provider_id,
+                        metadata.provider_session_id,
+                    )
+                )
+            return frozenset(ready)
         ready: set[ProviderSessionKey] = set()
         for record in self.cache.service_view_records():
             metadata = record.metadata
@@ -1823,6 +1903,7 @@ class ActionAvailabilityService:
         key: ProviderActionKey,
         provider_id: str,
         provider_session_id: str | None,
+        provider_labels: Mapping[str, str] | None,
         entry: ActionAvailabilityEntry,
     ) -> ActionMetadata | None:
         descriptor = entry.descriptor
@@ -1841,7 +1922,7 @@ class ActionAvailabilityService:
             provider_labels=(
                 candidate_metadata.provider_labels
                 if candidate_metadata is not None
-                else None
+                else dict(provider_labels or {})
             ),
             settings_schema=(
                 dict(descriptor.settings_schema)

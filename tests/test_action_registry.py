@@ -4,263 +4,105 @@ from unittest.mock import MagicMock
 
 import anyio
 import pytest
-from conftest import LaneHarness
-from deckr.actions.endpoints import action_provider_address
-from deckr.beacon import (
-    BEACON_ADVERTISEMENT_STORE_POLICY,
-    Beacon,
-    BeaconAdvertisementLease,
-    BeaconAdvertisementSpec,
-    beacon_advertisement_key,
-)
 from deckr.components import RunContext
-from deckr.profiles import ACTIONS_FEATURE_ID, ActionsBeaconPayload
 
 from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
-from deckr.controller.action_provider.events import ActionCatalogChangedEvent
 
 CONTROLLER_ID = "controller-main"
-ACTION_UUID = "test.stub.action"
-PROVIDER_INSTANCE_ID = "python-dev.deckr.clock"
-PROVIDER_ID = "dev.deckr.clock"
-TEST_NOTIFICATION_BATCH_SECONDS = 0.01
+BUILTIN_ACTION_UUID = "dev.deckr.controller.builtin.action.go_to_page"
+EXTERNAL_PROVIDER_INSTANCE_ID = "python-dev.deckr.clock"
+EXTERNAL_PROVIDER_ID = "dev.deckr.clock"
+EXTERNAL_ACTION_UUID = "dev.deckr.clock.action.time"
 
 
-def _state_bus() -> LaneHarness:
-    return LaneHarness("actions", default_endpoint="controller:controller-main")
+def _registry() -> ActionRegistry:
+    return ActionRegistry(MagicMock(), controller_id=CONTROLLER_ID)
 
 
-def _beacon(bus: LaneHarness) -> Beacon:
-    return Beacon(bus.substrate.kv_bucket(BEACON_ADVERTISEMENT_STORE_POLICY))
-
-
-def _registry(beacon: Beacon) -> ActionRegistry:
-    return ActionRegistry(
-        beacon,
-        controller_id=CONTROLLER_ID,
-        notification_batch_interval=TEST_NOTIFICATION_BATCH_SECONDS,
-    )
-
-
-def _actions_payload(
-    provider_instance_id: str = PROVIDER_INSTANCE_ID,
-    *,
-    session_id: str = "session-1",
-    action_uuid: str = ACTION_UUID,
-    provider_id: str = PROVIDER_ID,
-    labels: dict[str, str] | None = None,
-) -> ActionsBeaconPayload:
-    return ActionsBeaconPayload(
-        providerInstanceId=provider_instance_id,
-        providerEndpoint=action_provider_address(provider_instance_id),
-        providerId=provider_id,
-        sessionId=session_id,
-        labels=labels or {"room": "office"},
-        actions={
-            action_uuid: {
-                "actionId": action_uuid,
-                "name": f"Action {action_uuid}",
-                "providerId": provider_id,
-            }
-        },
-    )
-
-
-async def _advertise_actions(
-    beacon: Beacon,
-    payload: ActionsBeaconPayload | None = None,
-    *,
-    advertisement_id: str = "ad-1",
-    session_id: str = "session-1",
-) -> BeaconAdvertisementLease:
-    payload = payload or _actions_payload(session_id=session_id)
-    return await beacon.advertise(
-        BeaconAdvertisementSpec(
-            feature_id=ACTIONS_FEATURE_ID,
-            endpoint=payload.provider_endpoint,
-            session_id=payload.session_id,
-            advertisement_id=advertisement_id,
-            payload=payload.to_dict(),
-            labels=payload.labels,
+async def _start_registry(registry: ActionRegistry) -> None:
+    await registry.start(
+        RunContext(
+            tg=MagicMock(),
+            stopping=anyio.Event(),
         )
     )
 
 
-async def _run_registry(registry: ActionRegistry, callback):
-    events: list[ActionCatalogChangedEvent] = []
-
-    async def on_changed(event: ActionCatalogChangedEvent) -> None:
-        events.append(event)
-
-    registry._on_catalog_changed = on_changed
-    stopping = anyio.Event()
-    async with anyio.create_task_group() as tg:
-        registry._beacon.start(tg)
-        await registry.start(RunContext(tg=tg, stopping=stopping))
-        await callback(events)
-        tg.cancel_scope.cancel()
-
-
 @pytest.mark.asyncio
-async def test_action_registry_filters_by_provider_instance_and_labels():
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
+async def test_action_registry_loads_builtin_actions() -> None:
+    registry = _registry()
 
-    async def scenario(events):
-        del events
-        await _advertise_actions(beacon)
-        with anyio.fail_after(1):
-            while await registry.get_action(ACTION_UUID) is None:
-                await anyio.sleep(0.01)
+    await _start_registry(registry)
 
-        assert await registry.get_action(
-            ACTION_UUID,
-            provider_instance_id=PROVIDER_INSTANCE_ID,
-        )
-        assert await registry.get_action(
-            ACTION_UUID,
-            provider_labels={"room": "office"},
-        )
-        assert (
-            await registry.get_action(
-                ACTION_UUID,
-                provider_labels={"room": "kitchen"},
-            )
-            is None
-        )
-
-    await _run_registry(registry, scenario)
-
-
-@pytest.mark.asyncio
-async def test_action_registry_exposes_beacon_session_as_candidate_only():
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
-
-    async def scenario(events):
-        del events
-        old = await _advertise_actions(beacon, session_id="old")
-        with anyio.fail_after(1):
-            while (
-                candidate := registry.provider_session_candidate(
-                    PROVIDER_INSTANCE_ID,
-                    PROVIDER_ID,
-                )
-            ) is None or candidate.provider_session_id != "old":
-                await anyio.sleep(0.01)
-        assert registry.provider_instance_provides_provider(
-            PROVIDER_INSTANCE_ID, PROVIDER_ID
-        )
-
-        await old.aclose()
-        await _advertise_actions(beacon, session_id="new")
-        with anyio.fail_after(1):
-            while (
-                candidate := registry.provider_session_candidate(
-                    PROVIDER_INSTANCE_ID,
-                    PROVIDER_ID,
-                )
-            ) is None or candidate.provider_session_id != "new":
-                await anyio.sleep(0.01)
-        assert registry.provider_instance_provides_provider(
-            PROVIDER_INSTANCE_ID, PROVIDER_ID
-        )
-
-    await _run_registry(registry, scenario)
-
-
-@pytest.mark.asyncio
-async def test_action_registry_rejects_mismatched_beacon_payload_identity():
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
-    bucket = bus.substrate.kv_bucket(BEACON_ADVERTISEMENT_STORE_POLICY)
-
-    async def scenario(events):
-        await bucket.put(
-            beacon_advertisement_key(
-                feature_id=ACTIONS_FEATURE_ID,
-                advertisement_id="bad-ad",
-            ),
-            {
-                "schema": "dev.deckr.beacon.advertisement.v1",
-                "advertisementId": "bad-ad",
-                "featureId": ACTIONS_FEATURE_ID,
-                "advertiser": "action_provider:python.other",
-                "endpoint": "action_provider:python.other",
-                "sessionId": "session-1",
-                "refreshSeq": 1,
-                "ttlSeconds": 30,
-                "payload": _actions_payload().to_dict(),
-            },
-        )
-        await anyio.sleep(0.05)
-
-        assert await registry.get_action(ACTION_UUID) is None
-        assert events == []
-
-    await _run_registry(registry, scenario)
-
-
-@pytest.mark.asyncio
-async def test_action_registry_removes_actions_when_beacon_advertisement_is_withdrawn():
-    bus = _state_bus()
-    beacon = _beacon(bus)
-    registry = _registry(beacon)
-
-    async def scenario(events):
-        handle = await _advertise_actions(beacon)
-        with anyio.fail_after(1):
-            while await registry.get_action(ACTION_UUID) is None:
-                await anyio.sleep(0.01)
-
-        await handle.aclose()
-        with anyio.fail_after(1):
-            while await registry.get_action(ACTION_UUID) is not None:
-                await anyio.sleep(0.01)
-
-        assert events[-1].catalog_removed == [f"{PROVIDER_INSTANCE_ID}::{ACTION_UUID}"]
-        assert registry.provider_session_candidate(PROVIDER_INSTANCE_ID, PROVIDER_ID) is None
-
-    await _run_registry(registry, scenario)
-
-
-@pytest.mark.asyncio
-async def test_action_registry_background_loops_exit_when_stopping_is_set():
-    bus = _state_bus()
-    registry = _registry(_beacon(bus))
-    stopping = anyio.Event()
-
-    with anyio.fail_after(1):
-        async with anyio.create_task_group() as tg:
-            await registry.start(RunContext(tg=tg, stopping=stopping))
-            await anyio.sleep(0.05)
-            stopping.set()
-
-    await registry.stop()
-
-
-@pytest.mark.asyncio
-async def test_action_registry_loads_builtin_actions_without_provider_beacon_ads():
-    bus = _state_bus()
-    registry = _registry(_beacon(bus))
-    stopping = anyio.Event()
-    mock_tg = MagicMock()
-    mock_tg.start_soon = lambda fn, *a, **k: None
-
-    await registry.start(RunContext(tg=mock_tg, stopping=stopping))
-
-    goto_page = await registry.get_action(
-        "dev.deckr.controller.builtin.action.go_to_page"
-    )
-    assert goto_page is not None
-    assert goto_page.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-    descriptor = await registry.get_action_descriptor(
-        "dev.deckr.controller.builtin.action.go_to_page"
-    )
+    action = await registry.get_action(BUILTIN_ACTION_UUID)
+    assert action is not None
+    assert action.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+    descriptor = await registry.get_action_descriptor(BUILTIN_ACTION_UUID)
     assert descriptor is not None
     assert descriptor.requirements is not None
     assert descriptor.requirements[0].event_types == ("up", "press", "tap")
+
+
+@pytest.mark.asyncio
+async def test_action_registry_resolves_qualified_builtin_actions_only() -> None:
+    registry = _registry()
+
+    await _start_registry(registry)
+
+    qualified = f"{BUILTIN_ACTION_PROVIDER_ID}::{BUILTIN_ACTION_UUID}"
+    assert await registry.get_action(qualified) is not None
+    assert (
+        await registry.get_action(
+            qualified,
+            provider_instance_id=EXTERNAL_PROVIDER_INSTANCE_ID,
+        )
+        is None
+    )
+    assert (
+        await registry.get_action(
+            f"{EXTERNAL_PROVIDER_INSTANCE_ID}::{EXTERNAL_ACTION_UUID}",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_registry_does_not_resolve_external_actions_or_labels() -> None:
+    registry = _registry()
+
+    await _start_registry(registry)
+
+    assert (
+        await registry.get_action(
+            EXTERNAL_ACTION_UUID,
+            provider_instance_id=EXTERNAL_PROVIDER_INSTANCE_ID,
+        )
+        is None
+    )
+    assert (
+        await registry.get_action(
+            BUILTIN_ACTION_UUID,
+            provider_labels={"room": "office"},
+        )
+        is None
+    )
+    assert (
+        registry.provider_session_candidate(
+            EXTERNAL_PROVIDER_INSTANCE_ID,
+            EXTERNAL_PROVIDER_ID,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_registry_stop_clears_builtin_metadata() -> None:
+    registry = _registry()
+
+    await _start_registry(registry)
+    assert await registry.get_action(BUILTIN_ACTION_UUID) is not None
+
+    await registry.stop()
+
+    assert await registry.get_action(BUILTIN_ACTION_UUID) is None

@@ -5,7 +5,10 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import anyio
-from deckr.actions.endpoints import action_provider_address
+from deckr.action_runtime import (
+    ACTION_RUNTIME_SERVICE_PROTOCOL,
+    action_runtime_service_id,
+)
 from deckr.concord import (
     DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS,
     Concord,
@@ -19,11 +22,7 @@ from deckr.concord import (
     ParticipantHandle,
 )
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import controller_address
-from deckr.profiles import (
-    ACTION_PROVIDER_SESSION_PROFILE_ID,
-    ActionProviderSessionTerms,
-)
+from deckr.contracts.messages import controller_address, service_address
 
 from deckr.controller._stop_aware import cancel_on_stopping, sleep_until_stopping
 from deckr.controller.action_provider.provider import ActionMetadata
@@ -148,28 +147,23 @@ class ActionProviderSessionManager:
                 return await self._ensure_unlocked(action, key=key)
             return snapshot
 
-        provider_endpoint = action_provider_address(action.provider_instance_id)
+        provider_endpoint = service_address(
+            action_runtime_service_id(action.provider_instance_id)
+        )
         controller_endpoint = controller_address(self._controller_id)
         current_sessions = {
             str(controller_endpoint): self._controller_session_id,
-            str(provider_endpoint): key.provider_session_id,
+                str(provider_endpoint): key.provider_session_id,
         }
         agreement = await self._concord.propose(
             ConcordAgreementSpec(
-                profile=ACTION_PROVIDER_SESSION_PROFILE_ID,
+                profile=ACTION_RUNTIME_SERVICE_PROTOCOL.use_profile,
                 participants=(controller_endpoint, provider_endpoint),
                 local_participant=controller_endpoint,
                 local_session_id=self._controller_session_id,
-                terms=ActionProviderSessionTerms(
-                    sessionId=key.provider_session_id,
-                    controllerEndpoint=controller_endpoint,
-                    providerEndpoint=provider_endpoint,
-                    providerInstanceId=action.provider_instance_id,
-                    providerId=action.provider_id,
-                ),
                 current_sessions=current_sessions,
                 refresh_interval=PROVIDER_SESSION_HEARTBEAT_SECONDS,
-                log_label="ActionProviderSession",
+                log_label="ActionRuntimeServiceUse",
             ),
             start_soon=self._start_soon,
         )
@@ -317,7 +311,7 @@ class ActionProviderSessionManager:
             try:
                 async with (
                     self._concord.watch(
-                        ACTION_PROVIDER_SESSION_PROFILE_ID,
+                        ACTION_RUNTIME_SERVICE_PROTOCOL.use_profile,
                         participant=controller_endpoint,
                     ) as stream,
                     cancel_on_stopping(stopping),

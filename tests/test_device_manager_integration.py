@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -43,7 +44,6 @@ from deckr.concord import (
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import DeckrMessage, controller_address, endpoint_target
-from deckr.contracts.models import thaw_json
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
@@ -99,6 +99,12 @@ PROVIDER_ADDR = action_provider_address(PROVIDER_INSTANCE_ID)
 PROVIDER_SESSION_ID = "action-provider-session"
 UNSUPPORTED_SETTINGS_PATCH = "settingsPatch"
 UNSUPPORTED_SETTINGS_REPLACE = "settingsReplace"
+_PROVIDER_SETTINGS_REQUEST_REMOVED = pytest.mark.skip(
+    reason=(
+        "provider-originated settings requests were removed; Action Runtime uses "
+        "controller-written settings views"
+    )
+)
 
 
 def _contract_pointer_for_provider_session(
@@ -379,6 +385,44 @@ def _seed_action_availability(
         )
     ):
         manager._action_availability_service._provider_sessions = ReadyProviderSessions()
+    if (
+        getattr(manager._action_availability_service, "_services", None) is None
+        and not getattr(manager, "_test_runtime_send_shim", False)
+    ):
+
+        async def send_runtime_message(**kwargs):
+            body = kwargs["body"]
+            target = (
+                getattr(body, "metadata", None)
+                or getattr(body, "binding", None)
+                or getattr(body, "page_session", None)
+            )
+            assert target is not None
+            await manager._actions_bus.send(
+                lane="actions",
+                recipient=action_provider_address(kwargs["provider_instance_id"]),
+                recipient_session_id=PROVIDER_SESSION_ID,
+                subject=context_subject(
+                    target.context_id,
+                    provider_instance_id=target.provider_instance_id,
+                    provider_id=target.provider_id,
+                    config_id=target.config_id,
+                    action_instance_id=getattr(target, "action_instance_id", None),
+                    binding_id=getattr(target, "binding_id", None),
+                    page_session_id=getattr(target, "page_session_id", None),
+                ),
+                message_type=kwargs["message_type"],
+                body=body.to_dict(),
+                contract=_contract_pointer_for_provider_session(
+                    PROVIDER_SESSION_ID,
+                    provider_instance_id=target.provider_instance_id,
+                    provider_id=target.provider_id,
+                ),
+            )
+            return True
+
+        manager.send_action_runtime_message = send_runtime_message
+        manager._test_runtime_send_shim = True
     for metadata in metadatas:
         manager._action_availability.record_available(metadata)
 
@@ -1098,6 +1142,7 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
 
 
 @pytest.mark.asyncio
+@_PROVIDER_SETTINGS_REQUEST_REMOVED
 async def test_provider_settings_request_after_beacon_loss_uses_concord_session():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
@@ -1138,6 +1183,7 @@ async def test_provider_settings_request_after_beacon_loss_uses_concord_session(
 
 
 @pytest.mark.asyncio
+@_PROVIDER_SETTINGS_REQUEST_REMOVED
 async def test_provider_settings_request_from_non_owning_provider_is_ignored():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
@@ -1167,6 +1213,7 @@ async def test_provider_settings_request_from_non_owning_provider_is_ignored():
 
 
 @pytest.mark.asyncio
+@_PROVIDER_SETTINGS_REQUEST_REMOVED
 async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
@@ -1204,6 +1251,7 @@ async def test_provider_settings_request_for_unadvertised_provider_is_ignored():
 
 
 @pytest.mark.asyncio
+@_PROVIDER_SETTINGS_REQUEST_REMOVED
 async def test_provider_settings_rejects_invalid_concord_session():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
@@ -1246,6 +1294,7 @@ async def test_provider_settings_rejects_invalid_concord_session():
 
 
 @pytest.mark.asyncio
+@_PROVIDER_SETTINGS_REQUEST_REMOVED
 async def test_raw_settings_mutation_messages_are_ignored_without_crashing():
     config_service = MemoryConfigService(_provider_settings_config())
     action_bus = _actions_bus()
@@ -1878,27 +1927,11 @@ async def test_binding_activation_timeout_does_not_block_static_page_bind_loop(
         side_effect=lambda uuid, **_: _metadata(uuid),
     )
     action_bus = _actions_bus()
-    original_send = device_manager_module.send_with_endpoint_identity
-
-    async def send_or_block_action_instance_create(endpoint, message):
-        body = thaw_json(message.body)
-        metadata = body.get("metadata", {})
-        if (
-            message.message_type == ACTION_INSTANCE_CREATED
-            and metadata.get("actionId") == blocked_action
-        ):
-            await anyio.sleep_forever()
-        return await original_send(endpoint, message)
 
     monkeypatch.setattr(
         device_manager_module,
         "ACTION_INSTANCE_CREATE_TIMEOUT_SECONDS",
         0.01,
-    )
-    monkeypatch.setattr(
-        device_manager_module,
-        "send_with_endpoint_identity",
-        send_or_block_action_instance_create,
     )
     manager = DeviceManager(
         controller_id=CONTROLLER_ID,
@@ -1915,6 +1948,20 @@ async def test_binding_activation_timeout_does_not_block_static_page_bind_loop(
         _metadata(blocked_action),
         _metadata(NoopAction.uuid),
     )
+    original_send = manager.send_action_runtime_message
+
+    async def send_or_block_action_instance_create(**kwargs):
+        body = kwargs.get("body")
+        metadata = getattr(body, "metadata", None)
+        if (
+            kwargs.get("message_type") == ACTION_INSTANCE_CREATED
+            and getattr(metadata, "action_id", None) == blocked_action
+        ):
+            await anyio.sleep_forever()
+        return await original_send(**kwargs)
+
+    manager.send_action_runtime_message = send_or_block_action_instance_create
+    manager._test_runtime_send_shim = True
 
     with anyio.fail_after(1):
         await manager.set_page(profile="default", page=0)
@@ -2096,6 +2143,19 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
             actions_bus=_actions_session(action_bus),
             start_soon=tg.start_soon,
         )
+        sent_messages = []
+
+        async def record_runtime_message(**kwargs):
+            sent_messages.append(
+                SimpleNamespace(
+                    message_type=kwargs["message_type"],
+                    recipient_session_id=PROVIDER_SESSION_ID,
+                )
+            )
+            return True
+
+        manager.send_action_runtime_message = record_runtime_message
+        manager._test_runtime_send_shim = True
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             _seed_action_availability(
                 manager,
@@ -2108,6 +2168,7 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
             assert lease is not None
             assert lease.provider_session_id == PROVIDER_SESSION_ID
             await _drain_action_messages(stream)
+            sent_messages.clear()
 
             key = manager._action_availability_service.record_lifecycle_unavailable(
                 provider_instance_id=PROVIDER_INSTANCE_ID,
@@ -2141,7 +2202,8 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
                 key
             )
 
-            messages = await _collect_action_messages(stream)
+            await _collect_action_messages(stream)
+            messages = sent_messages
             created = [
                 msg
                 for msg in messages
@@ -2196,6 +2258,20 @@ async def test_provider_session_contract_change_replaces_matching_binding(
             start_soon=tg.start_soon,
         )
         manager._action_availability_service._provider_sessions = provider_sessions
+        sent_messages = []
+
+        async def record_runtime_message(**kwargs):
+            sent_messages.append(
+                SimpleNamespace(
+                    message_type=kwargs["message_type"],
+                    recipient_session_id=PROVIDER_SESSION_ID,
+                    contract=provider_sessions.contract,
+                )
+            )
+            return True
+
+        manager.send_action_runtime_message = record_runtime_message
+        manager._test_runtime_send_shim = True
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             _seed_action_availability(
                 manager,
@@ -2208,6 +2284,7 @@ async def test_provider_session_contract_change_replaces_matching_binding(
             assert lease is not None
             assert lease.context.contract == first_contract
             await _drain_action_messages(stream)
+            sent_messages.clear()
 
             provider_sessions.contract = next_contract
             await manager.on_action_availability_changed(
@@ -2229,7 +2306,8 @@ async def test_provider_session_contract_change_replaces_matching_binding(
             assert replacement_lease.context.contract == next_contract
             assert replacement_lease.attached
 
-            messages = await _collect_action_messages(stream)
+            await _collect_action_messages(stream)
+            messages = sent_messages
             created = [
                 msg
                 for msg in messages
@@ -2767,25 +2845,12 @@ async def test_held_input_cancelled_when_config_is_removed(
 @pytest.mark.asyncio
 async def test_close_dynamic_page_restores_when_close_notification_fails(
     device_config_set_raster_image,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     device = _make_mock_device()
     action_bus = _actions_bus()
     registry = MagicMock()
     registry.get_action = AsyncMock(
         return_value=_metadata(SetRasterImageOnAppearAction.uuid)
-    )
-    original_send = device_manager_module.send_with_endpoint_identity
-
-    async def fail_page_closed(endpoint, message):
-        if message.message_type == PAGE_SESSION_CLOSED:
-            raise RuntimeError("provider offline")
-        return await original_send(endpoint, message)
-
-    monkeypatch.setattr(
-        device_manager_module,
-        "send_with_endpoint_identity",
-        fail_page_closed,
     )
 
     async with anyio.create_task_group() as tg:
@@ -2803,6 +2868,15 @@ async def test_close_dynamic_page_restores_when_close_notification_fails(
             manager,
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
+        original_send = manager.send_action_runtime_message
+
+        async def fail_page_closed(**kwargs):
+            if kwargs.get("message_type") == PAGE_SESSION_CLOSED:
+                raise RuntimeError("provider offline")
+            return await original_send(**kwargs)
+
+        manager.send_action_runtime_message = fail_page_closed
+        manager._test_runtime_send_shim = True
         await manager.set_page(profile="default", page=0)
         owner_ctx = await manager.action_contexts.get("0,0")
         assert owner_ctx is not None

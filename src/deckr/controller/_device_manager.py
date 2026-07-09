@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
+from deckr.action_runtime import action_runtime_provider_instance_id
 from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
-    action_provider_address,
     parse_action_provider_address,
 )
 from deckr.actions.messages import (
@@ -40,8 +40,6 @@ from deckr.actions.messages import (
     SettingsSnapshot,
     SettingsTargetRef,
     action_body_dict,
-    action_message,
-    context_subject,
     make_binding_id,
     make_context_id,
     make_dynamic_page_id,
@@ -56,7 +54,7 @@ from deckr.actions.messages import (
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import (
     DeckrMessage,
-    controller_address,
+    parse_service_address,
 )
 from deckr.contracts.models import thaw_json
 from deckr.core.util.anyio import AsyncMap
@@ -120,7 +118,6 @@ from deckr.controller._device_layout import (
     control_surface_for_raster_capability,
     raster_controls,
 )
-from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._event_translator import EventTranslator
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._navigation_service import (
@@ -1273,6 +1270,21 @@ class DeviceManager:
     ) -> ContractPointer | None:
         return self._action_availability_service.contract_pointer(key)
 
+    async def send_action_runtime_message(
+        self,
+        *,
+        provider_instance_id: str,
+        message_type: str,
+        body,
+    ) -> bool:
+        if provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return False
+        return await self._action_availability_service.send_runtime_message(
+            provider_instance_id=provider_instance_id,
+            message_type=message_type,
+            body=body,
+        )
+
     def _provider_session_key_for_session(
         self,
         *,
@@ -1761,30 +1773,22 @@ class DeviceManager:
                 metadata.provider_instance_id,
             )
             return
-        msg = action_message(
-            sender=controller_address(self._controller_id),
-            sender_session_id=self._actions_bus.session_id,
-            recipient=action_provider_address(metadata.provider_instance_id),
-            recipient_session_id=(
-                provider_session_key_for_action.provider_session_id
-                if provider_session_key_for_action is not None
-                else None
-            ),
+        sent = await self.send_action_runtime_message(
+            provider_instance_id=metadata.provider_instance_id,
             message_type=ACTION_INSTANCE_CREATED,
             body=ActionInstanceLifecycleBody(
                 metadata=metadata,
                 settings=dict(settings),
             ),
-            subject=context_subject(
-                metadata.context_id or "",
-                provider_instance_id=metadata.provider_instance_id,
-                provider_id=metadata.provider_id,
-                config_id=metadata.config_id,
-                action_instance_id=metadata.action_instance_id,
-            ),
-            contract=contract,
         )
-        await send_with_endpoint_identity(self._actions_bus, msg)
+        if not sent:
+            logger.warning(
+                "Skipping action instance create without live Action Runtime lease "
+                "config=%s actionInstance=%s provider=%s",
+                self.config_id,
+                metadata.action_instance_id,
+                metadata.provider_instance_id,
+            )
 
     async def _recover_binding_lifecycle(
         self,
@@ -1874,27 +1878,19 @@ class DeviceManager:
                 provider_instance_id,
             )
             return
-        msg = action_message(
-            sender=controller_address(self._controller_id),
-            sender_session_id=self._actions_bus.session_id,
-            recipient=action_provider_address(provider_instance_id),
-            recipient_session_id=(
-                provider_session_key_for_action.provider_session_id
-                if provider_session_key_for_action is not None
-                else None
-            ),
+        sent = await self.send_action_runtime_message(
+            provider_instance_id=provider_instance_id,
             message_type=ACTION_INSTANCE_DESTROYED,
             body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
-            subject=context_subject(
-                metadata.context_id or "",
-                provider_instance_id=metadata.provider_instance_id,
-                provider_id=metadata.provider_id,
-                config_id=self.config_id,
-                action_instance_id=metadata.action_instance_id,
-            ),
-            contract=contract,
         )
-        await send_with_endpoint_identity(self._actions_bus, msg)
+        if not sent:
+            logger.warning(
+                "Skipping action instance destroy without live Action Runtime lease "
+                "config=%s actionInstance=%s provider=%s",
+                self.config_id,
+                metadata.action_instance_id,
+                provider_instance_id,
+            )
 
     async def _destroy_all_action_instances(self, *, reason: str) -> None:
         for action_instance_id in list(self._action_instances):
@@ -1992,6 +1988,18 @@ class DeviceManager:
                     settings_target.key(),
                     SETTINGS_SNAPSHOT_TIMEOUT_SECONDS,
                 )
+        if (
+            settings_target is not None
+            and action_meta.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
+        ):
+            await self._action_availability_service.put_settings_view(
+                provider_instance_id=action_meta.provider_instance_id,
+                target=settings_target,
+                snapshot=SettingsSnapshot(
+                    target=settings_target,
+                    settings=initial_settings,
+                ),
+            )
         builtin_action = None
         if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID and hasattr(
             self.manager, "get_builtin_action"
@@ -2171,28 +2179,14 @@ class DeviceManager:
                 session.owner_provider_instance_id,
             )
             return
-        msg = action_message(
-            sender=controller_address(self._controller_id),
-            sender_session_id=self._actions_bus.session_id,
-            recipient=action_provider_address(session.owner_provider_instance_id),
-            recipient_session_id=session.owner_provider_session_id,
-            message_type=PAGE_SESSION_OPENED,
-            body=PageSessionLifecycleBody(
-                pageSession=self._page_session_metadata(session)
-            ),
-            subject=context_subject(
-                session.context_id,
-                provider_instance_id=session.owner_provider_instance_id,
-                provider_id=session.owner_provider_id,
-                config_id=self.config_id,
-                action_instance_id=session.action_instance_id,
-                page_session_id=session.page_session_id,
-            ),
-            causation_id=causation_id,
-            contract=contract,
-        )
         try:
-            await send_with_endpoint_identity(self._actions_bus, msg)
+            await self.send_action_runtime_message(
+                provider_instance_id=session.owner_provider_instance_id,
+                message_type=PAGE_SESSION_OPENED,
+                body=PageSessionLifecycleBody(
+                    pageSession=self._page_session_metadata(session)
+                ),
+            )
         except Exception:
             logger.exception(
                 "Error notifying provider of page open config=%s pageSession=%s",
@@ -2225,29 +2219,15 @@ class DeviceManager:
                 session.owner_provider_instance_id,
             )
             return
-        msg = action_message(
-            sender=controller_address(self._controller_id),
-            sender_session_id=self._actions_bus.session_id,
-            recipient=action_provider_address(session.owner_provider_instance_id),
-            recipient_session_id=session.owner_provider_session_id,
-            message_type=PAGE_SESSION_CLOSED,
-            body=PageSessionLifecycleBody(
-                pageSession=self._page_session_metadata(session),
-                reason=reason,
-            ),
-            subject=context_subject(
-                session.context_id,
-                provider_instance_id=session.owner_provider_instance_id,
-                provider_id=session.owner_provider_id,
-                config_id=self.config_id,
-                action_instance_id=session.action_instance_id,
-                page_session_id=session.page_session_id,
-            ),
-            causation_id=causation_id,
-            contract=contract,
-        )
         try:
-            await send_with_endpoint_identity(self._actions_bus, msg)
+            await self.send_action_runtime_message(
+                provider_instance_id=session.owner_provider_instance_id,
+                message_type=PAGE_SESSION_CLOSED,
+                body=PageSessionLifecycleBody(
+                    pageSession=self._page_session_metadata(session),
+                    reason=reason,
+                ),
+            )
         except Exception:
             logger.exception(
                 "Error notifying provider of page close config=%s pageSession=%s reason=%s",
@@ -3184,6 +3164,13 @@ class DeviceManager:
 
     def _command_sender_provider_instance_id(self, msg: DeckrMessage) -> str | None:
         provider_instance_id = parse_action_provider_address(msg.sender)
+        if provider_instance_id is None:
+            service_id = parse_service_address(msg.sender)
+            provider_instance_id = (
+                action_runtime_provider_instance_id(service_id)
+                if service_id is not None
+                else None
+            )
         if provider_instance_id is None:
             logger.warning(
                 "Ignoring action command %s from non-provider sender %s",

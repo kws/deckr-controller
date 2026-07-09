@@ -1,4 +1,4 @@
-"""Internal controller events for action-provider catalog state."""
+"""Internal controller events for action availability cache changes."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class ProviderSessionSuccession:
 
 @dataclass(frozen=True)
 class ActionCatalogChangedEvent:
-    """Emitted by ActionRegistry when Beacon catalog snapshots change."""
+    """Emitted when controller-side action metadata snapshots change."""
 
     catalog_added: list[str]
     catalog_removed: list[str]

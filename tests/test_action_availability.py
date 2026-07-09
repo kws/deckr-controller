@@ -8,12 +8,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
-from deckr.actions.availability import (
-    ACTION_AVAILABILITY_SERVICE_PROTOCOL,
-    ActionAvailabilityViewPayload,
-    action_availability_service_id,
+from deckr.action_runtime import (
+    ACTION_RUNTIME_SERVICE_PROTOCOL,
+    ActionRuntimeAvailabilityViewPayload,
+    action_runtime_service_id,
 )
-from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import (
     ActionAvailabilityEntry,
     ActionDescriptor,
@@ -192,8 +191,8 @@ def _service_descriptor(
     refresh_seq: int = 1,
     backend_status: ServiceBackendStatus = ServiceBackendStatus.AVAILABLE,
 ) -> ServiceDescriptor:
-    service_id = action_availability_service_id(provider_instance_id)
-    protocol = ACTION_AVAILABILITY_SERVICE_PROTOCOL
+    service_id = action_runtime_service_id(provider_instance_id)
+    protocol = ACTION_RUNTIME_SERVICE_PROTOCOL
     return ServiceDescriptor(
         candidate=SimpleNamespace(
             key=f"advertisements.by_feature.test.{advertisement_id}",
@@ -214,6 +213,26 @@ def _service_descriptor(
         views={},
         backend_status=backend_status,
         diagnostics={},
+    )
+
+
+def _availability_view(
+    provider_instance_id: str,
+    *,
+    provider_id: str = "provider.test",
+    service_session_id: str = PROVIDER_SESSION_ID,
+    labels: dict[str, str] | None = None,
+    entries: tuple[ActionAvailabilityEntry, ...] = (),
+) -> ActionRuntimeAvailabilityViewPayload:
+    service_id = action_runtime_service_id(provider_instance_id)
+    return ActionRuntimeAvailabilityViewPayload(
+        providerInstanceId=provider_instance_id,
+        serviceId=service_id,
+        serviceEndpoint=service_address(service_id),
+        providerId=provider_id,
+        serviceSessionId=service_session_id,
+        labels=labels or {},
+        entries=entries,
     )
 
 
@@ -457,7 +476,7 @@ def test_service_watchers_prefer_newest_duplicate_service_descriptor():
         manager=MagicMock(),
         start_soon=lambda fn, *args: scheduled.append((fn, args)),
     )
-    service_id = action_availability_service_id("provider-alpha")
+    service_id = action_runtime_service_id("provider-alpha")
     stopping = object()
     newest = _service_descriptor(
         "provider-alpha",
@@ -500,12 +519,9 @@ def test_service_ingests_action_availability_view_payload():
         start_soon=None,
     )
     key = ProviderActionKey("provider-alpha", "action.alpha")
-    service_id = action_availability_service_id("provider-alpha")
-    payload = ActionAvailabilityViewPayload(
-        providerInstanceId="provider-alpha",
-        providerEndpoint=action_provider_address("provider-alpha"),
-        providerId="provider.test",
-        providerSessionId=PROVIDER_SESSION_ID,
+    service_id = action_runtime_service_id("provider-alpha")
+    payload = _availability_view(
+        "provider-alpha",
         entries=(
             ActionAvailabilityEntry(
                 actionId="action.alpha",
@@ -533,11 +549,8 @@ def test_service_ingests_action_availability_view_payload():
     assert record.metadata.settings_schema == {"type": "object"}
 
     changed = service.ingest_service_view_payload(
-        ActionAvailabilityViewPayload(
-            providerInstanceId="provider-alpha",
-            providerEndpoint=action_provider_address("provider-alpha"),
-            providerId="provider.test",
-            providerSessionId=PROVIDER_SESSION_ID,
+        _availability_view(
+            "provider-alpha",
             entries=(
                 ActionAvailabilityEntry(
                     actionId="action.alpha",
@@ -559,13 +572,7 @@ def test_service_ingests_action_availability_view_payload():
     assert planning.unavailable == frozenset({_intent("action.alpha")})
 
     changed = service.ingest_service_view_payload(
-        ActionAvailabilityViewPayload(
-            providerInstanceId="provider-alpha",
-            providerEndpoint=action_provider_address("provider-alpha"),
-            providerId="provider.test",
-            providerSessionId=PROVIDER_SESSION_ID,
-            entries=(),
-        ),
+        _availability_view("provider-alpha"),
         service_id=service_id,
     )
 
@@ -590,11 +597,10 @@ def test_service_view_same_action_from_multiple_providers_stays_distinct():
     intent = _intent("action.shared")
 
     service.ingest_service_view_payload(
-        ActionAvailabilityViewPayload(
-            providerInstanceId="provider-alpha",
-            providerEndpoint=action_provider_address("provider-alpha"),
-            providerId="provider.alpha",
-            providerSessionId="alpha-provider-session",
+        _availability_view(
+            "provider-alpha",
+            provider_id="provider.alpha",
+            service_session_id="alpha-provider-session",
             entries=(
                 ActionAvailabilityEntry(
                     actionId="action.shared",
@@ -603,14 +609,13 @@ def test_service_view_same_action_from_multiple_providers_stays_distinct():
                 ),
             ),
         ),
-        service_id=action_availability_service_id("provider-alpha"),
+        service_id=action_runtime_service_id("provider-alpha"),
     )
     service.ingest_service_view_payload(
-        ActionAvailabilityViewPayload(
-            providerInstanceId="provider-beta",
-            providerEndpoint=action_provider_address("provider-beta"),
-            providerId="provider.beta",
-            providerSessionId="beta-provider-session",
+        _availability_view(
+            "provider-beta",
+            provider_id="provider.beta",
+            service_session_id="beta-provider-session",
             entries=(
                 ActionAvailabilityEntry(
                     actionId="action.shared",
@@ -619,7 +624,7 @@ def test_service_view_same_action_from_multiple_providers_stays_distinct():
                 ),
             ),
         ),
-        service_id=action_availability_service_id("provider-beta"),
+        service_id=action_runtime_service_id("provider-beta"),
     )
 
     default_snapshot = service.planning_snapshot((intent,))
@@ -708,7 +713,7 @@ async def test_service_view_watch_missing_view_keeps_service_use_lease_open(
         ),
         now=0.0,
     )
-    service_id = action_availability_service_id("provider-alpha")
+    service_id = action_runtime_service_id("provider-alpha")
     descriptor = _service_descriptor(
         "provider-alpha",
         session_id="provider-session",
@@ -772,18 +777,15 @@ async def test_service_view_watch_recovers_from_missing_view_on_same_lease(
         ),
         now=0.0,
     )
-    service_id = action_availability_service_id("provider-alpha")
+    service_id = action_runtime_service_id("provider-alpha")
     descriptor = _service_descriptor(
         "provider-alpha",
         session_id="provider-session",
         updated_at=datetime(2026, 1, 2, tzinfo=UTC),
         advertisement_id="availability",
     )
-    payload = ActionAvailabilityViewPayload(
-        providerInstanceId="provider-alpha",
-        providerEndpoint=action_provider_address("provider-alpha"),
-        providerId="provider.test",
-        providerSessionId=PROVIDER_SESSION_ID,
+    payload = _availability_view(
+        "provider-alpha",
         entries=(
             ActionAvailabilityEntry(
                 actionId="action.alpha",
@@ -851,18 +853,15 @@ async def test_service_view_watch_transient_unavailable_keeps_same_service_use_l
         ),
         now=0.0,
     )
-    service_id = action_availability_service_id("provider-alpha")
+    service_id = action_runtime_service_id("provider-alpha")
     descriptor = _service_descriptor(
         "provider-alpha",
         session_id="provider-session",
         updated_at=datetime(2026, 1, 2, tzinfo=UTC),
         advertisement_id="availability",
     )
-    payload = ActionAvailabilityViewPayload(
-        providerInstanceId="provider-alpha",
-        providerEndpoint=action_provider_address("provider-alpha"),
-        providerId="provider.test",
-        providerSessionId=PROVIDER_SESSION_ID,
+    payload = _availability_view(
+        "provider-alpha",
         entries=(
             ActionAvailabilityEntry(
                 actionId="action.alpha",
@@ -939,7 +938,7 @@ async def test_service_view_watch_terminal_unavailable_closes_lease_and_retries(
         ),
         now=0.0,
     )
-    service_id = action_availability_service_id("provider-alpha")
+    service_id = action_runtime_service_id("provider-alpha")
     descriptor = _service_descriptor(
         "provider-alpha",
         session_id="provider-session",
@@ -1196,49 +1195,19 @@ async def test_provider_session_ready_transition_notifies_and_unlocks_planning()
 
 
 @pytest.mark.asyncio
-async def test_service_view_prepare_reports_provider_session_contract_change():
-    metadata = _metadata(
-        "action.alpha",
-        provider_instance_id="provider-alpha",
-        provider_id="provider.test",
-        provider_session_id="negotiating-session",
-    )
+async def test_service_view_ingest_records_runtime_service_session():
     key = ProviderActionKey("provider-alpha", "action.alpha")
     actions_bus = _actions_bus()
-    provider_sessions = _provider_sessions_mock()
-    first_contract = ContractPointer(contractId="provider-session-contract-1", generation=1)
-    next_contract = ContractPointer(contractId="provider-session-contract-2", generation=1)
-    contract_state = {"value": first_contract}
-
-    async def prepare_many(actions):
-        contract_state["value"] = next_contract
-        return {
-            _provider_session_key(action): SimpleNamespace(
-                key=_provider_session_key(action),
-                ready=True,
-                terminal=False,
-            )
-            for action in tuple(actions)
-        }
-
-    provider_sessions.prepare_many = AsyncMock(side_effect=prepare_many)
-    provider_sessions.contract_pointer.side_effect = (
-        lambda _key: contract_state["value"]
-    )
     service = ActionAvailabilityService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         actions_bus=actions_bus,
         manager=MagicMock(),
-        provider_sessions=provider_sessions,
         start_soon=None,
     )
-    service.cache.record_available(metadata, now=0.0)
-    view = ActionAvailabilityViewPayload(
-        providerInstanceId="provider-alpha",
-        providerEndpoint=action_provider_address("provider-alpha"),
-        providerId="provider.test",
-        providerSessionId="negotiating-session",
+    view = _availability_view(
+        "provider-alpha",
+        service_session_id="negotiating-session",
         entries=(
             ActionAvailabilityEntry(
                 actionId="action.alpha",
@@ -1248,9 +1217,16 @@ async def test_service_view_prepare_reports_provider_session_contract_change():
         ),
     )
 
-    changed = await service._prepare_provider_sessions_for_view(view)
+    changed = service.ingest_service_view_payload(
+        view,
+        service_id=action_runtime_service_id("provider-alpha"),
+    )
 
     assert changed == frozenset({key})
+    record = service.cache.record_for(key)
+    assert record is not None
+    assert record.metadata is not None
+    assert record.metadata.provider_session_id == "negotiating-session"
 
 
 @pytest.mark.asyncio

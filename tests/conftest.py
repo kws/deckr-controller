@@ -4,8 +4,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import pytest
-from deckr.contracts.lanes import CORE_LANE_CONTRACTS, MessageContractRegistry
+from deckr.contracts.lanes import (
+    ACTION_MESSAGE_TYPES,
+    CORE_LANE_CONTRACTS,
+    MessageContract,
+    MessageContractRegistry,
+)
 from deckr.contracts.messages import (
+    ACTIONS_LANE,
     DeckrMessage,
     EndpointAddress,
     parse_endpoint_address,
@@ -36,10 +42,27 @@ class LaneHarness:
     """Small test helper backed by endpoint-bound Deckr lanes."""
 
     def __init__(self, lane_name: str, *, default_endpoint: str | EndpointAddress):
-        lane_contracts = MessageContractRegistry(CORE_LANE_CONTRACTS.values())
+        contracts = dict(CORE_LANE_CONTRACTS)
+        if lane_name == ACTIONS_LANE:
+            contracts[ACTIONS_LANE] = MessageContract(
+                lane=ACTIONS_LANE,
+                message_types=ACTION_MESSAGE_TYPES,
+                allowed_sender_families=frozenset({"action_provider", "controller"}),
+                allowed_recipient_families=frozenset(
+                    {"action_provider", "controller"}
+                ),
+            )
+        lane_contracts = MessageContractRegistry(contracts.values())
         substrate = MemoryLaneSubstrate(lane_contracts=lane_contracts)
         self.substrate = substrate
-        self.deckr = Deckr(lane_contracts=lane_contracts, message_bus=substrate)
+        lanes = tuple(CORE_LANE_CONTRACTS)
+        if lane_name not in CORE_LANE_CONTRACTS:
+            lanes = (*lanes, lane_name)
+        self.deckr = Deckr(
+            lane_contracts=lane_contracts,
+            lanes=lanes,
+            message_bus=substrate,
+        )
         self.lane = self.deckr.lane(lane_name)
         self.lane_name = lane_name
         self.default_endpoint = parse_endpoint_address(default_endpoint)

@@ -17,13 +17,11 @@ from deckr.components import (
     RunContext,
 )
 from deckr.concord import Concord
-from deckr.contracts.lanes import SERVICE_LANE_CONTRACT
-from deckr.contracts.messages import ACTIONS_LANE, HARDWARE_MESSAGES_LANE, SERVICES_LANE
+from deckr.contracts.messages import HARDWARE_MESSAGES_LANE, SERVICES_LANE
 from deckr.lanes import EndpointSession
 from deckr.services import DeckrServices
 
 from deckr.controller._action_availability import ActionAvailabilityService
-from deckr.controller._action_provider_sessions import ActionProviderSessionManager
 from deckr.controller._config_document import (
     ControllerRuntimeConfig,
     parse_controller_config,
@@ -121,12 +119,6 @@ class ControllerRuntimeService(BaseComponent):
                 services=services,
                 close_services_on_aclose=True,
                 start_soon=ctx.tg.start_soon,
-                provider_sessions=ActionProviderSessionManager(
-                    controller_id=self._runtime.controller_id,
-                    controller_session_id=self._endpoint.session_id,
-                    concord=self._concord,
-                    start_soon=ctx.tg.start_soon,
-                ),
             )
             settings_service = build_settings_service(
                 self._runtime.config,
@@ -225,7 +217,6 @@ def component_factory(context: ComponentContext):
         controller_id=context.require_endpoint_id("controller"),
     )
     context.require_lane(HARDWARE_MESSAGES_LANE)
-    context.require_lane(ACTIONS_LANE)
     context.require_lane(SERVICES_LANE)
 
     materialized_config_bucket = None
@@ -248,9 +239,8 @@ def component_factory(context: ComponentContext):
 component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="dev.deckr.controller",
-        consumes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE, SERVICES_LANE),
-        publishes=(HARDWARE_MESSAGES_LANE, ACTIONS_LANE, SERVICES_LANE),
-        lane_contracts=(SERVICE_LANE_CONTRACT,),
+        consumes=(HARDWARE_MESSAGES_LANE, SERVICES_LANE),
+        publishes=(HARDWARE_MESSAGES_LANE, SERVICES_LANE),
         endpoint_slots=("controller",),
         role="controller",
     ),

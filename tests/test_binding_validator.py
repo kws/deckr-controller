@@ -321,7 +321,7 @@ async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
         pass
 
     actions_bus = LaneHarness(
-        "actions",
+        "services",
         default_endpoint=controller_address(CONTROLLER_ID),
     )
     manager = DeviceManager(
@@ -402,7 +402,7 @@ async def test_device_manager_loads_page_with_missing_action_shows_unavailable()
     registry.provider_instance_provides_provider.return_value = True
 
     actions_bus = LaneHarness(
-        "actions",
+        "services",
         default_endpoint=controller_address(CONTROLLER_ID),
     )
     async with anyio.create_task_group() as tg:

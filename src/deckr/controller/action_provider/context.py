@@ -2,7 +2,6 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from deckr.actions.endpoints import action_provider_address
 from deckr.actions.messages import (
     BINDING_ATTACHED,
     BINDING_DETACHED,
@@ -13,18 +12,14 @@ from deckr.actions.messages import (
     CapabilityInputBody,
     CapabilityInputEvent,
     SettingsTargetRef,
-    action_message,
-    context_subject,
 )
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import controller_address
 from deckr.contracts.models import thaw_json
 from deckr.hardware.descriptors import DeviceDescriptor
 from deckr.lanes import EndpointSession
 
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
-from deckr.controller._endpoint_messages import send_with_endpoint_identity
 from deckr.controller._hardware_service import HardwareCommandService
 from deckr.controller._render import RenderService, RenderSource
 from deckr.controller._render_dispatcher import RenderDispatcher
@@ -127,25 +122,23 @@ class ControlContext:
         return self._store.settings
 
     async def _publish(self, message_type: str, body: Mapping[str, Any] | Any) -> None:
-        msg = action_message(
-            sender=controller_address(self._controller_id),
-            sender_session_id=self._actions_bus.session_id,
-            recipient=action_provider_address(self.provider_instance_id),
-            recipient_session_id=self.provider_session_id,
+        sent = await self.manager.send_action_runtime_message(
+            provider_instance_id=self.provider_instance_id,
             message_type=message_type,
             body=body,
-            subject=context_subject(
-                self.id,
-                provider_instance_id=self.provider_instance_id,
-                provider_id=self.provider_id,
-                config_id=self.config_id,
-                action_instance_id=self.action_instance_id,
-                binding_id=self.binding_id,
-                page_session_id=self.page_session_id,
-            ),
-            contract=self.contract,
         )
-        await send_with_endpoint_identity(self._actions_bus, msg)
+        if sent:
+            return
+        logger.warning(
+            "Skipping action runtime message without live lease config=%s "
+            "control=%s action=%s provider=%s binding=%s message=%s",
+            self.config_id,
+            self.control.id,
+            self.action_uuid,
+            self.provider_instance_id,
+            self.binding_id,
+            message_type,
+        )
 
     async def on_binding_attached(self) -> None:
         if self._builtin_action is not None:
