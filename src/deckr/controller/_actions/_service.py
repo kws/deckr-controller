@@ -25,11 +25,12 @@ from deckr.action_runtime import (
 from deckr.actions.endpoints import RESERVED_BUILTIN_PROVIDER_IDS
 from deckr.actions.messages import ActionAvailabilityEntry, ActionMessageBody
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import DeckrMessage, parse_service_address
+from deckr.contracts.messages import DeckrMessage, entity_subject, parse_service_address
 from deckr.services import (
     DeckrServices,
     ServiceBackendStatus,
     ServiceDescriptor,
+    ServiceMessageBody,
     ServiceUnavailable,
     ServiceUseLease,
     newest_service_descriptor,
@@ -109,6 +110,7 @@ class ControllerActionService:
         self._service_watch_generations: dict[str, int] = {}
         self._runtime_leases: dict[ProviderSessionKey, _RuntimeLeaseState] = {}
         self._on_availability_changed = on_availability_changed
+        self._stopping: anyio.Event | None = None
 
     def set_change_callback(
         self,
@@ -121,6 +123,7 @@ class ControllerActionService:
         tg: anyio.abc.TaskGroup,
         stopping: anyio.Event,
     ) -> None:
+        self._stopping = stopping
         if self._services is not None:
             tg.start_soon(self._service_directory_loop, stopping)
 
@@ -130,6 +133,7 @@ class ControllerActionService:
         self._service_watch_scopes.clear()
         self._service_descriptor_keys.clear()
         self._runtime_leases.clear()
+        self._stopping = None
         if self._close_services_on_aclose and self._services is not None:
             await self._services.aclose()
             self._services = None
@@ -200,6 +204,7 @@ class ControllerActionService:
         except ServiceUnavailable as exc:
             if service_unavailable_ends_service_use(exc):
                 self._drop_runtime_lease(provider_session_key, state)
+                self._restart_service_watch_after_lease_loss(state)
                 changed = self.mark_provider_session_unavailable(
                     provider_session_key,
                     reason=SERVICE_VIEW_UNAVAILABLE_REASON,
@@ -253,14 +258,16 @@ class ControllerActionService:
         )
         for state in states:
             try:
-                authorized = await services.authorize_inbound_message(
-                    state.lease,
+                authorized = await _authorize_inbound_action_runtime_message(
+                    services,
+                    state,
                     deckr_message,
-                    name=body.name,
+                    body,
                 )
             except ServiceUnavailable as exc:
                 if service_unavailable_ends_service_use(exc):
                     self._drop_runtime_lease(state.key, state)
+                    self._restart_service_watch_after_lease_loss(state)
                     changed = self.mark_provider_session_unavailable(
                         state.key,
                         reason=SERVICE_VIEW_UNAVAILABLE_REASON,
@@ -657,6 +664,7 @@ class ControllerActionService:
         *,
         stopping: anyio.Event,
     ) -> None:
+        self._stopping = stopping
         candidates_by_service: dict[str, list[ServiceDescriptor]] = {}
         for descriptor in descriptors:
             provider_instance_id = action_runtime_provider_instance_id(
@@ -782,7 +790,8 @@ class ControllerActionService:
                             )
                             if changed:
                                 await self._notify_availability_changed(changed)
-                            return
+                            await anyio.sleep(_SERVICE_WATCH_RETRY_SECONDS)
+                            continue
                         logger.warning(
                             "Action availability service use unavailable "
                             "service=%s code=%s message=%s diagnostics=%s",
@@ -926,6 +935,18 @@ class ControllerActionService:
         if self._runtime_leases.get(key) is state:
             self._runtime_leases.pop(key, None)
 
+    def _restart_service_watch_after_lease_loss(
+        self,
+        state: _RuntimeLeaseState,
+    ) -> None:
+        stopping = self._stopping
+        if self._start_soon is None or stopping is None or stopping.is_set():
+            return
+        descriptor = state.lease.descriptor
+        if descriptor.backend_status == ServiceBackendStatus.UNAVAILABLE:
+            return
+        self._start_service_watch(state.service_id, descriptor, stopping=stopping)
+
     def _drop_runtime_lease_for_object(
         self,
         lease: ServiceUseLease,
@@ -1060,6 +1081,42 @@ def _runtime_provider_instance_id_from_message(message: DeckrMessage) -> str | N
     if service_id is None:
         return None
     return action_runtime_provider_instance_id(service_id)
+
+
+async def _authorize_inbound_action_runtime_message(
+    services: DeckrServices,
+    state: _RuntimeLeaseState,
+    message: DeckrMessage,
+    body: ServiceMessageBody,
+) -> ServiceMessageBody:
+    try:
+        return await services.authorize_inbound_message(
+            state.lease,
+            message,
+            name=body.name,
+        )
+    except ServiceUnavailable as exc:
+        if exc.code != "invalid_service_response" or message.subject.kind != "context":
+            raise
+
+    # Runtime commands keep their action context subject for downstream routing;
+    # validate the service-use envelope by temporarily applying its service subject.
+    descriptor = state.lease.descriptor
+    service_scoped_message = message.model_copy(
+        update={
+            "subject": entity_subject(
+                "service",
+                serviceId=descriptor.service_id,
+                namespace=descriptor.namespace,
+                name=body.name,
+            )
+        }
+    )
+    return await services.authorize_inbound_message(
+        state.lease,
+        service_scoped_message,
+        name=body.name,
+    )
 
 
 def _provider_id_from_descriptor(descriptor: ServiceDescriptor) -> str | None:

@@ -10,12 +10,35 @@ import pytest
 from deckr.action_runtime import (
     ACTION_RUNTIME_SERVICE_PROTOCOL,
     ActionRuntimeAvailabilityViewPayload,
+    action_runtime_message_name,
+    action_runtime_payload,
     action_runtime_service_id,
 )
-from deckr.actions.messages import ActionAvailabilityEntry, ActionDescriptor
+from deckr.actions.messages import (
+    CLOSE_PAGE,
+    ActionAvailabilityEntry,
+    ActionDescriptor,
+    EmptyActionBody,
+    context_subject,
+)
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import service_address
-from deckr.services import ServiceBackendStatus, ServiceDescriptor, ServiceUnavailable
+from deckr.contracts.messages import (
+    SERVICES_LANE,
+    DeckrMessage,
+    controller_address,
+    endpoint_target,
+    service_address,
+)
+from deckr.services import (
+    SERVICE_MESSAGE,
+    ServiceBackendStatus,
+    ServiceDescriptor,
+    ServiceExchangePattern,
+    ServiceMessageBody,
+    ServiceMessageIntent,
+    ServiceUnavailable,
+    service_body,
+)
 
 from deckr.controller._actions import (
     ControllerActionService,
@@ -159,6 +182,23 @@ class _ActionRuntimeServicesHarness:
             yield payload
 
 
+class _ContextSubjectAuthorizingServices:
+    def __init__(self) -> None:
+        self.subject_kinds: list[str] = []
+
+    async def authorize_inbound_message(self, lease, message, *, name=None):
+        del lease
+        self.subject_kinds.append(message.subject.kind)
+        if message.subject.kind != "service":
+            raise ServiceUnavailable(
+                "invalid_service_response",
+                "subject does not match active service-use lease",
+            )
+        body = service_body(message)
+        assert name is None or body.name == name
+        return body
+
+
 async def _wait_for_registered_session(
     service: ControllerActionService,
     intent: ActionIntentKey,
@@ -188,13 +228,14 @@ async def _wait_for_unavailable(
             await anyio.sleep(0.01)
 
 
-async def _wait_for_no_contract(
+async def _wait_for_contract(
     service: ControllerActionService,
     key: ProviderSessionKey,
+    expected: ContractPointer,
 ) -> None:
     with anyio.fail_after(1):
         while True:
-            if service.current_contract(key) is None:
+            if service.current_contract(key) == expected:
                 return
             await anyio.sleep(0.01)
 
@@ -262,7 +303,14 @@ async def test_controller_action_service_registers_stops_and_restarts_runtime_ac
             )
         )
         await _wait_for_unavailable(service, intent)
-        await _wait_for_no_contract(service, first_key)
+        await _wait_for_contract(
+            service,
+            first_key,
+            ContractPointer(
+                contractId="service-use:provider-session-1",
+                generation=2,
+            ),
+        )
 
         await services.publish_directory((second_descriptor,))
         await services.wait_used("provider-session-2")
@@ -278,9 +326,71 @@ async def test_controller_action_service_registers_stops_and_restarts_runtime_ac
         assert second_metadata.name == "Clock"
         assert service.current_contract(second_key) == ContractPointer(
             contractId="service-use:provider-session-2",
-            generation=2,
+            generation=3,
         )
 
         stopping.set()
         await service.aclose()
         tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_controller_action_service_decodes_runtime_context_subject_messages():
+    descriptor = _service_descriptor(
+        provider_session_id="provider-session-1",
+        advertisement_id="first",
+        refresh_seq=1,
+    )
+    lease = _RuntimeLease(descriptor, generation=1)
+    services = _ContextSubjectAuthorizingServices()
+    service = ControllerActionService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        manager=MagicMock(),
+        services=services,
+    )
+    service._remember_runtime_lease(
+        ProviderSessionKey(PROVIDER_INSTANCE_ID, PROVIDER_ID, "provider-session-1"),
+        lease=lease,
+        service_id=descriptor.service_id,
+        generation=1,
+    )
+    name = action_runtime_message_name(CLOSE_PAGE)
+    params, event = action_runtime_payload(name, EmptyActionBody())
+    subject = context_subject(
+        "ctx-1",
+        provider_instance_id=PROVIDER_INSTANCE_ID,
+        provider_id=PROVIDER_ID,
+        config_id="config-1",
+        action_instance_id="action-instance-1",
+    )
+
+    decoded = await service.decode_inbound_runtime_message(
+        DeckrMessage(
+            lane=SERVICES_LANE,
+            messageType=SERVICE_MESSAGE,
+            sender=descriptor.endpoint,
+            senderSessionId=descriptor.session_id,
+            recipient=endpoint_target(controller_address(CONTROLLER_ID)),
+            recipientSessionId=CONTROLLER_SESSION_ID,
+            subject=subject,
+            contract=ContractPointer(
+                contractId=lease.contract.contract_id,
+                generation=lease.contract.generation,
+            ),
+            body=ServiceMessageBody(
+                serviceNamespace=ACTION_RUNTIME_SERVICE_PROTOCOL.namespace,
+                name=name,
+                intent=ServiceMessageIntent.COMMAND,
+                exchangePattern=ServiceExchangePattern.ONE_WAY,
+                params=params,
+                event=event,
+            ).to_dict(),
+        )
+    )
+
+    assert decoded is not None
+    assert decoded.message_type == CLOSE_PAGE
+    assert decoded.subject == subject
+    assert decoded.body == {}
+    assert services.subject_kinds == ["context", "service"]

@@ -14,8 +14,11 @@ from deckr.action_runtime import (
     action_runtime_service_id,
 )
 from deckr.actions.messages import (
+    ACTION_INSTANCE_DESTROYED,
     ActionAvailabilityEntry,
     ActionDescriptor,
+    ActionInstanceLifecycleBody,
+    ActionInstanceMetadata,
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import service_address
@@ -227,6 +230,16 @@ class _ServiceViewWatchServices:
             if isinstance(payload, BaseException):
                 raise payload
             yield payload
+
+
+class _SendFailingServices:
+    def __init__(self, error: ServiceUnavailable) -> None:
+        self.error = error
+        self.send_calls = []
+
+    async def send(self, lease, name, *, params=None, event=None):
+        self.send_calls.append((lease, name, params, event))
+        raise self.error
 
 
 @pytest.mark.parametrize(
@@ -465,6 +478,76 @@ async def test_descriptor_removal_preserves_active_runtime_lease():
         generation=1,
     )
     assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_send_lease_loss_restarts_service_watch():
+    scheduled: list[tuple[object, tuple[object, ...]]] = []
+    services = _SendFailingServices(
+        ServiceUnavailable(
+            "contract_cancelled",
+            "service-use contract cancelled",
+        )
+    )
+    service = ControllerActionService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        manager=MagicMock(),
+        services=services,
+        start_soon=lambda fn, *args: scheduled.append((fn, args)),
+    )
+    service_id = action_runtime_service_id("provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    stopping = anyio.Event()
+    service._reconcile_service_watchers((descriptor,), stopping=stopping)
+    scheduled.clear()
+
+    session_key = ProviderSessionKey(
+        "provider-alpha",
+        "provider.test",
+        "provider-session",
+    )
+    lease = _RuntimeLease(descriptor)
+    scope = anyio.CancelScope()
+    service._service_watch_scopes[service_id] = scope
+    service._remember_runtime_lease(
+        session_key,
+        lease=lease,
+        service_id=service_id,
+        generation=1,
+    )
+
+    sent = await service.send_runtime_message(
+        session_key,
+        ACTION_INSTANCE_DESTROYED,
+        ActionInstanceLifecycleBody(
+            metadata=ActionInstanceMetadata(
+                providerInstanceId="provider-alpha",
+                providerId="provider.test",
+                actionId="action.alpha",
+                actionInstanceId="action-instance",
+                configId="config",
+                contextId="context",
+            ),
+            reason="test",
+        ),
+    )
+
+    assert sent is False
+    assert services.send_calls
+    assert service.current_contract(session_key) is None
+    assert scope.cancel_called is True
+    assert scheduled == [
+        (
+            service._run_service_view_watch,
+            (service_id, descriptor, 2, stopping),
+        )
+    ]
 
 
 def test_service_ingests_action_availability_view_payload():
@@ -858,7 +941,7 @@ async def test_service_view_watch_transient_unavailable_keeps_same_service_use_l
 
 
 @pytest.mark.asyncio
-async def test_service_view_watch_terminal_unavailable_closes_lease_without_retrying_descriptor(
+async def test_service_view_watch_terminal_unavailable_retries_descriptor(
     monkeypatch,
 ):
     monkeypatch.setattr(
@@ -910,11 +993,15 @@ async def test_service_view_watch_terminal_unavailable_closes_lease_without_retr
             while services.closed_count < 1:
                 await anyio.sleep(0.01)
 
-        assert services.use_count == 1
+        while services.use_count < 2 or len(services.watch_calls) < 2:
+            await anyio.sleep(0.01)
+
+        assert services.use_count == 2
         assert services.closed_count == 1
-        assert services.lease_open is False
+        assert services.lease_open is True
         assert services.watch_calls[0][0] is services.leases[0]
-        assert len(services.watch_calls) == 1
+        assert services.watch_calls[1][0] is services.leases[1]
+        assert len(services.watch_calls) == 2
         record = service.record_for_key(key)
         assert record is not None
         assert record.state == ActionAvailabilityState.UNAVAILABLE
