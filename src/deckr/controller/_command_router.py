@@ -17,7 +17,7 @@ from deckr.controller.invariant.recipes import (
 
 if TYPE_CHECKING:
     from deckr.controller._device_layout import RasterImageFormat
-    from deckr.controller._hardware_service import HardwareCommandService
+    from deckr.controller._hardware import HardwareCommandService
 
 logger = logging.getLogger(__name__)
 

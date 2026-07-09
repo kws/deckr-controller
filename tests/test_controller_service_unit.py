@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
-import anyio
 import pytest
 from deckr.actions.endpoints import action_provider_address
 from deckr.contracts.authority import ContractPointer
@@ -20,6 +19,7 @@ from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import CapabilityRef, DeviceDescriptor, DeviceRef
 
 from deckr.controller._controller_service import ControllerService
+from deckr.controller._hardware import LiveDeviceRoute
 
 CONTROLLER_ID = "controller-main"
 CONFIG_ID = "config-a"
@@ -114,8 +114,8 @@ def _device() -> DeviceDescriptor:
     )
 
 
-async def _register_route(service: ControllerService) -> None:
-    service._device_registry.connect(
+def _live_route() -> LiveDeviceRoute:
+    return LiveDeviceRoute(
         config_id=CONFIG_ID,
         ref=_device_ref(),
         device=_device(),
@@ -131,6 +131,7 @@ def _manager_context() -> MagicMock:
     ctx.on_event = AsyncMock()
     ctx.on_capability_state_changed = AsyncMock()
     ctx.on_command_rejected = AsyncMock()
+    ctx.on_descriptor_changed = AsyncMock()
     return ctx
 
 
@@ -152,66 +153,25 @@ async def test_action_command_ignores_invalid_settings_body_and_missing_subject(
 
 
 @pytest.mark.asyncio
-async def test_hardware_input_loop_ignores_message_with_no_device_ref(
-    monkeypatch,
-) -> None:
+async def test_hardware_callbacks_ignore_missing_controller_context() -> None:
     body = hw_messages.ControlInputMessage(
         deviceRef=_device_ref(),
         controlId="key-1",
         capabilityId="input",
         eventType="down",
     )
-    endpoint = _Endpoint([_hardware_message(hw_messages.CONTROL_INPUT, body)])
-    service = _service(endpoint=endpoint)
-    ctx = _manager_context()
-    await _register_route(service)
-    await service._controller_contexts.set(CONFIG_ID, ctx)
-    monkeypatch.setattr(
-        hw_messages,
-        "hardware_device_ref_from_message",
-        lambda message: None,
+    service = _service()
+
+    await service.on_hardware_control_input(
+        _live_route(),
+        _hardware_message(hw_messages.CONTROL_INPUT, body),
     )
 
-    await service._hardware_input_loop(stopping=anyio.Event())
-
-    ctx.on_event.assert_not_awaited()
+    assert await service._controller_contexts.get(CONFIG_ID) is None
 
 
 @pytest.mark.asyncio
-async def test_hardware_input_loop_ignores_message_without_route() -> None:
-    body = hw_messages.ControlInputMessage(
-        deviceRef=_device_ref(),
-        controlId="key-1",
-        capabilityId="input",
-        eventType="down",
-    )
-    endpoint = _Endpoint([_hardware_message(hw_messages.CONTROL_INPUT, body)])
-    service = _service(endpoint=endpoint)
-
-    await service._hardware_input_loop(stopping=anyio.Event())
-
-    assert endpoint.subscribed_lanes == [HARDWARE_MESSAGES_LANE]
-
-
-@pytest.mark.asyncio
-async def test_hardware_input_loop_ignores_message_without_controller_context() -> None:
-    body = hw_messages.ControlInputMessage(
-        deviceRef=_device_ref(),
-        controlId="key-1",
-        capabilityId="input",
-        eventType="down",
-    )
-    endpoint = _Endpoint([_hardware_message(hw_messages.CONTROL_INPUT, body)])
-    service = _service(endpoint=endpoint)
-    await _register_route(service)
-
-    await service._hardware_input_loop(stopping=anyio.Event())
-
-    assert endpoint.subscribed_lanes == [HARDWARE_MESSAGES_LANE]
-
-
-@pytest.mark.asyncio
-async def test_hardware_input_loop_routes_input_state_and_rejection_messages() -> None:
+async def test_hardware_callbacks_route_input_state_rejection_and_descriptor() -> None:
     input_body = hw_messages.ControlInputMessage(
         deviceRef=_device_ref(),
         controlId="key-1",
@@ -237,13 +197,15 @@ async def test_hardware_input_loop_routes_input_state_and_rejection_messages() -
         _hardware_message(hw_messages.CAPABILITY_STATE_CHANGED, state_body),
         _hardware_message(hw_messages.COMMAND_REJECTED, rejected_body),
     ]
-    endpoint = _Endpoint(messages)
-    service = _service(endpoint=endpoint)
+    service = _service()
     ctx = _manager_context()
-    await _register_route(service)
     await service._controller_contexts.set(CONFIG_ID, ctx)
+    live = _live_route()
 
-    await service._hardware_input_loop(stopping=anyio.Event())
+    await service.on_hardware_control_input(live, messages[0])
+    await service.on_hardware_capability_state_changed(live, state_body)
+    await service.on_hardware_command_rejected(live, rejected_body)
+    await service.on_hardware_descriptor_changed(CONFIG_ID, _device())
 
     ctx.on_event.assert_awaited_once_with(messages[0])
     state_event = ctx.on_capability_state_changed.await_args.args[0]
@@ -252,3 +214,4 @@ async def test_hardware_input_loop_routes_input_state_and_rejection_messages() -
     assert state_event.value is True
     assert rejected_event.capability_id == "raster"
     assert rejected_event.command_type == "set_frame"
+    ctx.on_descriptor_changed.assert_awaited_once()

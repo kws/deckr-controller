@@ -21,7 +21,7 @@ from deckr.lanes import EndpointSession
 from deckr.controller._actions import ProviderSessionKey
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
-from deckr.controller._hardware_service import HardwareCommandService
+from deckr.controller._hardware import HardwareCommandService
 from deckr.controller._render import RenderService, RenderSource
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore

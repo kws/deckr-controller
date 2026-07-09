@@ -114,7 +114,7 @@ from deckr.controller._device_layout import (
     raster_controls,
 )
 from deckr.controller._event_translator import EventTranslator
-from deckr.controller._hardware_service import HardwareCommandService
+from deckr.controller._hardware import HardwareCommandService
 from deckr.controller._navigation_service import (
     NavigationService,
     PageStackEntry,

@@ -7,7 +7,8 @@ from deckr.concord import (
     ContractValidityStatus,
 )
 
-from deckr.controller._controller_service import ControllerService, OwnedHardwareClaim
+from deckr.controller._hardware._models import OwnedHardwareClaim
+from deckr.controller._hardware._validity import validate_owned_claim
 
 
 class _Agreement:
@@ -43,12 +44,6 @@ class _Concord:
         raise AssertionError("validate_exact should not run during hardware claim checks")
 
 
-def _service(concord: _Concord) -> ControllerService:
-    service = ControllerService.__new__(ControllerService)
-    service._concord = concord
-    return service
-
-
 def _owned(agreement: _Agreement) -> OwnedHardwareClaim:
     return OwnedHardwareClaim(
         claim_id="claim-1",
@@ -70,9 +65,8 @@ async def test_hardware_claim_validity_conflict_falls_back_to_cached_validation(
     )
     owned = _owned(agreement)
 
-    result = await _service(concord)._hardware_claim_contract_validity(owned)  # noqa: SLF001
+    result = await validate_owned_claim(concord, owned)
 
     assert result is validity
     assert agreement._validity is validity
     assert concord.validate_calls == 1
-

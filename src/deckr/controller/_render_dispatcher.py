@@ -17,7 +17,7 @@ import httpx
 from deckr.controller._render import RenderRequest, RenderResult, render_request_to_jpeg
 
 if TYPE_CHECKING:
-    from deckr.controller._hardware_service import HardwareCommandService
+    from deckr.controller._hardware import HardwareCommandService
 
 
 class ControlOutput(Protocol):
