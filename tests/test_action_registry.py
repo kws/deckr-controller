@@ -98,3 +98,20 @@ async def test_action_registry_stop_clears_builtin_metadata() -> None:
     await registry.stop()
 
     assert await registry.get_action(BUILTIN_ACTION_UUID) is None
+
+
+@pytest.mark.asyncio
+async def test_action_registry_can_restart_builtin_actions() -> None:
+    registry = _registry()
+
+    await _start_registry(registry)
+    assert await registry.get_action(BUILTIN_ACTION_UUID) is not None
+
+    await registry.stop()
+    assert await registry.get_action(BUILTIN_ACTION_UUID) is None
+
+    await _start_registry(registry)
+
+    action = await registry.get_action(BUILTIN_ACTION_UUID)
+    assert action is not None
+    assert action.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
