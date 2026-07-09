@@ -128,23 +128,6 @@ async def test_invalid_yaml_does_not_emit(config_service, tmp_path):
             await config_service.stop()
 
 
-def test_navigation_service_update_config():
-    """NavigationService.update_config resets to root."""
-    from deckr.controller._navigation_service import NavigationService, StaticPageRef
-
-    cfg1 = _make_config("dev1", "Config1")
-    nav = NavigationService(cfg1)
-    nav.set_page(StaticPageRef(profile_name="default", page_index=0))
-    nav.set_page(StaticPageRef(profile_name="default", page_index=1))
-
-    cfg2 = _make_config("dev1", "Config2")
-    transition = nav.update_config(cfg2)
-
-    assert nav.current_page == StaticPageRef(profile_name="default", page_index=0)
-    assert transition.arriving == nav.current_page
-    assert nav._config.name == "Config2"
-
-
 @pytest.mark.asyncio
 async def test_match_device_uses_fingerprint_only_config_for_other_labels(
     config_service,
@@ -183,5 +166,3 @@ async def test_match_device_rejects_ambiguous_same_specificity(
             fingerprint="serial-a",
             labels={"location": "room-a"},
         )
-
-

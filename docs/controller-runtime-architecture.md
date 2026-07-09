@@ -29,7 +29,7 @@ The current code already has the rough pieces: device config is dynamic and subs
 Once a device is claimed by the controller, the controller owns:
 
 * the current profile/page
-* dynamic page stack
+* the active dynamic page frame
 * dynamic page timeout
 * raster output state
 * input routing
@@ -108,7 +108,7 @@ Responsibilities:
 * Track hardware route, descriptor, manager session, and connection state.
 * Match the live device to configuration.
 * Maintain the active static page frame.
-* Maintain a stack or overlay frame for dynamic pages.
+* Maintain a single overlay frame for the active dynamic page.
 * Own dynamic page timeout.
 * Own all raster output for controls.
 * Own input routing and held-input capture.
@@ -1067,7 +1067,7 @@ and provider lifecycle authority remain valid.
 These should become tests.
 
 1. **Device ownership invariant**
-   Action availability changes must not clear the current device page or dynamic page stack.
+   Action availability changes must not clear the current device page or active dynamic page frame.
 
 2. **No remote wait invariant**
    Page transition and input routing must not perform provider network I/O.

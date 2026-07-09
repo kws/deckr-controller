@@ -10,7 +10,6 @@ from typing import Any
 from deckr.actions.messages import (
     DynamicPageCommand,
     PageChildBindingDescriptor,
-    SettingsTargetRef,
 )
 from deckr.hardware.descriptors import DeviceDescriptor
 
@@ -22,7 +21,7 @@ from deckr.controller._binding_resolution import (
     resolve_binding,
 )
 from deckr.controller._binding_validator import ValidationError
-from deckr.controller._navigation_service import PageStackEntry, StaticPageRef
+from deckr.controller._pages import DynamicPageSession, PageStackEntry, StaticPageRef
 from deckr.controller.settings import (
     derive_action_instance_id,
     derive_static_action_instance_id,
@@ -42,28 +41,6 @@ class ActionIntentKey:
     action_uuid: str
     provider_instance_id: str | None
     provider_labels: tuple[tuple[str, str], ...]
-
-
-@dataclass(slots=True)
-class DynamicPageSession:
-    page_id: str
-    page_session_id: str
-    context_id: str
-    action_instance_id: str
-    owner_context_id: str
-    owner_binding_id: str
-    owner_control_id: str
-    owner_action_uuid: str
-    owner_provider_instance_id: str
-    owner_provider_id: str
-    owner_provider_session_id: str | None
-    owner_action_meta: ActionMetadata
-    owner_profile: str
-    owner_page: int
-    timeout_ms: int
-    last_activity: float
-    settings_target: SettingsTargetRef | None
-    generation: int = 0
 
 
 @dataclass(slots=True)
@@ -91,13 +68,6 @@ class PagePlan:
     page_id: str
     page_session: DynamicPageSession | None
     bindings: tuple[PlannedBinding, ...]
-
-
-@dataclass(slots=True)
-class PageFrame:
-    entry: PageStackEntry
-    page_session: DynamicPageSession | None
-    committed_plan: PagePlan
 
 
 @dataclass(slots=True)
@@ -225,6 +195,7 @@ class BindingPlanner:
         *,
         device: DeviceDescriptor,
         page_session: DynamicPageSession,
+        page_session_generation: int | None = None,
         action_metadata: Mapping[ActionIntentKey, ActionMetadata],
         action_status: Mapping[ActionIntentKey, BindingPlanStatus] | None = None,
         retained_plan: PagePlan | None = None,
@@ -308,6 +279,7 @@ class BindingPlanner:
                 binding=resolved.binding,
                 action_instance_id=self._dynamic_child_action_instance_id(
                     page_session=page_session,
+                    page_session_generation=page_session_generation,
                     child=child,
                     binding=resolved.binding,
                 ),
@@ -463,6 +435,7 @@ class BindingPlanner:
         self,
         *,
         page_session: DynamicPageSession,
+        page_session_generation: int | None,
         child: PageChildBindingDescriptor,
         binding: ResolvedControlBinding,
     ) -> str:
@@ -485,7 +458,11 @@ class BindingPlanner:
             (
                 "dynamic-page",
                 page_session.page_session_id,
-                str(page_session.generation),
+                str(
+                    page_session.generation
+                    if page_session_generation is None
+                    else page_session_generation
+                ),
                 provider_key,
                 target_key,
             )

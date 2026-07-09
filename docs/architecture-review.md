@@ -248,14 +248,13 @@ class DynamicPageFrame:
     owner_context_id: str
     owner_binding_id: str
     owner_control_id: str
-    invoking_frame_id: str
     opened_at: float
     last_activity_at: float
     timeout_ms: int
     close_reason: str | None
 ```
 
-The current `DynamicPageSession` already records owner action/provider/session/context/binding/control fields, which is good, but I would add an explicit `invoking_frame_id` or return-frame pointer. `owner_profile` / `owner_page` is not enough once dynamic pages can nest or once a static page changes beneath an open dynamic frame. ([GitHub][4])
+The current `DynamicPageSession` records owner action/provider/session/context/binding/control fields. v1 intentionally keeps only one active dynamic page frame per device; opening another dynamic page dismisses the existing one, and close returns to the configured static page.
 
 ### 8.1 Opening a dynamic page
 
@@ -419,7 +418,7 @@ Recommended rewrite:
 
 ```text
 DeviceManager owns device I/O and commit orchestration.
-FrameStack owns static/dynamic page stack and return-frame semantics.
+FrameStack owns static/current dynamic page state and static-return semantics.
 BindingPlanner builds plans for a requested frame.
 AttachmentManager owns live provider attachments.
 AvailabilityService owns provider/action availability cache.

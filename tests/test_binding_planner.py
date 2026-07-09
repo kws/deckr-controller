@@ -14,10 +14,9 @@ from deckr.controller._binding_planner import (
     ActionIntentKey,
     BindingPlanner,
     BindingPlanStatus,
-    DynamicPageSession,
 )
 from deckr.controller._binding_resolution import ConfiguredControlBinding
-from deckr.controller._navigation_service import StaticPageRef
+from deckr.controller._pages import DynamicPageSession, StaticPageRef
 from deckr.controller.config import ControlSelector
 from deckr.controller.settings import derive_static_action_instance_id
 
@@ -223,4 +222,3 @@ def test_selector_only_static_plan_uses_config_fallback_identity():
         page_id="0",
         identity_fallback="0",
     )
-

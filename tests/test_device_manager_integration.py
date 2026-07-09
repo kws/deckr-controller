@@ -1430,9 +1430,6 @@ async def test_binding_without_live_provider_session_remains_pending(
             ctx = await manager.action_contexts.get("0,0")
             assert ctx is None
             assert manager._binding_leases == {}
-            assert manager._page_frames[-1].committed_plan.bindings[0].status == (
-                "pending"
-            )
             await _assert_no_action_message(stream)
 
         tg.cancel_scope.cancel()
@@ -2042,7 +2039,7 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
                 descriptor=_dynamic_page("dynamic-page", "1,0"),
                 context_id=owner_ctx.id,
             )
-            session = manager._dynamic_page_session
+            session = manager._pages.active_dynamic_session()
             assert session is not None
             child_ctx = await manager.action_contexts.get("1,0")
             assert child_ctx is not None
@@ -2075,7 +2072,7 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
             assert replacement_lease is not None
             assert replacement_lease is not child_lease
             assert replacement_lease.provider_session_id == successor_session_id
-            assert manager._dynamic_page_session is session
+            assert manager._pages.active_dynamic_session() is session
             assert session.owner_provider_session_id == successor_session_id
             assert manager._action_instances[session.action_instance_id] is action_instance
             action_session = manager._action_instance_provider_sessions[
@@ -2098,7 +2095,7 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
                 )
             )
 
-            assert manager._dynamic_page_session is None
+            assert manager._pages.active_dynamic_session() is None
             restored_ctx = await manager.action_contexts.get("0,0")
             assert restored_ctx is not None
             assert restored_ctx.provider_session_id == successor_session_id
@@ -2140,12 +2137,12 @@ async def test_close_dynamic_page_restores_cached_static_plan_without_metadata_l
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         child_ctx = await manager.action_contexts.get("1,0")
         assert child_ctx is not None
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
 
         registry.get_action.return_value = None
@@ -2156,7 +2153,7 @@ async def test_close_dynamic_page_restores_cached_static_plan_without_metadata_l
         restored_ctx = await manager.action_contexts.get("0,0")
         assert restored_ctx is not None
         assert restored_ctx.provider_session_id == PROVIDER_SESSION_ID
-        assert manager._dynamic_page_session is None
+        assert manager._pages.active_dynamic_session() is None
 
         tg.cancel_scope.cancel()
 
@@ -2198,7 +2195,7 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
             context_id=owner_ctx.id,
         )
         assert registry.get_action.await_count == 0
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
 
         command_service.clear_raster.reset_mock()
@@ -2435,7 +2432,7 @@ async def test_held_input_cancelled_when_config_is_removed(
             assert body.event.event_type == "cancel"
             assert body.binding.binding_id == ctx.binding_id
             await _drain_action_messages(stream)
-            assert not manager._config_active
+            assert not manager.config_active
             assert await manager.action_contexts.get("0,0") is None
             assert manager._binding_leases == {}
             assert manager._action_service._interest_by_config == {}
@@ -2488,12 +2485,12 @@ async def test_close_dynamic_page_restores_when_close_notification_fails(
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
 
         await manager.close_page(context_id=session.context_id)
 
-        assert manager._dynamic_page_session is None
+        assert manager._pages.active_dynamic_session() is None
         assert await manager.action_contexts.get("0,0") is not None
         tg.cancel_scope.cancel()
 
@@ -2543,7 +2540,7 @@ async def test_close_dynamic_page_destroys_external_action_child(
                 ),
                 context_id=owner_ctx.id,
             )
-            session = manager._dynamic_page_session
+            session = manager._pages.active_dynamic_session()
             assert session is not None
             child_lease = manager._binding_lease_for_control("1,0")
             assert child_lease is not None
@@ -2618,7 +2615,7 @@ async def test_replace_dynamic_page_remounts_all_external_action_children(
                 ),
                 context_id=owner_ctx.id,
             )
-            session = manager._dynamic_page_session
+            session = manager._pages.active_dynamic_session()
             assert session is not None
             keep_lease = manager._binding_lease_for_control("1,0")
             drop_lease = manager._binding_lease_for_control("2,0")
@@ -2745,7 +2742,7 @@ async def test_dynamic_page_external_child_lifecycle_attach_carries_settings(
 
 
 @pytest.mark.asyncio
-async def test_external_action_child_owner_survives_nested_dynamic_page(
+async def test_external_action_child_owner_survives_successor_dynamic_page(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -2789,7 +2786,7 @@ async def test_external_action_child_owner_survives_nested_dynamic_page(
                 ),
                 context_id=owner_ctx.id,
             )
-            first_session = manager._dynamic_page_session
+            first_session = manager._pages.active_dynamic_session()
             assert first_session is not None
             child_ctx = await manager.action_contexts.get("1,0")
             assert child_ctx is not None
@@ -2797,23 +2794,32 @@ async def test_external_action_child_owner_survives_nested_dynamic_page(
             await _drain_action_messages(stream)
 
             await manager.open_page(
-                descriptor=_dynamic_page("nested-page", "0,0"),
+                descriptor=_dynamic_page("successor-page", "0,0"),
                 context_id=child_ctx.id,
             )
 
-            nested_session = manager._dynamic_page_session
-            assert nested_session is not None
-            assert nested_session.page_id == "nested-page"
-            assert nested_session.page_session_id != first_session.page_session_id
-            assert nested_session.action_instance_id == child_action_instance_id
+            successor_session = manager._pages.active_dynamic_session()
+            assert successor_session is not None
+            assert successor_session.page_id == "successor-page"
+            assert successor_session.page_session_id != first_session.page_session_id
+            assert successor_session.action_instance_id == child_action_instance_id
             assert child_action_instance_id in manager._action_instances
 
             messages = await _collect_action_messages(stream)
+            closed_sessions = [
+                message
+                for message in messages
+                if message.message_type == PAGE_SESSION_CLOSED
+                and message.body["pageSession"]["pageSessionId"]
+                == first_session.page_session_id
+            ]
             destroyed_ids = [
                 message.body["metadata"]["actionInstanceId"]
                 for message in messages
                 if message.message_type == ACTION_INSTANCE_DESTROYED
             ]
+            assert len(closed_sessions) == 1
+            assert closed_sessions[0].body["reason"] == "open_page"
             assert child_action_instance_id not in destroyed_ids
         tg.cancel_scope.cancel()
 
@@ -2864,7 +2870,7 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
             ),
             context_id=owner_ctx.id,
         )
-        first_session = manager._dynamic_page_session
+        first_session = manager._pages.active_dynamic_session()
         assert first_session is not None
         child_ctx = await manager.action_contexts.get("1,0")
         assert child_ctx is not None
@@ -2874,12 +2880,19 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
             context_id=child_ctx.id,
         )
 
-        second_session = manager._dynamic_page_session
+        second_session = manager._pages.active_dynamic_session()
         assert second_session is not None
         assert second_session.page_id == "second-page"
         assert second_session.page_session_id != first_session.page_session_id
         assert second_session.owner_binding_id == child_ctx.binding_id
         assert second_session.owner_provider_instance_id == "python-child"
+
+        await manager.close_page(context_id=second_session.context_id)
+
+        assert manager._pages.active_dynamic_session() is None
+        restored_owner_ctx = await manager.action_contexts.get("0,0")
+        assert restored_owner_ctx is not None
+        assert restored_owner_ctx.page_session_id is None
         tg.cancel_scope.cancel()
 
 
@@ -2930,7 +2943,7 @@ async def test_stale_opener_binding_cannot_open_page_after_transition(
             descriptor=_dynamic_page("active-page", "1,0"),
             context_id=owner_ctx.id,
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         assert session.page_id == "active-page"
         child_ctx = await manager.action_contexts.get("1,0")
@@ -2938,7 +2951,7 @@ async def test_stale_opener_binding_cannot_open_page_after_transition(
 
         await manager.handle_command(stale_open)
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
         assert await manager.action_contexts.get("0,0") is None
         tg.cancel_scope.cancel()
@@ -2990,7 +3003,7 @@ async def test_replace_page_from_non_owner_is_noop(
             ),
             context_id=owner_ctx.id,
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         child_ctx = await manager.action_contexts.get("1,0")
         assert child_ctx is not None
@@ -3000,7 +3013,7 @@ async def test_replace_page_from_non_owner_is_noop(
             context_id=child_ctx.id,
         )
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
         assert await manager.action_contexts.get("0,0") is None
         tg.cancel_scope.cancel()
@@ -3052,14 +3065,14 @@ async def test_close_page_from_non_owner_is_noop(
             ),
             context_id=owner_ctx.id,
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         child_ctx = await manager.action_contexts.get("1,0")
         assert child_ctx is not None
 
         await manager.close_page(context_id=child_ctx.id)
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
         assert await manager.action_contexts.get("0,0") is None
         tg.cancel_scope.cancel()
@@ -3098,7 +3111,7 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         child_ctx = await manager.action_contexts.get("1,0")
         assert child_ctx is not None
@@ -3117,7 +3130,7 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
         )
         await manager.handle_command(child_replace)
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
         assert await manager.action_contexts.get("0,0") is None
 
@@ -3128,7 +3141,7 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
         )
         await manager.handle_command(child_close)
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
         assert await manager.action_contexts.get("0,0") is None
 
@@ -3142,7 +3155,7 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
             )
         )
 
-        assert manager._dynamic_page_session is None
+        assert manager._pages.active_dynamic_session() is None
         assert await manager.action_contexts.get("0,0") is not None
         tg.cancel_scope.cancel()
 
@@ -3218,7 +3231,7 @@ async def test_builtin_context_replaces_and_closes_opened_dynamic_page():
                 provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
             )
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         assert await manager.action_contexts.get("1,0") is not None
 
@@ -3231,13 +3244,13 @@ async def test_builtin_context_replaces_and_closes_opened_dynamic_page():
             )
         )
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is None
         assert await manager.action_contexts.get("0,0") is not None
 
         await owner_context.close_page()
 
-        assert manager._dynamic_page_session is None
+        assert manager._pages.active_dynamic_session() is None
         restored = await manager.action_contexts.get("0,0")
         assert restored is not None
         assert restored.action_uuid == owner_action.uuid
@@ -3314,7 +3327,7 @@ async def test_builtin_child_context_cannot_control_parent_page_session():
                 provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
             )
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         child_context = child_action.contexts[-1]
         child_ctx = await manager.action_contexts.get("1,0")
@@ -3329,13 +3342,13 @@ async def test_builtin_child_context_cannot_control_parent_page_session():
             )
         )
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
         assert await manager.action_contexts.get("0,0") is None
 
         await child_context.close_page()
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is child_ctx
         assert await manager.action_contexts.get("0,0") is None
         tg.cancel_scope.cancel()
@@ -3373,7 +3386,7 @@ async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
         descriptor=_dynamic_page("dynamic-page", "1,0"),
         context_id=owner_ctx.id,
     )
-    session = manager._dynamic_page_session
+    session = manager._pages.active_dynamic_session()
     assert session is not None
     child_ctx = await manager.action_contexts.get("1,0")
     assert child_ctx is not None
@@ -3397,7 +3410,7 @@ async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
         )
     )
 
-    assert manager._dynamic_page_session is session
+    assert manager._pages.active_dynamic_session() is session
     assert await manager.action_contexts.get("1,0") is None
     assert await manager.action_contexts.get("0,0") is not None
 
@@ -3571,8 +3584,6 @@ async def test_action_instance_rejection_from_owner_during_nonterminal_unavailab
     assert await manager.action_contexts.get("0,0") is None
     assert manager._binding_leases == {}
     assert ctx.action_instance_id in manager._action_instances
-    assert manager._page_frames
-    assert manager._page_frames[-1].committed_plan.bindings[0].status == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -3686,7 +3697,7 @@ async def test_action_lifecycle_rejected_page_session_resource_unavailable_repla
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
-        session = manager._dynamic_page_session
+        session = manager._pages.active_dynamic_session()
         assert session is not None
         child_ctx = await manager.action_contexts.get("1,0")
         assert child_ctx is not None
@@ -3709,13 +3720,8 @@ async def test_action_lifecycle_rejected_page_session_resource_unavailable_repla
             )
         )
 
-        assert manager._dynamic_page_session is session
+        assert manager._pages.active_dynamic_session() is session
         assert await manager.action_contexts.get("1,0") is None
-        assert manager._page_frames
-        assert manager._page_frames[-1].page_session is session
-        assert manager._page_frames[-1].committed_plan.bindings[0].status == (
-            "unavailable"
-        )
         assert all(
             lease.page_session_id != session.page_session_id
             for lease in manager._binding_leases.values()

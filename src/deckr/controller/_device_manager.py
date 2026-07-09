@@ -39,8 +39,6 @@ from deckr.actions.messages import (
     action_body_dict,
     make_binding_id,
     make_context_id,
-    make_dynamic_page_id,
-    make_page_session_id,
     subject_action_instance_id,
     subject_binding_id,
     subject_config_id,
@@ -94,8 +92,6 @@ from deckr.controller._binding_planner import (
     ActionIntentKey,
     BindingPlanner,
     BindingPlanStatus,
-    DynamicPageSession,
-    PageFrame,
     PagePlan,
     PlannedBinding,
 )
@@ -115,10 +111,13 @@ from deckr.controller._device_layout import (
 )
 from deckr.controller._event_translator import EventTranslator
 from deckr.controller._hardware import HardwareCommandService
-from deckr.controller._navigation_service import (
-    NavigationService,
+from deckr.controller._pages import (
+    DynamicPageSession,
+    PageOwnerBinding,
+    PageSessionService,
     PageStackEntry,
-    PageTransition,
+    PageTransitionDraft,
+    PageTransitionEffects,
     StaticPageRef,
 )
 from deckr.controller._render import RenderModel, RenderService, RenderSource
@@ -129,12 +128,11 @@ from deckr.controller._render_dispatcher import (
 )
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.action_provider.context import ControlContext
-from deckr.controller.config._data import DeviceConfig, Profile
+from deckr.controller.config._data import DeviceConfig
 from deckr.controller.settings import SettingsService
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WIDGET_TIMEOUT_MS = 60_000
 ACTION_INSTANCE_CREATE_TIMEOUT_SECONDS = 1.0
 BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS = 1.0
 SETTINGS_SERVICE_TIMEOUT_SECONDS = 1.0
@@ -461,16 +459,11 @@ class DeviceManager:
         self._settings_service = settings_service
         self.action_contexts = AsyncMap[str, ControlContext]()
         self._translator = EventTranslator(controller_id=controller_id)
-        self._nav = NavigationService(config)
+        self._pages = PageSessionService(config, clock=self._clock)
         self._binding_planner = BindingPlanner(
             controller_id=controller_id,
             config_id=self.config_id,
         )
-        self._dynamic_page_session: DynamicPageSession | None = None
-        self._page_frames: list[PageFrame] = []
-        self._current_plan: PagePlan | None = None
-        self._planned_bindings_by_control: dict[str, PlannedBinding] = {}
-        self._config_active = True
         self._action_service = action_service or (
             ControllerActionService(
                 controller_id=controller_id,
@@ -497,7 +490,7 @@ class DeviceManager:
 
     @property
     def config_active(self) -> bool:
-        return self._config_active
+        return self._pages.config_active
 
     async def start(
         self,
@@ -673,13 +666,6 @@ class DeviceManager:
         if planned.action_meta is not None:
             return planned.action_meta.provider_instance_id
         return planned.binding.provider_instance_id
-
-    def _find_profile(self, profile_name: str) -> Profile:
-        for profile in self.config.profiles:
-            if profile.name == profile_name:
-                return profile
-        logger.error(f"Profile {profile_name} not found. Returning the first profile.")
-        return self.config.profiles[0]
 
     def _describe_page_entry(self, entry: PageStackEntry | None) -> str:
         if entry is None:
@@ -1045,24 +1031,6 @@ class DeviceManager:
         return current
 
     def _sync_top_frame_state(self) -> None:
-        frame = self._page_frames[-1] if self._page_frames else None
-        self._current_plan = frame.committed_plan if frame is not None else None
-        self._planned_bindings_by_control = (
-            {
-                planned.control_id: planned
-                for planned in frame.committed_plan.bindings
-            }
-            if frame is not None
-            else {}
-        )
-        dynamic_sessions = [
-            page_frame.page_session
-            for page_frame in self._page_frames
-            if page_frame.page_session is not None
-        ]
-        self._dynamic_page_session = (
-            dynamic_sessions[-1] if dynamic_sessions else None
-        )
         self._sync_action_interest()
 
     def action_interest_snapshot(
@@ -1074,7 +1042,7 @@ class DeviceManager:
 
     def _sync_action_interest(self) -> None:
         now = self._clock()
-        if self._config_active:
+        if self._pages.config_active:
             self._action_interest.replace_strong_interests(
                 ActionInterestSource.CONNECTED_CONFIG,
                 self._configured_action_intents(),
@@ -1113,7 +1081,7 @@ class DeviceManager:
         self._publish_action_interest_snapshot(now=now)
 
     def _publish_action_interest_snapshot(self, *, now: float) -> None:
-        if self._config_active:
+        if self._pages.config_active:
             self._action_service.update_config_interest(
                 self.config_id,
                 self._action_interest.snapshot(now=now),
@@ -1122,10 +1090,8 @@ class DeviceManager:
             self._action_service.clear_config_interest(self.config_id)
 
     def _visible_action_interest_source(self) -> ActionInterestSource:
-        if (
-            self._current_plan is not None
-            and self._current_plan.page_session is not None
-        ):
+        current_plan = self._pages.current_plan()
+        if current_plan is not None and current_plan.page_session is not None:
             return ActionInterestSource.DYNAMIC_PAGE
         return ActionInterestSource.VISIBLE_BINDING
 
@@ -1133,7 +1099,7 @@ class DeviceManager:
         intents: list[ActionIntentKey] = []
         for profile in self.config.profiles:
             for page_index in range(len(profile.pages)):
-                bindings = self._nav.resolve_static_bindings(
+                bindings = self._pages.resolve_static_bindings(
                     StaticPageRef(
                         profile_name=profile.name,
                         page_index=page_index,
@@ -1143,18 +1109,12 @@ class DeviceManager:
         return _dedupe_action_intents(intents)
 
     def _current_plan_action_intents(self) -> tuple[ActionIntentKey, ...]:
-        if self._current_plan is None:
+        current_plan = self._pages.current_plan()
+        if current_plan is None:
             return ()
         return _dedupe_action_intents(
             self._binding_planner.resolved_action_intent_key(planned.binding)
-            for planned in self._current_plan.bindings
-        )
-
-    def _committed_dynamic_page_plans(self) -> tuple[PagePlan, ...]:
-        return tuple(
-            frame.committed_plan
-            for frame in self._page_frames
-            if frame.page_session is not None
+            for planned in current_plan.bindings
         )
 
     def _external_dynamic_page_child_action_instance_ids(
@@ -1175,16 +1135,17 @@ class DeviceManager:
     def _active_external_dynamic_page_child_action_instance_ids(
         self,
     ) -> frozenset[str]:
-        if self._current_plan is None:
+        current_plan = self._pages.current_plan()
+        if current_plan is None:
             return frozenset()
         return self._external_dynamic_page_child_action_instance_ids(
-            (self._current_plan,)
+            (current_plan,)
         )
 
     def _active_dynamic_page_owner_action_instance_ids(self) -> frozenset[str]:
         return frozenset(
             frame.page_session.action_instance_id
-            for frame in self._page_frames
+            for frame in self._pages.snapshot().frames
             if frame.page_session is not None
         )
 
@@ -1363,9 +1324,13 @@ class DeviceManager:
         return body.reason in _TERMINAL_LIFECYCLE_REJECTION_REASONS
 
     def _planned_intent_for_lease(self, lease: BindingLease) -> ActionIntentKey:
-        planned = self._planned_bindings_by_control.get(lease.control_id)
-        if planned is not None:
-            return self._binding_planner.resolved_action_intent_key(planned.binding)
+        current_plan = self._pages.current_plan()
+        if current_plan is not None:
+            for planned in current_plan.bindings:
+                if planned.control_id == lease.control_id:
+                    return self._binding_planner.resolved_action_intent_key(
+                        planned.binding
+                    )
         return ActionIntentKey(
             action_uuid=lease.action_uuid,
             provider_instance_id=lease.provider_instance_id,
@@ -1507,7 +1472,7 @@ class DeviceManager:
         retained_plan: PagePlan | None = None,
         refresh_actions: bool = True,
     ) -> PagePlan | None:
-        bindings = self._nav.resolve_static_bindings(entry)
+        bindings = self._pages.resolve_static_bindings(entry)
         action_metadata = await self._action_metadata_snapshot_for_plan(
             self._binding_planner.static_action_intents(bindings),
             refresh_actions=refresh_actions,
@@ -1530,6 +1495,7 @@ class DeviceManager:
         entry: DynamicPageCommand,
         *,
         page_session: DynamicPageSession,
+        page_session_generation: int | None = None,
         retained_plan: PagePlan | None = None,
         refresh_actions: bool = True,
     ) -> PagePlan | None:
@@ -1546,6 +1512,7 @@ class DeviceManager:
             entry,
             device=self.device,
             page_session=page_session,
+            page_session_generation=page_session_generation,
             action_metadata=action_metadata.metadata,
             action_status=action_status,
             retained_plan=retained_plan,
@@ -1559,6 +1526,7 @@ class DeviceManager:
         entry: PageStackEntry,
         *,
         page_session: DynamicPageSession | None = None,
+        page_session_generation: int | None = None,
         retained_plan: PagePlan | None = None,
         refresh_actions: bool = True,
     ) -> PagePlan | None:
@@ -1574,6 +1542,7 @@ class DeviceManager:
         return await self._build_dynamic_page_plan(
             entry,
             page_session=page_session,
+            page_session_generation=page_session_generation,
             retained_plan=retained_plan,
             refresh_actions=refresh_actions,
         )
@@ -2087,34 +2056,13 @@ class DeviceManager:
         )
         return False
 
-    def _resolve_widget_timeout_ms(self, profile_name: str, page_index: int) -> int:
-        profile = self._find_profile(profile_name)
-        timeout_ms: int | None = None
-        if 0 <= page_index < len(profile.pages):
-            timeout_ms = profile.pages[page_index].widget_timeout_ms
-        if timeout_ms is None:
-            timeout_ms = profile.widget_timeout_ms
-        if timeout_ms is None:
-            timeout_ms = DEFAULT_WIDGET_TIMEOUT_MS
-        return max(0, int(timeout_ms))
-
-    def _record_page_activity(self) -> None:
-        session = self._dynamic_page_session
-        if session is not None:
-            session.last_activity = self._clock()
-
     async def _page_timeout_loop(self, stopping: anyio.Event) -> None:
         while not stopping.is_set():
             await anyio.sleep(self._page_timeout_check_interval)
             if stopping.is_set():
                 return
-            session = self._dynamic_page_session
-            if session is None:
-                continue
-            if session.timeout_ms <= 0:
-                continue
-            elapsed_ms = int((self._clock() - session.last_activity) * 1000)
-            if elapsed_ms >= session.timeout_ms:
+            session = self._pages.expired_session()
+            if session is not None:
                 await self.close_page(context_id=session.context_id, reason="timeout")
 
     def _page_session_metadata(
@@ -2217,62 +2165,68 @@ class DeviceManager:
                 reason,
             )
 
+    async def _apply_page_transition_effects(
+        self,
+        effects: PageTransitionEffects,
+        *,
+        causation_id: str | None = None,
+    ) -> None:
+        for session in effects.sessions_to_close:
+            await self._emit_page_closed(
+                session,
+                effects.cleanup_reason,
+                causation_id=causation_id,
+            )
+        await self._destroy_inactive_external_dynamic_page_children(
+            effects.previous_dynamic_plans,
+            reason=effects.cleanup_reason,
+        )
+
     async def _finalize_dynamic_page(
         self,
         reason: str,
         *,
         causation_id: str | None = None,
     ) -> tuple[PagePlan, ...]:
-        dynamic_frames = [
-            frame
-            for frame in reversed(self._page_frames)
-            if frame.page_session is not None
-        ]
-        if not dynamic_frames:
-            return ()
-        for frame in dynamic_frames:
-            session = frame.page_session
-            if session is None:
-                continue
+        effects = self._pages.clear(reason=reason, dynamic_only=True)
+        self._sync_top_frame_state()
+        for session in effects.sessions_to_close:
             await self._emit_page_closed(
                 session,
                 reason,
                 causation_id=causation_id,
             )
-        finalized_plans = tuple(frame.committed_plan for frame in dynamic_frames)
-        self._page_frames = [
-            frame for frame in self._page_frames if frame.page_session is None
-        ]
-        if self._page_frames:
-            self._nav.set_page(self._page_frames[-1].entry)
-        else:
-            self._nav._current_page = None
-        self._sync_top_frame_state()
-        return finalized_plans
+        return effects.previous_dynamic_plans
 
-    async def _execute_transition(
+    async def _execute_page_draft(
         self,
-        transition: PageTransition,
+        draft: PageTransitionDraft,
         *,
-        page_session: DynamicPageSession | None = None,
-        preserve_rebound_outputs: bool = False,
-        retained_plan: PagePlan | None = None,
-        refresh_actions: bool = True,
-    ) -> bool:
+        causation_id: str | None = None,
+        apply_effects: bool = True,
+    ) -> tuple[bool, PageTransitionEffects | None]:
         plan = await self._build_page_plan(
-            transition.arriving,
-            page_session=page_session,
-            retained_plan=retained_plan,
-            refresh_actions=refresh_actions,
+            draft.entry,
+            page_session=draft.page_session,
+            page_session_generation=draft.page_session_generation,
+            retained_plan=draft.retained_plan,
+            refresh_actions=draft.refresh_actions,
         )
         if plan is None:
-            return False
+            return False, None
         await self._commit_page_plan(
             plan,
-            departing=transition.departing,
-            preserve_rebound_outputs=preserve_rebound_outputs,
+            departing=draft.departing,
+            preserve_rebound_outputs=draft.preserve_rebound_outputs,
         )
-        return True
+        effects = self._pages.commit(draft, plan)
+        self._sync_top_frame_state()
+        if apply_effects:
+            await self._apply_page_transition_effects(
+                effects,
+                causation_id=causation_id,
+            )
+        return True, effects
 
     async def _commit_page_plan(
         self,
@@ -2379,11 +2333,6 @@ class DeviceManager:
             preserve_control_ids=commit.preserve_output_control_ids,
         )
 
-        self._current_plan = plan
-        self._planned_bindings_by_control = {
-            planned.control_id: planned for planned in plan.bindings
-        }
-
         resolved_count = 0
         unavailable_count = 0
         for planned in plan.bindings:
@@ -2487,102 +2436,6 @@ class DeviceManager:
             return lease
         return None
 
-    async def _set_page_locked(
-        self,
-        *,
-        profile: str | None = None,
-        page: int | None = None,
-        descriptor: DynamicPageCommand | None = None,
-        page_session: DynamicPageSession | None = None,
-        close_dynamic: bool = True,
-        close_reason: str = "navigate",
-        causation_id: str | None = None,
-    ) -> bool:
-        """Navigate to a static page (profile, page) or dynamic page (descriptor). Caller must hold _nav_lock."""
-        if not self._config_active:
-            logger.info("Ignoring page transition while config %s is inactive", self.config_id)
-            return False
-        previous_dynamic_plans = self._committed_dynamic_page_plans()
-        dynamic_sessions_to_close = (
-            [
-                frame.page_session
-                for frame in self._page_frames
-                if frame.page_session is not None
-            ]
-            if close_dynamic
-            else []
-        )
-        current_frame = self._page_frames[-1] if self._page_frames else None
-        departing = current_frame.entry if current_frame is not None else None
-        replace_dynamic_page = (
-            descriptor is not None
-            and page_session is not None
-            and current_frame is not None
-            and current_frame.page_session is page_session
-        )
-        if descriptor is not None:
-            entry: PageStackEntry = descriptor
-        else:
-            profile_name = profile or "default"
-            page_index = page if page is not None else 0
-            profile_obj = self._find_profile(profile_name)
-            entry = StaticPageRef(profile_name=profile_obj.name, page_index=page_index)
-
-        retained_plan = (
-            current_frame.committed_plan
-            if (
-                current_frame is not None
-                and current_frame.entry == entry
-                and not replace_dynamic_page
-            )
-            else None
-        )
-        plan = await self._build_page_plan(
-            entry,
-            page_session=page_session,
-            retained_plan=retained_plan,
-            refresh_actions=True,
-        )
-        if plan is None:
-            return False
-
-        preserve_rebound_outputs = isinstance(departing, DynamicPageCommand) and (
-            isinstance(entry, StaticPageRef)
-            or (page_session is not None and isinstance(entry, DynamicPageCommand))
-        )
-        await self._commit_page_plan(
-            plan,
-            departing=departing,
-            preserve_rebound_outputs=preserve_rebound_outputs,
-        )
-
-        if isinstance(entry, StaticPageRef):
-            self._page_frames = [PageFrame(entry, None, plan)]
-        elif page_session is not None:
-            next_frame = PageFrame(entry, page_session, plan)
-            if (
-                current_frame is not None
-                and current_frame.page_session is page_session
-            ):
-                self._page_frames[-1] = next_frame
-            else:
-                self._page_frames.append(next_frame)
-        self._nav.set_page(entry)
-        self._sync_top_frame_state()
-
-        for session in reversed(dynamic_sessions_to_close):
-            if session is not None:
-                await self._emit_page_closed(
-                    session,
-                    close_reason,
-                    causation_id=causation_id,
-                )
-        await self._destroy_inactive_external_dynamic_page_children(
-            previous_dynamic_plans,
-            reason="page_child_removed" if replace_dynamic_page else close_reason,
-        )
-        return True
-
     async def set_page(
         self,
         *,
@@ -2593,14 +2446,25 @@ class DeviceManager:
     ) -> bool:
         """Navigate to a static page (profile, page) or dynamic page (descriptor)."""
         async with self._nav_lock:
-            return await self._set_page_locked(
+            draft = self._pages.begin_set_page(
                 profile=profile,
                 page=page,
                 descriptor=descriptor,
                 close_dynamic=True,
                 close_reason="navigate",
+            )
+            if draft is None:
+                if not self._pages.config_active:
+                    logger.info(
+                        "Ignoring page transition while config %s is inactive",
+                        self.config_id,
+                    )
+                return False
+            ok, _ = await self._execute_page_draft(
+                draft,
                 causation_id=causation_id,
             )
+            return ok
 
     async def open_page(
         self,
@@ -2615,7 +2479,6 @@ class DeviceManager:
             return None
 
         async with self._nav_lock:
-            current = self._dynamic_page_session
             if binding_id is not None:
                 owner_lease = self._binding_leases.get(binding_id)
                 if owner_lease is not None and (
@@ -2632,76 +2495,34 @@ class DeviceManager:
                 )
                 return None
 
-            try:
-                owner_page = int(owner_lease.page_id)
-            except ValueError:
-                owner_page = current.owner_page if current is not None else 0
-            if owner_lease.page_session_id is not None and current is not None:
-                owner_profile = current.owner_profile
-                owner_page = current.owner_page
-            else:
-                owner_profile = owner_lease.profile_id
-            timeout_ms = self._resolve_widget_timeout_ms(owner_profile, owner_page)
-            owner_context_id = context_id
-            owner_binding_id = owner_lease.binding_id
-            owner_control_id = owner_lease.control_id
-            owner_action_uuid = owner_lease.action_uuid
-            owner_provider_instance_id = owner_lease.provider_instance_id
-            owner_provider_id = owner_lease.provider_id
-            owner_provider_session_id = owner_lease.provider_session_id
-            action_instance_id = owner_lease.action_instance_id
-            settings_target = owner_lease.settings_target
-            owner_action_meta = ActionMetadata(
-                uuid=owner_action_uuid,
-                provider_instance_id=owner_provider_instance_id,
-                provider_id=owner_provider_id,
-                provider_session_id=owner_provider_session_id,
-            )
-
-            page_id = descriptor.page_id or make_dynamic_page_id()
-            descriptor = DynamicPageCommand(
-                pageId=page_id,
-                bindings=descriptor.bindings,
-            )
-
-            session = DynamicPageSession(
-                page_id=page_id,
-                page_session_id=make_page_session_id(),
-                context_id=make_context_id(),
-                action_instance_id=action_instance_id,
-                owner_context_id=owner_context_id,
-                owner_binding_id=owner_binding_id,
-                owner_control_id=owner_control_id,
-                owner_action_uuid=owner_action_uuid,
-                owner_provider_instance_id=owner_provider_instance_id,
-                owner_provider_id=owner_provider_id,
-                owner_provider_session_id=owner_provider_session_id,
-                owner_action_meta=owner_action_meta,
-                owner_profile=owner_profile,
-                owner_page=owner_page,
-                timeout_ms=timeout_ms,
-                last_activity=self._clock(),
-                settings_target=settings_target,
-                generation=0,
-            )
-
-            ok = await self._set_page_locked(
+            draft = self._pages.begin_open_page(
                 descriptor=descriptor,
-                page_session=session,
-                close_dynamic=False,
+                owner=PageOwnerBinding(
+                    context_id=context_id,
+                    binding_id=owner_lease.binding_id,
+                    control_id=owner_lease.control_id,
+                    action_uuid=owner_lease.action_uuid,
+                    provider_instance_id=owner_lease.provider_instance_id,
+                    provider_id=owner_lease.provider_id,
+                    provider_session_id=owner_lease.provider_session_id,
+                    action_instance_id=owner_lease.action_instance_id,
+                    profile_id=owner_lease.profile_id,
+                    page_id=owner_lease.page_id,
+                    page_session_id=owner_lease.page_session_id,
+                    settings_target=owner_lease.settings_target,
+                ),
+            )
+            if draft is None or draft.page_session is None:
+                return None
+            ok, _ = await self._execute_page_draft(
+                draft,
+                causation_id=causation_id,
             )
             if ok:
+                session = draft.page_session
                 await self._emit_page_opened(session, causation_id=causation_id)
                 return session
             return None
-
-    def _page_control_session(self, context_id: str) -> DynamicPageSession | None:
-        session = self._dynamic_page_session
-        if session is None:
-            return None
-        if context_id == session.context_id:
-            return session
-        return None
 
     async def replace_page(
         self,
@@ -2714,31 +2535,21 @@ class DeviceManager:
         if not descriptor or not descriptor.bindings:
             return
         async with self._nav_lock:
-            current = self._page_control_session(context_id)
-            if current is None:
+            draft = self._pages.begin_replace_page(
+                descriptor=descriptor,
+                context_id=context_id,
+            )
+            if draft is None:
                 logger.warning(
                     "replace_page ignored: no active page for %s", context_id
                 )
                 return
-            if descriptor.page_id != current.page_id:
-                logger.warning(
-                    "replace_page ignored: descriptor page %s does not match session page %s",
-                    descriptor.page_id,
-                    current.page_id,
-                )
-                return
-            replacement = DynamicPageCommand(
-                pageId=current.page_id,
-                bindings=descriptor.bindings,
-            )
-            current.generation += 1
-            ok = await self._set_page_locked(
-                descriptor=replacement,
-                page_session=current,
-                close_dynamic=False,
+            ok, _ = await self._execute_page_draft(
+                draft,
+                causation_id=causation_id,
             )
             if ok:
-                current.last_activity = self._clock()
+                self._pages.record_activity()
 
     async def close_page(
         self,
@@ -2762,69 +2573,39 @@ class DeviceManager:
         reason: str,
         causation_id: str | None = None,
     ) -> bool:
-        session = self._page_control_session(context_id)
-        if session is None:
+        draft = self._pages.begin_close_page(
+            context_id=context_id,
+            reason=reason,
+        )
+        if draft is None:
             logger.info("No owner for dynamic page")
             return False
-        if (
-            len(self._page_frames) < 2
-            or self._page_frames[-1].page_session is not session
-        ):
-            logger.info("Dynamic page close ignored for non-top session")
-            return False
-        previous_dynamic_plans = self._committed_dynamic_page_plans()
-        departing_frame = self._page_frames[-1]
-        restore_frame = self._page_frames[-2]
-        restored_plan = await self._build_page_plan(
-            restore_frame.entry,
-            page_session=restore_frame.page_session,
-            retained_plan=restore_frame.committed_plan,
-            refresh_actions=False,
-        )
-        if restored_plan is None:
-            logger.warning("Dynamic page close rejected because restore frame is invalid")
-            return False
-        await self._commit_page_plan(
-            restored_plan,
-            departing=departing_frame.entry,
-            preserve_rebound_outputs=True,
-        )
-        self._page_frames.pop()
-        self._page_frames[-1] = PageFrame(
-            restore_frame.entry,
-            restore_frame.page_session,
-            restored_plan,
-        )
-        self._nav.set_page(restore_frame.entry)
-        self._sync_top_frame_state()
-        await self._emit_page_closed(
-            session,
-            reason=reason,
+        ok, _ = await self._execute_page_draft(
+            draft,
             causation_id=causation_id,
         )
-        await self._destroy_inactive_external_dynamic_page_children(
-            previous_dynamic_plans,
-            reason=reason,
-        )
-        return True
+        if not ok:
+            logger.warning("Dynamic page close rejected because restore frame is invalid")
+        return ok
 
     async def clear_page(self, *, clear_outputs: bool = True):
         async with self._nav_lock:
             await self._cancel_all_held_inputs()
-            finalized_plans = await self._finalize_dynamic_page(reason="clear")
+            effects = self._pages.clear(reason="clear")
+            self._sync_top_frame_state()
+            for session in effects.sessions_to_close:
+                await self._emit_page_closed(session, "clear")
             await self._revoke_active_bindings(
                 clear_outputs=clear_outputs,
                 reason="clear_page",
             )
             await self._destroy_inactive_external_dynamic_page_children(
-                finalized_plans,
+                effects.previous_dynamic_plans,
                 reason="clear",
             )
             await self._destroy_all_action_instances(reason="clear")
             if clear_outputs:
                 await self._clear_all_raster_controls()
-            self._page_frames.clear()
-            self._nav._current_page = None
             self._sync_top_frame_state()
 
     async def on_descriptor_changed(self, descriptor: DeviceDescriptor) -> None:
@@ -2832,18 +2613,15 @@ class DeviceManager:
 
         async with self._nav_lock:
             self.device = descriptor
-            current_frame = self._page_frames[-1] if self._page_frames else None
-            if current_frame is None:
-                return
-            ok = await self._execute_transition(
-                PageTransition(
-                    departing=current_frame.entry,
-                    arriving=current_frame.entry,
-                ),
-                page_session=current_frame.page_session,
-                preserve_rebound_outputs=True,
-                retained_plan=current_frame.committed_plan,
+            draft = self._pages.begin_refresh_current(
                 refresh_actions=False,
+                preserve_rebound_outputs=True,
+            )
+            if draft is None:
+                return
+            ok, _ = await self._execute_page_draft(
+                draft,
+                apply_effects=False,
             )
             if not ok:
                 finalized_plans = await self._finalize_dynamic_page(
@@ -2858,13 +2636,6 @@ class DeviceManager:
                     reason="device_descriptor_changed",
                 )
                 return
-            if self._page_frames and self._current_plan is not None:
-                self._page_frames[-1] = PageFrame(
-                    current_frame.entry,
-                    current_frame.page_session,
-                    self._current_plan,
-                )
-                self._sync_top_frame_state()
 
     async def on_capability_state_changed(
         self,
@@ -2899,8 +2670,11 @@ class DeviceManager:
         """Refresh the current page availability overlay after provider availability changes."""
         changed_key_set = frozenset(changed_keys)
         async with self._nav_lock:
-            current_frame = self._page_frames[-1] if self._page_frames else None
-            if current_frame is None:
+            draft = self._pages.begin_refresh_current(
+                refresh_actions=True,
+                preserve_rebound_outputs=False,
+            )
+            if draft is None or draft.retained_plan is None:
                 logger.debug(
                     "Action availability page refresh skipped config=%s "
                     "changed_keys=%s reason=no_current_page",
@@ -2910,13 +2684,13 @@ class DeviceManager:
                 return
             if changed_key_set and not self._action_availability_change_affects_plan(
                 changed_key_set,
-                current_frame.committed_plan,
+                draft.retained_plan,
             ):
                 logger.debug(
                     "Action availability page refresh decision config=%s page=%s "
                     "changed_keys=%s affected=False keys=%s",
                     self.config_id,
-                    current_frame.committed_plan.page_id,
+                    draft.retained_plan.page_id,
                     len(changed_key_set),
                     _format_provider_action_keys(changed_key_set),
                 )
@@ -2925,16 +2699,17 @@ class DeviceManager:
                 "Action availability page refresh decision config=%s page=%s "
                 "changed_keys=%s affected=True keys=%s",
                 self.config_id,
-                current_frame.committed_plan.page_id,
+                draft.retained_plan.page_id,
                 len(changed_key_set),
                 _format_provider_action_keys(changed_key_set),
             )
 
             refreshed_plan = await self._build_page_plan(
-                current_frame.entry,
-                page_session=current_frame.page_session,
-                retained_plan=current_frame.committed_plan,
-                refresh_actions=True,
+                draft.entry,
+                page_session=draft.page_session,
+                page_session_generation=draft.page_session_generation,
+                retained_plan=draft.retained_plan,
+                refresh_actions=draft.refresh_actions,
             )
             if refreshed_plan is None:
                 logger.warning(
@@ -2948,11 +2723,7 @@ class DeviceManager:
                 refreshed_plan.page_id,
             )
 
-            self._page_frames[-1] = PageFrame(
-                current_frame.entry,
-                current_frame.page_session,
-                refreshed_plan,
-            )
+            self._pages.commit(draft, refreshed_plan)
             self._sync_top_frame_state()
 
             for planned in refreshed_plan.bindings:
@@ -3107,7 +2878,7 @@ class DeviceManager:
         lease: BindingLease,
         action_meta: ActionMetadata | None,
     ) -> bool:
-        session = self._dynamic_page_session
+        session = self._pages.active_dynamic_session()
         return (
             session is not None
             and action_meta is not None
@@ -3121,19 +2892,11 @@ class DeviceManager:
         self,
         action_meta: ActionMetadata,
     ) -> None:
-        session = self._dynamic_page_session
+        session = self._pages.active_dynamic_session()
         if session is None:
             return
-        if (
-            action_meta.uuid != session.owner_action_uuid
-            or action_meta.provider_instance_id
-            != session.owner_provider_instance_id
-        ):
-            return
-        if (
-            action_meta.provider_id == session.owner_provider_id
-            and action_meta.provider_session_id == session.owner_provider_session_id
-        ):
+        old_provider_session_id = session.owner_provider_session_id
+        if not self._pages.move_owner_provider_session(action_meta):
             return
         logger.info(
             "Moving dynamic page owner provider session config=%s pageSession=%s "
@@ -3142,12 +2905,9 @@ class DeviceManager:
             session.page_session_id,
             session.owner_action_uuid,
             session.owner_provider_instance_id,
-            session.owner_provider_session_id,
+            old_provider_session_id,
             action_meta.provider_session_id,
         )
-        session.owner_provider_id = action_meta.provider_id
-        session.owner_provider_session_id = action_meta.provider_session_id
-        session.owner_action_meta = action_meta
 
     async def _config_listener(self) -> None:
         """Consume config stream and apply changes."""
@@ -3159,39 +2919,34 @@ class DeviceManager:
     async def _on_config_changed(self, config: DeviceConfig | None) -> None:
         """Handle config update or removal."""
         if config is None:
-            self._config_active = False
+            self._pages.mark_config_inactive()
             await self.clear_page()
             return
-        if config == self.config and self._config_active:
+        if config == self.config and self._pages.config_active:
             return
         async with self._nav_lock:
             await self._cancel_all_held_inputs()
-            self._config_active = True
             self.config = config
-            self._nav.update_config(config)
-            finalized_plans = await self._finalize_dynamic_page(reason="config_change")
+            draft = self._pages.update_config(config)
+            for session in draft.sessions_to_close:
+                await self._emit_page_closed(session, "config_change")
             await self._revoke_active_bindings(
                 clear_outputs=False,
                 reason="config_change",
             )
             await self._destroy_inactive_external_dynamic_page_children(
-                finalized_plans,
+                draft.previous_dynamic_plans,
                 reason="config_change",
             )
             await self._destroy_all_action_instances(reason="config_change")
-            profile = config.profiles[0]
-            entry = StaticPageRef(profile_name=profile.name, page_index=0)
-            plan = await self._build_page_plan(entry, refresh_actions=True)
-            if plan is None:
-                self._page_frames.clear()
-                self._nav._current_page = None
+            ok, _ = await self._execute_page_draft(
+                draft,
+                apply_effects=False,
+            )
+            if not ok:
+                self._pages.clear(reason="config_change")
                 self._sync_top_frame_state()
                 return
-            departing = self._page_frames[-1].entry if self._page_frames else None
-            await self._commit_page_plan(plan, departing=departing)
-            self._page_frames = [PageFrame(entry, None, plan)]
-            self._nav.set_page(entry)
-            self._sync_top_frame_state()
 
     def _command_sender_provider_instance_id(self, msg: DeckrMessage) -> str | None:
         provider_instance_id = parse_action_provider_address(msg.sender)
@@ -3314,7 +3069,7 @@ class DeviceManager:
                 binding=lease,
             )
 
-        session = self._dynamic_page_session
+        session = self._pages.active_dynamic_session()
         if page_session_id is not None:
             if (
                 session is None
@@ -3551,7 +3306,7 @@ class DeviceManager:
         *,
         reason: str,
     ) -> None:
-        page_session = self._dynamic_page_session
+        page_session = self._pages.active_dynamic_session()
         if (
             page_session is not None
             and page_session.action_instance_id == metadata.action_instance_id
@@ -3861,8 +3616,8 @@ class DeviceManager:
         translated = self._translator.translate(event, self.config_id)
         if translated is None:
             return
-        if self._dynamic_page_session is not None:
-            self._record_page_activity()
+        if self._pages.active_dynamic_session() is not None:
+            self._pages.record_activity()
 
         control_id = translated.control_id
         route_owner = self._attachments.active_input_for_event(
