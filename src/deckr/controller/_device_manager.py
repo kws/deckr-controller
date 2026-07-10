@@ -85,10 +85,6 @@ class DeviceManager:
     def config_active(self) -> bool:
         return self._pages.config_active
 
-    @property
-    def bindings(self) -> ControlBindingService:
-        return self._bindings
-
     def snapshot(self) -> BindingActionSnapshot:
         return self._bindings.snapshot()
 
@@ -108,6 +104,7 @@ class DeviceManager:
         stopping: anyio.Event,
     ) -> None:
         await self._bindings.start(tg, stopping)
+        tg.start_soon(self._config_listener)
 
     async def _config_listener(self) -> None:
         if self._config_stream is None:

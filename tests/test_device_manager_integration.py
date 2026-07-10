@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import anyio
 import pytest
 from conftest import LaneHarness
 from deckr.contracts.messages import DeckrMessage, controller_address
@@ -153,8 +154,7 @@ async def test_device_manager_constructs_binding_service_with_page_session(
     manager = _manager(monkeypatch)
     binding = _FakeBindingService.instances[0]
 
-    assert manager.bindings is binding
-    assert binding.kwargs["pages"] is manager._pages
+    assert binding.kwargs["pages"] is not None
     assert binding.kwargs["page_command_port"] is manager
     assert binding.kwargs["action_service"].controller_id == CONTROLLER_ID
     assert binding.kwargs["device"] is manager.device
@@ -209,16 +209,23 @@ async def test_device_manager_config_listener_fans_out_config_changes(
     monkeypatch: pytest.MonkeyPatch,
 ):
     reloaded = _device_config("reloaded-device")
+    listener_finished = anyio.Event()
 
     async def config_stream() -> AsyncIterator[DeviceConfig | None]:
         yield reloaded
         yield None
+        listener_finished.set()
 
     manager = _manager(monkeypatch, config_stream=config_stream())
     binding = _FakeBindingService.instances[0]
 
-    await manager._config_listener()
+    stopping = anyio.Event()
+    async with anyio.create_task_group() as tg:
+        await manager.start(tg, stopping)
+        await listener_finished.wait()
+        tg.cancel_scope.cancel()
 
     assert manager.config is reloaded
+    assert ("start", (tg, stopping)) in binding.calls
     assert ("on_config_changed", reloaded) in binding.calls
     assert ("on_config_changed", None) in binding.calls

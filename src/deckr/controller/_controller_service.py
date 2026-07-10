@@ -119,15 +119,15 @@ class ControllerService(BaseComponent):
                 try:
                     if not isinstance(event, DeckrMessage):
                         continue
-                    actihandle_hardware_input = (
+                    action_runtime_message = (
                         await self._action_service.decode_inbound_runtime_message(event)
                         if self._action_service is not None
                         else None
                     )
-                    if actihandle_hardware_input is None:
+                    if action_runtime_message is None:
                         continue
-                    if actihandle_hardware_input.message_type in COMMAND_MESSAGE_TYPES:
-                        await self._handle_action_command(actihandle_hardware_input)
+                    if action_runtime_message.message_type in COMMAND_MESSAGE_TYPES:
+                        await self._handle_action_command(action_runtime_message)
                 except Exception:
                     if isinstance(event, DeckrMessage):
                         logger.exception(
@@ -289,7 +289,6 @@ class ControllerService(BaseComponent):
             await self._controller_contexts.set(live.config_id, ctrl_ctx)
             async with anyio.create_task_group() as device_tg:
                 await ctrl_ctx.start(device_tg, disconnect_event)
-                device_tg.start_soon(ctrl_ctx._config_listener)
                 if initial_config_removed:
                     await ctrl_ctx.on_config_changed(None)
                     await disconnect_event.wait()
