@@ -15,7 +15,6 @@ from deckr.beacon import (
 from deckr.components import RunContext
 from deckr.concord import (
     CONCORD_CONTRACT_BUCKET_POLICY,
-    CONCORD_MAINTENANCE_BUCKET_POLICY,
     CONCORD_TOKEN_BUCKET_POLICY,
     Concord,
     ContractValidityStatus,
@@ -34,6 +33,7 @@ from deckr.hardware.descriptors import (
     DeviceRef,
 )
 from deckr.hardware.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
+from deckr.testing import ConcordRuntimeHarness
 
 from deckr.controller._controller_service import (
     ControllerService,
@@ -163,11 +163,10 @@ def _beacon(bus: LaneHarness) -> Beacon:
 
 
 def _concord(bus: LaneHarness) -> Concord:
-    return Concord(
-        bus.substrate.kv_bucket(CONCORD_CONTRACT_BUCKET_POLICY),
-        bus.substrate.kv_bucket(CONCORD_TOKEN_BUCKET_POLICY),
-        bus.substrate.kv_bucket(CONCORD_MAINTENANCE_BUCKET_POLICY),
-    )
+    return ConcordRuntimeHarness(
+        contract_store=bus.substrate.kv_bucket(CONCORD_CONTRACT_BUCKET_POLICY),
+        token_store=bus.substrate.kv_bucket(CONCORD_TOKEN_BUCKET_POLICY),
+    ).concord
 
 
 def _claims(controller: ControllerService):

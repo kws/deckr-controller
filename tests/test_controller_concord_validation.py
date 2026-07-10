@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from deckr.concord import (
     ConcordConflict,
+    ConcordConflictCode,
     ContractValidity,
     ContractValidityStatus,
 )
@@ -26,7 +27,10 @@ class _Agreement:
 
     async def refresh(self) -> ContractValidity:
         if self._conflict:
-            raise ConcordConflict("refresh conflict")
+            raise ConcordConflict(
+                ConcordConflictCode.REVISION_CHANGED,
+                "refresh conflict",
+            )
         self._validity = self._next_validity
         return self._next_validity
 
