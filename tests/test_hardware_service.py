@@ -96,6 +96,9 @@ def _contract() -> ContractPointer:
     return ContractPointer(contractId="contract-a", generation=1)
 
 
+_DEFAULT_CONTRACT = _contract()
+
+
 def _device(*, power: bool = False) -> DeviceDescriptor:
     capabilities = ()
     if power:
@@ -147,7 +150,14 @@ def _sent_body(endpoint) -> dict:
     return endpoint.send.await_args.kwargs["body"]
 
 
-def _hardware_message(message_type: str, body) -> DeckrMessage:
+def _hardware_message(
+    message_type: str,
+    body,
+    *,
+    sender: str | None = None,
+    sender_session_id: str = "manager-session",
+    contract: ContractPointer | None = _DEFAULT_CONTRACT,
+) -> DeckrMessage:
     ref = body.device_ref
     capability_ref = CapabilityRef(
         deviceRef=ref,
@@ -157,11 +167,12 @@ def _hardware_message(message_type: str, body) -> DeckrMessage:
     return DeckrMessage(
         lane=HARDWARE_MESSAGES_LANE,
         messageType=message_type,
-        sender=hardware_manager_address(ref.manager_id),
-        senderSessionId="manager-session",
+        sender=sender or hardware_manager_address(ref.manager_id),
+        senderSessionId=sender_session_id,
         recipient=endpoint_target(controller_address("controller-main")),
         subject=hw_messages.hardware_subject_for_capability(capability_ref),
         body=hw_messages.hardware_body_to_dict(body),
+        contract=contract,
     )
 
 
@@ -367,3 +378,144 @@ async def test_hardware_input_loop_routes_input_state_and_rejection_messages() -
     assert state_event.value is True
     assert rejected_event.capability_id == "raster"
     assert rejected_event.command_type == "set_frame"
+
+
+@pytest.mark.parametrize(
+    "message_updates",
+    (
+        {"contract": None},
+        {"contract": ContractPointer(contractId="wrong-contract", generation=1)},
+        {"contract": ContractPointer(contractId="contract-a", generation=2)},
+        {"sender": hardware_manager_address("manager-b")},
+    ),
+)
+@pytest.mark.asyncio
+async def test_hardware_input_rejects_wrong_endpoint_or_contract_without_reconcile(
+    message_updates,
+) -> None:
+    body = hw_messages.ControlInputMessage(
+        deviceRef=_ref(),
+        controlId="key-1",
+        capabilityId="input",
+        eventType="down",
+    )
+    endpoint = _InputEndpoint(
+        [_hardware_message(hw_messages.CONTROL_INPUT, body, **message_updates)]
+    )
+    callbacks = _Callbacks()
+    service = _controller_hardware(endpoint, callbacks)
+    _connect_route(service)
+    service.reconcile = AsyncMock()
+
+    await service._input_loop(stopping=anyio.Event())
+
+    callbacks.control_input.assert_not_awaited()
+    service.reconcile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hardware_input_reconciles_stale_session_once_then_drops() -> None:
+    body = hw_messages.ControlInputMessage(
+        deviceRef=_ref(),
+        controlId="key-1",
+        capabilityId="input",
+        eventType="down",
+    )
+    endpoint = _InputEndpoint(
+        [
+            _hardware_message(
+                hw_messages.CONTROL_INPUT,
+                body,
+                sender_session_id="successor-session",
+            )
+        ]
+    )
+    callbacks = _Callbacks()
+    service = _controller_hardware(endpoint, callbacks)
+    _connect_route(service)
+    service.reconcile = AsyncMock()
+
+    await service._input_loop(stopping=anyio.Event())
+
+    service.reconcile.assert_awaited_once_with(
+        reason="hardware ingress sender session mismatch"
+    )
+    callbacks.control_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hardware_input_rechecks_refreshed_route_after_session_reconcile() -> None:
+    body = hw_messages.ControlInputMessage(
+        deviceRef=_ref(),
+        controlId="key-1",
+        capabilityId="input",
+        eventType="down",
+    )
+    endpoint = _InputEndpoint(
+        [
+            _hardware_message(
+                hw_messages.CONTROL_INPUT,
+                body,
+                sender_session_id="successor-session",
+            )
+        ]
+    )
+    callbacks = _Callbacks()
+    service = _controller_hardware(endpoint, callbacks)
+    _connect_route(service)
+
+    async def refresh_route(*, reason: str) -> None:
+        assert reason == "hardware ingress sender session mismatch"
+        service._routes.update_descriptor(
+            ref=_ref(),
+            device=_device(),
+            contract=_contract(),
+            manager_session_id="successor-session",
+        )
+
+    service.reconcile = AsyncMock(side_effect=refresh_route)
+
+    await service._input_loop(stopping=anyio.Event())
+
+    service.reconcile.assert_awaited_once()
+    callbacks.control_input.assert_awaited_once()
+    refreshed = callbacks.control_input.await_args.args[0]
+    assert refreshed.manager_session_id == "successor-session"
+
+
+@pytest.mark.asyncio
+async def test_hardware_input_rechecks_complete_route_after_reconcile() -> None:
+    body = hw_messages.ControlInputMessage(
+        deviceRef=_ref(),
+        controlId="key-1",
+        capabilityId="input",
+        eventType="down",
+    )
+    endpoint = _InputEndpoint(
+        [
+            _hardware_message(
+                hw_messages.CONTROL_INPUT,
+                body,
+                sender_session_id="successor-session",
+            )
+        ]
+    )
+    callbacks = _Callbacks()
+    service = _controller_hardware(endpoint, callbacks)
+    _connect_route(service)
+
+    async def replace_contract(*, reason: str) -> None:
+        assert reason == "hardware ingress sender session mismatch"
+        service._routes.update_descriptor(
+            ref=_ref(),
+            device=_device(),
+            contract=ContractPointer(contractId="successor-contract", generation=1),
+            manager_session_id="successor-session",
+        )
+
+    service.reconcile = AsyncMock(side_effect=replace_contract)
+
+    await service._input_loop(stopping=anyio.Event())
+
+    service.reconcile.assert_awaited_once()
+    callbacks.control_input.assert_not_awaited()

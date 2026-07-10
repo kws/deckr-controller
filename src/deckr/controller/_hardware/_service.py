@@ -5,9 +5,14 @@ import logging
 import anyio
 from deckr.beacon import Beacon, BeaconDirectory
 from deckr.concord import Concord, ConcordUnavailable
-from deckr.contracts.messages import HARDWARE_MESSAGES_LANE, DeckrMessage
+from deckr.contracts.messages import (
+    HARDWARE_MESSAGES_LANE,
+    DeckrMessage,
+    hardware_manager_address,
+)
 from deckr.core.util.anyio import CoalescedTrigger
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import DeviceRef
 from deckr.hardware.profiles import HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
@@ -32,6 +37,31 @@ logger = logging.getLogger(__name__)
 STATE_RECONCILE_SECONDS = 15.0
 STATE_NOTIFICATION_BATCH_SECONDS = 0.05
 WATCH_RETRY_SECONDS = 1.0
+
+
+def _route_sender_and_contract_match(
+    live: LiveDeviceRoute,
+    message: DeckrMessage,
+) -> bool:
+    claimed = message.contract
+    expected = live.contract
+    return (
+        message.sender == hardware_manager_address(live.ref.manager_id)
+        and claimed is not None
+        and claimed.contract_id == expected.contract_id
+        and claimed.generation == expected.generation
+    )
+
+
+def _route_authorizes_message(
+    live: LiveDeviceRoute,
+    message: DeckrMessage,
+) -> bool:
+    return (
+        _route_sender_and_contract_match(live, message)
+        and live.manager_session_id is not None
+        and message.sender_session_id == live.manager_session_id
+    )
 
 
 class ControllerHardwareService:
@@ -137,7 +167,7 @@ class ControllerHardwareService:
                 ref = hw_messages.hardware_device_ref_from_message(message)
                 if ref is None:
                     continue
-                live = self._routes.get_by_ref(ref)
+                live = await self._authorized_ingress_route(ref, message)
                 if live is None:
                     continue
                 if isinstance(event, hw_messages.ControlInputMessage):
@@ -149,6 +179,31 @@ class ControllerHardwareService:
                     )
                 elif isinstance(event, hw_messages.CommandRejectedMessage):
                     await self._callbacks.on_hardware_command_rejected(live, event)
+
+    async def _authorized_ingress_route(
+        self,
+        ref: DeviceRef,
+        message: DeckrMessage,
+    ) -> LiveDeviceRoute | None:
+        live = self._routes.get_by_ref(ref)
+        if live is None or not _route_sender_and_contract_match(live, message):
+            return None
+        if _route_authorizes_message(live, message):
+            return live
+
+        try:
+            await self.reconcile(reason="hardware ingress sender session mismatch")
+        except (ConcordUnavailable, KvUnavailable):
+            logger.warning(
+                "Hardware authority unavailable while reconciling ingress session",
+                exc_info=True,
+            )
+            return None
+
+        refreshed = self._routes.get_by_ref(ref)
+        if refreshed is None or not _route_authorizes_message(refreshed, message):
+            return None
+        return refreshed
 
     async def _directory_snapshot_loop(self, stopping: anyio.Event) -> None:
         async with cancel_on_stopping(stopping):
