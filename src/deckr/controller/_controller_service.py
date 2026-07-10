@@ -92,7 +92,7 @@ class ControllerService(BaseComponent):
             return
         ctrl_ctx = await self._controller_contexts.get(config_id)
         if ctrl_ctx is not None:
-            await ctrl_ctx.handle_command(msg)
+            await ctrl_ctx.handle_provider_command(msg)
 
     async def _handle_internal_action_availability_changed(
         self,
@@ -119,15 +119,15 @@ class ControllerService(BaseComponent):
                 try:
                     if not isinstance(event, DeckrMessage):
                         continue
-                    action_event = (
+                    actihandle_hardware_input = (
                         await self._action_service.decode_inbound_runtime_message(event)
                         if self._action_service is not None
                         else None
                     )
-                    if action_event is None:
+                    if actihandle_hardware_input is None:
                         continue
-                    if action_event.message_type in COMMAND_MESSAGE_TYPES:
-                        await self._handle_action_command(action_event)
+                    if actihandle_hardware_input.message_type in COMMAND_MESSAGE_TYPES:
+                        await self._handle_action_command(actihandle_hardware_input)
                 except Exception:
                     if isinstance(event, DeckrMessage):
                         logger.exception(
@@ -184,7 +184,7 @@ class ControllerService(BaseComponent):
     ) -> None:
         ctrl_ctx = await self._controller_contexts.get(config_id)
         if ctrl_ctx is not None:
-            await ctrl_ctx.on_descriptor_changed(device)
+            await ctrl_ctx.on_device_descriptor_changed(device)
 
     async def on_hardware_control_input(
         self,
@@ -193,7 +193,7 @@ class ControllerService(BaseComponent):
     ) -> None:
         ctrl_ctx = await self._controller_contexts.get(live.config_id)
         if ctrl_ctx is not None:
-            await ctrl_ctx.on_event(message)
+            await ctrl_ctx.handle_hardware_input(message)
 
     async def on_hardware_capability_state_changed(
         self,
@@ -291,7 +291,7 @@ class ControllerService(BaseComponent):
                 await ctrl_ctx.start(device_tg, disconnect_event)
                 device_tg.start_soon(ctrl_ctx._config_listener)
                 if initial_config_removed:
-                    await ctrl_ctx._on_config_changed(None)
+                    await ctrl_ctx.on_config_changed(None)
                     await disconnect_event.wait()
                     device_tg.cancel_scope.cancel()
                     return

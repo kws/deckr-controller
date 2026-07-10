@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from deckr.actions.messages import (
     BINDING_ATTACHED,
@@ -11,27 +11,73 @@ from deckr.actions.messages import (
     BindingMetadata,
     CapabilityInputBody,
     CapabilityInputEvent,
+    DynamicPageCommand,
     SettingsTargetRef,
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.models import thaw_json
 from deckr.hardware.descriptors import DeviceDescriptor
-from deckr.lanes import EndpointSession
 
 from deckr.controller._actions import ProviderSessionKey
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
 from deckr.controller._hardware import HardwareCommandService
+from deckr.controller._pages import DynamicPageSession
 from deckr.controller._render import RenderService, RenderSource
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
 from deckr.controller.action_provider.builtin._context import ControllerActionContext
 
 if TYPE_CHECKING:
-    from deckr.controller._device_manager import DeviceManager
     from deckr.controller.action_provider.builtin import BuiltinAction
 
 logger = logging.getLogger(__name__)
+
+
+class RuntimeMessageSender(Protocol):
+    async def send_action_runtime_message(
+        self,
+        *,
+        provider_session_key: ProviderSessionKey | None,
+        message_type: str,
+        body: Any,
+    ) -> bool: ...
+
+
+class PageCommandPort(Protocol):
+    async def set_page(
+        self,
+        *,
+        profile: str | None = None,
+        page: int | None = None,
+        descriptor: DynamicPageCommand | None = None,
+        causation_id: str | None = None,
+    ) -> bool: ...
+
+    async def open_page(
+        self,
+        *,
+        descriptor: DynamicPageCommand,
+        context_id: str,
+        binding_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> DynamicPageSession | None: ...
+
+    async def replace_page(
+        self,
+        *,
+        descriptor: DynamicPageCommand,
+        context_id: str,
+        causation_id: str | None = None,
+    ) -> None: ...
+
+    async def close_page(
+        self,
+        *,
+        context_id: str,
+        reason: str = "close",
+        causation_id: str | None = None,
+    ) -> None: ...
 
 
 class ControlContext:
@@ -49,8 +95,8 @@ class ControlContext:
         control: ControlSurface,
         settings: Mapping[str, Any],
         internal: Mapping[str, Any],
-        manager: "DeviceManager",
-        actions_bus: EndpointSession,
+        runtime_sender: RuntimeMessageSender,
+        page_command_port: PageCommandPort,
         start_soon: Callable[..., None],
         render_dispatcher: RenderDispatcher,
         context_settings_target: SettingsTargetRef | None,
@@ -78,8 +124,8 @@ class ControlContext:
         self._builtin_action = builtin_action
         self.metadata = metadata
         self.control = control
-        self.manager = manager
-        self._actions_bus = actions_bus
+        self.runtime_sender = runtime_sender
+        self.page_command_port = page_command_port
         self.profile_id = profile_id
         self.page_id = page_id
         self.settings_target = context_settings_target
@@ -111,7 +157,7 @@ class ControlContext:
         )
         self.controller_context = ControllerActionContext(
             router=self._router,
-            manager=manager,
+            page_command_port=page_command_port,
             context_id=self.id,
             binding_metadata=metadata,
             settings=self._store.settings,
@@ -139,7 +185,7 @@ class ControlContext:
                 self.provider_session_id,
             )
         )
-        sent = await self.manager.send_action_runtime_message(
+        sent = await self.runtime_sender.send_action_runtime_message(
             provider_session_key=provider_session_key,
             message_type=message_type,
             body=body,

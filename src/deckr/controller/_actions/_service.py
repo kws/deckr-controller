@@ -38,7 +38,8 @@ from deckr.services import (
     service_unavailable_ends_service_use,
 )
 
-from deckr.controller._action_availability import (
+from deckr.controller._action_interest import ActionInterestSnapshot
+from deckr.controller._actions._availability import (
     PROVIDER_SESSION_INVALID_REASON,
     SERVICE_VIEW_MISSING_REASON,
     SERVICE_VIEW_UNAVAILABLE_REASON,
@@ -49,7 +50,6 @@ from deckr.controller._action_availability import (
     _metadata_requires_provider_session_revalidation,
     _state_value,
 )
-from deckr.controller._action_interest import ActionInterestSnapshot
 from deckr.controller._actions._models import (
     ActionAvailabilityPolicy,
     ActionAvailabilityState,

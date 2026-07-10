@@ -142,6 +142,7 @@ class _ActionRuntimeServicesHarness:
         self._view_send, self._view_receive = anyio.create_memory_object_stream(10)
         self._use_events: dict[str, anyio.Event] = {}
         self._use_generation = 0
+        self.subject_kinds: list[str] = []
 
     def directory(self, protocol):
         assert protocol == ACTION_RUNTIME_SERVICE_PROTOCOL
@@ -180,11 +181,6 @@ class _ActionRuntimeServicesHarness:
             if isinstance(payload, BaseException):
                 raise payload
             yield payload
-
-
-class _ContextSubjectAuthorizingServices:
-    def __init__(self) -> None:
-        self.subject_kinds: list[str] = []
 
     async def authorize_inbound_message(self, lease, message, *, name=None):
         del lease
@@ -341,19 +337,12 @@ async def test_controller_action_service_decodes_runtime_context_subject_message
         advertisement_id="first",
         refresh_seq=1,
     )
-    lease = _RuntimeLease(descriptor, generation=1)
-    services = _ContextSubjectAuthorizingServices()
+    services = _ActionRuntimeServicesHarness((descriptor,))
     service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         manager=MagicMock(),
         services=services,
-    )
-    service._remember_runtime_lease(
-        ProviderSessionKey(PROVIDER_INSTANCE_ID, PROVIDER_ID, "provider-session-1"),
-        lease=lease,
-        service_id=descriptor.service_id,
-        generation=1,
     )
     name = action_runtime_message_name(CLOSE_PAGE)
     params, event = action_runtime_payload(name, EmptyActionBody())
@@ -365,32 +354,41 @@ async def test_controller_action_service_decodes_runtime_context_subject_message
         action_instance_id="action-instance-1",
     )
 
-    decoded = await service.decode_inbound_runtime_message(
-        DeckrMessage(
-            lane=SERVICES_LANE,
-            messageType=SERVICE_MESSAGE,
-            sender=descriptor.endpoint,
-            senderSessionId=descriptor.session_id,
-            recipient=endpoint_target(controller_address(CONTROLLER_ID)),
-            recipientSessionId=CONTROLLER_SESSION_ID,
-            subject=subject,
-            contract=ContractPointer(
-                contractId=lease.contract.contract_id,
-                generation=lease.contract.generation,
-            ),
-            body=ServiceMessageBody(
-                serviceNamespace=ACTION_RUNTIME_SERVICE_PROTOCOL.namespace,
-                name=name,
-                intent=ServiceMessageIntent.COMMAND,
-                exchangePattern=ServiceExchangePattern.ONE_WAY,
-                params=params,
-                event=event,
-            ).to_dict(),
-        )
-    )
+    async with anyio.create_task_group() as tg:
+        stopping = anyio.Event()
+        service._start_soon = tg.start_soon
+        await service.start(tg, stopping)
+        await services.wait_used("provider-session-1")
 
-    assert decoded is not None
-    assert decoded.message_type == CLOSE_PAGE
-    assert decoded.subject == subject
-    assert decoded.body == {}
-    assert services.subject_kinds == ["context", "service"]
+        decoded = await service.decode_inbound_runtime_message(
+            DeckrMessage(
+                lane=SERVICES_LANE,
+                messageType=SERVICE_MESSAGE,
+                sender=descriptor.endpoint,
+                senderSessionId=descriptor.session_id,
+                recipient=endpoint_target(controller_address(CONTROLLER_ID)),
+                recipientSessionId=CONTROLLER_SESSION_ID,
+                subject=subject,
+                contract=ContractPointer(
+                    contractId="service-use:provider-session-1",
+                    generation=1,
+                ),
+                body=ServiceMessageBody(
+                    serviceNamespace=ACTION_RUNTIME_SERVICE_PROTOCOL.namespace,
+                    name=name,
+                    intent=ServiceMessageIntent.COMMAND,
+                    exchangePattern=ServiceExchangePattern.ONE_WAY,
+                    params=params,
+                    event=event,
+                ).to_dict(),
+            )
+        )
+
+        assert decoded is not None
+        assert decoded.message_type == CLOSE_PAGE
+        assert decoded.subject == subject
+        assert decoded.body == {}
+        assert services.subject_kinds == ["context", "service"]
+        stopping.set()
+        await service.aclose()
+        tg.cancel_scope.cancel()

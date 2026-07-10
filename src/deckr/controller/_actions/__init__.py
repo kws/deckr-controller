@@ -1,5 +1,12 @@
 """Private controller action-service API."""
 
+from deckr.controller._actions._availability import (
+    PROVIDER_SESSION_INVALID_REASON,
+    SERVICE_VIEW_MISSING_REASON,
+    SERVICE_VIEW_UNAVAILABLE_REASON,
+    action_unavailable_cause,
+    unavailable_overlay_template,
+)
 from deckr.controller._actions._models import (
     ActionAvailabilityPolicy,
     ActionAvailabilityRecord,
@@ -14,12 +21,12 @@ from deckr.controller._actions._models import (
     SettingsActionMetadata,
     provider_session_key,
 )
+from deckr.controller._actions._service import ControllerActionService
 
 __all__ = [
     "PROVIDER_SESSION_INVALID_REASON",
     "SERVICE_VIEW_MISSING_REASON",
     "SERVICE_VIEW_UNAVAILABLE_REASON",
-    "ActionAvailabilityCache",
     "ActionAvailabilityPolicy",
     "ActionAvailabilityRecord",
     "ActionAvailabilitySource",
@@ -36,24 +43,3 @@ __all__ = [
     "provider_session_key",
     "unavailable_overlay_template",
 ]
-
-_AVAILABILITY_EXPORTS = {
-    "PROVIDER_SESSION_INVALID_REASON",
-    "SERVICE_VIEW_MISSING_REASON",
-    "SERVICE_VIEW_UNAVAILABLE_REASON",
-    "ActionAvailabilityCache",
-    "action_unavailable_cause",
-    "unavailable_overlay_template",
-}
-
-
-def __getattr__(name: str):
-    if name == "ControllerActionService":
-        from deckr.controller._actions._service import ControllerActionService
-
-        return ControllerActionService
-    if name in _AVAILABILITY_EXPORTS:
-        from deckr.controller import _action_availability
-
-        return getattr(_action_availability, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

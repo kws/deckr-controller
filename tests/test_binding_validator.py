@@ -1,12 +1,9 @@
 """Tests for binding validator."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
-import anyio
 import pytest
-from conftest import LaneHarness
 from deckr.actions.messages import PageChildBindingDescriptor, PageChildBindingTarget
-from deckr.contracts.messages import controller_address
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_OUTPUT_RASTER,
@@ -14,7 +11,6 @@ from deckr.hardware.descriptors import (
     ControlDescriptor,
     ControlGeometry,
     DeviceDescriptor,
-    DeviceRef,
 )
 
 from deckr.controller._actions import ActionMetadata
@@ -25,17 +21,7 @@ from deckr.controller._binding_validator import (
     validate_dynamic_page_bindings,
     validate_page_bindings,
 )
-from deckr.controller._render import RenderResult
-from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 from deckr.controller.config import CapabilitySelector, ControlSelector
-
-CONTROLLER_ID = "controller-main"
-
-
-class FakeHardwareCommandService:
-    def __init__(self):
-        self.set_raster_frame = AsyncMock()
-        self.clear_raster = AsyncMock()
 
 
 def _make_device(
@@ -48,24 +34,6 @@ def _make_device(
         fingerprint=f"fingerprint:{device_id}",
         controls=controls or [_make_control("0,0")],
     )
-
-
-def _hardware_ref(device: DeviceDescriptor) -> DeviceRef:
-    return DeviceRef(managerId="manager-main", deviceId=device.device_id)
-
-
-class _ImmediateRenderBackend:
-    async def render(self, request):
-        return RenderResult(
-            context_id=request.context_id,
-            binding_id=request.binding_id,
-            control_id=request.control_id,
-            generation=request.generation,
-            frame=b"frame",
-        )
-
-    async def aclose(self) -> None:
-        return
 
 
 def _make_control(
@@ -270,159 +238,3 @@ async def test_activation_requirement_does_not_match_momentary_only_control():
 def test_format_validation_summary_passed():
     result = ValidationResult(valid=True)
     assert "passed" in format_validation_summary(result)
-
-
-# --- Integration: DeviceManager rejects invalid static page ---
-
-
-@pytest.mark.asyncio
-async def test_device_manager_rejects_invalid_static_page_and_reverts_stack():
-    """When static page has invalid bindings (e.g. missing control), DeviceManager rejects transition and reverts stack."""
-    from deckr.controller._device_manager import DeviceManager
-    from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
-
-    device = _make_device(controls=[_make_control("0,0")])  # only control 0,0 exists
-    command_service = FakeHardwareCommandService()
-
-    config = DeviceConfig(
-        id="test-dev",
-        name="Test",
-        match={"fingerprint": "fingerprint:test-dev"},
-        profiles=[
-            Profile(
-                name="default",
-                pages=[
-                    Page(
-                        controls=[
-                            Control(
-                                selector={"control_id": "99,99"},
-                                action="dev.deckr.controller.builtin.action.go_to_page",
-                                settings={},
-                            ),
-                        ]
-                    ),
-                ],
-            ),
-        ],
-    )
-
-    registry = MagicMock()
-    registry.get_action = AsyncMock(
-        return_value=ActionMetadata(
-            uuid="dev.deckr.controller.builtin.action.go_to_page",
-            provider_instance_id="builtin",
-            provider_id="dev.deckr.controller.builtin",
-        )
-    )
-
-    def start_soon(*args, **kwargs):
-        pass
-
-    actions_bus = LaneHarness(
-        "services",
-        default_endpoint=controller_address(CONTROLLER_ID),
-    )
-    manager = DeviceManager(
-        controller_id=CONTROLLER_ID,
-        device=device,
-        hardware_ref=_hardware_ref(device),
-        command_service=command_service,
-        config=config,
-        manager=registry,
-        actions_bus=actions_bus.endpoint(controller_address(CONTROLLER_ID)).session,
-        start_soon=start_soon,
-    )
-    await manager.set_page(profile="default", page=0)
-
-    # Validation rejected the page: no contexts were created (invalid control 99,99 not on device).
-    # Current page remains unchanged when validation fails on the first page.
-    contexts = await manager.action_contexts.values()
-    assert len(contexts) == 0
-
-
-@pytest.mark.asyncio
-async def test_device_manager_loads_page_with_missing_action_shows_unavailable():
-    """When static page has missing action, page loads; control shows 'unavailable' overlay."""
-    from deckr.controller._device_manager import DeviceManager
-    from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
-
-    device = _make_device(controls=[_make_control("0,0"), _make_control("0,1")])
-    command_service = FakeHardwareCommandService()
-
-    config = DeviceConfig(
-        id="test-dev",
-        name="Test",
-        match={"fingerprint": "fingerprint:test-dev"},
-        profiles=[
-            Profile(
-                name="default",
-                pages=[
-                    Page(
-                        controls=[
-                            Control(
-                                selector={"control_id": "0,0"},
-                                action="dev.deckr.controller.builtin.action.go_to_page",
-                                settings={},
-                            ),
-                            Control(
-                                selector={"control_id": "0,1"},
-                                action="com.example.nonexistent",
-                                settings={},
-                            ),
-                        ]
-                    ),
-                ],
-            ),
-        ],
-    )
-
-    registry = MagicMock()
-    action = _make_key_action()
-    action.uuid = "dev.deckr.controller.builtin.action.go_to_page"
-
-    async def get_action(uuid, **kwargs):
-        del kwargs
-        if uuid == "dev.deckr.controller.builtin.action.go_to_page":
-            return ActionMetadata(
-                uuid=action.uuid,
-                provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
-                provider_id="dev.deckr.controller.builtin",
-            )
-        return None
-
-    registry.get_action = get_action
-    builtin_action = MagicMock()
-    builtin_action.on_bind = AsyncMock()
-    builtin_action.on_unbind = AsyncMock()
-    builtin_action.on_input = AsyncMock()
-    registry.get_builtin_action.return_value = builtin_action
-
-    actions_bus = LaneHarness(
-        "services",
-        default_endpoint=controller_address(CONTROLLER_ID),
-    )
-    async with anyio.create_task_group() as tg:
-        manager = DeviceManager(
-            controller_id=CONTROLLER_ID,
-            device=device,
-            hardware_ref=_hardware_ref(device),
-            command_service=command_service,
-            config=config,
-            manager=registry,
-            actions_bus=actions_bus.endpoint(controller_address(CONTROLLER_ID)).session,
-            start_soon=tg.start_soon,
-            render_backend=_ImmediateRenderBackend(),
-        )
-        await manager.set_page(profile="default", page=0)
-
-        contexts = await manager.action_contexts.values()
-        assert len(contexts) == 1
-
-        with anyio.fail_after(1.0):
-            while not any(
-                c[0][1] == "0,1"
-                for c in command_service.set_raster_frame.call_args_list
-            ):
-                await anyio.sleep(0.01)
-
-        tg.cancel_scope.cancel()

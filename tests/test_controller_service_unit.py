@@ -126,12 +126,12 @@ def _live_route() -> LiveDeviceRoute:
 
 def _manager_context() -> MagicMock:
     ctx = MagicMock()
-    ctx.handle_command = AsyncMock()
+    ctx.handle_provider_command = AsyncMock()
     ctx.on_action_availability_changed = AsyncMock()
-    ctx.on_event = AsyncMock()
+    ctx.handle_hardware_input = AsyncMock()
     ctx.on_capability_state_changed = AsyncMock()
     ctx.on_command_rejected = AsyncMock()
-    ctx.on_descriptor_changed = AsyncMock()
+    ctx.on_device_descriptor_changed = AsyncMock()
     return ctx
 
 
@@ -149,7 +149,7 @@ async def test_action_command_ignores_invalid_settings_body_and_missing_subject(
     )
     await service._handle_action_command(_action_message("openPage"))
 
-    ctx.handle_command.assert_not_awaited()
+    ctx.handle_provider_command.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -207,11 +207,11 @@ async def test_hardware_callbacks_route_input_state_rejection_and_descriptor() -
     await service.on_hardware_command_rejected(live, rejected_body)
     await service.on_hardware_descriptor_changed(CONFIG_ID, _device())
 
-    ctx.on_event.assert_awaited_once_with(messages[0])
+    ctx.handle_hardware_input.assert_awaited_once_with(messages[0])
     state_event = ctx.on_capability_state_changed.await_args.args[0]
     rejected_event = ctx.on_command_rejected.await_args.args[0]
     assert state_event.capability_id == "input"
     assert state_event.value is True
     assert rejected_event.capability_id == "raster"
     assert rejected_event.command_type == "set_frame"
-    ctx.on_descriptor_changed.assert_awaited_once()
+    ctx.on_device_descriptor_changed.assert_awaited_once()

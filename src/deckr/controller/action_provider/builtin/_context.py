@@ -1,4 +1,4 @@
-"""Controller action context: thin facade for builtin actions with direct access to controller."""
+"""Controller action context: thin facade for builtin action page/output commands."""
 
 from collections.abc import Mapping
 from types import SimpleNamespace
@@ -9,22 +9,22 @@ from deckr.actions.messages import BindingMetadata, DynamicPageCommand
 from deckr.controller._command_router import CommandRouter
 
 if TYPE_CHECKING:
-    from deckr.controller._device_manager import DeviceManager
+    from deckr.controller._bindings import PageCommandPort
 
 
 class ControllerActionContext:
-    """Thin facade for builtin actions: delegates to router and manager."""
+    """Thin facade for builtin actions: delegates to router and page commands."""
 
     def __init__(
         self,
         router: CommandRouter,
-        manager: "DeviceManager",
+        page_command_port: "PageCommandPort",
         context_id: str,
         binding_metadata: BindingMetadata,
         settings: Mapping[str, Any],
     ):
         self._router = router
-        self._manager = manager
+        self._page_command_port = page_command_port
         self._context_id = context_id
         self.binding_metadata = binding_metadata
         self.settings = SimpleNamespace(**settings)
@@ -42,10 +42,10 @@ class ControllerActionContext:
         profile: str = "default",
         page: int = 0,
     ) -> None:
-        await self._manager.set_page(profile=profile, page=page)
+        await self._page_command_port.set_page(profile=profile, page=page)
 
     async def open_page(self, descriptor: DynamicPageCommand) -> None:
-        session = await self._manager.open_page(
+        session = await self._page_command_port.open_page(
             descriptor=descriptor,
             context_id=self._context_id,
             binding_id=self.binding_metadata.binding_id,
@@ -56,7 +56,7 @@ class ControllerActionContext:
     async def replace_page(self, descriptor: DynamicPageCommand) -> None:
         if self._page_session_context_id is None:
             return
-        await self._manager.replace_page(
+        await self._page_command_port.replace_page(
             descriptor=descriptor,
             context_id=self._page_session_context_id,
         )
@@ -64,4 +64,6 @@ class ControllerActionContext:
     async def close_page(self) -> None:
         if self._page_session_context_id is None:
             return
-        await self._manager.close_page(context_id=self._page_session_context_id)
+        await self._page_command_port.close_page(
+            context_id=self._page_session_context_id
+        )

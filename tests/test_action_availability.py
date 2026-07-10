@@ -27,7 +27,6 @@ from deckr.services import ServiceBackendStatus, ServiceDescriptor, ServiceUnava
 from deckr.controller._actions import (
     PROVIDER_SESSION_INVALID_REASON,
     SERVICE_VIEW_UNAVAILABLE_REASON,
-    ActionAvailabilityCache,
     ActionAvailabilityPolicy,
     ActionAvailabilityRecord,
     ActionAvailabilitySource,
@@ -40,6 +39,7 @@ from deckr.controller._actions import (
     action_unavailable_cause,
     unavailable_overlay_template,
 )
+from deckr.controller._actions._availability import ActionAvailabilityCache
 from deckr.controller._binding_planner import ActionIntentKey
 
 CONTROLLER_ID = "controller-main"
@@ -123,7 +123,7 @@ def _service_descriptor(
         supported_messages=protocol.messages,
         views={},
         backend_status=backend_status,
-        diagnostics={},
+        diagnostics={"providerId": "provider.test"},
     )
 
 
@@ -195,7 +195,11 @@ def _record_service_available(
 
 
 class _ServiceViewWatchServices:
-    def __init__(self) -> None:
+    def __init__(self, initial: tuple[ServiceDescriptor, ...] = ()) -> None:
+        self._directory_send, self._directory_receive = (
+            anyio.create_memory_object_stream[tuple[ServiceDescriptor, ...]](10)
+        )
+        self._initial = initial
         self._send, self._receive = anyio.create_memory_object_stream(10)
         self.entered = anyio.Event()
         self.use_count = 0
@@ -203,13 +207,40 @@ class _ServiceViewWatchServices:
         self.lease_open = False
         self.leases = []
         self.watch_calls = []
+        self.send_calls = []
+        self.send_error: ServiceUnavailable | None = None
+        self._use_count_events: dict[int, anyio.Event] = {}
 
-    async def send(self, payload) -> None:
-        await self._send.send(payload)
+    def directory(self, protocol):
+        assert protocol == ACTION_RUNTIME_SERVICE_PROTOCOL
+        return self
+
+    async def publish_directory(
+        self,
+        descriptors: tuple[ServiceDescriptor, ...],
+    ) -> None:
+        await self._directory_send.send(descriptors)
+
+    async def watch_records(self):
+        yield self._initial
+        async with self._directory_receive:
+            async for descriptors in self._directory_receive:
+                yield descriptors
+
+    async def send(self, *args, params=None, event=None) -> None:
+        if len(args) == 1:
+            await self._send.send(args[0])
+            return
+        lease, name = args
+        self.send_calls.append((lease, name, params, event))
+        if self.send_error is not None:
+            raise self.send_error
 
     @asynccontextmanager
     async def use(self, descriptor):
         self.use_count += 1
+        event = self._use_count_events.setdefault(self.use_count, anyio.Event())
+        event.set()
         lease = _RuntimeLease(
             descriptor,
             contract_id=f"provider-session-contract-{self.use_count}",
@@ -223,6 +254,13 @@ class _ServiceViewWatchServices:
             self.lease_open = False
             self.closed_count += 1
 
+    async def wait_use_count(self, count: int) -> None:
+        if self.use_count >= count:
+            return
+        event = self._use_count_events.setdefault(count, anyio.Event())
+        with anyio.fail_after(1):
+            await event.wait()
+
     async def watch_view(self, lease, view):
         self.watch_calls.append((lease, view))
         while True:
@@ -231,15 +269,9 @@ class _ServiceViewWatchServices:
                 raise payload
             yield payload
 
-
-class _SendFailingServices:
-    def __init__(self, error: ServiceUnavailable) -> None:
-        self.error = error
-        self.send_calls = []
-
-    async def send(self, lease, name, *, params=None, event=None):
-        self.send_calls.append((lease, name, params, event))
-        raise self.error
+    async def authorize_inbound_message(self, lease, message, *, name=None):
+        del lease, message, name
+        return True
 
 
 @pytest.mark.parametrize(
@@ -391,16 +423,13 @@ def test_current_service_view_probe_is_pending():
     assert snapshot.unavailable == frozenset()
 
 
-def test_service_watchers_prefer_newest_duplicate_service_descriptor():
-    scheduled: list[tuple[object, tuple[object, ...]]] = []
+@pytest.mark.asyncio
+async def test_service_watchers_prefer_newest_duplicate_service_descriptor():
     service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         manager=MagicMock(),
-        start_soon=lambda fn, *args: scheduled.append((fn, args)),
     )
-    service_id = action_runtime_service_id("provider-alpha")
-    stopping = object()
     newest = _service_descriptor(
         "provider-alpha",
         session_id="new-provider-session",
@@ -413,36 +442,24 @@ def test_service_watchers_prefer_newest_duplicate_service_descriptor():
         updated_at=datetime(2026, 1, 1, tzinfo=UTC),
         advertisement_id="stale",
     )
+    services = _ServiceViewWatchServices(initial=(newest, stale))
+    service._services = services
+    service._start_soon = None
 
-    service._reconcile_service_watchers((newest, stale), stopping=stopping)
+    async with anyio.create_task_group() as tg:
+        stopping = anyio.Event()
+        service._start_soon = tg.start_soon
+        await service.start(tg, stopping)
+        await services.wait_use_count(1)
 
-    assert service._service_descriptor_keys[service_id] == (
-        str(newest.endpoint),
-        "new-provider-session",
-        "available",
-    )
-    watch_tasks = [
-        (fn, args) for fn, args in scheduled if fn == service._run_service_view_watch
-    ]
-    assert watch_tasks == [
-        (
-            service._run_service_view_watch,
-            (service_id, newest, 1, stopping),
-        )
-    ]
+        assert services.leases[0].descriptor is newest
+        stopping.set()
+        await service.aclose()
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio
 async def test_descriptor_removal_preserves_active_runtime_lease():
-    scheduled: list[tuple[object, tuple[object, ...]]] = []
-    service = ControllerActionService(
-        controller_id=CONTROLLER_ID,
-        controller_session_id=CONTROLLER_SESSION_ID,
-        manager=MagicMock(),
-        services=MagicMock(),
-        start_soon=lambda fn, *args: scheduled.append((fn, args)),
-    )
-    service_id = action_runtime_service_id("provider-alpha")
     descriptor = _service_descriptor(
         "provider-alpha",
         session_id="provider-session",
@@ -454,100 +471,87 @@ async def test_descriptor_removal_preserves_active_runtime_lease():
         "provider.test",
         "provider-session",
     )
-    lease = _RuntimeLease(descriptor)
-    scope = anyio.CancelScope()
-
-    service._service_descriptor_keys[service_id] = (
-        str(descriptor.endpoint),
-        descriptor.session_id,
-        descriptor.backend_status.value,
-    )
-    service._service_watch_scopes[service_id] = scope
-    service._remember_runtime_lease(
-        session_key,
-        lease=lease,
-        service_id=service_id,
-        generation=1,
+    services = _ServiceViewWatchServices(initial=(descriptor,))
+    service = ControllerActionService(
+        controller_id=CONTROLLER_ID,
+        controller_session_id=CONTROLLER_SESSION_ID,
+        manager=MagicMock(),
+        services=services,
     )
 
-    service._reconcile_service_watchers((), stopping=anyio.Event())
+    async with anyio.create_task_group() as tg:
+        stopping = anyio.Event()
+        service._start_soon = tg.start_soon
+        await service.start(tg, stopping)
+        await services.wait_use_count(1)
 
-    assert scope.cancel_called is False
-    assert service.current_contract(session_key) == ContractPointer(
-        contractId="provider-session-contract",
-        generation=1,
-    )
-    assert scheduled == []
+        await services.publish_directory(())
+        await anyio.sleep(0.05)
+
+        assert services.lease_open is True
+        assert service.current_contract(session_key) == ContractPointer(
+            contractId="provider-session-contract-1",
+            generation=1,
+        )
+        stopping.set()
+        await service.aclose()
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio
 async def test_runtime_send_lease_loss_restarts_service_watch():
-    scheduled: list[tuple[object, tuple[object, ...]]] = []
-    services = _SendFailingServices(
-        ServiceUnavailable(
-            "contract_cancelled",
-            "service-use contract cancelled",
-        )
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="provider-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    session_key = ProviderSessionKey(
+        "provider-alpha",
+        "provider.test",
+        "provider-session",
+    )
+    services = _ServiceViewWatchServices(initial=(descriptor,))
+    services.send_error = ServiceUnavailable(
+        "contract_cancelled",
+        "service-use contract cancelled",
     )
     service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         manager=MagicMock(),
         services=services,
-        start_soon=lambda fn, *args: scheduled.append((fn, args)),
-    )
-    service_id = action_runtime_service_id("provider-alpha")
-    descriptor = _service_descriptor(
-        "provider-alpha",
-        session_id="provider-session",
-        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
-        advertisement_id="availability",
-    )
-    stopping = anyio.Event()
-    service._reconcile_service_watchers((descriptor,), stopping=stopping)
-    scheduled.clear()
-
-    session_key = ProviderSessionKey(
-        "provider-alpha",
-        "provider.test",
-        "provider-session",
-    )
-    lease = _RuntimeLease(descriptor)
-    scope = anyio.CancelScope()
-    service._service_watch_scopes[service_id] = scope
-    service._remember_runtime_lease(
-        session_key,
-        lease=lease,
-        service_id=service_id,
-        generation=1,
     )
 
-    sent = await service.send_runtime_message(
-        session_key,
-        ACTION_INSTANCE_DESTROYED,
-        ActionInstanceLifecycleBody(
-            metadata=ActionInstanceMetadata(
-                providerInstanceId="provider-alpha",
-                providerId="provider.test",
-                actionId="action.alpha",
-                actionInstanceId="action-instance",
-                configId="config",
-                contextId="context",
+    async with anyio.create_task_group() as tg:
+        stopping = anyio.Event()
+        service._start_soon = tg.start_soon
+        await service.start(tg, stopping)
+        await services.wait_use_count(1)
+
+        sent = await service.send_runtime_message(
+            session_key,
+            ACTION_INSTANCE_DESTROYED,
+            ActionInstanceLifecycleBody(
+                metadata=ActionInstanceMetadata(
+                    providerInstanceId="provider-alpha",
+                    providerId="provider.test",
+                    actionId="action.alpha",
+                    actionInstanceId="action-instance",
+                    configId="config",
+                    contextId="context",
+                ),
+                reason="test",
             ),
-            reason="test",
-        ),
-    )
-
-    assert sent is False
-    assert services.send_calls
-    assert service.current_contract(session_key) is None
-    assert scope.cancel_called is True
-    assert scheduled == [
-        (
-            service._run_service_view_watch,
-            (service_id, descriptor, 2, stopping),
         )
-    ]
+
+        assert sent is False
+        assert services.send_calls
+        assert service.current_contract(session_key) is None
+        await services.wait_use_count(2)
+        stopping.set()
+        await service.aclose()
+        tg.cancel_scope.cancel()
 
 
 def test_service_ingests_action_availability_view_payload():
@@ -1204,41 +1208,47 @@ async def test_matching_runtime_lease_unlocks_planning_and_current_contract():
         "negotiating-session",
     )
     intent = _intent("action.alpha", provider_instance_id="provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="negotiating-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    services = _ServiceViewWatchServices(initial=(descriptor,))
     service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         manager=MagicMock(),
-        services=MagicMock(),
-        start_soon=None,
+        services=services,
     )
-    lease = _RuntimeLease(
-        _service_descriptor(
-            "provider-alpha",
-            session_id="negotiating-session",
-            updated_at=datetime(2026, 1, 2, tzinfo=UTC),
-            advertisement_id="availability",
-        ),
-        contract_id="provider-session-contract",
-    )
-    service._remember_runtime_lease(
-        session_key,
-        lease=lease,
-        service_id=action_runtime_service_id("provider-alpha"),
-        generation=1,
-    )
-    _record_service_available(service, metadata, now=0.0)
 
-    planning = service.planning_snapshot((intent,))
+    async with anyio.create_task_group() as tg:
+        stopping = anyio.Event()
+        service._start_soon = tg.start_soon
+        await service.start(tg, stopping)
+        await services.wait_use_count(1)
+        _record_service_available(service, metadata, now=0.0)
 
-    assert planning.metadata[intent].uuid == metadata.uuid
-    assert planning.metadata[intent].provider_instance_id == metadata.provider_instance_id
-    assert planning.metadata[intent].provider_id == metadata.provider_id
-    assert planning.metadata[intent].provider_session_id == metadata.provider_session_id
-    assert planning.pending == frozenset()
-    assert service.current_contract(session_key) == ContractPointer(
-        contractId="provider-session-contract",
-        generation=1,
-    )
+        planning = service.planning_snapshot((intent,))
+
+        assert planning.metadata[intent].uuid == metadata.uuid
+        assert (
+            planning.metadata[intent].provider_instance_id
+            == metadata.provider_instance_id
+        )
+        assert planning.metadata[intent].provider_id == metadata.provider_id
+        assert (
+            planning.metadata[intent].provider_session_id
+            == metadata.provider_session_id
+        )
+        assert planning.pending == frozenset()
+        assert service.current_contract(session_key) == ContractPointer(
+            contractId="provider-session-contract-1",
+            generation=1,
+        )
+        stopping.set()
+        await service.aclose()
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio
@@ -1255,39 +1265,35 @@ async def test_runtime_lease_session_mismatch_keeps_planning_pending():
         "negotiating-session",
     )
     intent = _intent("action.alpha", provider_instance_id="provider-alpha")
+    descriptor = _service_descriptor(
+        "provider-alpha",
+        session_id="different-session",
+        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
+        advertisement_id="availability",
+    )
+    services = _ServiceViewWatchServices(initial=(descriptor,))
     service = ControllerActionService(
         controller_id=CONTROLLER_ID,
         controller_session_id=CONTROLLER_SESSION_ID,
         manager=MagicMock(),
-        services=MagicMock(),
-        start_soon=None,
+        services=services,
     )
-    mismatched_key = ProviderSessionKey(
-        "provider-alpha",
-        "provider.test",
-        "different-session",
-    )
-    lease = _RuntimeLease(
-        _service_descriptor(
-            "provider-alpha",
-            session_id="different-session",
-            updated_at=datetime(2026, 1, 2, tzinfo=UTC),
-            advertisement_id="availability",
-        )
-    )
-    service._remember_runtime_lease(
-        mismatched_key,
-        lease=lease,
-        service_id=action_runtime_service_id("provider-alpha"),
-        generation=1,
-    )
-    _record_service_available(service, metadata, now=0.0)
 
-    planning = service.planning_snapshot((intent,), now=1.0)
+    async with anyio.create_task_group() as tg:
+        stopping = anyio.Event()
+        service._start_soon = tg.start_soon
+        await service.start(tg, stopping)
+        await services.wait_use_count(1)
+        _record_service_available(service, metadata, now=0.0)
 
-    assert planning.metadata == {}
-    assert planning.pending == frozenset({intent})
-    assert service.current_contract(session_key) is None
+        planning = service.planning_snapshot((intent,), now=1.0)
+
+        assert planning.metadata == {}
+        assert planning.pending == frozenset({intent})
+        assert service.current_contract(session_key) is None
+        stopping.set()
+        await service.aclose()
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio

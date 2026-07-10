@@ -9,9 +9,9 @@ from typing import Any
 from deckr.actions.messages import SettingsTargetRef
 
 from deckr.controller._actions._models import ProviderSessionKey
+from deckr.controller._bindings._context import ControlContext
 from deckr.controller._device_layout import ControlSurface
 from deckr.controller._pages import DynamicPageSession
-from deckr.controller.action_provider.context import ControlContext
 
 
 @dataclass(slots=True)
