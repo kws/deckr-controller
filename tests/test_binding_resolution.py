@@ -199,6 +199,47 @@ def test_selected_capability_ids_with_and_without_requirements() -> None:
     assert filtered.binding.output_capability_ids == frozenset({"output-a"})
 
 
+def test_selector_rejects_multiple_matching_controls_as_ambiguous() -> None:
+    result = resolve_binding(
+        _binding(ControlSelector(kind="key")),
+        (_control(controlId="control-1"), _control(controlId="control-2")),
+    )
+
+    assert result.ok is False
+    assert result.code == "control_selector_ambiguous"
+
+
+def test_activation_requirement_does_not_match_momentary_input() -> None:
+    control = _control(
+        inputCapabilities=(
+            _capability(
+                "input-a",
+                family="deckr.input.button",
+                capability_type="momentary",
+                event_types=("down", "up"),
+            ),
+        )
+    )
+
+    result = resolve_binding(
+        _binding(
+            ControlSelector(
+                control_id="control-1",
+                input=(
+                    CapabilitySelector(
+                        family="deckr.input.button",
+                        type="activation",
+                    ),
+                ),
+            )
+        ),
+        (control,),
+    )
+
+    assert result.ok is False
+    assert result.code == "capability_not_found"
+
+
 def test_selector_summary_for_empty_geometry_and_capability_selectors() -> None:
     empty = ControlSelector.model_construct(
         control_id=None,

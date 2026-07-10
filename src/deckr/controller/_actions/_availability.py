@@ -20,6 +20,7 @@ from deckr.controller._actions._models import (
     ActionAvailabilityRecord,
     ActionAvailabilitySource,
     ActionAvailabilityState,
+    ActionIntentKey,
     ActionMetadata,
     ActionPlanningSnapshot,
     ActionUnavailableCause,
@@ -27,7 +28,6 @@ from deckr.controller._actions._models import (
     ProviderSessionKey,
     SettingsActionMetadata,
 )
-from deckr.controller._binding_planner import ActionIntentKey
 
 PROVIDER_SESSION_INVALID_REASON = "provider_session_invalid"
 SERVICE_VIEW_MISSING_REASON = "action_availability_view_missing"

@@ -6,8 +6,10 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from deckr.controller._binding_planner import ActionIntentKey
+if TYPE_CHECKING:
+    from deckr.controller._actions._models import ActionIntentKey
 
 DEFAULT_WARM_RETENTION_SECONDS = 4 * 60 * 60
 

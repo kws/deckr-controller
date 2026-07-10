@@ -41,10 +41,10 @@ from deckr.services import (
 )
 
 from deckr.controller._actions import (
+    ActionIntentKey,
     ControllerActionService,
     ProviderSessionKey,
 )
-from deckr.controller._binding_planner import ActionIntentKey
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_SESSION_ID = "controller-session"

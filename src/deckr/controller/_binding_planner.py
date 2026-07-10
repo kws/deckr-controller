@@ -13,19 +13,45 @@ from deckr.actions.messages import (
 )
 from deckr.hardware.descriptors import DeviceDescriptor
 
-from deckr.controller._actions._models import ActionMetadata
+from deckr.controller._actions._models import ActionIntentKey, ActionMetadata
 from deckr.controller._binding_resolution import (
     ConfiguredControlBinding,
     ResolvedControlBinding,
     exact_control_binding,
     resolve_binding,
 )
-from deckr.controller._binding_validator import ValidationError
 from deckr.controller._pages import DynamicPageSession, PageStackEntry, StaticPageRef
 from deckr.controller.settings import (
     derive_action_instance_id,
     derive_static_action_instance_id,
 )
+
+
+@dataclass(frozen=True)
+class ValidationError:
+    """One binding planning failure."""
+
+    code: str
+    message: str
+    control_ref: str
+    action_uuid: str
+    profile_id: str | None = None
+    page_id: str | None = None
+    details: list[str] = field(default_factory=list)
+
+
+def format_validation_summary(errors: Sequence[ValidationError]) -> str:
+    """Return a concise one-line summary of binding planning failures."""
+    if not errors:
+        return "validation passed"
+    parts = [f"{len(errors)} error(s):"]
+    for error in errors[:3]:
+        parts.append(
+            f" [{error.code}] {error.control_ref!r} / {error.action_uuid!r}"
+        )
+    if len(errors) > 3:
+        parts.append(f" ... and {len(errors) - 3} more")
+    return "; ".join(parts)
 
 
 class BindingPlanStatus(StrEnum):
@@ -34,13 +60,6 @@ class BindingPlanStatus(StrEnum):
     UNAVAILABLE = "unavailable"
     INVALID_CONFIG = "invalid_config"
     INVALID_DEVICE_CONTROL = "invalid_device_control"
-
-
-@dataclass(frozen=True, slots=True)
-class ActionIntentKey:
-    action_uuid: str
-    provider_instance_id: str | None
-    provider_labels: tuple[tuple[str, str], ...]
 
 
 @dataclass(slots=True)

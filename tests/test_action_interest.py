@@ -5,7 +5,7 @@ from deckr.controller._action_interest import (
     ActionInterestSource,
     ActionInterestTracker,
 )
-from deckr.controller._binding_planner import ActionIntentKey
+from deckr.controller._actions import ActionIntentKey
 
 
 def _intent(
@@ -84,5 +84,4 @@ def test_replace_warm_interests_removes_absent_warm_records():
     )
 
     assert tracker.snapshot(now=20.0).warm_intents == (beta,)
-
 

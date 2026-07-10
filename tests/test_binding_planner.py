@@ -1,5 +1,10 @@
 """Tests for pure binding planner decisions."""
 
+from deckr.actions.messages import (
+    DynamicPageCommand,
+    PageChildBindingDescriptor,
+    PageChildBindingTarget,
+)
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_OUTPUT_RASTER,
@@ -9,11 +14,11 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
 )
 
-from deckr.controller._actions import ActionMetadata
+from deckr.controller._actions import ActionIntentKey, ActionMetadata
 from deckr.controller._binding_planner import (
-    ActionIntentKey,
     BindingPlanner,
     BindingPlanStatus,
+    format_validation_summary,
 )
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._pages import DynamicPageSession, StaticPageRef
@@ -222,3 +227,53 @@ def test_selector_only_static_plan_uses_config_fallback_identity():
         page_id="0",
         identity_fallback="0",
     )
+
+
+def test_dynamic_page_plan_resolves_explicit_child_action_target():
+    planner = _planner()
+    child = PageChildBindingDescriptor(
+        controlId="3,0",
+        target=PageChildBindingTarget(
+            kind="action",
+            actionId="action.volume",
+            providerInstanceId="sonos-bedroom",
+            instanceKey="bedroom-volume",
+        ),
+        settings={"zoneName": "Bedroom"},
+    )
+    descriptor = DynamicPageCommand(pageId="dynamic-page", bindings=(child,))
+    metadata = _metadata(
+        "action.volume",
+        provider_instance_id="sonos-bedroom",
+        provider_id="dev.deckr.sonos",
+    )
+
+    result = planner.build_dynamic_page_plan(
+        descriptor,
+        device=_device("3,0"),
+        page_session=_dynamic_session(),
+        action_metadata={_intent("action.volume", "sonos-bedroom"): metadata},
+    )
+
+    assert result.plan is not None
+    planned = result.plan.bindings[0]
+    assert planned.status == BindingPlanStatus.BOUND
+    assert planned.binding.action_uuid == "action.volume"
+    assert planned.binding.provider_instance_id == "sonos-bedroom"
+    assert planned.binding.settings["zoneName"] == "Bedroom"
+
+
+def test_format_validation_summary_handles_empty_and_truncated_errors():
+    planner = _planner()
+    entry = StaticPageRef(profile_name="default", page_index=0)
+    result = planner.build_static_page_plan(
+        entry,
+        bindings=tuple(_binding(f"missing-{index}", f"action.{index}") for index in range(4)),
+        device=_device("0,0"),
+        action_metadata={},
+    )
+
+    assert format_validation_summary(()) == "validation passed"
+    summary = format_validation_summary(result.validation_errors)
+    assert "4 error(s)" in summary
+    assert "... and 1 more" in summary

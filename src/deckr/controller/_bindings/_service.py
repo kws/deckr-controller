@@ -1,64 +1,25 @@
-import hashlib
-import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any
 
 import anyio
-from deckr.action_runtime import action_runtime_provider_instance_id
-from deckr.actions.endpoints import (
-    RESERVED_BUILTIN_PROVIDER_IDS,
-    parse_action_provider_address,
-)
 from deckr.actions.messages import (
-    ACTION_INSTANCE_CREATED,
-    ACTION_INSTANCE_DESTROYED,
-    ACTION_LIFECYCLE_REJECTED,
-    BINDING_OUTPUT,
-    BINDING_OVERLAY,
-    BINDING_OVERLAY_CLEAR,
-    CLOSE_PAGE,
-    OPEN_PAGE,
-    PAGE_SESSION_CLOSED,
-    PAGE_SESSION_OPENED,
-    REPLACE_PAGE,
-    ActionInstanceLifecycleBody,
-    ActionInstanceMetadata,
-    ActionLifecycleRejectedBody,
     BindingMetadata,
-    BindingOutputBody,
-    BindingOverlayBody,
-    BindingOverlayClearBody,
     DynamicPageCommand,
     MatchedCapability,
-    PageSessionLifecycleBody,
     PageSessionMetadata,
     SettingsTargetRef,
-    action_body_dict,
     make_binding_id,
     make_context_id,
-    subject_action_instance_id,
-    subject_binding_id,
-    subject_config_id,
-    subject_context_id,
-    subject_page_session_id,
-    subject_provider_instance_id,
 )
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import (
-    DeckrMessage,
-    parse_service_address,
-)
+from deckr.contracts.messages import DeckrMessage
 from deckr.contracts.models import thaw_json
 from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.capabilities import (
-    RasterBitmapClearParams,
-    raster_bitmap_command_params,
-)
 from deckr.hardware.descriptors import (
     DECKR_OUTPUT_RASTER,
     CapabilityRef,
@@ -67,7 +28,6 @@ from deckr.hardware.descriptors import (
     DeviceRef,
 )
 from deckr.lanes import EndpointSession
-from pydantic import ValidationError
 
 from deckr.controller._action_interest import (
     ActionInterestSnapshot,
@@ -78,6 +38,7 @@ from deckr.controller._actions import (
     ActionAvailabilityRecord,
     ActionAvailabilitySource,
     ActionAvailabilityState,
+    ActionIntentKey,
     ActionMetadata,
     ActionPlanningSnapshot,
     ActionProviderManager,
@@ -85,31 +46,34 @@ from deckr.controller._actions import (
     ControllerActionService,
     ProviderActionKey,
     ProviderSessionKey,
-    SettingsActionMetadata,
     action_unavailable_cause,
     provider_session_key,
     unavailable_overlay_template,
 )
 from deckr.controller._binding_planner import (
-    ActionIntentKey,
     BindingPlanner,
     BindingPlanStatus,
     PagePlan,
     PlannedBinding,
+    format_validation_summary,
 )
 from deckr.controller._binding_resolution import ResolvedControlBinding
-from deckr.controller._binding_validator import format_validation_summary
+from deckr.controller._bindings._action_lifecycle import (
+    ActionInstanceLifecycleService,
+    ActionInstanceSnapshot,
+)
 from deckr.controller._bindings._attachments import (
-    AuthorizedCommandTarget,
     BindingLease,
     ControlAttachmentState,
     HeldInputRecord,
 )
+from deckr.controller._bindings._commands import ProviderCommandIngress
 from deckr.controller._bindings._context import (
     ControlContext,
     PageCommandPort,
     RuntimeMessageSender,
 )
+from deckr.controller._bindings._ports import BindingActionService
 from deckr.controller._command_router import DeviceOutput
 from deckr.controller._device_layout import (
     ControlSurface,
@@ -144,102 +108,6 @@ BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS = 1.0
 SETTINGS_SERVICE_TIMEOUT_SECONDS = 1.0
 DETACH_NOTIFY_TIMEOUT_SECONDS = 1.0
 _ACTION_METADATA_UNSET: Any = object()
-_IMAGE_SOURCE_SCHEMES = ("data:", "http://", "https://")
-_TERMINAL_LIFECYCLE_REJECTION_REASONS = frozenset(
-    {
-        "invalid_settings",
-        "unsupported_capability",
-        "permission_denied",
-    }
-)
-
-
-def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
-    """Validate a dynamic page descriptor from a bus payload."""
-    if not data:
-        return None
-    bindings_data = data.get("bindings")
-    if not bindings_data:
-        return None
-    try:
-        return DynamicPageCommand.model_validate(data)
-    except ValidationError:
-        logger.warning(
-            "Ignoring invalid dynamic page descriptor payload", exc_info=True
-        )
-        return None
-
-
-def _binding_output_image_source(params: Mapping[str, Any]) -> str | None:
-    image = params.get("image")
-    if not isinstance(image, str) or not image:
-        return None
-    if image.startswith(_IMAGE_SOURCE_SCHEMES):
-        return image
-    encoding = params.get("encoding")
-    if encoding in {"jpeg", "png"}:
-        return f"data:image/{encoding};base64,{image}"
-    return None
-
-
-def _image_source_content_kind(image_source: str) -> str:
-    if image_source.startswith("data:application/vnd.invariant.graph"):
-        return "invariant_graph"
-    if image_source.startswith("data:"):
-        return "data_image"
-    if image_source.startswith(("http://", "https://")):
-        return "remote_image"
-    return "image"
-
-
-def _message_trace_payload(msg: DeckrMessage) -> dict[str, Any] | None:
-    if msg.trace is None:
-        return None
-    return msg.trace.model_dump(by_alias=True, exclude_none=True, mode="json")
-
-
-def _binding_output_render_source(
-    body: BindingOutputBody,
-    msg: DeckrMessage,
-    *,
-    image_source: str,
-) -> RenderSource:
-    binding = body.binding
-    return RenderSource(
-        provider_instance_id=binding.provider_instance_id,
-        provider_id=binding.provider_id,
-        provider_session_id=msg.sender_session_id,
-        action_id=binding.action_id,
-        action_instance_id=binding.action_instance_id,
-        action_message_id=msg.message_id,
-        action_causation_id=msg.causation_id,
-        trace=_message_trace_payload(msg),
-        command_type=body.command_type,
-        content_kind=_image_source_content_kind(image_source),
-        binding_output_generation=body.generation,
-    )
-
-
-def _binding_overlay_render_source(
-    binding: BindingMetadata,
-    msg: DeckrMessage,
-    *,
-    command_type: str,
-    overlay_generation: int,
-) -> RenderSource:
-    return RenderSource(
-        provider_instance_id=binding.provider_instance_id,
-        provider_id=binding.provider_id,
-        provider_session_id=msg.sender_session_id,
-        action_id=binding.action_id,
-        action_instance_id=binding.action_instance_id,
-        action_message_id=msg.message_id,
-        action_causation_id=msg.causation_id,
-        trace=_message_trace_payload(msg),
-        command_type=command_type,
-        binding_output_generation=binding.output_generation,
-        overlay_generation=overlay_generation,
-    )
 
 
 def _find_control_surface(
@@ -276,45 +144,6 @@ def _format_provider_action_keys(
     keys: Iterable[ProviderActionKey],
 ) -> tuple[tuple[str, str], ...]:
     return tuple(sorted((key.provider_instance_id, key.action_uuid) for key in keys))
-
-
-def _context_content_kind(context: object) -> str:
-    store = getattr(context, "_store", None)
-    content = getattr(store, "content", None)
-    overlay = getattr(store, "overlay", None)
-    if overlay is not None:
-        return f"overlay:{getattr(overlay, 'template', 'unknown')}"
-    image = getattr(content, "image", None)
-    if image is not None:
-        image = str(image)
-        if image.startswith("data:application/vnd.invariant.graph"):
-            return "invariant_graph"
-        if image.startswith("data:"):
-            return "data_image"
-        if image.startswith(("http://", "https://")):
-            return "remote_image"
-        return "image"
-    if getattr(content, "title", None) is not None:
-        return "title"
-    return "empty"
-
-
-def _payload_kind_hash(params: Mapping[str, Any]) -> tuple[str, str | None]:
-    image = params.get("image")
-    if isinstance(image, str):
-        if image.startswith("data:"):
-            kind = "data_uri"
-        elif image.startswith(("http://", "https://")):
-            kind = "remote_uri"
-        elif image:
-            kind = "encoded_image"
-        else:
-            kind = "empty_image"
-        return kind, hashlib.sha256(image.encode("utf-8")).hexdigest()[:12]
-    if not params:
-        return "empty", None
-    payload = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
-    return "params", hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,16 +196,6 @@ class ControlContextSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class ActionInstanceSnapshot:
-    provider_instance_id: str
-    provider_id: str
-    action_id: str
-    action_instance_id: str
-    config_id: str
-    context_id: str
-
-
-@dataclass(frozen=True, slots=True)
 class HeldInputSnapshot:
     binding_id: str
     control_id: str
@@ -400,86 +219,6 @@ class _UnavailableFallbackRender:
     cause: ActionUnavailableCause
     record: ActionAvailabilityRecord | None
     state: ActionAvailabilityState | None
-
-
-class BindingActionService(Protocol):
-    def planning_snapshot(
-        self,
-        intents: Iterable[ActionIntentKey],
-        *,
-        existing_provider_keys: Iterable[ProviderActionKey] = (),
-        now: float | None = None,
-    ) -> ActionPlanningSnapshot: ...
-
-    def settings_action_metadata(
-        self,
-        action_uuid: str,
-        *,
-        provider_instance_id: str | None = None,
-        provider_id: str | None = None,
-        provider_labels: Mapping[str, str] | None = None,
-        now: float | None = None,
-    ) -> SettingsActionMetadata: ...
-
-    def current_contract(
-        self,
-        provider_session_key: ProviderSessionKey | None,
-    ) -> ContractPointer | None: ...
-
-    async def send_runtime_message(
-        self,
-        provider_session_key: ProviderSessionKey,
-        message_type: str,
-        body: Any,
-    ) -> bool: ...
-
-    async def ensure_local_builtin_availability(
-        self,
-        intents: Iterable[ActionIntentKey],
-    ) -> frozenset[ProviderActionKey]: ...
-
-    def record_lifecycle_unavailable(
-        self,
-        *,
-        provider_instance_id: str,
-        provider_id: str,
-        action_uuid: str,
-        provider_session_id: str | None = None,
-        reason: str | None = None,
-        intent: ActionIntentKey | None = None,
-        now: float | None = None,
-    ) -> ProviderActionKey: ...
-
-    def record_for_key(
-        self,
-        key: ProviderActionKey,
-    ) -> ActionAvailabilityRecord | None: ...
-
-    def record_for_intent(
-        self,
-        intent: ActionIntentKey,
-        *,
-        now: float | None = None,
-    ) -> ActionAvailabilityRecord | None: ...
-
-    def state_for_key(
-        self,
-        key: ProviderActionKey,
-        *,
-        now: float | None = None,
-    ) -> ActionAvailabilityState | None: ...
-
-    def provider_lifecycle_recovery_required(self, key: ProviderActionKey) -> bool: ...
-
-    def consume_provider_lifecycle_recovery(self, key: ProviderActionKey) -> bool: ...
-
-    def update_config_interest(
-        self,
-        config_id: str,
-        snapshot: ActionInterestSnapshot,
-    ) -> None: ...
-
-    def clear_config_interest(self, config_id: str) -> None: ...
 
 
 def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
@@ -513,60 +252,6 @@ def _contract_pointer_matches(
     if left is None or right is None:
         return left is right
     return left.contract_id == right.contract_id and left.generation == right.generation
-
-
-def _binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
-    return (
-        binding.provider_instance_id == lease.provider_instance_id
-        and binding.provider_id == lease.provider_id
-        and binding.action_id == lease.action_uuid
-        and binding.context_id == lease.context_id
-        and binding.binding_id == lease.binding_id
-        and binding.action_instance_id == lease.action_instance_id
-    )
-
-
-def _action_instance_matches_metadata(
-    stored: ActionInstanceMetadata,
-    metadata: ActionInstanceMetadata,
-) -> bool:
-    return (
-        stored.provider_instance_id == metadata.provider_instance_id
-        and stored.provider_id == metadata.provider_id
-        and stored.action_id == metadata.action_id
-        and stored.action_instance_id == metadata.action_instance_id
-        and stored.config_id == metadata.config_id
-        and stored.context_id == metadata.context_id
-    )
-
-
-def _action_instance_matches_action(
-    stored: ActionInstanceMetadata,
-    action_meta: ActionMetadata,
-    *,
-    config_id: str,
-) -> bool:
-    return (
-        stored.provider_instance_id == action_meta.provider_instance_id
-        and stored.provider_id == action_meta.provider_id
-        and stored.action_id == action_meta.uuid
-        and stored.config_id == config_id
-    )
-
-
-def _page_session_matches_metadata(
-    session: DynamicPageSession,
-    metadata: PageSessionMetadata,
-) -> bool:
-    return (
-        metadata.provider_instance_id == session.owner_provider_instance_id
-        and metadata.provider_id == session.owner_provider_id
-        and metadata.action_instance_id == session.action_instance_id
-        and metadata.page_id == session.page_id
-        and metadata.page_session_id == session.page_session_id
-        and metadata.context_id == session.context_id
-        and metadata.owner_binding_id == session.owner_binding_id
-    )
 
 
 def _binding_lease_snapshot(
@@ -611,19 +296,6 @@ def _control_context_snapshot(lease: BindingLease) -> ControlContextSnapshot:
         provider_id=lease.provider_id,
         provider_session_id=lease.provider_session_id,
         page_session_id=lease.page_session_id,
-    )
-
-
-def _action_instance_snapshot(
-    metadata: ActionInstanceMetadata,
-) -> ActionInstanceSnapshot:
-    return ActionInstanceSnapshot(
-        provider_instance_id=metadata.provider_instance_id,
-        provider_id=metadata.provider_id,
-        action_id=metadata.action_id,
-        action_instance_id=metadata.action_instance_id,
-        config_id=metadata.config_id,
-        context_id=metadata.context_id,
     )
 
 
@@ -687,12 +359,17 @@ class ControlBindingService:
         )
         self._action_interest = ActionInterestTracker(clock=self._clock)
         self._binding_leases = self._attachments.binding_leases
-        self._action_instances: dict[str, ActionInstanceMetadata] = {}
-        self._action_instance_providers: dict[str, str] = {}
-        self._action_instance_provider_sessions: dict[
-            str,
-            ProviderSessionKey | None,
-        ] = {}
+        self._lifecycle = ActionInstanceLifecycleService(
+            config_id=self.config_id,
+            runtime_sender=self._runtime_sender,
+            availability_recorder=self._action_service,
+            host=self,
+            clock=self._clock,
+        )
+        self._command_ingress = ProviderCommandIngress(
+            host=self,
+            lifecycle=self._lifecycle,
+        )
         self._page_timeout_check_interval = page_timeout_check_interval
         self._nav_lock = anyio.Lock()
         self._sync_action_interest()
@@ -719,21 +396,14 @@ class ControlBindingService:
                 {
                     binding_id: _binding_lease_snapshot(
                         lease,
-                        planned_intent=self._planned_intent_for_lease(lease),
+                        planned_intent=self.planned_intent_for_lease(lease),
                     )
                     for binding_id, lease in self._binding_leases.items()
                 }
             ),
             active_contexts=MappingProxyType(active_contexts),
-            action_instances=MappingProxyType(
-                {
-                    action_instance_id: _action_instance_snapshot(metadata)
-                    for action_instance_id, metadata in self._action_instances.items()
-                }
-            ),
-            provider_session_keys=MappingProxyType(
-                dict(self._action_instance_provider_sessions)
-            ),
+            action_instances=self._lifecycle.snapshot_action_instances(),
+            provider_session_keys=self._lifecycle.provider_session_keys(),
             output_owners=MappingProxyType(
                 dict(self._attachments.active_output_by_control)
             ),
@@ -753,6 +423,21 @@ class ControlBindingService:
         if lease is None or not self._attachments.binding_command_authorized(lease):
             return None
         return lease.context
+
+    def binding_by_id(self, binding_id: str) -> BindingLease | None:
+        return self._binding_leases.get(binding_id)
+
+    def iter_binding_leases(self) -> Iterable[BindingLease]:
+        return tuple(self._binding_leases.values())
+
+    def active_page_session(self) -> DynamicPageSession | None:
+        return self._pages.active_dynamic_session()
+
+    def binding_command_authorized(self, lease: BindingLease) -> bool:
+        return self._attachments.binding_command_authorized(lease)
+
+    def binding_output_authorized(self, lease: BindingLease) -> bool:
+        return self._attachments.binding_output_authorized(lease)
 
     async def _render_unavailable_to_control(
         self,
@@ -847,7 +532,7 @@ class ControlBindingService:
         if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
             return True
         session_key = provider_session_key(action_meta)
-        return self._contract_pointer_for_provider_session_key(session_key) is not None
+        return self.current_contract(session_key) is not None
 
     def _log_unavailable_fallback_render(
         self,
@@ -928,6 +613,23 @@ class ControlBindingService:
         if isinstance(entry, StaticPageRef):
             return f"static:{entry.profile_name}:{entry.page_index}"
         return f"dynamic:{entry.page_id}"
+
+    async def revoke_binding(
+        self,
+        binding_id: str,
+        *,
+        clear_output: bool = True,
+        notify_provider: bool = True,
+        reason: str = "detach",
+        clear_held_input: bool = False,
+    ) -> BindingLease | None:
+        return await self._revoke_binding(
+            binding_id,
+            clear_output=clear_output,
+            notify_provider=notify_provider,
+            reason=reason,
+            clear_held_input=clear_held_input,
+        )
 
     async def _revoke_binding(
         self,
@@ -1108,17 +810,13 @@ class ControlBindingService:
             await self.action_contexts.delete(lease.control_id)
 
     async def _refresh_binding_output(self, lease: BindingLease, *, reason: str) -> None:
-        base_output_generation = getattr(
-            getattr(lease.context, "_store", None),
-            "base_output_generation",
-            None,
-        )
+        base_output_generation = lease.context.base_output_generation
         metadata_output_generation = getattr(
             lease.context.metadata,
             "output_generation",
             None,
         )
-        content_kind = _context_content_kind(lease.context)
+        content_kind = lease.context.content_kind
         if not lease.attached:
             logger.debug(
                 "Skipping cached binding output refresh for detached lease "
@@ -1418,7 +1116,10 @@ class ControlBindingService:
             | self._active_dynamic_page_owner_action_instance_ids()
         )
         for action_instance_id in sorted(candidates - retained):
-            await self._destroy_action_instance(action_instance_id, reason=reason)
+            await self._lifecycle.destroy_action_instance(
+                action_instance_id,
+                reason=reason,
+            )
 
     def _action_availability_change_affects_plan(
         self,
@@ -1492,7 +1193,7 @@ class ControlBindingService:
             for lease in self._binding_leases.values()
         )
 
-    def _contract_pointer_for_provider_session_key(
+    def current_contract(
         self,
         key: ProviderSessionKey | None,
     ) -> ContractPointer | None:
@@ -1513,7 +1214,7 @@ class ControlBindingService:
             body=body,
         )
 
-    def _provider_session_key_for_session(
+    def provider_session_key_for_session(
         self,
         *,
         provider_instance_id: str,
@@ -1528,12 +1229,12 @@ class ControlBindingService:
             provider_session_id=provider_session_id,
         )
 
-    async def _message_contract_authorized(
+    async def message_contract_authorized(
         self,
         msg: DeckrMessage,
         key: ProviderSessionKey | None,
     ) -> bool:
-        expected = self._contract_pointer_for_provider_session_key(key)
+        expected = self.current_contract(key)
         return expected is not None and msg.contract == expected
 
     def _provider_lifecycle_recovery_key(
@@ -1566,19 +1267,9 @@ class ControlBindingService:
         self,
         lease: BindingLease,
     ) -> ContractPointer | None:
-        return self._contract_pointer_for_provider_session_key(lease.provider_session_key)
+        return self.current_contract(lease.provider_session_key)
 
-    def _lifecycle_rejection_is_terminal(
-        self,
-        body: ActionLifecycleRejectedBody,
-    ) -> bool:
-        if body.reason == "stale_lifecycle":
-            return False
-        if body.retryable:
-            return False
-        return body.reason in _TERMINAL_LIFECYCLE_REJECTION_REASONS
-
-    def _planned_intent_for_lease(self, lease: BindingLease) -> ActionIntentKey:
+    def planned_intent_for_lease(self, lease: BindingLease) -> ActionIntentKey:
         current_plan = self._pages.current_plan()
         if current_plan is not None:
             for planned in current_plan.bindings:
@@ -1592,23 +1283,7 @@ class ControlBindingService:
             provider_labels=(),
         )
 
-    def _record_lifecycle_unavailable_for_binding(
-        self,
-        lease: BindingLease,
-        *,
-        reason: str,
-    ) -> ProviderActionKey:
-        return self._action_service.record_lifecycle_unavailable(
-            provider_instance_id=lease.provider_instance_id,
-            provider_id=lease.provider_id,
-            provider_session_id=lease.provider_session_id,
-            action_uuid=lease.action_uuid,
-            reason=reason,
-            intent=self._planned_intent_for_lease(lease),
-            now=self._clock(),
-        )
-
-    async def _recover_binding_provider_session_contract(
+    async def recover_binding_provider_session_contract(
         self,
         lease: BindingLease,
         *,
@@ -1632,57 +1307,6 @@ class ControlBindingService:
         await self.on_action_availability_changed(
             (ProviderActionKey(lease.provider_instance_id, lease.action_uuid),)
         )
-
-    def _record_lifecycle_unavailable_for_action_instance(
-        self,
-        metadata: ActionInstanceMetadata,
-        *,
-        reason: str,
-    ) -> ProviderActionKey:
-        session_key = self._action_instance_provider_sessions.get(
-            metadata.action_instance_id
-        )
-        return self._action_service.record_lifecycle_unavailable(
-            provider_instance_id=metadata.provider_instance_id,
-            provider_id=metadata.provider_id,
-            action_uuid=metadata.action_id,
-            provider_session_id=(
-                session_key.provider_session_id if session_key is not None else None
-            ),
-            reason=reason,
-            intent=ActionIntentKey(
-                action_uuid=metadata.action_id,
-                provider_instance_id=metadata.provider_instance_id,
-                provider_labels=(),
-            ),
-            now=self._clock(),
-        )
-
-    def _record_lifecycle_unavailable_for_page_session(
-        self,
-        session: DynamicPageSession,
-        *,
-        reason: str,
-    ) -> ProviderActionKey:
-        return self._action_service.record_lifecycle_unavailable(
-            provider_instance_id=session.owner_provider_instance_id,
-            provider_id=session.owner_provider_id,
-            action_uuid=session.owner_action_uuid,
-            provider_session_id=session.owner_provider_session_id,
-            reason=reason,
-            intent=ActionIntentKey(
-                action_uuid=session.owner_action_uuid,
-                provider_instance_id=session.owner_provider_instance_id,
-                provider_labels=(),
-            ),
-            now=self._clock(),
-        )
-
-    async def _handle_nondestructive_lifecycle_rejection(
-        self,
-        key: ProviderActionKey,
-    ) -> None:
-        await self.on_action_availability_changed(frozenset({key}))
 
     def _log_static_page_plan_rejection(
         self,
@@ -1854,7 +1478,6 @@ class ControlBindingService:
             provider_id=lease.provider_id,
             provider_session_id=lease.provider_session_id,
         )
-        had_action_instance = lease.action_instance_id in self._action_instances
         logger.info(
             "Binding activation starting config=%s control=%s action=%s "
             "provider=%s binding=%s",
@@ -1865,19 +1488,12 @@ class ControlBindingService:
             lease.binding_id,
         )
         with anyio.move_on_after(ACTION_INSTANCE_CREATE_TIMEOUT_SECONDS) as scope:
-            await self._ensure_action_instance(
+            await self._lifecycle.ensure_action_instance(
                 action_meta=action_meta,
                 action_instance_id=lease.action_instance_id,
                 context_id=lease.context_id,
             )
         if scope.cancel_called:
-            if not had_action_instance:
-                self._action_instances.pop(lease.action_instance_id, None)
-                self._action_instance_providers.pop(lease.action_instance_id, None)
-                self._action_instance_provider_sessions.pop(
-                    lease.action_instance_id,
-                    None,
-                )
             logger.warning(
                 "Binding activation timed out config=%s control=%s action=%s "
                 "provider=%s binding=%s stage=actionInstanceCreated timeout=%ss",
@@ -1930,189 +1546,6 @@ class ControlBindingService:
             if not lease.attached:
                 await self._activate_binding(lease)
 
-    async def _ensure_action_instance(
-        self,
-        *,
-        action_meta: Any,
-        action_instance_id: str,
-        context_id: str,
-    ) -> None:
-        existing = self._action_instances.get(action_instance_id)
-        if existing is not None and _action_instance_matches_action(
-            existing,
-            action_meta,
-            config_id=self.config_id,
-        ):
-            return
-        if existing is not None:
-            await self._destroy_action_instance(
-                action_instance_id,
-                reason="action_instance_retargeted",
-            )
-        metadata = ActionInstanceMetadata(
-            providerInstanceId=action_meta.provider_instance_id,
-            providerId=action_meta.provider_id,
-            actionId=action_meta.uuid,
-            actionInstanceId=action_instance_id,
-            configId=self.config_id,
-            contextId=context_id,
-        )
-        self._action_instances[action_instance_id] = metadata
-        self._action_instance_providers[action_instance_id] = (
-            action_meta.provider_instance_id
-        )
-        provider_session_key_for_action = (
-            None
-            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-            else provider_session_key(action_meta)
-        )
-        self._action_instance_provider_sessions[action_instance_id] = (
-            provider_session_key_for_action
-        )
-        await self._publish_action_instance_created(
-            metadata=metadata,
-            provider_session_key_for_action=provider_session_key_for_action,
-        )
-
-    async def _publish_action_instance_created(
-        self,
-        *,
-        metadata: ActionInstanceMetadata,
-        provider_session_key_for_action: ProviderSessionKey | None,
-    ) -> None:
-        if metadata.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
-            return
-        contract = self._contract_pointer_for_provider_session_key(
-            provider_session_key_for_action
-        )
-        if contract is None:
-            logger.warning(
-                "Skipping action instance create without live provider-session "
-                "contract config=%s actionInstance=%s provider=%s",
-                self.config_id,
-                metadata.action_instance_id,
-                metadata.provider_instance_id,
-            )
-            return
-        sent = await self._runtime_sender.send_action_runtime_message(
-            provider_session_key=provider_session_key_for_action,
-            message_type=ACTION_INSTANCE_CREATED,
-            body=ActionInstanceLifecycleBody(metadata=metadata),
-        )
-        if not sent:
-            logger.warning(
-                "Skipping action instance create without live Action Runtime lease "
-                "config=%s actionInstance=%s provider=%s",
-                self.config_id,
-                metadata.action_instance_id,
-                metadata.provider_instance_id,
-            )
-
-    async def _recover_binding_lifecycle(
-        self,
-        lease: BindingLease,
-        *,
-        reason: str,
-    ) -> None:
-        if lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
-            return
-        if lease.stale_lifecycle_recoveries >= 1:
-            logger.info(
-                "Ignoring repeated stale lifecycle rejection config=%s control=%s "
-                "action=%s provider=%s binding=%s reason=%s",
-                self.config_id,
-                lease.control_id,
-                lease.action_uuid,
-                lease.provider_instance_id,
-                lease.binding_id,
-                reason,
-            )
-            return
-        metadata = self._action_instances.get(lease.action_instance_id)
-        if metadata is None:
-            return
-        lease.stale_lifecycle_recoveries += 1
-        logger.info(
-            "Recovering binding lifecycle config=%s control=%s action=%s "
-            "provider=%s binding=%s reason=%s",
-            self.config_id,
-            lease.control_id,
-            lease.action_uuid,
-            lease.provider_instance_id,
-            lease.binding_id,
-            reason,
-        )
-        await self._publish_action_instance_created(
-            metadata=metadata,
-            provider_session_key_for_action=lease.provider_session_key,
-        )
-        with anyio.move_on_after(BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS) as scope:
-            await lease.context.on_binding_attached()
-        if scope.cancel_called:
-            logger.warning(
-                "Binding lifecycle recovery timed out config=%s control=%s action=%s "
-                "provider=%s binding=%s timeout=%ss",
-                self.config_id,
-                lease.control_id,
-                lease.action_uuid,
-                lease.provider_instance_id,
-                lease.binding_id,
-                BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS,
-            )
-
-    async def _destroy_action_instance(
-        self,
-        action_instance_id: str,
-        *,
-        reason: str,
-        notify_provider: bool = True,
-    ) -> None:
-        metadata = self._action_instances.pop(action_instance_id, None)
-        provider_instance_id = self._action_instance_providers.pop(
-            action_instance_id,
-            None,
-        )
-        provider_session_key_for_action = self._action_instance_provider_sessions.pop(
-            action_instance_id,
-            None,
-        )
-        if (
-            metadata is None
-            or provider_instance_id is None
-            or provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-            or not notify_provider
-        ):
-            return
-        contract = self._contract_pointer_for_provider_session_key(
-            provider_session_key_for_action
-        )
-        if contract is None:
-            logger.warning(
-                "Skipping action instance destroy without live provider-session "
-                "contract config=%s actionInstance=%s provider=%s",
-                self.config_id,
-                metadata.action_instance_id,
-                provider_instance_id,
-            )
-            return
-        sent = await self._runtime_sender.send_action_runtime_message(
-            provider_session_key=provider_session_key_for_action,
-            message_type=ACTION_INSTANCE_DESTROYED,
-            body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
-        )
-        if not sent:
-            logger.warning(
-                "Skipping action instance destroy without live Action Runtime lease "
-                "config=%s actionInstance=%s provider=%s",
-                self.config_id,
-                metadata.action_instance_id,
-                provider_instance_id,
-            )
-
-    async def _destroy_all_action_instances(self, *, reason: str) -> None:
-        for action_instance_id in list(self._action_instances):
-            await self._destroy_action_instance(action_instance_id, reason=reason)
-
     async def _try_resolve_binding(
         self,
         binding: ResolvedControlBinding,
@@ -2161,7 +1594,7 @@ class ControlBindingService:
             if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
             else provider_session_key(action_meta)
         )
-        contract = self._contract_pointer_for_provider_session_key(session_key)
+        contract = self.current_contract(session_key)
         if (
             action_meta.provider_instance_id != BUILTIN_ACTION_PROVIDER_ID
             and contract is None
@@ -2212,17 +1645,11 @@ class ControlBindingService:
         ):
             builtin_action = self.manager.get_builtin_action(action_meta.uuid)
         binding_id = make_binding_id()
-        existing_action_instance = self._action_instances.get(action_instance_id)
-        context_id = (
-            existing_action_instance.context_id
-            if existing_action_instance is not None
-            and _action_instance_matches_action(
-                existing_action_instance,
-                action_meta,
-                config_id=self.config_id,
-            )
-            else make_context_id()
+        existing_context_id = self._lifecycle.context_id_for_action_instance(
+            action_meta=action_meta,
+            action_instance_id=action_instance_id,
         )
+        context_id = existing_context_id or make_context_id()
         matched_capabilities = self._matched_capabilities(binding)
         binding_metadata = BindingMetadata(
             providerInstanceId=action_meta.provider_instance_id,
@@ -2320,7 +1747,7 @@ class ControlBindingService:
             if session is not None:
                 await self.close_page(context_id=session.context_id, reason="timeout")
 
-    def _page_session_metadata(
+    def page_session_metadata(
         self,
         session: DynamicPageSession,
     ) -> PageSessionMetadata:
@@ -2341,85 +1768,6 @@ class ControlBindingService:
             bindings=bindings,
         )
 
-    async def _emit_page_opened(
-        self,
-        session: DynamicPageSession,
-        *,
-        causation_id: str | None = None,
-    ) -> None:
-        if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
-            return
-        session_key = self._provider_session_key_for_session(
-            provider_instance_id=session.owner_provider_instance_id,
-            provider_id=session.owner_provider_id,
-            provider_session_id=session.owner_provider_session_id,
-        )
-        contract = self._contract_pointer_for_provider_session_key(session_key)
-        if contract is None:
-            logger.warning(
-                "Skipping page open without live provider-session contract "
-                "config=%s pageSession=%s provider=%s",
-                self.config_id,
-                session.page_session_id,
-                session.owner_provider_instance_id,
-            )
-            return
-        try:
-            await self._runtime_sender.send_action_runtime_message(
-                provider_session_key=session_key,
-                message_type=PAGE_SESSION_OPENED,
-                body=PageSessionLifecycleBody(
-                    pageSession=self._page_session_metadata(session)
-                ),
-            )
-        except Exception:
-            logger.exception(
-                "Error notifying provider of page open config=%s pageSession=%s",
-                self.config_id,
-                session.page_session_id,
-            )
-
-    async def _emit_page_closed(
-        self,
-        session: DynamicPageSession,
-        reason: str,
-        *,
-        causation_id: str | None = None,
-    ) -> None:
-        if session.owner_provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
-            return
-        session_key = self._provider_session_key_for_session(
-            provider_instance_id=session.owner_provider_instance_id,
-            provider_id=session.owner_provider_id,
-            provider_session_id=session.owner_provider_session_id,
-        )
-        contract = self._contract_pointer_for_provider_session_key(session_key)
-        if contract is None:
-            logger.warning(
-                "Skipping page close without live provider-session contract "
-                "config=%s pageSession=%s provider=%s",
-                self.config_id,
-                session.page_session_id,
-                session.owner_provider_instance_id,
-            )
-            return
-        try:
-            await self._runtime_sender.send_action_runtime_message(
-                provider_session_key=session_key,
-                message_type=PAGE_SESSION_CLOSED,
-                body=PageSessionLifecycleBody(
-                    pageSession=self._page_session_metadata(session),
-                    reason=reason,
-                ),
-            )
-        except Exception:
-            logger.exception(
-                "Error notifying provider of page close config=%s pageSession=%s reason=%s",
-                self.config_id,
-                session.page_session_id,
-                reason,
-            )
-
     async def _apply_page_transition_effects(
         self,
         effects: PageTransitionEffects,
@@ -2427,7 +1775,7 @@ class ControlBindingService:
         causation_id: str | None = None,
     ) -> None:
         for session in effects.sessions_to_close:
-            await self._emit_page_closed(
+            await self._lifecycle.emit_page_closed(
                 session,
                 effects.cleanup_reason,
                 causation_id=causation_id,
@@ -2446,7 +1794,7 @@ class ControlBindingService:
         effects = self._pages.clear(reason=reason, dynamic_only=True)
         self._sync_top_frame_state()
         for session in effects.sessions_to_close:
-            await self._emit_page_closed(
+            await self._lifecycle.emit_page_closed(
                 session,
                 reason,
                 causation_id=causation_id,
@@ -2775,7 +2123,10 @@ class ControlBindingService:
             )
             if ok:
                 session = draft.page_session
-                await self._emit_page_opened(session, causation_id=causation_id)
+                await self._lifecycle.emit_page_opened(
+                    session,
+                    causation_id=causation_id,
+                )
                 return session
             return None
 
@@ -2854,7 +2205,7 @@ class ControlBindingService:
             effects = self._pages.clear(reason=reason)
             self._sync_top_frame_state()
             for session in effects.sessions_to_close:
-                await self._emit_page_closed(session, reason)
+                await self._lifecycle.emit_page_closed(session, reason)
             await self._revoke_active_bindings(
                 clear_outputs=clear_outputs,
                 reason=f"{reason}_page",
@@ -2863,7 +2214,7 @@ class ControlBindingService:
                 effects.previous_dynamic_plans,
                 reason=reason,
             )
-            await self._destroy_all_action_instances(reason=reason)
+            await self._lifecycle.destroy_all_action_instances(reason=reason)
             if clear_outputs:
                 await self._clear_all_raster_controls()
             self._sync_top_frame_state()
@@ -3122,11 +2473,12 @@ class ControlBindingService:
         )
         if preserve_page_owner and planned.action_meta is not None:
             self._move_dynamic_page_owner_provider_session(planned.action_meta)
-            self._action_instance_provider_sessions[action_instance_id] = (
-                provider_session_key(planned.action_meta)
+            self._lifecycle.move_action_instance_provider_session(
+                action_instance_id,
+                planned.action_meta,
             )
         else:
-            await self._destroy_action_instance(
+            await self._lifecycle.destroy_action_instance(
                 action_instance_id,
                 reason=reason,
                 notify_provider=True,
@@ -3182,7 +2534,7 @@ class ControlBindingService:
             self.config = config
             draft = self._pages.update_config(config)
             for session in draft.sessions_to_close:
-                await self._emit_page_closed(session, "config_change")
+                await self._lifecycle.emit_page_closed(session, "config_change")
             await self._revoke_active_bindings(
                 clear_outputs=False,
                 reason="config_change",
@@ -3191,7 +2543,9 @@ class ControlBindingService:
                 draft.previous_dynamic_plans,
                 reason="config_change",
             )
-            await self._destroy_all_action_instances(reason="config_change")
+            await self._lifecycle.destroy_all_action_instances(
+                reason="config_change"
+            )
             ok, _ = await self._execute_page_draft(
                 draft,
                 apply_effects=False,
@@ -3201,668 +2555,9 @@ class ControlBindingService:
                 self._sync_top_frame_state()
                 return
 
-    def _command_sender_provider_instance_id(self, msg: DeckrMessage) -> str | None:
-        provider_instance_id = parse_action_provider_address(msg.sender)
-        if provider_instance_id is None:
-            service_id = parse_service_address(msg.sender)
-            provider_instance_id = (
-                action_runtime_provider_instance_id(service_id)
-                if service_id is not None
-                else None
-            )
-        if provider_instance_id is None:
-            logger.warning(
-                "Ignoring action command %s from non-provider sender %s",
-                msg.message_type,
-                msg.sender,
-            )
-            return None
-        if provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS:
-            logger.warning(
-                "Ignoring action command %s from external provider using reserved id %s",
-                msg.message_type,
-                provider_instance_id,
-            )
-            return None
-        return provider_instance_id
-
-    async def _authorize_action_command(
-        self,
-        msg: DeckrMessage,
-        *,
-        context_id: str,
-    ) -> AuthorizedCommandTarget | None:
-        sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
-        if sender_provider_instance_id is None:
-            return None
-
-        action_instance_id = subject_action_instance_id(msg.subject)
-        binding_id = subject_binding_id(msg.subject)
-        page_session_id = subject_page_session_id(msg.subject)
-        subject_provider_id = subject_provider_instance_id(msg.subject)
-        if (
-            subject_provider_id is not None
-            and subject_provider_id != sender_provider_instance_id
-        ):
-            logger.warning(
-                "Ignoring action command %s from %s with mismatched subject provider %s",
-                msg.message_type,
-                msg.sender,
-                subject_provider_id,
-            )
-            return None
-
-        if binding_id is not None:
-            lease = self._binding_leases.get(binding_id)
-            if lease is None or lease.context_id != context_id:
-                logger.debug(
-                    "Ignoring action command %s from %s for inactive binding %s",
-                    msg.message_type,
-                    msg.sender,
-                    binding_id,
-                )
-                return None
-            if not self._attachments.binding_command_authorized(lease):
-                logger.warning(
-                    "Ignoring action command %s for unauthorized binding %s",
-                    msg.message_type,
-                    binding_id,
-                )
-                return None
-            if sender_provider_instance_id != lease.provider_instance_id:
-                logger.warning(
-                    "Ignoring action command %s from provider %s for binding owned by provider %s",
-                    msg.message_type,
-                    sender_provider_instance_id,
-                    lease.provider_instance_id,
-                )
-                return None
-            if msg.sender_session_id != lease.provider_session_id:
-                logger.warning(
-                    "Ignoring action command %s from stale provider session %s",
-                    msg.message_type,
-                    msg.sender_session_id,
-                )
-                return None
-            if not await self._message_contract_authorized(
-                msg,
-                lease.provider_session_key,
-            ):
-                await self._recover_binding_provider_session_contract(
-                    lease,
-                    reason=f"{msg.message_type}_contract_mismatch",
-                )
-                logger.warning(
-                    "Ignoring action command %s from provider session %s without "
-                    "matching Concord contract",
-                    msg.message_type,
-                    msg.sender_session_id,
-                )
-                return None
-            if (
-                action_instance_id is not None
-                and action_instance_id != lease.action_instance_id
-            ):
-                logger.warning(
-                    "Ignoring action command %s for mismatched action instance %s",
-                    msg.message_type,
-                    action_instance_id,
-                )
-                return None
-            if page_session_id is not None and page_session_id != lease.page_session_id:
-                logger.warning(
-                    "Ignoring action command %s for mismatched page session %s",
-                    msg.message_type,
-                    page_session_id,
-                )
-                return None
-            return AuthorizedCommandTarget(
-                sender_provider_instance_id=sender_provider_instance_id,
-                context_id=context_id,
-                binding=lease,
-            )
-
-        session = self._pages.active_dynamic_session()
-        if page_session_id is not None:
-            if (
-                session is None
-                or page_session_id != session.page_session_id
-                or context_id != session.context_id
-            ):
-                logger.warning(
-                    "Ignoring action command %s for inactive page session %s",
-                    msg.message_type,
-                    page_session_id,
-                )
-                return None
-            if sender_provider_instance_id != session.owner_provider_instance_id:
-                logger.warning(
-                    "Ignoring action command %s from provider %s for page owned by provider %s",
-                    msg.message_type,
-                    sender_provider_instance_id,
-                    session.owner_provider_instance_id,
-                )
-                return None
-            if msg.sender_session_id != session.owner_provider_session_id:
-                logger.warning(
-                    "Ignoring page action command %s from stale provider session %s",
-                    msg.message_type,
-                    msg.sender_session_id,
-                )
-                return None
-            if not await self._message_contract_authorized(
-                msg,
-                self._provider_session_key_for_session(
-                    provider_instance_id=session.owner_provider_instance_id,
-                    provider_id=session.owner_provider_id,
-                    provider_session_id=session.owner_provider_session_id,
-                ),
-            ):
-                logger.warning(
-                    "Ignoring page action command %s from provider session %s "
-                    "without matching Concord contract",
-                    msg.message_type,
-                    msg.sender_session_id,
-                )
-                return None
-            if (
-                action_instance_id is not None
-                and action_instance_id != session.action_instance_id
-            ):
-                logger.warning(
-                    "Ignoring action command %s for mismatched page action instance %s",
-                    msg.message_type,
-                    action_instance_id,
-                )
-                return None
-            return AuthorizedCommandTarget(
-                sender_provider_instance_id=sender_provider_instance_id,
-                context_id=context_id,
-                page_session=session,
-            )
-
-        logger.warning(
-            "Ignoring action command %s from %s without binding or page session subject",
-            msg.message_type,
-            msg.sender,
-        )
-        return None
-
-    async def _action_instance_rejection_authorized(
-        self,
-        msg: DeckrMessage,
-        *,
-        sender_provider_instance_id: str,
-        metadata: ActionInstanceMetadata,
-        context_id: str,
-    ) -> bool:
-        if metadata.config_id != self.config_id or metadata.context_id != context_id:
-            return False
-        if metadata.provider_instance_id != sender_provider_instance_id:
-            return False
-        action_instance_id = subject_action_instance_id(msg.subject)
-        if (
-            action_instance_id is not None
-            and action_instance_id != metadata.action_instance_id
-        ):
-            return False
-        stored = self._action_instances.get(metadata.action_instance_id)
-        if stored is None or not _action_instance_matches_metadata(stored, metadata):
-            return False
-        key = self._action_instance_provider_sessions.get(metadata.action_instance_id)
-        return (
-            key is not None
-            and msg.sender_session_id == key.provider_session_id
-            and await self._message_contract_authorized(msg, key)
-        )
-
-    async def _handle_action_lifecycle_rejected(
-        self,
-        msg: DeckrMessage,
-        body: ActionLifecycleRejectedBody,
-        *,
-        context_id: str,
-    ) -> None:
-        if body.reason == "stale_lifecycle":
-            await self._handle_stale_lifecycle_rejected(
-                msg,
-                body,
-                context_id=context_id,
-            )
-            return
-
-        sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
-        if sender_provider_instance_id is None:
-            return
-
-        if body.target_kind == "action_instance":
-            metadata = body.action_instance
-            if metadata is None:
-                return
-            if not await self._action_instance_rejection_authorized(
-                msg,
-                sender_provider_instance_id=sender_provider_instance_id,
-                metadata=metadata,
-                context_id=context_id,
-            ):
-                logger.warning(
-                    "Ignoring unauthorized action lifecycle rejection for action instance %s",
-                    metadata.action_instance_id,
-                )
-                return
-            if self._lifecycle_rejection_is_terminal(body):
-                await self._reject_action_instance(metadata, reason=body.reason)
-                return
-            key = self._record_lifecycle_unavailable_for_action_instance(
-                metadata,
-                reason=body.reason,
-            )
-            await self._handle_nondestructive_lifecycle_rejection(key)
-            return
-
-        authorization = await self._authorize_action_command(
-            msg,
-            context_id=context_id,
-        )
-        if authorization is None:
-            return
-
-        if body.target_kind == "binding":
-            lease = authorization.binding
-            metadata = body.binding
-            if (
-                lease is None
-                or metadata is None
-                or metadata.config_id != self.config_id
-                or not _binding_body_matches_lease(lease, metadata)
-            ):
-                logger.warning(
-                    "Ignoring action lifecycle rejection for mismatched binding"
-                )
-                return
-            if self._lifecycle_rejection_is_terminal(body):
-                await self._revoke_binding(
-                    lease.binding_id,
-                    clear_output=True,
-                    notify_provider=False,
-                    reason=body.reason,
-                    clear_held_input=True,
-                )
-                return
-            key = self._record_lifecycle_unavailable_for_binding(
-                lease,
-                reason=body.reason,
-            )
-            await self._handle_nondestructive_lifecycle_rejection(key)
-            return
-
-        if body.target_kind == "page_session":
-            session = authorization.page_session
-            metadata = body.page_session
-            if (
-                session is None
-                or metadata is None
-                or metadata.config_id != self.config_id
-                or not _page_session_matches_metadata(session, metadata)
-            ):
-                logger.warning(
-                    "Ignoring action lifecycle rejection for mismatched page session"
-                )
-                return
-            if self._lifecycle_rejection_is_terminal(body):
-                await self._close_rejected_page_session(session, reason=body.reason)
-                return
-            key = self._record_lifecycle_unavailable_for_page_session(
-                session,
-                reason=body.reason,
-            )
-            await self._handle_nondestructive_lifecycle_rejection(key)
-
-    async def _handle_stale_lifecycle_rejected(
-        self,
-        msg: DeckrMessage,
-        body: ActionLifecycleRejectedBody,
-        *,
-        context_id: str,
-    ) -> None:
-        if body.target_kind != "binding":
-            logger.info(
-                "Ignoring stale action lifecycle rejection config=%s target=%s",
-                self.config_id,
-                body.target_kind,
-            )
-            return
-        authorization = await self._authorize_action_command(
-            msg,
-            context_id=context_id,
-        )
-        if authorization is None:
-            return
-        lease = authorization.binding
-        metadata = body.binding
-        if (
-            lease is None
-            or metadata is None
-            or metadata.config_id != self.config_id
-            or not _binding_body_matches_lease(lease, metadata)
-        ):
-            logger.warning("Ignoring stale lifecycle rejection for mismatched binding")
-            return
-        await self._recover_binding_lifecycle(
-            lease,
-            reason="stale_lifecycle_rejected",
-        )
-
-    async def _reject_action_instance(
-        self,
-        metadata: ActionInstanceMetadata,
-        *,
-        reason: str,
-    ) -> None:
-        page_session = self._pages.active_dynamic_session()
-        if (
-            page_session is not None
-            and page_session.action_instance_id == metadata.action_instance_id
-        ):
-            await self._close_rejected_page_session(page_session, reason=reason)
-
-        for binding_id, lease in tuple(self._binding_leases.items()):
-            if lease.action_instance_id == metadata.action_instance_id:
-                await self._revoke_binding(
-                    binding_id,
-                    notify_provider=False,
-                    reason=reason,
-                    clear_held_input=True,
-                )
-        await self._destroy_action_instance(
-            metadata.action_instance_id,
-            reason=reason,
-            notify_provider=False,
-        )
-
-    async def _close_rejected_page_session(
-        self,
-        session: DynamicPageSession,
-        *,
-        reason: str,
-    ) -> None:
-        await self.close_page(context_id=session.context_id, reason=reason)
-
     async def handle_provider_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from an action provider."""
-        try:
-            payload = action_body_dict(msg)
-        except (ValidationError, ValueError):
-            logger.warning(
-                "Ignoring invalid action command body %s from %s",
-                msg.message_type,
-                msg.sender,
-                exc_info=True,
-            )
-            return
-        msg_type = msg.message_type
-
-        context_id = subject_context_id(msg.subject) or ""
-        if not context_id:
-            return
-        config_id = subject_config_id(msg.subject)
-        if config_id != self.config_id:
-            return
-        if msg_type == ACTION_LIFECYCLE_REJECTED:
-            body = ActionLifecycleRejectedBody.model_validate(payload)
-            await self._handle_action_lifecycle_rejected(
-                msg,
-                body,
-                context_id=context_id,
-            )
-            return
-        authorization = await self._authorize_action_command(
-            msg,
-            context_id=context_id,
-        )
-        if authorization is None:
-            return
-
-        if msg_type == OPEN_PAGE:
-            if authorization.binding is None:
-                logger.warning(
-                    "Ignoring open_page without binding authority for %s",
-                    context_id,
-                )
-                return
-            desc_data = payload.get("descriptor")
-            descriptor = _descriptor_from_payload(desc_data) if desc_data else None
-            if descriptor is not None:
-                await self.open_page(
-                    descriptor=descriptor,
-                    context_id=context_id,
-                    binding_id=authorization.binding.binding_id,
-                    causation_id=msg.message_id,
-                )
-            return
-
-        if msg_type == REPLACE_PAGE:
-            if authorization.page_session is None:
-                logger.warning(
-                    "Ignoring replace_page without page-session authority for %s",
-                    context_id,
-                )
-                return
-            desc_data = payload.get("descriptor")
-            descriptor = _descriptor_from_payload(desc_data) if desc_data else None
-            if descriptor is not None:
-                await self.replace_page(
-                    descriptor=descriptor,
-                    context_id=authorization.page_session.context_id,
-                    causation_id=msg.message_id,
-                )
-            return
-
-        if msg_type == CLOSE_PAGE:
-            if authorization.page_session is None:
-                logger.warning(
-                    "Ignoring close_page without page-session authority for %s",
-                    context_id,
-                )
-                return
-            await self.close_page(
-                context_id=authorization.page_session.context_id,
-                reason="close",
-                causation_id=msg.message_id,
-            )
-            return
-
-        if msg_type == BINDING_OUTPUT:
-            if authorization.binding is not None:
-                body = BindingOutputBody.model_validate(payload)
-                await self._handle_binding_output(authorization.binding, body, msg)
-            return
-
-        if msg_type == BINDING_OVERLAY:
-            if authorization.binding is not None:
-                body = BindingOverlayBody.model_validate(payload)
-                await self._handle_binding_overlay(authorization.binding, body, msg)
-            return
-
-        if msg_type == BINDING_OVERLAY_CLEAR:
-            if authorization.binding is not None:
-                body = BindingOverlayClearBody.model_validate(payload)
-                await self._handle_binding_overlay_clear(
-                    authorization.binding,
-                    body,
-                    msg,
-                )
-            return
-
-        if authorization.page_session is not None:
-            return
-
-        lease = authorization.binding
-        if lease is None:
-            return
-
-    async def _handle_binding_output(
-        self,
-        lease: BindingLease,
-        body: BindingOutputBody,
-        msg: DeckrMessage,
-    ) -> None:
-        if not self._attachments.binding_output_authorized(lease):
-            logger.warning(
-                "Ignoring binding output from non-output owner binding %s",
-                lease.binding_id,
-            )
-            return
-        if not _binding_body_matches_lease(lease, body.binding):
-            logger.warning(
-                "Ignoring binding output with mismatched mirrored lease identity"
-            )
-            return
-        if body.binding.output_generation != body.generation:
-            logger.warning(
-                "Ignoring binding output with mismatched generation for binding %s",
-                lease.binding_id,
-            )
-            return
-        if body.capability.control_id != lease.control_id:
-            logger.warning(
-                "Ignoring binding output for wrong control %s on binding %s",
-                body.capability.control_id,
-                lease.binding_id,
-            )
-            return
-        if body.capability.capability_id != lease.raster_capability_id:
-            logger.warning(
-                "Ignoring unsupported binding output capability %s on binding %s",
-                body.capability.capability_id,
-                lease.binding_id,
-            )
-            return
-        payload_kind, payload_hash = _payload_kind_hash(body.params)
-        logger.debug(
-            "Accepted binding output config=%s control=%s action=%s provider=%s "
-            "binding=%s command_type=%s generation=%s capability=%s "
-            "payload_kind=%s payload_hash=%s",
-            self.config_id,
-            lease.control_id,
-            lease.action_uuid,
-            lease.provider_instance_id,
-            lease.binding_id,
-            body.command_type,
-            body.generation,
-            body.capability.capability_id,
-            payload_kind,
-            payload_hash,
-        )
-        if body.command_type == "clear":
-            try:
-                params = raster_bitmap_command_params(body.command_type, body.params)
-            except (ValueError, ValidationError) as exc:
-                logger.warning(
-                    "Ignoring invalid raster output command %s on binding %s: %s",
-                    body.command_type,
-                    lease.binding_id,
-                    exc,
-                )
-                return
-            if not isinstance(params, RasterBitmapClearParams):
-                return
-            await lease.context.clear_raster(generation=body.generation)
-            return
-        if body.command_type != "set_frame":
-            logger.warning(
-                "Ignoring unsupported raster output command %s on binding %s",
-                body.command_type,
-                lease.binding_id,
-            )
-            return
-        image_source = _binding_output_image_source(body.params)
-        if image_source is None:
-            logger.warning(
-                "Ignoring raster output without a valid image source on binding %s",
-                lease.binding_id,
-            )
-            return
-        source = _binding_output_render_source(body, msg, image_source=image_source)
-        await lease.context.set_raster_image(
-            image_source,
-            generation=body.generation,
-            source=source,
-        )
-
-    async def _handle_binding_overlay(
-        self,
-        lease: BindingLease,
-        body: BindingOverlayBody,
-        msg: DeckrMessage,
-    ) -> None:
-        if not self._attachments.binding_output_authorized(lease):
-            logger.warning(
-                "Ignoring binding overlay from non-output owner binding %s",
-                lease.binding_id,
-            )
-            return
-        if not _binding_body_matches_lease(lease, body.binding):
-            logger.warning(
-                "Ignoring binding overlay with mismatched mirrored lease identity"
-            )
-            return
-        ok = await lease.context.show_overlay(
-            template=body.template,
-            title=body.title,
-            params=dict(body.params),
-            duration_seconds=body.duration_seconds,
-            overlay_id=body.overlay_id,
-            generation=body.generation,
-            binding_output_generation=body.binding.output_generation,
-            source=_binding_overlay_render_source(
-                body.binding,
-                msg,
-                command_type=BINDING_OVERLAY,
-                overlay_generation=body.generation,
-            ),
-        )
-        if not ok:
-            logger.info(
-                "Ignoring stale binding overlay for binding %s generation=%s",
-                lease.binding_id,
-                body.generation,
-            )
-
-    async def _handle_binding_overlay_clear(
-        self,
-        lease: BindingLease,
-        body: BindingOverlayClearBody,
-        msg: DeckrMessage,
-    ) -> None:
-        if not self._attachments.binding_output_authorized(lease):
-            logger.warning(
-                "Ignoring binding overlay clear from non-output owner binding %s",
-                lease.binding_id,
-            )
-            return
-        if not _binding_body_matches_lease(lease, body.binding):
-            logger.warning(
-                "Ignoring binding overlay clear with mismatched mirrored lease identity"
-            )
-            return
-        ok = await lease.context.clear_overlay(
-            overlay_id=body.overlay_id,
-            generation=body.generation,
-            binding_output_generation=body.binding.output_generation,
-            source=_binding_overlay_render_source(
-                body.binding,
-                msg,
-                command_type=BINDING_OVERLAY_CLEAR,
-                overlay_generation=body.generation,
-            ),
-        )
-        if not ok:
-            logger.info(
-                "Ignoring stale binding overlay clear for binding %s generation=%s",
-                lease.binding_id,
-                body.generation,
-            )
+        await self._command_ingress.handle(msg)
 
     async def handle_hardware_input(self, message: DeckrMessage):
         event = hw_messages.hardware_body_from_message(message)

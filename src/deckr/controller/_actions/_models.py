@@ -5,10 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
-if TYPE_CHECKING:
-    from deckr.controller._binding_planner import ActionIntentKey
+
+@dataclass(frozen=True, slots=True)
+class ActionIntentKey:
+    action_uuid: str
+    provider_instance_id: str | None
+    provider_labels: tuple[tuple[str, str], ...]
 
 
 @dataclass

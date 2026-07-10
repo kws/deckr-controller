@@ -53,6 +53,7 @@ from deckr.controller._actions._availability import (
 from deckr.controller._actions._models import (
     ActionAvailabilityPolicy,
     ActionAvailabilityState,
+    ActionIntentKey,
     ActionMetadata,
     ActionPlanningSnapshot,
     ActionProviderManager,
@@ -62,7 +63,6 @@ from deckr.controller._actions._models import (
     SettingsActionMetadata,
     provider_session_key,
 )
-from deckr.controller._binding_planner import ActionIntentKey
 
 logger = logging.getLogger(__name__)
 

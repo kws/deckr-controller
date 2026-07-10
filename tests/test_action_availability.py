@@ -31,6 +31,7 @@ from deckr.controller._actions import (
     ActionAvailabilityRecord,
     ActionAvailabilitySource,
     ActionAvailabilityState,
+    ActionIntentKey,
     ActionMetadata,
     ActionUnavailableCause,
     ControllerActionService,
@@ -40,7 +41,6 @@ from deckr.controller._actions import (
     unavailable_overlay_template,
 )
 from deckr.controller._actions._availability import ActionAvailabilityCache
-from deckr.controller._binding_planner import ActionIntentKey
 
 CONTROLLER_ID = "controller-main"
 CONTROLLER_SESSION_ID = "controller-session"

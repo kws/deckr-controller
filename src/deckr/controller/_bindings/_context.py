@@ -175,6 +175,28 @@ class ControlContext:
     def internal(self) -> Mapping[str, Any]:
         return self._internal
 
+    @property
+    def base_output_generation(self) -> int:
+        return self._store.base_output_generation
+
+    @property
+    def content_kind(self) -> str:
+        overlay = self._store.overlay
+        if overlay is not None:
+            return f"overlay:{overlay.template}"
+        image = self._store.content.image
+        if image is not None:
+            if image.startswith("data:application/vnd.invariant.graph"):
+                return "invariant_graph"
+            if image.startswith("data:"):
+                return "data_image"
+            if image.startswith(("http://", "https://")):
+                return "remote_image"
+            return "image"
+        if self._store.content.title is not None:
+            return "title"
+        return "empty"
+
     async def _publish(self, message_type: str, body: Mapping[str, Any] | Any) -> None:
         provider_session_key = (
             None
