@@ -103,6 +103,35 @@ async def test_subscribe_receives_config_on_file_add(config_service, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_file_config_slow_subscriber_converges_after_identity_overflow(
+    config_service,
+    tmp_path,
+) -> None:
+    stream = config_service.subscribe("config-256")
+    assert await anext(stream) is None
+
+    for index in range(257):
+        config = _make_config(f"config-{index:03d}", name=f"Version {index}")
+        await config_service._cache_and_notify(  # noqa: SLF001
+            tmp_path / f"config-{index:03d}.yml",
+            config,
+        )
+    final = _make_config("config-256", name="Final")
+    await config_service._cache_and_notify(  # noqa: SLF001
+        tmp_path / "config-256.yml",
+        final,
+    )
+
+    with anyio.fail_after(1):
+        converged = await anext(stream)
+    assert converged is not None
+    assert converged.name == "Final"
+
+    await stream.aclose()
+    await config_service.stop()
+
+
+@pytest.mark.asyncio
 async def test_invalid_yaml_does_not_emit(config_service, tmp_path):
     """Invalid YAML or invalid config does not emit; previous config preserved."""
     cfg = _make_config("dev1")

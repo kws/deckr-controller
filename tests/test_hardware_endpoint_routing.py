@@ -641,11 +641,22 @@ async def test_live_hardware_claim_is_replaced_on_manager_session_change():
             session_id="new-session",
             advertisement_id="hardware-ad-2",
         )
-        await _reconcile(controller, "test session change")
+        with anyio.fail_after(1):
+            while True:
+                validity = await concord.validate(owned.contract)
+                claims = _claims(controller)
+                if (
+                    validity.status == ContractValidityStatus.CANCELLED
+                    and claims
+                    and claims[0].claim_id != owned.claim_id
+                    and claims[0].current_sessions.get(
+                        str(hardware_manager_address("room-a"))
+                    )
+                    == "new-session"
+                ):
+                    break
+                await anyio.sleep(0.01)
 
-        assert (await concord.validate(owned.contract)).status == (
-            ContractValidityStatus.CANCELLED
-        )
         assert _route(controller, "config-room-a") is None
         current_owned = _claim(controller)
         assert current_owned.claim_id != owned.claim_id

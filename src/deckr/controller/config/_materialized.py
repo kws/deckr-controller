@@ -9,7 +9,13 @@ import anyio
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.keys import encode_key_token
 from deckr.contracts.models import DeckrModel
-from deckr.substrates.nats_kv import KvBucketPolicy, KvEntry, KvUnavailable
+from deckr.core.util.anyio import CoalescedStateBroadcaster
+from deckr.substrates.nats_kv import (
+    KvBucketPolicy,
+    KvEntry,
+    KvUnavailable,
+    KvWatchBarrier,
+)
 from pydantic import Field, field_serializer, field_validator
 
 from deckr.controller.config._data import DeviceConfig
@@ -180,10 +186,8 @@ class MaterializedDeviceConfigService(BaseComponent):
         self._config_key = materialized_config_key(controller_id)
         self._result_key = materialized_config_result_key(controller_id)
         self._config_by_id: dict[str, DeviceConfig] = {}
-        self._subscribers: dict[
-            str, set[anyio.abc.ObjectSendStream[DeviceConfig | None]]
-        ] = {}
-        self._lock = anyio.Lock()
+        self._state = CoalescedStateBroadcaster[str](current=True)
+        self._lock = self._state.lock
         self._stopping: anyio.Event | None = None
 
     async def start(self, ctx: RunContext) -> None:
@@ -194,6 +198,7 @@ class MaterializedDeviceConfigService(BaseComponent):
     async def stop(self) -> None:
         if self._stopping is not None:
             self._stopping.set()
+        await self._state.aclose()
 
     async def match_device(
         self,
@@ -259,31 +264,26 @@ class MaterializedDeviceConfigService(BaseComponent):
         self,
         config_id: str,
     ) -> AsyncIterator[DeviceConfig | None]:
-        send, receive = anyio.create_memory_object_stream[DeviceConfig | None](
-            max_buffer_size=32
-        )
-        async with self._lock:
-            self._subscribers.setdefault(config_id, set()).add(send)
-            initial = self._config_by_id.get(config_id)
-        try:
-            await send.send(initial)
-            async for value in receive:
-                yield value
-        finally:
-            async with self._lock:
-                subscribers = self._subscribers.get(config_id)
-                if subscribers is not None:
-                    subscribers.discard(send)
-                    if not subscribers:
-                        self._subscribers.pop(config_id, None)
-            await send.aclose()
+        async with self._state.subscribe(
+            lambda _version, _current: self._config_by_id.get(config_id)
+        ) as subscription:
+            yield subscription.initial
+            async for wakeup in subscription:
+                if not wakeup.resnapshot_required and config_id not in wakeup.changed:
+                    continue
+                try:
+                    yield await self._state.capture(
+                        lambda _version, _current: self._config_by_id.get(config_id)
+                    )
+                except anyio.ClosedResourceError:
+                    return
 
     async def _watch_loop(self) -> None:
         while self._stopping is None or not self._stopping.is_set():
             try:
                 async with self._bucket.watch(self._config_key) as stream:
                     async for change in stream:
-                        if change is None:
+                        if isinstance(change, KvWatchBarrier):
                             continue
                         if change.key != self._config_key:
                             continue
@@ -369,22 +369,14 @@ class MaterializedDeviceConfigService(BaseComponent):
     async def _replace_configs(self, configs: Mapping[str, DeviceConfig]) -> None:
         async with self._lock:
             old_configs = self._config_by_id
-            affected_ids = set(old_configs) | set(configs)
+            affected_ids = {
+                config_id
+                for config_id in old_configs.keys() | configs.keys()
+                if old_configs.get(config_id) != configs.get(config_id)
+            }
             self._config_by_id = dict(configs)
-            to_send = [
-                (
-                    self._config_by_id.get(config_id),
-                    set(self._subscribers.get(config_id, set())),
-                )
-                for config_id in affected_ids
-                if old_configs.get(config_id) != self._config_by_id.get(config_id)
-            ]
-        for value, subscribers in to_send:
-            for send in subscribers:
-                try:
-                    await send.send(value)
-                except Exception:
-                    logger.exception("Failed to send materialized config update")
+            if affected_ids:
+                self._state.publish_locked(affected_ids)
 
     async def _write_result(
         self,

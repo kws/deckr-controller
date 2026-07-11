@@ -238,9 +238,11 @@ class ControllerHardwareService:
                     self._concord.watch(HARDWARE_CLAIM_PROFILE_ID) as stream,
                     cancel_on_stopping(stopping),
                 ):
-                    async for event in stream:
+                    async for snapshot in stream:
+                        changed = getattr(snapshot, "changed_pointers", frozenset())
                         await self._reconcile_notifications.request(
-                            f"hardware claim {event.event_type.value}"
+                            "hardware claim snapshot "
+                            f"version={snapshot.version} changed={len(changed)}"
                         )
             except ConcordUnavailable:
                 await sleep_until_stopping(stopping, WATCH_RETRY_SECONDS)

@@ -11,6 +11,7 @@ from typing import Protocol
 import anyio
 import yaml
 from deckr.components import BaseComponent, RunContext
+from deckr.core.util.anyio import CoalescedStateBroadcaster
 from decouple import config as decouple_config
 from watchfiles import Change, awatch
 
@@ -103,10 +104,8 @@ class FileBackedDeviceConfigService(BaseComponent):
         self._materialized_publisher = materialized_publisher
         self._path_to_config: dict[Path, str] = {}
         self._config_by_id: dict[str, DeviceConfig] = {}
-        self._subscribers: dict[
-            str, set[anyio.abc.ObjectSendStream[DeviceConfig | None]]
-        ] = {}
-        self._lock = anyio.Lock()
+        self._state = CoalescedStateBroadcaster[str](current=True)
+        self._lock = self._state.lock
         self._stop_event: anyio.Event | None = None
 
     async def start(self, ctx: RunContext) -> None:
@@ -120,6 +119,7 @@ class FileBackedDeviceConfigService(BaseComponent):
     async def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        await self._state.aclose()
 
     async def match_device(
         self,
@@ -190,29 +190,20 @@ class FileBackedDeviceConfigService(BaseComponent):
     async def _subscribe_impl(
         self, config_id: str
     ) -> AsyncIterator[DeviceConfig | None]:
-        send, receive = anyio.create_memory_object_stream[DeviceConfig | None](
-            max_buffer_size=32
-        )
-        async with self._lock:
-            if config_id not in self._subscribers:
-                self._subscribers[config_id] = set()
-            self._subscribers[config_id].add(send)
-
-        try:
-            # Send initial config
-            cfg = await self._load_config(config_id)
-            await send.send(cfg)
-
-            async for value in receive:
-                yield value
-        finally:
-            async with self._lock:
-                subs = self._subscribers.get(config_id)
-                if subs is not None:
-                    subs.discard(send)
-                    if not subs:
-                        del self._subscribers[config_id]
-            await send.aclose()
+        await self._scan_configs()
+        async with self._state.subscribe(
+            lambda _version, _current: self._config_by_id.get(config_id)
+        ) as subscription:
+            yield subscription.initial
+            async for wakeup in subscription:
+                if not wakeup.resnapshot_required and config_id not in wakeup.changed:
+                    continue
+                try:
+                    yield await self._state.capture(
+                        lambda _version, _current: self._config_by_id.get(config_id)
+                    )
+                except anyio.ClosedResourceError:
+                    return
 
     async def _load_config(self, config_id: str) -> DeviceConfig | None:
         async with self._lock:
@@ -231,20 +222,7 @@ class FileBackedDeviceConfigService(BaseComponent):
                 self._config_by_id.pop(old_config_id, None)
             self._path_to_config[path] = config.id
             self._config_by_id[config.id] = config
-            to_send = [
-                (
-                    self._config_by_id.get(config_id),
-                    set(self._subscribers.get(config_id, set())),
-                )
-                for config_id in affected_config_ids
-            ]
-
-        for value, subscribers in to_send:
-            for send in subscribers:
-                try:
-                    await send.send(value)
-                except Exception:
-                    logger.exception("Failed to send config update to subscriber")
+            self._state.publish_locked(affected_config_ids)
 
     async def _scan_configs(self) -> None:
         """Scan config_dir for .yml files and update caches."""
@@ -261,8 +239,15 @@ class FileBackedDeviceConfigService(BaseComponent):
                 path_to_config[path] = cfg.id
                 config_by_id[cfg.id] = cfg
         async with self._lock:
+            affected_config_ids = {
+                config_id
+                for config_id in self._config_by_id.keys() | config_by_id.keys()
+                if self._config_by_id.get(config_id) != config_by_id.get(config_id)
+            }
             self._path_to_config = path_to_config
             self._config_by_id = config_by_id
+            if affected_config_ids:
+                self._state.publish_locked(affected_config_ids)
 
     async def _watch_loop(self) -> None:
         """Background task: watch config_dir and emit to subscribers on changes."""
@@ -284,16 +269,19 @@ class FileBackedDeviceConfigService(BaseComponent):
 
     async def _process_changes(self, changes: set[tuple[Change, str]]) -> None:
         """Process file changes and notify affected subscribers."""
-        to_send: list[
-            tuple[
-                DeviceConfig | None,
-                set[anyio.abc.ObjectSendStream[DeviceConfig | None]],
-            ]
-        ] = []
+        observations = [
+            (
+                change,
+                Path(path_str),
+                None
+                if change == Change.deleted
+                else _load_config_file(Path(path_str)),
+            )
+            for change, path_str in changes
+        ]
         async with self._lock:
             affected_config_ids: set[str] = set()
-            for change, path_str in changes:
-                path = Path(path_str)
+            for change, path, cfg in observations:
                 if change == Change.deleted:
                     config_id = self._path_to_config.pop(path, None)
                     if config_id is not None:
@@ -302,7 +290,6 @@ class FileBackedDeviceConfigService(BaseComponent):
                 else:
                     # added or modified
                     old_config_id = self._path_to_config.get(path)
-                    cfg = _load_config_file(path)
                     if cfg is not None:
                         if old_config_id is not None and old_config_id != cfg.id:
                             affected_config_ids.add(old_config_id)
@@ -312,19 +299,8 @@ class FileBackedDeviceConfigService(BaseComponent):
                     elif old_config_id is not None:
                         # Parse error: keep previous config, do not emit
                         pass
-
-            for config_id in affected_config_ids:
-                config = self._config_by_id.get(config_id)
-                subs = self._subscribers.get(config_id, set())
-                if subs:
-                    to_send.append((config, set(subs)))
-
-        for config, subs in to_send:
-            for send in subs:
-                try:
-                    await send.send(config)
-                except Exception:
-                    logger.exception("Failed to send config update to subscriber")
+            if affected_config_ids:
+                self._state.publish_locked(affected_config_ids)
         await self._publish_materialized_snapshot()
 
     async def _publish_materialized_snapshot(self) -> None:

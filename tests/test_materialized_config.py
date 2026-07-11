@@ -151,6 +151,49 @@ async def test_materialized_service_watches_projection_updates() -> None:
 
 
 @pytest.mark.asyncio
+async def test_materialized_config_slow_subscriber_converges_after_overflow() -> (
+    None
+):
+    bucket = MemoryJsonKvBucket(bucket="config")
+    service = MaterializedDeviceConfigService(
+        controller_id=CONTROLLER_ID,
+        bucket=bucket,
+    )
+    stream = service.subscribe("config-256")
+    assert await _next_with_timeout(stream) is None
+
+    first = tuple(
+        _config(
+            config_id=f"config-{index:03d}",
+            name=f"Version {index}",
+            fingerprint=f"fingerprint:{index}",
+        )
+        for index in range(257)
+    )
+    await service._replace_configs(  # noqa: SLF001
+        {config.id: config for config in first}
+    )
+    final = tuple(
+        _config(
+            config_id=config.id,
+            name="Final" if config.id == "config-256" else f"Next {index}",
+            fingerprint=config.match.fingerprint,
+        )
+        for index, config in enumerate(first)
+    )
+    await service._replace_configs(  # noqa: SLF001
+        {config.id: config for config in final}
+    )
+
+    converged = await _next_with_timeout(stream)
+    assert converged is not None
+    assert converged.name == "Final"
+
+    await stream.aclose()
+    await service.stop()
+
+
+@pytest.mark.asyncio
 async def test_materialized_service_rejects_invalid_projection_without_deactivating() -> (
     None
 ):
