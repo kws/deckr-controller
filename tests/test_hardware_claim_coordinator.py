@@ -70,15 +70,12 @@ class _Agreement:
         contract_id: str = "contract-a",
     ) -> None:
         self.contract = SimpleNamespace(contract_id=contract_id, generation=1)
-        self.local_token = None
-        self._validity = ContractValidity(ContractValidityStatus.NOT_YET_FULFILLED)
-        self._next_validity = validity
+        self.state = SimpleNamespace(validity=validity)
         self.cancelled = False
         self.closed = False
 
-    async def refresh(self) -> ContractValidity:
-        self._validity = self._next_validity
-        return self._next_validity
+    async def __aenter__(self):
+        return self
 
     async def cancel(self, reason: str | None = None) -> bool:
         self.cancelled = True
@@ -92,23 +89,14 @@ class _Concord:
     def __init__(
         self,
         *,
-        exact_validity: ContractValidity | None = None,
         proposed_validity: ContractValidity | None = None,
     ) -> None:
-        self.exact_validity = exact_validity
         self.proposed_validity = proposed_validity or ContractValidity(
             ContractValidityStatus.NOT_YET_FULFILLED
         )
-        self.exact_calls = 0
         self.proposals = []
 
-    async def validate_exact(self, *args, **kwargs) -> ContractValidity:  # noqa: ANN002, ANN003
-        self.exact_calls += 1
-        if self.exact_validity is None:
-            raise AssertionError("validate_exact should not run")
-        return self.exact_validity
-
-    async def propose(self, spec, *, start_soon=None):  # noqa: ANN001
+    def propose(self, endpoint, spec):  # noqa: ANN001
         self.proposals.append(spec)
         return _Agreement(
             self.proposed_validity,
@@ -140,8 +128,10 @@ def _coordinator(concord: _Concord) -> HardwareClaimCoordinator:
         config_service=_ConfigService(),
         route_registry=DeviceRouteRegistry(),
         callbacks=_Callbacks(),
-        controller_id="controller-main",
-        controller_session_id="controller-session",
+        endpoint=SimpleNamespace(
+            address=controller_address("controller-main"),
+            session_id="controller-session",
+        ),
     )
 
 
@@ -202,15 +192,12 @@ async def test_pending_claim_with_candidate_survives_unavailable_refresh() -> No
     claims = coordinator.snapshot()
     assert len(claims) == 1
     assert claims[0].claim_id == owned.claim_id
-    assert concord.exact_calls == 0
     assert concord.proposals == []
 
 
 @pytest.mark.asyncio
-async def test_terminal_refresh_requires_exact_confirmation() -> None:
-    concord = _Concord(
-        exact_validity=ContractValidity(ContractValidityStatus.NOT_YET_FULFILLED),
-    )
+async def test_terminal_state_cancels_and_allows_successor_claim() -> None:
+    concord = _Concord()
     coordinator = _coordinator(concord)
     owned = _seed_claim(
         coordinator,
@@ -224,32 +211,6 @@ async def test_terminal_refresh_requires_exact_confirmation() -> None:
     )
 
     claims = coordinator.snapshot()
-    assert len(claims) == 1
-    assert claims[0].claim_id == owned.claim_id
-    assert concord.exact_calls == 1
-    assert owned.agreement.cancelled is False
-    assert concord.proposals == []
-
-
-@pytest.mark.asyncio
-async def test_exact_terminal_cancels_and_allows_successor_claim() -> None:
-    concord = _Concord(
-        exact_validity=ContractValidity(ContractValidityStatus.MISSING_TOKEN),
-    )
-    coordinator = _coordinator(concord)
-    owned = _seed_claim(
-        coordinator,
-        _Agreement(ContractValidity(ContractValidityStatus.MISSING_TOKEN)),
-    )
-    candidate = _candidate()
-
-    await coordinator.reconcile(
-        {ref_key(candidate.ref): candidate},
-        reason="test terminal refresh",
-    )
-
-    claims = coordinator.snapshot()
-    assert len(claims) == 1
     assert claims[0].claim_id != owned.claim_id
     assert owned.agreement.cancelled is True
     assert len(concord.proposals) == 1

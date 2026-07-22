@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Protocol
 from deckr.concord import (
     ConcordAgreementLease,
     ContractHandle,
-    ParticipantHandle,
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import DeckrMessage, EndpointAddress
@@ -46,7 +45,6 @@ class OwnedHardwareClaim:
     device: DeviceDescriptor
     agreement: ConcordAgreementLease
     current_sessions: dict[str, str]
-    controller_token: ParticipantHandle | None = None
     live: bool = False
 
     @property
@@ -70,7 +68,6 @@ class OwnedHardwareClaimSnapshot:
     contract: ContractHandle
     contract_pointer: ContractPointer
     current_sessions: Mapping[str, str]
-    controller_token: ParticipantHandle | None
     live: bool
 
     @classmethod
@@ -83,7 +80,6 @@ class OwnedHardwareClaimSnapshot:
             contract=owned.contract,
             contract_pointer=owned.contract_pointer,
             current_sessions=dict(owned.current_sessions),
-            controller_token=owned.controller_token,
             live=owned.live,
         )
 

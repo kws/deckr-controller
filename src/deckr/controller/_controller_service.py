@@ -62,8 +62,6 @@ class ControllerService(BaseComponent):
             concord=concord,
             config_service=config_service,
             callbacks=self,
-            controller_id=controller_id,
-            controller_session_id=self._session_id,
         )
         self._command_service = self._hardware.command_service
         self._controller_contexts = AsyncMap[str, DeviceManager]()

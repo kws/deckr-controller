@@ -49,6 +49,7 @@ class _Stream:
 
 class _InputEndpoint:
     def __init__(self, messages=()) -> None:
+        self.address = controller_address("controller-main")
         self.session_id = "controller-session"
         self.send = AsyncMock()
         self._messages = list(messages)
@@ -186,8 +187,6 @@ def _controller_hardware(
         concord=MagicMock(),
         config_service=MagicMock(),
         callbacks=callbacks,
-        controller_id="controller-main",
-        controller_session_id="controller-session",
     )
 
 

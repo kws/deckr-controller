@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from uuid import uuid4
 
 import anyio
 from deckr.concord import (
-    DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS,
     Concord,
     ConcordAgreementSpec,
     ConcordConflict,
@@ -21,10 +20,10 @@ from deckr.hardware.profiles import (
     HardwareClaimDevice,
     HardwareClaimTerms,
 )
+from deckr.lanes import EndpointSession
 
 from deckr.controller._hardware._discovery import (
     hardware_claim_current_sessions,
-    manager_session_changed,
     owned_manager_session_id,
     unmatched_hardware_signature,
 )
@@ -45,9 +44,6 @@ from deckr.controller.config import DeviceConfigService
 
 logger = logging.getLogger(__name__)
 
-CLAIM_HEARTBEAT_SECONDS = DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS
-
-
 class HardwareClaimCoordinator:
     """Owns controller-side Concord claims for hardware devices."""
 
@@ -58,24 +54,31 @@ class HardwareClaimCoordinator:
         config_service: DeviceConfigService,
         route_registry: DeviceRouteRegistry,
         callbacks: HardwareServiceCallbacks,
-        controller_id: str,
-        controller_session_id: str,
+        endpoint: EndpointSession,
     ) -> None:
         self._concord = concord
         self._config_service = config_service
         self._route_registry = route_registry
         self._callbacks = callbacks
-        self._controller_id = controller_id
-        self._controller_session_id = controller_session_id
+        self._endpoint = endpoint
+        self._controller_id = endpoint.address.endpoint_id
+        self._controller_session_id = endpoint.session_id
         self._owned_claims: dict[tuple[str, str], OwnedHardwareClaim] = {}
         self._unmatched_hardware_signatures: dict[
             tuple[str, str],
             tuple[str, tuple[tuple[str, str], ...]],
         ] = {}
         self._start_soon: Callable[..., Any] | None = None
+        self._state_changed: Callable[[str], Awaitable[None]] | None = None
 
     def set_start_soon(self, start_soon: Callable[..., Any] | None) -> None:
         self._start_soon = start_soon
+
+    def set_state_changed(
+        self,
+        state_changed: Callable[[str], Awaitable[None]] | None,
+    ) -> None:
+        self._state_changed = state_changed
 
     def snapshot(self) -> tuple[OwnedHardwareClaimSnapshot, ...]:
         return tuple(
@@ -93,30 +96,7 @@ class HardwareClaimCoordinator:
 
         for owned in tuple(self._owned_claims.values()):
             candidate = candidates.get(ref_key(owned.ref))
-            if candidate is not None and manager_session_changed(owned, candidate):
-                validity = await self.validate_claim(
-                    owned,
-                    current_sessions=hardware_claim_current_sessions(
-                        self._controller_id,
-                        self._controller_session_id,
-                        candidate,
-                    ),
-                )
-                owned.controller_token = owned.agreement.local_token
-                if validity.status == ContractValidityStatus.UNAVAILABLE:
-                    continue
-                await self._revoke_owned_claim(
-                    owned,
-                    cancel_contract=True,
-                    reason=(
-                        f"hardware manager session changed during {reason}: "
-                        f"{candidate.payload.session_id}"
-                    ),
-                )
-                continue
-
             validity = await self.validate_claim(owned)
-            owned.controller_token = owned.agreement.local_token
 
             if candidate is None:
                 if validity.status == ContractValidityStatus.UNAVAILABLE:
@@ -219,22 +199,19 @@ class HardwareClaimCoordinator:
             candidate,
         )
         try:
-            agreement = await self._concord.propose(
+            agreement = self._concord.propose(
+                self._endpoint,
                 ConcordAgreementSpec(
                     profile=HARDWARE_CLAIM_PROFILE_ID,
                     participants=(
                         controller_address(self._controller_id),
                         candidate.payload.manager_endpoint,
                     ),
-                    local_participant=controller_address(self._controller_id),
-                    local_session_id=self._controller_session_id,
                     terms=terms,
                     current_sessions=current_sessions,
-                    refresh_interval=CLAIM_HEARTBEAT_SECONDS,
-                    log_label="ControllerHardware",
                 ),
-                start_soon=self._start_soon,
             )
+            await agreement.__aenter__()
         except (ConcordConflict, ConcordUnavailable):
             logger.warning("Could not create hardware claim for %s", candidate.ref)
             return
@@ -248,22 +225,17 @@ class HardwareClaimCoordinator:
             current_sessions=current_sessions,
         )
         self._owned_claims[key] = owned
+        if self._start_soon is not None:
+            self._start_soon(self._agreement_state_loop, owned)
         validity = await self.validate_claim(owned)
-        owned.controller_token = owned.agreement.local_token
         if validity.status == ContractValidityStatus.VALID:
             await self._connect_owned_claim(owned, candidate)
 
     async def validate_claim(
         self,
         owned: OwnedHardwareClaim,
-        *,
-        current_sessions: Mapping[str, str] | None = None,
     ) -> ContractValidity:
-        return await validate_owned_claim(
-            self._concord,
-            owned,
-            current_sessions=current_sessions,
-        )
+        return await validate_owned_claim(owned)
 
     async def _connect_owned_claim(
         self,
@@ -307,19 +279,8 @@ class HardwareClaimCoordinator:
         *,
         validity: ContractValidity,
         reason: str,
-        current_sessions: Mapping[str, str] | None = None,
     ) -> None:
         if validity.status not in HARDWARE_CLAIM_TERMINAL_STATUSES:
-            return
-        try:
-            exact = await self._concord.validate_exact(
-                owned.contract,
-                current_sessions=current_sessions or owned.current_sessions,
-            )
-        except ConcordUnavailable:
-            return
-        owned.agreement._validity = exact  # noqa: SLF001
-        if exact.status not in HARDWARE_CLAIM_TERMINAL_STATUSES:
             return
         await self._revoke_owned_claim(
             owned,
@@ -452,6 +413,20 @@ class HardwareClaimCoordinator:
                 await owned.agreement.cancel(reason=reason)
             except (ConcordConflict, ConcordUnavailable, ValueError):
                 logger.info("Could not cancel hardware claim %s", owned.claim_id)
+            finally:
+                await owned.agreement.aclose()
+
+    async def _agreement_state_loop(self, owned: OwnedHardwareClaim) -> None:
+        async with owned.agreement.watch_state() as states:
+            async for state in states:
+                if ref_key(owned.ref) not in self._owned_claims:
+                    return
+                state_changed = self._state_changed
+                if state_changed is not None:
+                    await state_changed(
+                        "hardware agreement state "
+                        f"contract={owned.contract.contract_id} version={state.version}"
+                    )
 
     async def disconnect_config(
         self,

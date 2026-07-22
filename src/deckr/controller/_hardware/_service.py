@@ -13,7 +13,7 @@ from deckr.contracts.messages import (
 from deckr.core.util.anyio import CoalescedTrigger
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceRef
-from deckr.hardware.profiles import HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID
+from deckr.hardware.profiles import HARDWARE_FEATURE_ID
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
 
@@ -75,8 +75,6 @@ class ControllerHardwareService:
         concord: Concord,
         config_service: DeviceConfigService,
         callbacks: HardwareServiceCallbacks,
-        controller_id: str,
-        controller_session_id: str,
     ) -> None:
         self._endpoint = endpoint
         self._routes = DeviceRouteRegistry()
@@ -97,10 +95,8 @@ class ControllerHardwareService:
             config_service=config_service,
             route_registry=self._routes,
             callbacks=callbacks,
-            controller_id=controller_id,
-            controller_session_id=controller_session_id,
+            endpoint=endpoint,
         )
-        self._concord = concord
         self._stopping: anyio.Event | None = None
         self.command_service = HardwareCommandService(
             endpoint,
@@ -110,11 +106,11 @@ class ControllerHardwareService:
     async def start(self, tg: anyio.abc.TaskGroup, stopping: anyio.Event) -> None:
         self._stopping = stopping
         self._claims.set_start_soon(tg.start_soon)
+        self._claims.set_state_changed(self._reconcile_notifications.request)
         self._directory.start(tg)
         tg.start_soon(self._close_directory_on_stopping, stopping)
         tg.start_soon(self._input_loop, stopping)
         tg.start_soon(self._directory_snapshot_loop, stopping)
-        tg.start_soon(self._claim_event_loop, stopping)
         tg.start_soon(self._notification_reconciliation_loop, stopping)
         tg.start_soon(self._reconciliation_loop, stopping)
 
@@ -230,22 +226,6 @@ class ControllerHardwareService:
                     exc_info=True,
                 )
             await sleep_until_stopping(stopping, STATE_RECONCILE_SECONDS)
-
-    async def _claim_event_loop(self, stopping: anyio.Event) -> None:
-        while not stopping.is_set():
-            try:
-                async with (
-                    self._concord.watch(HARDWARE_CLAIM_PROFILE_ID) as stream,
-                    cancel_on_stopping(stopping),
-                ):
-                    async for snapshot in stream:
-                        changed = getattr(snapshot, "changed_pointers", frozenset())
-                        await self._reconcile_notifications.request(
-                            "hardware claim snapshot "
-                            f"version={snapshot.version} changed={len(changed)}"
-                        )
-            except ConcordUnavailable:
-                await sleep_until_stopping(stopping, WATCH_RETRY_SECONDS)
 
     async def _notification_reconciliation_loop(
         self,

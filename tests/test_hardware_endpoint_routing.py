@@ -452,17 +452,20 @@ async def test_pending_hardware_claim_recovers_when_manager_attaches_later():
         assert _claim(controller).claim_id == owned.claim_id
         assert _routes(controller) == ()
 
-        await concord.attach(
+        manager_token = await concord._attach(  # noqa: SLF001
             owned.contract,
             participant=hardware_manager_address("room-a"),
             session_id="manager-session",
         )
-        await _reconcile(controller, "test late attach")
+        with anyio.fail_after(1):
+            while _route(controller, "config-room-a") is None:
+                await anyio.sleep(0.01)
 
         live = _route(controller, "config-room-a")
         assert live is not None
         assert live.ref == DeviceRef(managerId="room-a", deviceId="deck")
         assert _claim(controller).claim_id == owned.claim_id
+        await concord._withdraw_token(manager_token)  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -480,7 +483,7 @@ async def test_removed_config_rematches_claimed_hardware_to_new_matching_config(
                 await anyio.sleep(0.01)
         owned = _claim(controller)
         original_claim_id = owned.claim_id
-        await concord.attach(
+        await concord._attach(  # noqa: SLF001
             owned.contract,
             participant=hardware_manager_address("room-a"),
             session_id="manager-session",
@@ -552,7 +555,7 @@ async def test_device_manager_background_work_is_scoped_to_device_lifecycle(
             while not _claims(controller):
                 await anyio.sleep(0.01)
         owned = _claim(controller)
-        await concord.attach(
+        await concord._attach(  # noqa: SLF001
             owned.contract,
             participant=hardware_manager_address("room-a"),
             session_id="manager-session",
@@ -589,7 +592,7 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
             while not _claims(controller):
                 await anyio.sleep(0.01)
         owned = _claim(controller)
-        await concord.attach(
+        await concord._attach(  # noqa: SLF001
             owned.contract,
             participant=hardware_manager_address("room-a"),
             session_id="manager-session",
@@ -610,7 +613,7 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
 
 
 @pytest.mark.asyncio
-async def test_live_hardware_claim_is_replaced_on_manager_session_change():
+async def test_live_hardware_claim_is_replaced_after_owned_manager_token_is_lost():
     async with _running_controller(config_service=MemoryConfigService(_config())) as (
         controller,
         beacon,
@@ -622,7 +625,7 @@ async def test_live_hardware_claim_is_replaced_on_manager_session_change():
             while not _claims(controller):
                 await anyio.sleep(0.01)
         owned = _claim(controller)
-        await concord.attach(
+        manager_token = await concord._attach(  # noqa: SLF001
             owned.contract,
             participant=hardware_manager_address("room-a"),
             session_id="old-session",
@@ -641,6 +644,12 @@ async def test_live_hardware_claim_is_replaced_on_manager_session_change():
             session_id="new-session",
             advertisement_id="hardware-ad-2",
         )
+
+        await anyio.sleep(0.05)
+        assert _claim(controller).claim_id == owned.claim_id
+        assert _route(controller, "config-room-a") is not None
+
+        await concord._withdraw_token(manager_token)  # noqa: SLF001
         with anyio.fail_after(1):
             while True:
                 validity = await concord.validate(owned.contract)
@@ -664,14 +673,15 @@ async def test_live_hardware_claim_is_replaced_on_manager_session_change():
             str(hardware_manager_address("room-a"))
         ] == "new-session"
 
-        await concord.attach(
+        replacement_token = await concord._attach(  # noqa: SLF001
             current_owned.contract,
             participant=hardware_manager_address("room-a"),
             session_id="new-session",
         )
-        await _reconcile(controller, "test replacement manager token")
-
-        assert _route(controller, "config-room-a") is not None
+        with anyio.fail_after(1):
+            while _route(controller, "config-room-a") is None:
+                await anyio.sleep(0.01)
+        await concord._withdraw_token(replacement_token)  # noqa: SLF001
 
 
 @pytest.mark.asyncio

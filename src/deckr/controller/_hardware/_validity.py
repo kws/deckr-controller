@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from deckr.concord import (
-    Concord,
-    ConcordConflict,
-    ConcordUnavailable,
     ContractValidity,
     ContractValidityStatus,
 )
@@ -27,33 +22,11 @@ HARDWARE_CLAIM_TERMINAL_STATUSES = frozenset(
 
 
 async def validate_owned_claim(
-    concord: Concord,
     owned: OwnedHardwareClaim,
-    *,
-    current_sessions: Mapping[str, str] | None = None,
 ) -> ContractValidity:
-    sessions = current_sessions or owned.current_sessions
-    try:
-        validity = await owned.agreement.refresh()
-    except ConcordConflict:
-        try:
-            validity = await concord.validate(
-                owned.contract,
-                current_sessions=sessions,
-            )
-        except ConcordUnavailable:
-            return ContractValidity(ContractValidityStatus.UNAVAILABLE)
-    else:
-        if current_sessions is not None:
-            try:
-                validity = await concord.validate(
-                    owned.contract,
-                    current_sessions=sessions,
-                )
-            except ConcordUnavailable:
-                return ContractValidity(ContractValidityStatus.UNAVAILABLE)
-    owned.agreement._validity = validity  # noqa: SLF001
-    return validity
+    return owned.agreement.state.validity or ContractValidity(
+        ContractValidityStatus.NOT_YET_FULFILLED
+    )
 
 
 def pending_hardware_claim_validity(validity: ContractValidity) -> bool:

@@ -40,6 +40,7 @@ class _Stream:
 
 class _Endpoint:
     def __init__(self, messages=()) -> None:
+        self.address = controller_address(CONTROLLER_ID)
         self.session_id = "controller-session"
         self.send = AsyncMock()
         self._messages = list(messages)
