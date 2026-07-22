@@ -131,20 +131,33 @@ class _RuntimeLease:
     def __init__(
         self,
         descriptor: ServiceDescriptor,
+        services,
         *,
         contract_id: str = "provider-session-contract",
         generation: int = 1,
-        refresh_error: ServiceUnavailable | None = None,
     ) -> None:
         self.descriptor = descriptor
-        self.contract = SimpleNamespace(contract_id=contract_id, generation=generation)
-        self.refresh_error = refresh_error
-        self.refresh_calls = 0
+        self._services = services
+        self._contract = ContractPointer(
+            contractId=contract_id,
+            generation=generation,
+        )
 
-    async def refresh(self) -> None:
-        self.refresh_calls += 1
-        if self.refresh_error is not None:
-            raise self.refresh_error
+    async def send(self, name, params=None, *, event=None) -> None:
+        await self._services.send(self, name, params=params, event=event)
+
+    def watch_view(self, view):
+        return self._services.watch_view(self, view)
+
+    async def authorize_inbound_message(self, message, *, name=None):
+        return await self._services.authorize_inbound_message(
+            self,
+            message,
+            name=name,
+        )
+
+    def _authority_pointer(self) -> ContractPointer:
+        return self._contract
 
 
 def _availability_view(
@@ -243,6 +256,7 @@ class _ServiceViewWatchServices:
         event.set()
         lease = _RuntimeLease(
             descriptor,
+            self,
             contract_id=f"provider-session-contract-{self.use_count}",
         )
         self.leases.append(lease)
@@ -861,7 +875,7 @@ async def test_service_view_watch_recovers_from_missing_view_on_same_lease(
 
 
 @pytest.mark.asyncio
-async def test_service_view_watch_transient_unavailable_keeps_same_service_use_lease(
+async def test_service_view_watch_unavailable_fails_closed_and_negotiates_successor(
     monkeypatch,
 ):
     monkeypatch.setattr(
@@ -918,27 +932,22 @@ async def test_service_view_watch_transient_unavailable_keeps_same_service_use_l
                 "contract materialized view unavailable",
             )
         )
+        await services.wait_use_count(2)
         with anyio.fail_after(1):
-            while len(services.watch_calls) < 2:
-                await anyio.sleep(0.01)
-
-        with anyio.move_on_after(0.05) as scope:
-            await notify_receive.receive()
-        assert scope.cancel_called
-        assert services.use_count == 1
-        assert services.closed_count == 0
+            assert await notify_receive.receive() == frozenset({key})
+        assert services.use_count == 2
+        assert services.closed_count == 1
         assert services.lease_open is True
         assert services.watch_calls[0][0] is services.leases[0]
-        assert services.watch_calls[1][0] is services.leases[0]
         record = service.record_for_key(key)
         assert record is not None
-        assert record.state == ActionAvailabilityState.AVAILABLE
+        assert record.state == ActionAvailabilityState.UNAVAILABLE
 
         await services.send(payload.to_dict())
         with anyio.fail_after(1):
             assert await notify_receive.receive() == frozenset({key})
-        assert services.use_count == 1
-        assert services.closed_count == 0
+        assert services.use_count == 2
+        assert services.closed_count == 1
         assert services.lease_open is True
 
         tg.cancel_scope.cancel()

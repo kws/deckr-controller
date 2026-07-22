@@ -214,7 +214,10 @@ class ControllerHardwareService:
         while not stopping.is_set():
             try:
                 async with cancel_on_stopping(stopping):
-                    await self._directory.wait_current()
+                    try:
+                        await self._directory.wait_current()
+                    except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+                        return
                 if stopping.is_set():
                     return
                 await self.reconcile(reason="broker snapshot")

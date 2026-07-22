@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -196,7 +197,6 @@ async def _advertise_hardware(
     *,
     manager_id: str = "room-a",
     session_id: str = "manager-session",
-    advertisement_id: str = "hardware-ad-1",
     device: DeviceDescriptor | None = None,
     labels: dict[str, str] | None = None,
 ):
@@ -218,16 +218,19 @@ async def _advertise_hardware(
             }
         },
     )
-    return await beacon.advertise(
+    lease = beacon.advertise(
+        SimpleNamespace(
+            address=hardware_manager_address(manager_id),
+            session_id=session_id,
+        ),
         BeaconAdvertisementSpec(
             feature_id=HARDWARE_FEATURE_ID,
-            endpoint=hardware_manager_address(manager_id),
-            session_id=session_id,
-            advertisement_id=advertisement_id,
             payload=payload.to_dict(),
             labels=payload.labels,
-        )
+        ),
     )
+    await lease.__aenter__()
+    return lease
 
 
 @asynccontextmanager
@@ -354,9 +357,7 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
 
 
 @pytest.mark.asyncio
-async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
-    caplog,
-):
+async def test_managed_hardware_advertisement_replaces_stale_same_endpoint_lease():
     hardware_bus = LaneHarness(
         "hardware_messages",
         default_endpoint=controller_address(CONTROLLER_ID),
@@ -374,8 +375,6 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
         controller_id=CONTROLLER_ID,
         action_registry=registry,
     )
-    caplog.set_level("INFO", logger="deckr.controller._hardware._discovery")
-
     async with anyio.create_task_group() as tg:
         beacon.start(tg)
         concord.start(tg)
@@ -384,16 +383,16 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
             beacon,
             manager_id="room-a",
             session_id="live-session",
-            advertisement_id="hardware_manager_test",
         )
         await _advertise_hardware(
             beacon,
             manager_id="room-a",
             session_id="live-session",
-            advertisement_id="hardware_manager_mirabox-rust-001",
         )
         await controller._hardware.wait_current()  # noqa: SLF001
-        await _reconcile(controller, "test duplicate beacon")
+        await _reconcile(controller, "test managed advertisement replacement")
+
+        assert len(beacon.candidates(HARDWARE_FEATURE_ID)) == 1
         tg.cancel_scope.cancel()
 
     assert len(_claims(controller)) == 1
@@ -401,11 +400,6 @@ async def test_hardware_claim_uses_newest_duplicate_device_beacon_advertisement(
     assert owned.current_sessions[str(hardware_manager_address("room-a"))] == (
         "live-session"
     )
-    assert "Multiple hardware Beacon advertisements describe device room-a/deck" in (
-        caplog.text
-    )
-    assert "hardware_manager_mirabox-rust-001" in caplog.text
-    assert "hardware_manager_test" in caplog.text
 
 @pytest.mark.asyncio
 async def test_pending_hardware_claim_survives_missing_beacon_candidate():
@@ -580,13 +574,13 @@ async def test_device_manager_background_work_is_scoped_to_device_lifecycle(
 
 
 @pytest.mark.asyncio
-async def test_live_hardware_claim_ignores_advertisement_id_change():
+async def test_live_hardware_claim_survives_advertisement_replacement():
     async with _running_controller(config_service=MemoryConfigService(_config())) as (
         controller,
         beacon,
         concord,
     ):
-        handle = await _advertise_hardware(beacon, advertisement_id="hardware-ad-1")
+        handle = await _advertise_hardware(beacon)
 
         with anyio.fail_after(1):
             while not _claims(controller):
@@ -603,8 +597,8 @@ async def test_live_hardware_claim_ignores_advertisement_id_change():
                 await anyio.sleep(0.01)
 
         await handle.aclose()
-        await _advertise_hardware(beacon, advertisement_id="hardware-ad-2")
-        await _reconcile(controller, "test advertisement id change")
+        await _advertise_hardware(beacon)
+        await _reconcile(controller, "test advertisement replacement")
 
         live = _route(controller, "config-room-a")
         assert live is not None
@@ -642,7 +636,6 @@ async def test_live_hardware_claim_is_replaced_after_owned_manager_token_is_lost
         await _advertise_hardware(
             beacon,
             session_id="new-session",
-            advertisement_id="hardware-ad-2",
         )
 
         await anyio.sleep(0.05)

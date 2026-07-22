@@ -208,7 +208,7 @@ class HardwareClaimCoordinator:
                         candidate.payload.manager_endpoint,
                     ),
                     terms=terms,
-                    current_sessions=current_sessions,
+                    participant_sessions=current_sessions,
                 ),
             )
             await agreement.__aenter__()

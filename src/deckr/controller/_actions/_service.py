@@ -28,11 +28,11 @@ from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import DeckrMessage, entity_subject, parse_service_address
 from deckr.services import (
     DeckrServices,
+    ManagedService,
     ServiceBackendStatus,
     ServiceDescriptor,
     ServiceMessageBody,
     ServiceUnavailable,
-    ServiceUseLease,
     newest_service_descriptor,
     service_body,
     service_unavailable_ends_service_use,
@@ -72,7 +72,7 @@ _SERVICE_WATCH_RETRY_SECONDS = 1.0
 @dataclass(frozen=True, slots=True)
 class _RuntimeLeaseState:
     key: ProviderSessionKey
-    lease: ServiceUseLease
+    lease: ManagedService
     service_id: str
     generation: int
 
@@ -182,10 +182,7 @@ class ControllerActionService:
             return None
         if state.lease.descriptor.session_id != provider_session_key.provider_session_id:
             return None
-        return ContractPointer(
-            contractId=state.lease.contract.contract_id,
-            generation=state.lease.contract.generation,
-        )
+        return state.lease._authority_pointer()  # noqa: SLF001
 
     async def send_runtime_message(
         self,
@@ -200,7 +197,7 @@ class ControllerActionService:
         name = action_runtime_message_name(message_type)
         params, event = action_runtime_payload(name, body)
         try:
-            await services.send(state.lease, name, params=params, event=event)
+            await state.lease.send(name, params=params, event=event)
         except ServiceUnavailable as exc:
             if service_unavailable_ends_service_use(exc):
                 self._drop_runtime_lease(provider_session_key, state)
@@ -259,7 +256,6 @@ class ControllerActionService:
         for state in states:
             try:
                 authorized = await _authorize_inbound_action_runtime_message(
-                    services,
                     state,
                     deckr_message,
                     body,
@@ -727,7 +723,7 @@ class ControllerActionService:
             try:
                 view_ref = action_availability_view_ref(service_id)
                 while not stopping.is_set():
-                    lease: ServiceUseLease | None = None
+                    lease: ManagedService | None = None
                     try:
                         async with services.use(descriptor) as lease:
                             descriptor_provider_id = _provider_id_from_descriptor(
@@ -749,10 +745,7 @@ class ControllerActionService:
                                 )
                             while not stopping.is_set():
                                 try:
-                                    async for payload in services.watch_view(
-                                        lease,
-                                        view_ref,
-                                    ):
+                                    async for payload in lease.watch_view(view_ref):
                                         if stopping.is_set():
                                             return
                                         changed = await self._handle_view_payload(
@@ -816,7 +809,7 @@ class ControllerActionService:
         self,
         payload: Mapping[str, object] | None,
         *,
-        lease: ServiceUseLease,
+        lease: ManagedService,
         service_id: str,
         provider_instance_id: str | None,
         generation: int,
@@ -916,7 +909,7 @@ class ControllerActionService:
         self,
         key: ProviderSessionKey,
         *,
-        lease: ServiceUseLease,
+        lease: ManagedService,
         service_id: str,
         generation: int,
     ) -> None:
@@ -949,7 +942,7 @@ class ControllerActionService:
 
     def _drop_runtime_lease_for_object(
         self,
-        lease: ServiceUseLease,
+        lease: ManagedService,
         *,
         service_id: str,
         generation: int,
@@ -1084,14 +1077,12 @@ def _runtime_provider_instance_id_from_message(message: DeckrMessage) -> str | N
 
 
 async def _authorize_inbound_action_runtime_message(
-    services: DeckrServices,
     state: _RuntimeLeaseState,
     message: DeckrMessage,
     body: ServiceMessageBody,
 ) -> ServiceMessageBody:
     try:
-        return await services.authorize_inbound_message(
-            state.lease,
+        return await state.lease.authorize_inbound_message(
             message,
             name=body.name,
         )
@@ -1112,8 +1103,7 @@ async def _authorize_inbound_action_runtime_message(
             )
         }
     )
-    return await services.authorize_inbound_message(
-        state.lease,
+    return await state.lease.authorize_inbound_message(
         service_scoped_message,
         name=body.name,
     )

@@ -111,11 +111,38 @@ def _availability_view(
 
 
 class _RuntimeLease:
-    def __init__(self, descriptor: ServiceDescriptor, generation: int) -> None:
+    def __init__(
+        self,
+        services: _ActionRuntimeServicesHarness,
+        descriptor: ServiceDescriptor,
+        generation: int,
+    ) -> None:
+        self._services = services
         self.descriptor = descriptor
-        self.contract = SimpleNamespace(
-            contract_id=f"service-use:{descriptor.session_id}",
+        self._contract = ContractPointer(
+            contractId=f"service-use:{descriptor.session_id}",
             generation=generation,
+        )
+
+    def _authority_pointer(self) -> ContractPointer:
+        return self._contract
+
+    async def send(self, name, *, params=None, event=None):
+        return await self._services.send(
+            self,
+            name,
+            params=params,
+            event=event,
+        )
+
+    def watch_view(self, view_ref):
+        return self._services.watch_view(self, view_ref)
+
+    async def authorize_inbound_message(self, message, *, name=None):
+        return await self._services.authorize_inbound_message(
+            self,
+            message,
+            name=name,
         )
 
 
@@ -172,7 +199,10 @@ class _ActionRuntimeServicesHarness:
         self._use_generation += 1
         event = self._use_events.setdefault(descriptor.session_id, anyio.Event())
         event.set()
-        yield _RuntimeLease(descriptor, self._use_generation)
+        yield _RuntimeLease(self, descriptor, self._use_generation)
+
+    async def send(self, lease, name, *, params=None, event=None):
+        del lease, name, params, event
 
     async def watch_view(self, lease, view_ref):
         del lease, view_ref
