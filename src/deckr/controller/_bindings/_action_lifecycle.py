@@ -17,7 +17,6 @@ from deckr.actions.messages import (
     ActionInstanceLifecycleBody,
     ActionInstanceMetadata,
     ActionLifecycleRejectedBody,
-    BindingMetadata,
     PageSessionLifecycleBody,
     PageSessionMetadata,
     subject_action_instance_id,
@@ -35,6 +34,9 @@ from deckr.controller._actions import (
 from deckr.controller._bindings._attachments import (
     AuthorizedCommandTarget,
     BindingLease,
+)
+from deckr.controller._bindings._attachments import (
+    binding_body_matches_lease as _binding_body_matches_lease,
 )
 from deckr.controller._bindings._context import RuntimeMessageSender
 from deckr.controller._bindings._ports import LifecycleAvailabilityRecorder
@@ -160,17 +162,6 @@ def _action_instance_matches_action(
         and stored.provider_id == action_meta.provider_id
         and stored.action_id == action_meta.uuid
         and stored.config_id == config_id
-    )
-
-
-def _binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
-    return (
-        binding.provider_instance_id == lease.provider_instance_id
-        and binding.provider_id == lease.provider_id
-        and binding.action_id == lease.action_uuid
-        and binding.context_id == lease.context_id
-        and binding.binding_id == lease.binding_id
-        and binding.action_instance_id == lease.action_instance_id
     )
 
 

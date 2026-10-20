@@ -15,9 +15,17 @@ def encode_jpeg(image: ImageArtifact, quality: int = 95) -> BlobArtifact:
     Returns:
         BlobArtifact with content_type "image/jpeg" containing the encoded bytes.
     """
+    return encode_raster(image, quality=quality, format="JPEG")
+
+
+def encode_raster(
+    image: ImageArtifact, quality: int = 95, format: str = "JPEG"
+) -> BlobArtifact:
+    if format not in {"JPEG", "PNG"}:
+        raise ValueError(f"Unsupported raster encoding: {format}")
     pil_image = image.image
-    if pil_image.mode != "RGB":
+    if format == "JPEG" and pil_image.mode != "RGB":
         pil_image = pil_image.convert("RGB")
     buf = io.BytesIO()
-    pil_image.save(buf, format="JPEG", quality=quality)
-    return BlobArtifact(data=buf.getvalue(), content_type="image/jpeg")
+    pil_image.save(buf, format=format, quality=quality)
+    return BlobArtifact(data=buf.getvalue(), content_type=f"image/{format.lower()}")

@@ -6,7 +6,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from deckr.actions.messages import SettingsTargetRef
+from deckr.actions.catalog import ActionDescriptor
+from deckr.actions.messages import BindingMetadata, SettingsTargetRef
 
 from deckr.controller._actions._models import ProviderSessionKey
 from deckr.controller._bindings._context import ControlContext
@@ -39,6 +40,19 @@ class BindingLease:
     output_route_generation: int = 0
     command_route_generation: int = 0
     stale_lifecycle_recoveries: int = 0
+    action_descriptor: ActionDescriptor | None = None
+
+
+def binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
+    stored = lease.context.metadata
+    return all(
+        getattr(binding, name) == getattr(stored, name)
+        for name in (
+            "provider_instance_id", "provider_id", "action_id", "context_id",
+            "binding_id", "action_instance_id", "config_id", "device_ref",
+            "control_ref", "page_session_id",
+        )
+    )
 
 
 @dataclass(slots=True)

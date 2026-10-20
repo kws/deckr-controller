@@ -1,15 +1,21 @@
 """Tests for the controller raster render pipeline."""
 
+import io
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Lock
 
 import httpx
 import pytest
+from deckr.hardware.descriptors import CapabilityDescriptor
+from PIL import Image
 
 import deckr.controller.invariant.executor as executor_module
 import deckr.controller.invariant.ops.fetch_url as fetch_url_module
+from deckr.controller._device_layout import _raster_image_format
 from deckr.controller._render import (
+    build_render_request,
+    render_request_to_frame,
     resolve,
 )
 from deckr.controller._state_store import ControlStateStore, RenderContent
@@ -22,6 +28,30 @@ def test_blank_title_resolves_to_blank_raster_overlay():
     model = resolve(store)
 
     assert model.overlay_type == "blank"
+
+
+def test_png_only_descriptor_is_preserved_through_render_worker():
+    capability = CapabilityDescriptor(
+        capabilityId="raster",
+        family="dev.deckr.output.raster",
+        type="bitmap",
+        direction="output",
+        access=("settable",),
+        commandTypes=("set_frame", "clear"),
+        constraints=(
+            {"type": "enum", "subject": "encoding", "values": ["png"]},
+            {"type": "enum", "subject": "width", "values": [96]},
+            {"type": "range", "subject": "height", "minimum": 80, "maximum": 100},
+        ),
+    )
+    image_format = _raster_image_format(capability)
+    assert image_format.format == "PNG"
+    store = ControlStateStore(context_id="render-test")
+    store.content = RenderContent(title="PNG")
+    request = build_render_request(resolve(store), image_format)
+    with Image.open(io.BytesIO(render_request_to_frame(request))) as image:
+        assert image.format == "PNG"
+        assert image.size == (96, 80)
 
 
 def test_get_executor_builds_singleton_once_under_concurrent_calls(monkeypatch):

@@ -16,7 +16,10 @@ from deckr.controller._hardware._validity import validate_owned_claim
 
 
 def _owned(validity: ContractValidity | None) -> OwnedHardwareClaim:
-    agreement = SimpleNamespace(state=SimpleNamespace(validity=validity))
+    agreement = SimpleNamespace(state=SimpleNamespace(
+        validity=validity,
+        valid=validity is not None and validity.status == ContractValidityStatus.VALID,
+    ))
     return OwnedHardwareClaim(
         claim_id="claim-1",
         config_id="device-1",
@@ -49,3 +52,10 @@ async def test_starting_hardware_claim_is_not_yet_fulfilled() -> None:
     validity = await validate_owned_claim(_owned(None))
 
     assert validity.status == ContractValidityStatus.NOT_YET_FULFILLED
+
+
+@pytest.mark.asyncio
+async def test_valid_contract_without_local_authority_is_not_authorized() -> None:
+    owned = _owned(ContractValidity(ContractValidityStatus.VALID))
+    owned.agreement.state.valid = False
+    assert (await validate_owned_claim(owned)).status == ContractValidityStatus.UNAVAILABLE

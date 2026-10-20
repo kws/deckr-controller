@@ -44,6 +44,7 @@ from deckr.controller.config import DeviceConfigService
 
 logger = logging.getLogger(__name__)
 
+
 class HardwareClaimCoordinator:
     """Owns controller-side Concord claims for hardware devices."""
 
@@ -86,6 +87,21 @@ class HardwareClaimCoordinator:
             for owned in self._owned_claims.values()
         )
 
+    def authorized_route(self, config_id: str) -> LiveDeviceRoute | None:
+        """Check current Concord authority at each protected operation."""
+        live = self._route_registry.get(config_id)
+        if live is None:
+            return None
+        owned = self._owned_claims.get(ref_key(live.ref))
+        if (
+            owned is None
+            or not owned.agreement.state.valid
+            or owned.contract_pointer != live.contract
+            or owned_manager_session_id(owned) != live.manager_session_id
+        ):
+            return None
+        return live
+
     async def reconcile(
         self,
         candidates: Mapping[tuple[str, str], HardwareCandidate],
@@ -97,13 +113,24 @@ class HardwareClaimCoordinator:
         for owned in tuple(self._owned_claims.values()):
             candidate = candidates.get(ref_key(owned.ref))
             validity = await self.validate_claim(owned)
+            if validity.status != ContractValidityStatus.VALID and (
+                owned.authority_acquired or owned.live
+            ):
+                await self._revoke_owned_claim(
+                    owned,
+                    cancel_contract=True,
+                    reason=f"hardware authority lost during {reason}",
+                )
+                continue
 
             if candidate is None:
                 if validity.status == ContractValidityStatus.UNAVAILABLE:
                     continue
                 if validity.status == ContractValidityStatus.VALID:
+                    if await self._rematch_owned_claim_if_needed(owned):
+                        continue
                     if not owned.live:
-                        await self._connect_owned_claim(owned, None)
+                        await self._connect_owned_claim(owned)
                     continue
                 if pending_hardware_claim_validity(validity):
                     continue
@@ -115,12 +142,10 @@ class HardwareClaimCoordinator:
                 continue
 
             if validity.status == ContractValidityStatus.VALID:
-                if await self._rematch_owned_claim_if_needed(owned, candidate):
+                if await self._rematch_owned_claim_if_needed(owned):
                     continue
                 if not owned.live:
-                    await self._connect_owned_claim(owned, candidate)
-                else:
-                    await self._refresh_live_descriptor(owned, candidate)
+                    await self._connect_owned_claim(owned)
                 continue
 
             if validity.status == ContractValidityStatus.UNAVAILABLE:
@@ -231,13 +256,14 @@ class HardwareClaimCoordinator:
             device=device,
             agreement=agreement,
             current_sessions=current_sessions,
+            labels=dict(labels),
         )
         self._owned_claims[key] = owned
         if self._start_soon is not None:
             self._start_soon(self._agreement_state_loop, owned)
         validity = await self.validate_claim(owned)
         if validity.status == ContractValidityStatus.VALID:
-            await self._connect_owned_claim(owned, candidate)
+            await self._connect_owned_claim(owned)
 
     async def validate_claim(
         self,
@@ -248,9 +274,10 @@ class HardwareClaimCoordinator:
     async def _connect_owned_claim(
         self,
         owned: OwnedHardwareClaim,
-        candidate: HardwareCandidate | None,
     ) -> None:
         config = await self._config_service.get_config(owned.config_id)
+        if not owned.agreement.state.valid:
+            return
         if config is None or not config.enabled:
             logger.info(
                 "Config %s is unavailable; keeping hardware claim %s idle",
@@ -258,12 +285,8 @@ class HardwareClaimCoordinator:
                 owned.claim_id,
             )
             return
-        device = candidate.device if candidate is not None else owned.device
-        manager_session_id = (
-            candidate.payload.session_id
-            if candidate is not None
-            else owned_manager_session_id(owned)
-        )
+        device = owned.device
+        manager_session_id = owned_manager_session_id(owned)
         if manager_session_id is None:
             logger.warning(
                 "Claim %s is valid but manager session is unknown; keeping idle",
@@ -299,23 +322,22 @@ class HardwareClaimCoordinator:
     async def _rematch_owned_claim_if_needed(
         self,
         owned: OwnedHardwareClaim,
-        candidate: HardwareCandidate,
     ) -> bool:
         current_config = await self._config_service.get_config(owned.config_id)
         if current_config is not None and current_config.enabled:
             return False
         try:
             matched = await self._config_service.match_device(
-                fingerprint=candidate.device.fingerprint,
-                labels=candidate.labels,
+                fingerprint=owned.device.fingerprint,
+                labels=owned.labels,
             )
         except ValueError:
             logger.exception(
                 "Ambiguous rematch config for claimed hardware fingerprint=%s "
                 "labels=%s manager=%s",
-                candidate.device.fingerprint,
-                dict(candidate.labels),
-                candidate.ref.manager_id,
+                owned.device.fingerprint,
+                dict(owned.labels),
+                owned.ref.manager_id,
             )
             return False
         if matched is None:
@@ -324,7 +346,6 @@ class HardwareClaimCoordinator:
             return False
         await self._migrate_owned_claim_config(
             owned,
-            candidate,
             next_config=matched,
         )
         return True
@@ -332,7 +353,6 @@ class HardwareClaimCoordinator:
     async def _migrate_owned_claim_config(
         self,
         owned: OwnedHardwareClaim,
-        candidate: HardwareCandidate,
         *,
         next_config,
     ) -> None:
@@ -346,48 +366,23 @@ class HardwareClaimCoordinator:
         )
         if self._route_registry.get(previous_config_id) is not None:
             self._route_registry.disconnect_config(previous_config_id)
+        owned.live = False
         await self._callbacks.on_hardware_disconnected(
             previous_config_id,
             reason=f"hardware rematched to config {next_config.id}",
         )
         owned.config_id = next_config.id
-        owned.device = candidate.device
+        if not owned.agreement.state.valid:
+            return
         live = self._route_registry.connect(
             config_id=next_config.id,
             ref=owned.ref,
-            device=candidate.device,
+            device=owned.device,
             contract=owned.contract_pointer,
-            manager_session_id=candidate.payload.session_id,
+            manager_session_id=owned_manager_session_id(owned),
         )
         owned.live = True
         await self._callbacks.on_hardware_connected(live, initial_config=next_config)
-
-    async def _refresh_live_descriptor(
-        self,
-        owned: OwnedHardwareClaim,
-        candidate: HardwareCandidate,
-    ) -> None:
-        live = self._route_registry.get_by_ref(owned.ref)
-        if live is None:
-            return
-        if (
-            candidate.device == live.device
-            and candidate.payload.session_id == live.manager_session_id
-        ):
-            return
-        updated = self._route_registry.update_descriptor(
-            ref=owned.ref,
-            device=candidate.device,
-            contract=owned.contract_pointer,
-            manager_session_id=candidate.payload.session_id,
-        )
-        if updated is None:
-            return
-        owned.device = candidate.device
-        await self._callbacks.on_hardware_descriptor_changed(
-            updated.config_id,
-            updated.device,
-        )
 
     async def _revoke_owned_claim(
         self,

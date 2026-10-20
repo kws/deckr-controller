@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -151,9 +152,7 @@ async def test_materialized_service_watches_projection_updates() -> None:
 
 
 @pytest.mark.asyncio
-async def test_materialized_config_slow_subscriber_converges_after_overflow() -> (
-    None
-):
+async def test_materialized_config_slow_subscriber_converges_after_overflow() -> None:
     bucket = MemoryJsonKvBucket(bucket="config")
     service = MaterializedDeviceConfigService(
         controller_id=CONTROLLER_ID,
@@ -245,6 +244,56 @@ async def test_materialized_service_write_config_updates_projection() -> None:
     assert entry.value["deviceConfigs"][0]["name"] == "Written"
     result = await _wait_for_result(bucket, "active")
     assert result.value["activeConfigIds"] == ("config-1",)
+
+
+@pytest.mark.asyncio
+async def test_recovery_snapshot_removes_deleted_config_and_reports_freshness() -> None:
+    class RecoveringBucket(MemoryJsonKvBucket):
+        def __init__(self):
+            super().__init__(bucket="config")
+            self.recover = anyio.Event()
+            self.stream = None
+
+        @asynccontextmanager
+        async def watch(self, prefix=""):
+            if self.stream is not None:
+                await self.recover.wait()
+            async with super().watch(prefix) as stream:
+                self.stream = stream
+                yield stream
+
+    bucket = RecoveringBucket()
+    await MaterializedConfigPublisher(
+        controller_id=CONTROLLER_ID, bucket=bucket
+    ).publish_configs((_config(),))
+    service = MaterializedDeviceConfigService(
+        controller_id=CONTROLLER_ID, bucket=bucket
+    )
+    async with anyio.create_task_group() as tg:
+        await service.start(RunContext(tg=tg, stopping=anyio.Event()))
+        async with service.watch_state() as states:
+            initial = await anext(states)
+            assert initial.current
+            # End the transport's send side to wake the outstanding receive.
+            for sender in tuple(bucket._watchers):
+                await sender.aclose()
+            with anyio.fail_after(3):
+                while service.is_current:
+                    await anyio.sleep(0.01)
+                stale = await anext(states)
+                assert not stale.current
+                await bucket.delete(materialized_config_key(CONTROLLER_ID))
+                bucket.recover.set()
+                while (
+                    not service.is_current
+                    or await service.get_config("config-1") is not None
+                ):
+                    await anyio.sleep(0.01)
+                recovered = await anext(states)
+                assert recovered.current
+                assert recovered.version > stale.version > initial.version
+        await service.stop()
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,7 @@
 """Tests for pure binding planner decisions."""
 
+import pytest
+from deckr.actions.catalog import ActionDescriptor
 from deckr.actions.messages import (
     DynamicPageCommand,
     PageChildBindingDescriptor,
@@ -12,6 +14,7 @@ from deckr.hardware.descriptors import (
     ControlDescriptor,
     ControlGeometry,
     DeviceDescriptor,
+    DeviceRef,
 )
 
 from deckr.controller._actions import ActionIntentKey, ActionMetadata
@@ -21,6 +24,7 @@ from deckr.controller._binding_planner import (
     format_validation_summary,
 )
 from deckr.controller._binding_resolution import ConfiguredControlBinding
+from deckr.controller._capability_matching import matched_capabilities
 from deckr.controller._pages import DynamicPageSession, StaticPageRef
 from deckr.controller.config import ControlSelector
 from deckr.controller.settings import derive_static_action_instance_id
@@ -168,6 +172,69 @@ def test_static_page_plan_records_bound_and_unavailable_controls():
     assert result.plan.bindings[1].action_meta is None
 
 
+@pytest.mark.parametrize(
+    "required, expected",
+    [
+        (True, BindingPlanStatus.INVALID_DEVICE_CONTROL),
+        (False, BindingPlanStatus.BOUND),
+    ],
+)
+def test_missing_action_requirements_control_attachment(required, expected):
+    metadata = _metadata("action.test")
+    metadata.descriptor = ActionDescriptor(
+        actionId="action.test",
+        requirements=(
+            {
+                "name": "turn",
+                "required": required,
+                "preferences": [{"family": "dev.deckr.input.encoder"}],
+            },
+        ),
+    )
+    result = _planner().build_static_page_plan(
+        StaticPageRef("default", 0),
+        bindings=(_binding("0,0", "action.test"),),
+        device=_device("0,0"),
+        action_metadata={_intent("action.test"): metadata},
+    )
+    assert result.plan.bindings[0].status == expected
+
+
+def test_action_requirement_preference_and_named_matches_are_preserved():
+    metadata = _metadata("action.test")
+    metadata.descriptor = ActionDescriptor(
+        actionId="action.test",
+        requirements=(
+            {
+                "name": "activate",
+                "eventTypes": ["down"],
+                "views": ["native"],
+                "preferences": [
+                    {"family": "dev.deckr.input.encoder"},
+                    {"family": "dev.deckr.input.button", "type": "momentary"},
+                ],
+            },
+        ),
+    )
+    result = _planner().build_static_page_plan(
+        StaticPageRef("default", 0),
+        bindings=(_binding("0,0", "action.test"),),
+        device=_device("0,0"),
+        action_metadata={_intent("action.test"): metadata},
+    )
+    planned = result.plan.bindings[0]
+    assert planned.status == BindingPlanStatus.BOUND
+    matches = matched_capabilities(
+        planned.binding,
+        metadata.requirements,
+        DeviceRef(managerId="manager", deviceId="test-device"),
+    )
+    assert [(m.requirement_name, m.capability.capability_id) for m in matches] == [
+        ("activate", "button.momentary")
+    ]
+    assert planned.binding.output_capability_ids == frozenset()
+
+
 def test_retained_static_plan_restores_metadata_when_snapshot_is_empty():
     planner = _planner()
     entry = StaticPageRef(profile_name="default", page_index=0)
@@ -268,7 +335,9 @@ def test_format_validation_summary_handles_empty_and_truncated_errors():
     entry = StaticPageRef(profile_name="default", page_index=0)
     result = planner.build_static_page_plan(
         entry,
-        bindings=tuple(_binding(f"missing-{index}", f"action.{index}") for index in range(4)),
+        bindings=tuple(
+            _binding(f"missing-{index}", f"action.{index}") for index in range(4)
+        ),
         device=_device("0,0"),
         action_metadata={},
     )

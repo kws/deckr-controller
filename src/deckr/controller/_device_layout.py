@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil, floor
 from typing import Any
 
 from deckr.hardware.descriptors import (
@@ -14,6 +15,7 @@ from deckr.hardware.descriptors import (
     ControlDescriptor,
     DeviceDescriptor,
 )
+from deckr.hardware.validation import validate_constraints
 
 
 @dataclass(frozen=True)
@@ -167,15 +169,53 @@ def _constraint_value(
     subject: str,
     default: Any,
 ) -> Any:
-    for constraint in capability.constraints:
-        if constraint.subject == subject and constraint.value is not None:
-            return constraint.value
-    return default
+    constraints = tuple(c for c in capability.constraints if c.subject == subject)
+    candidates = [default]
+    for constraint in constraints:
+        if constraint.value is not None:
+            candidates.append(constraint.value)
+        candidates.extend(constraint.values)
+        if constraint.minimum is not None:
+            candidates.append(ceil(constraint.minimum))
+        if constraint.maximum is not None:
+            candidates.append(floor(constraint.maximum))
+    for constraint in constraints:
+        if constraint.step is not None:
+            base = constraint.minimum or 0
+            candidates.extend(
+                base + ceil((candidate - base) / constraint.step) * constraint.step
+                for candidate in tuple(candidates)
+                if isinstance(candidate, int | float)
+            )
+    for candidate in candidates:
+        if subject in {"width", "height"} and (
+            not isinstance(candidate, int | float)
+            or candidate <= 0
+            or int(candidate) != candidate
+        ):
+            continue
+        try:
+            validate_constraints(capability, {subject: candidate})
+        except (TypeError, ValueError, ArithmeticError):
+            continue
+        return candidate
+    raise ValueError(f"No supported raster {subject} satisfies the descriptor")
 
 
 def _raster_image_format(capability: CapabilityDescriptor) -> RasterImageFormat:
+    encoding = None
+    for candidate in ("jpeg", "png"):
+        try:
+            validate_constraints(capability, {"encoding": candidate})
+        except (TypeError, ValueError, ArithmeticError):
+            continue
+        encoding = candidate
+        break
+    if encoding is None:
+        raise ValueError("Raster capability has no supported image encoding")
     return RasterImageFormat(
         width=int(_constraint_value(capability, "width", 72)),
         height=int(_constraint_value(capability, "height", 72)),
         rotation=int(_constraint_value(capability, "rotation", 0)),
+        format=encoding.upper(),
     )

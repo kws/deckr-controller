@@ -33,7 +33,6 @@ from deckr.services import (
     ServiceDescriptor,
     ServiceMessageBody,
     ServiceUnavailable,
-    newest_service_descriptor,
     service_body,
     service_unavailable_ends_service_use,
 )
@@ -106,7 +105,6 @@ class ControllerActionService:
         self._start_soon = start_soon
         self._interest_by_config: dict[str, ActionInterestSnapshot] = {}
         self._service_watch_scopes: dict[str, anyio.CancelScope] = {}
-        self._service_descriptor_keys: dict[str, tuple[str, str, str]] = {}
         self._service_watch_generations: dict[str, int] = {}
         self._runtime_leases: dict[ProviderSessionKey, _RuntimeLeaseState] = {}
         self._on_availability_changed = on_availability_changed
@@ -131,7 +129,7 @@ class ControllerActionService:
         for scope in tuple(self._service_watch_scopes.values()):
             scope.cancel()
         self._service_watch_scopes.clear()
-        self._service_descriptor_keys.clear()
+        self._service_watch_generations.clear()
         self._runtime_leases.clear()
         self._stopping = None
         if self._close_services_on_aclose and self._services is not None:
@@ -180,9 +178,12 @@ class ControllerActionService:
         state = self._runtime_leases.get(provider_session_key)
         if state is None:
             return None
-        if state.lease.descriptor.session_id != provider_session_key.provider_session_id:
+        try:
+            if state.lease.descriptor.session_id != provider_session_key.provider_session_id:
+                return None
+            return state.lease._authority_pointer()  # noqa: SLF001
+        except ServiceUnavailable:
             return None
-        return state.lease._authority_pointer()  # noqa: SLF001
 
     async def send_runtime_message(
         self,
@@ -669,27 +670,23 @@ class ControllerActionService:
             if provider_instance_id is None:
                 continue
             candidates_by_service.setdefault(descriptor.service_id, []).append(descriptor)
-        active: dict[str, ServiceDescriptor] = {}
-        for service_id, candidates in candidates_by_service.items():
-            descriptor = newest_service_descriptor(candidates)
-            if descriptor is not None:
-                active[service_id] = descriptor
-
-        for service_id, descriptor in sorted(active.items()):
-            descriptor_key = _service_descriptor_key(descriptor)
-            if self._service_descriptor_keys.get(service_id) == descriptor_key:
+        for service_id, candidates in sorted(candidates_by_service.items()):
+            if service_id in self._service_watch_generations:
+                # The managed use owns its winner and recovery. Beacon changes
+                # only affect the selection of a subsequent contract.
                 continue
-            self._service_descriptor_keys[service_id] = descriptor_key
-            if descriptor.backend_status == ServiceBackendStatus.UNAVAILABLE:
+            if all(
+                candidate.backend_status == ServiceBackendStatus.UNAVAILABLE
+                for candidate in candidates
+            ):
                 continue
             if self._start_soon is None:
                 continue
-            self._start_service_watch(service_id, descriptor, stopping=stopping)
+            self._start_service_watch(service_id, stopping=stopping)
 
     def _start_service_watch(
         self,
         service_id: str,
-        descriptor: ServiceDescriptor,
         *,
         stopping: anyio.Event,
     ) -> None:
@@ -701,7 +698,6 @@ class ControllerActionService:
         self._start_soon(
             self._run_service_view_watch,
             service_id,
-            descriptor,
             generation,
             stopping,
         )
@@ -709,7 +705,6 @@ class ControllerActionService:
     async def _run_service_view_watch(
         self,
         service_id: str,
-        descriptor: ServiceDescriptor,
         generation: int,
         stopping: anyio.Event,
     ) -> None:
@@ -725,7 +720,12 @@ class ControllerActionService:
                 while not stopping.is_set():
                     lease: ManagedService | None = None
                     try:
-                        async with services.use(descriptor) as lease:
+                        async with services.use_matching(
+                            ACTION_RUNTIME_SERVICE_PROTOCOL,
+                            predicate=lambda candidate: candidate.service_id == service_id,
+                            timeout_seconds=10.0,
+                        ) as lease:
+                            descriptor = lease.descriptor
                             descriptor_provider_id = _provider_id_from_descriptor(
                                 descriptor
                             )
@@ -935,10 +935,7 @@ class ControllerActionService:
         stopping = self._stopping
         if self._start_soon is None or stopping is None or stopping.is_set():
             return
-        descriptor = state.lease.descriptor
-        if descriptor.backend_status == ServiceBackendStatus.UNAVAILABLE:
-            return
-        self._start_service_watch(state.service_id, descriptor, stopping=stopping)
+        self._start_service_watch(state.service_id, stopping=stopping)
 
     def _drop_runtime_lease_for_object(
         self,
@@ -1038,6 +1035,9 @@ class ControllerActionService:
             return None
         return ActionMetadata(
             uuid=key.action_uuid,
+            descriptor=descriptor or (
+                existing_metadata.descriptor if existing_metadata is not None else None
+            ),
             provider_instance_id=key.provider_instance_id,
             provider_id=provider_id,
             name=descriptor.name if descriptor is not None else (
@@ -1112,11 +1112,3 @@ async def _authorize_inbound_action_runtime_message(
 def _provider_id_from_descriptor(descriptor: ServiceDescriptor) -> str | None:
     value = descriptor.diagnostics.get("providerId")
     return value if isinstance(value, str) and value else None
-
-
-def _service_descriptor_key(descriptor: ServiceDescriptor) -> tuple[str, str, str]:
-    return (
-        str(descriptor.endpoint),
-        descriptor.session_id,
-        descriptor.backend_status.value,
-    )

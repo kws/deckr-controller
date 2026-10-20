@@ -232,6 +232,7 @@ class _ServiceViewWatchServices:
         self,
         descriptors: tuple[ServiceDescriptor, ...],
     ) -> None:
+        self._initial = descriptors
         await self._directory_send.send(descriptors)
 
     async def watch_records(self):
@@ -248,6 +249,14 @@ class _ServiceViewWatchServices:
         self.send_calls.append((lease, name, params, event))
         if self.send_error is not None:
             raise self.send_error
+
+    @asynccontextmanager
+    async def use_matching(self, protocol, *, predicate, timeout_seconds):
+        assert protocol == ACTION_RUNTIME_SERVICE_PROTOCOL
+        assert timeout_seconds == 10.0
+        descriptor = next(item for item in self._initial if predicate(item))
+        async with self.use(descriptor) as lease:
+            yield lease
 
     @asynccontextmanager
     async def use(self, descriptor):
@@ -774,7 +783,8 @@ async def test_service_view_watch_missing_view_keeps_service_use_lease_open(
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
+        services._initial = (descriptor,)
+        tg.start_soon(service._run_service_view_watch, service_id, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -847,7 +857,8 @@ async def test_service_view_watch_recovers_from_missing_view_on_same_lease(
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
+        services._initial = (descriptor,)
+        tg.start_soon(service._run_service_view_watch, service_id, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -922,7 +933,8 @@ async def test_service_view_watch_unavailable_fails_closed_and_negotiates_succes
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
+        services._initial = (descriptor,)
+        tg.start_soon(service._run_service_view_watch, service_id, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -991,7 +1003,8 @@ async def test_service_view_watch_terminal_unavailable_retries_descriptor(
     stopping = anyio.Event()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
+        services._initial = (descriptor,)
+        tg.start_soon(service._run_service_view_watch, service_id, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 
@@ -1066,7 +1079,8 @@ async def test_service_view_watch_rejects_mismatched_payload_provider(
     )
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(service._run_service_view_watch, service_id, descriptor, 1, stopping)
+        services._initial = (descriptor,)
+        tg.start_soon(service._run_service_view_watch, service_id, 1, stopping)
         with anyio.fail_after(1):
             await services.entered.wait()
 

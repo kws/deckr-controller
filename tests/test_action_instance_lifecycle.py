@@ -136,7 +136,7 @@ def _lease():
         provider_session_key=_session_key(),
         control_id="key-1",
         stale_lifecycle_recoveries=0,
-        context=SimpleNamespace(on_binding_attached=AsyncMock()),
+        context=SimpleNamespace(on_binding_attached=AsyncMock(), metadata=_binding_metadata()),
         planned_intent=ActionIntentKey(ACTION_ID, PROVIDER_INSTANCE_ID, ()),
     )
 

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from deckr.actions.catalog import ActionDescriptor
 from deckr.actions.messages import (
     DynamicPageCommand,
     SettingsTargetRef,
@@ -78,6 +79,7 @@ class PageOwnerBinding:
     page_id: str
     page_session_id: str | None
     settings_target: SettingsTargetRef | None
+    action_descriptor: ActionDescriptor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +272,7 @@ class PageSessionService:
             provider_instance_id=owner.provider_instance_id,
             provider_id=owner.provider_id,
             provider_session_id=owner.provider_session_id,
+            descriptor=owner.action_descriptor,
         )
         session = DynamicPageSession(
             page_id=page_id,

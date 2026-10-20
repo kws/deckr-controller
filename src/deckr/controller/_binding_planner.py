@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -20,6 +20,7 @@ from deckr.controller._binding_resolution import (
     exact_control_binding,
     resolve_binding,
 )
+from deckr.controller._capability_matching import select_requirements
 from deckr.controller._pages import DynamicPageSession, PageStackEntry, StaticPageRef
 from deckr.controller.settings import (
     derive_action_instance_id,
@@ -382,6 +383,22 @@ class BindingPlanner:
                 BindingPlanStatus.UNAVAILABLE,
             )
         )
+        if action_meta is not None:
+            try:
+                matches = select_requirements(binding, action_meta.requirements)
+            except ValueError:
+                status = BindingPlanStatus.INVALID_DEVICE_CONTROL
+            else:
+                if action_meta.requirements is not None:
+                    selected = frozenset(cap.capability_id for _name, cap in matches)
+                    binding = replace(binding, **{
+                        name: getattr(binding, name) & selected
+                        for name in (
+                            "input_capability_ids", "output_capability_ids",
+                            "state_capability_ids", "config_capability_ids",
+                            "diagnostic_capability_ids",
+                        )
+                    })
         return PlannedBinding(
             binding=binding,
             action_instance_id=action_instance_id,

@@ -9,9 +9,9 @@ It owns the controller-specific parts of the system:
 - command routing, navigation, and persistence
 - rendering and plugin execution context
 
-The shared contracts it depends on live in the sibling `deckr` repository:
-
-- `https://github.com/kws/deckr`
+The specification lives in [`deckr`](https://github.com/kws/deckr).
+The Python implementation is the `deckr` distribution, developed in
+[`deckr-core-python`](https://github.com/kws/deckr-core-python).
 
 ## Repository Layout
 
@@ -19,8 +19,9 @@ The shared contracts it depends on live in the sibling `deckr` repository:
 src/deckr/controller/
   config/      Configuration models and file-backed services
   invariant/   Rendering helpers and invariant integrations
-  mqtt/        MQTT host integration
-  plugin/      Controller-side plugin runtime and builtins
+  _hardware/   Hardware discovery, claims, and controller routing
+  _actions/    Action Runtime service integration
+  action_provider/  Controller-side action lookup and builtins
 tests/
 ```
 
@@ -31,11 +32,18 @@ tests/
 
 ## Quick Start
 
-Install the project and development tooling:
+Check out `deckr-core-python` beside this repository, then install the project
+and development tooling. The uv source override uses that sibling checkout
+as an editable dependency while the core API is in alpha:
 
 ```bash
 uv sync
 ```
+
+CI checks out the core revision recorded in `.deckr-core-revision` and installs
+the locked dependencies. When adopting a new core revision, update that file
+and `uv.lock` together after running the controller checks against that checkout.
+The local source override does not change the published dependency requirement.
 
 Run the default validation suite:
 
@@ -94,7 +102,8 @@ uv build
 
 Keep the boundary clean:
 
-- shared contracts and reusable wire models belong in `deckr`
+- shared contracts belong in the `deckr` specification
+- reusable Python APIs and wire models belong in `deckr-core-python`
 - controller orchestration and runtime policy belong here
 
 If a controller change needs a new shared contract, release `deckr` first, then

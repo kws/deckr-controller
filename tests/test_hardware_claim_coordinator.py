@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from deckr.concord import ContractValidity, ContractValidityStatus
@@ -70,7 +72,9 @@ class _Agreement:
         contract_id: str = "contract-a",
     ) -> None:
         self.contract = SimpleNamespace(contract_id=contract_id, generation=1)
-        self.state = SimpleNamespace(validity=validity)
+        self.state = SimpleNamespace(
+            validity=validity, valid=validity.status == ContractValidityStatus.VALID
+        )
         self.cancelled = False
         self.closed = False
 
@@ -119,7 +123,8 @@ class _ConfigService:
 
 
 class _Callbacks:
-    pass
+    on_hardware_connected = AsyncMock()
+    on_hardware_disconnected = AsyncMock()
 
 
 def _coordinator(concord: _Concord) -> HardwareClaimCoordinator:
@@ -235,4 +240,49 @@ async def test_pending_old_session_is_cancelled_before_successor_proposal() -> N
     assert owned.agreement.closed is True
     assert coordinator.snapshot()[0].claim_id != owned.claim_id
     assert len(concord.proposals) == 1
-    assert concord.proposals[0].participant_sessions[str(hardware_manager_address("room-a"))] == "manager-session"
+    assert (
+        concord.proposals[0].participant_sessions[
+            str(hardware_manager_address("room-a"))
+        ]
+        == "manager-session"
+    )
+
+
+@pytest.mark.asyncio
+async def test_established_claim_loses_route_when_local_authority_is_lost() -> None:
+    coordinator = _coordinator(_Concord())
+    owned = _seed_claim(
+        coordinator, _Agreement(ContractValidity(ContractValidityStatus.VALID))
+    )
+    await coordinator.reconcile({}, reason="ready")
+    assert coordinator.authorized_route(owned.config_id) is not None
+    # Validity can still report a valid contract while the local view is stale.
+    owned.agreement.state.valid = False
+    assert coordinator.authorized_route(owned.config_id) is None
+    await coordinator.reconcile({}, reason="authority lost")
+    assert coordinator.snapshot() == ()
+    assert coordinator._route_registry.get(owned.config_id) is None
+    assert owned.agreement.closed
+
+
+@pytest.mark.asyncio
+async def test_replacement_advertisement_does_not_change_established_claim() -> None:
+    coordinator = _coordinator(_Concord())
+    owned = _seed_claim(
+        coordinator, _Agreement(ContractValidity(ContractValidityStatus.VALID))
+    )
+    candidate = _candidate()
+    replacement = replace(
+        candidate,
+        device=candidate.device.model_copy(update={"display_name": "Replacement"}),
+        payload=candidate.payload.model_copy(
+            update={"session_id": "replacement-session"}
+        ),
+    )
+    await coordinator.reconcile(
+        {ref_key(owned.ref): replacement}, reason="changed discovery"
+    )
+    live = coordinator.authorized_route(owned.config_id)
+    assert live.device == candidate.device
+    assert live.manager_session_id == "manager-session"
+    assert live.contract == owned.contract_pointer

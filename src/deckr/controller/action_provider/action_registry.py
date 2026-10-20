@@ -100,6 +100,7 @@ class ActionRegistry(BaseComponent):
 def _metadata(descriptor: ActionDescriptor) -> ActionMetadata:
     return ActionMetadata(
         uuid=descriptor.action_id,
+        descriptor=descriptor,
         provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
         provider_id=descriptor.provider_id or BUILTIN_ACTION_PROVIDER_ID,
         name=descriptor.name,

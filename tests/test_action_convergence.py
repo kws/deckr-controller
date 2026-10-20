@@ -154,6 +154,7 @@ class _DirectoryHarness:
         ](10)
 
     async def publish(self, descriptors: tuple[ServiceDescriptor, ...]) -> None:
+        self._initial = descriptors
         await self._send.send(descriptors)
 
     async def watch_records(self):
@@ -193,6 +194,13 @@ class _ActionRuntimeServicesHarness:
         event = self._use_events.setdefault(provider_session_id, anyio.Event())
         with anyio.fail_after(1):
             await event.wait()
+
+    @asynccontextmanager
+    async def use_matching(self, protocol, *, predicate, timeout_seconds):
+        assert protocol == ACTION_RUNTIME_SERVICE_PROTOCOL
+        descriptor = next(item for item in self.directory_harness._initial if predicate(item))
+        async with self.use(descriptor) as lease:
+            yield lease
 
     @asynccontextmanager
     async def use(self, descriptor: ServiceDescriptor):
@@ -267,7 +275,8 @@ async def _wait_for_contract(
 
 
 @pytest.mark.asyncio
-async def test_controller_action_service_registers_stops_and_restarts_runtime_actions():
+async def test_controller_action_service_registers_stops_and_restarts_runtime_actions(monkeypatch):
+    monkeypatch.setattr("deckr.controller._actions._service._SERVICE_WATCH_RETRY_SECONDS", 0.01)
     first_descriptor = _service_descriptor(
         provider_session_id="provider-session-1",
         advertisement_id="first",
@@ -339,6 +348,10 @@ async def test_controller_action_service_registers_stops_and_restarts_runtime_ac
         )
 
         await services.publish_directory((second_descriptor,))
+        # A new advertisement alone cannot revoke the healthy lease.
+        await anyio.sleep(0)
+        assert service.current_contract(first_key) is not None
+        await services.publish_view(ServiceUnavailable("contract_cancelled", "lost authority"))
         await services.wait_used("provider-session-2")
         await services.publish_view(
             _availability_view(provider_session_id="provider-session-2")

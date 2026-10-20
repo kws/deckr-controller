@@ -43,12 +43,16 @@ from deckr.hardware.capabilities import (
 from pydantic import ValidationError
 
 from deckr.controller._actions import ProviderSessionKey
+from deckr.controller._actions._routing import contextualize_action_command
 from deckr.controller._bindings._action_lifecycle import (
     ActionInstanceLifecycleService,
 )
 from deckr.controller._bindings._attachments import (
     AuthorizedCommandTarget,
     BindingLease,
+)
+from deckr.controller._bindings._attachments import (
+    binding_body_matches_lease as _binding_body_matches_lease,
 )
 from deckr.controller._pages import DynamicPageSession
 from deckr.controller._render import RenderSource
@@ -222,17 +226,6 @@ def _payload_kind_hash(params: Mapping[str, Any]) -> tuple[str, str | None]:
     return "params", hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
-def _binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) -> bool:
-    return (
-        binding.provider_instance_id == lease.provider_instance_id
-        and binding.provider_id == lease.provider_id
-        and binding.action_id == lease.action_uuid
-        and binding.context_id == lease.context_id
-        and binding.binding_id == lease.binding_id
-        and binding.action_instance_id == lease.action_instance_id
-    )
-
-
 class ProviderCommandIngress:
     def __init__(
         self,
@@ -248,6 +241,7 @@ class ProviderCommandIngress:
     async def handle(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from an action provider."""
         try:
+            msg = contextualize_action_command(msg)
             payload = action_body_dict(msg)
         except (ValidationError, ValueError):
             self._logger.warning(
@@ -592,6 +586,9 @@ class ProviderCommandIngress:
                 body.capability.control_id,
                 lease.binding_id,
             )
+            return
+        if body.capability.device_ref != lease.context.metadata.device_ref:
+            self._logger.warning("Ignoring binding output for a different device")
             return
         if body.capability.capability_id != lease.raster_capability_id:
             self._logger.warning(

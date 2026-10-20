@@ -64,7 +64,7 @@ dev = [
 
 
 [tool.uv.sources]
-deckr = { workspace = true }
+deckr = { path = "../deckr-core-python", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deckr"]

@@ -24,9 +24,14 @@ HARDWARE_CLAIM_TERMINAL_STATUSES = frozenset(
 async def validate_owned_claim(
     owned: OwnedHardwareClaim,
 ) -> ContractValidity:
-    return owned.agreement.state.validity or ContractValidity(
-        ContractValidityStatus.NOT_YET_FULFILLED
-    )
+    state = owned.agreement.state
+    if state.valid:
+        owned.authority_acquired = True
+        return state.validity or ContractValidity(ContractValidityStatus.VALID)
+    # A successful contract check alone does not imply current local authority.
+    if state.validity and state.validity.status == ContractValidityStatus.VALID:
+        return ContractValidity(ContractValidityStatus.UNAVAILABLE)
+    return state.validity or ContractValidity(ContractValidityStatus.NOT_YET_FULFILLED)
 
 
 def pending_hardware_claim_validity(validity: ContractValidity) -> bool:

@@ -17,6 +17,7 @@ from deckr.hardware.descriptors import (
     CapabilityRef,
     DeviceDescriptor,
 )
+from deckr.hardware.validation import resolve_capability, validate_command
 from deckr.lanes import EndpointSession
 
 from deckr.controller._hardware._routes import LiveDeviceRoute
@@ -51,11 +52,13 @@ class HardwareCommandService:
         control_id: str,
         capability_id: str,
         image: bytes,
-        encoding: RasterBitmapEncoding = "jpeg",
+        encoding: RasterBitmapEncoding | None = None,
     ) -> None:
         live = await self._live_for(config_id)
         if live is None:
             return
+        if encoding is None:
+            encoding = "png" if image.startswith(b"\x89PNG\r\n\x1a\n") else "jpeg"
         params = raster_bitmap_command_params(
             "set_frame",
             {
@@ -147,6 +150,10 @@ class HardwareCommandService:
             commandType=command_type,
             params=dict(params),
         )
+        capability = resolve_capability({device.device_id: live.device}, ref)
+        validate_command(capability, command_type, params)
+        if self._route_lookup(live.config_id) != live:
+            return
         await self._endpoint.send(
             lane=HARDWARE_MESSAGES_LANE,
             recipient=hardware_manager_address(device.manager_id),

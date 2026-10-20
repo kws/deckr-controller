@@ -19,6 +19,7 @@ from deckr.hardware.descriptors import DeviceDescriptor
 from deckr.lanes import EndpointSession
 
 from deckr.controller._actions import ControllerActionService, ProviderActionKey
+from deckr.controller._actions._routing import contextualize_action_command
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware import (
     ControllerHardwareService,
@@ -80,6 +81,7 @@ class ControllerService(BaseComponent):
         """Route command messages to the appropriate DeviceManager."""
         if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
+        msg = contextualize_action_command(msg)
         config_id = subject_config_id(msg.subject)
         if config_id is None:
             logger.warning(

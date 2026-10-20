@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING, Protocol
 import anyio
 import httpx
 
-from deckr.controller._render import RenderRequest, RenderResult, render_request_to_jpeg
+from deckr.controller._render import (
+    RenderRequest,
+    RenderResult,
+    render_request_to_frame,
+)
 
 if TYPE_CHECKING:
     from deckr.controller._hardware import HardwareCommandService
@@ -65,7 +69,7 @@ class ThreadRenderBackend:
 
     async def render(self, request: RenderRequest) -> RenderResult:
         try:
-            frame = await anyio.to_thread.run_sync(render_request_to_jpeg, request)
+            frame = await anyio.to_thread.run_sync(render_request_to_frame, request)
             return RenderResult(
                 context_id=request.context_id,
                 binding_id=request.binding_id,
@@ -175,12 +179,12 @@ async def _run_in_process_pool(
     """
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, _render_request_to_jpeg_worker, request)
+    return await loop.run_in_executor(executor, _render_request_to_frame_worker, request)
 
 
-def _render_request_to_jpeg_worker(request: RenderRequest) -> bytes:
+def _render_request_to_frame_worker(request: RenderRequest) -> bytes:
     try:
-        return render_request_to_jpeg(request)
+        return render_request_to_frame(request)
     except httpx.HTTPError as exc:
         raise RenderWorkerImageFetchError(str(exc)) from None
 

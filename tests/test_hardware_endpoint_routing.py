@@ -26,6 +26,10 @@ from deckr.contracts.messages import (
     hardware_manager_address,
 )
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.capabilities import (
+    device_power_command_schema,
+    raster_bitmap_command_schema,
+)
 from deckr.hardware.descriptors import (
     CapabilityDescriptor,
     CapabilityRef,
@@ -35,6 +39,7 @@ from deckr.hardware.descriptors import (
 )
 from deckr.hardware.profiles import HARDWARE_FEATURE_ID, HardwareBeaconPayload
 from deckr.testing import ConcordRuntimeHarness
+from test_hardware_service import _image
 
 from deckr.controller._controller_service import (
     ControllerService,
@@ -65,6 +70,7 @@ def _device(device_id: str = "deck", fingerprint: str = "serial-a") -> DeviceDes
                         direction="output",
                         access=("settable",),
                         commandTypes=("set_frame", "clear"),
+                        commandSchema=raster_bitmap_command_schema(),
                     ),
                 ),
             ),
@@ -77,6 +83,7 @@ def _device(device_id: str = "deck", fingerprint: str = "serial-a") -> DeviceDes
                 direction="command",
                 access=("invokable",),
                 commandTypes=("sleep", "wake"),
+                commandSchema=device_power_command_schema(),
             ),
         ),
     )
@@ -330,7 +337,7 @@ async def test_manager_local_device_ids_do_not_collide_in_registry_or_commands()
         bus.subscribe(hardware_manager_address("room-b")) as stream_b,
     ):
         await command_service.set_raster_frame(
-            "config-room-a", "0,0", "raster.bitmap", b"a"
+            "config-room-a", "0,0", "raster.bitmap", _image()
         )
         await command_service.clear_raster("config-room-b", "0,0", "raster.bitmap")
         msg_a = await stream_a.receive()

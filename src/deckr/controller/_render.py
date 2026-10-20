@@ -46,6 +46,7 @@ class RenderImageFormat:
     width: int
     height: int
     rotation: int = 0
+    format: str = "JPEG"
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +209,7 @@ def _to_render_image_format(image_format: RasterImageFormat) -> RenderImageForma
         width=image_format.width,
         height=image_format.height,
         rotation=image_format.rotation,
+        format=image_format.format,
     )
 
 
@@ -216,6 +218,7 @@ def _to_hw_image_format(image_format: RenderImageFormat) -> RasterImageFormat:
         width=image_format.width,
         height=image_format.height,
         rotation=image_format.rotation,
+        format=image_format.format,
     )
 
 
@@ -291,10 +294,10 @@ def build_render_request(
     )
 
 
-def _graph_to_jpeg_bytes(
+def _graph_to_raster_bytes(
     render_node: _RenderNode, image_format: RasterImageFormat
 ) -> bytes:
-    """Run invariant-gfx graph with canvas context; apply rotation; return JPEG bytes."""
+    """Render and encode bytes using the descriptor-selected raster format."""
 
     graph = {"src": render_node.node}
     img_name = "src"
@@ -307,8 +310,8 @@ def _graph_to_jpeg_bytes(
         img_name = "rotated"
 
     graph["output"] = Node(
-        op_name="deckr:encode_jpeg",
-        params={"image": ref(img_name), "quality": 50},
+        op_name="deckr:encode_raster",
+        params={"image": ref(img_name), "quality": 50, "format": image_format.format},
         deps=[img_name],
     )
 
@@ -320,14 +323,14 @@ def _graph_to_jpeg_bytes(
     return artifact.data
 
 
-def render_request_to_jpeg(request: RenderRequest) -> bytes:
+def render_request_to_frame(request: RenderRequest) -> bytes:
     """Worker-side render function used by thread/process backends."""
 
     if request.delay_ms > 0:
         time.sleep(request.delay_ms / 1000)
     node = _wire_to_node(request.graph, request.context)
     image_format = _to_hw_image_format(request.image_format)
-    return _graph_to_jpeg_bytes(node, image_format)
+    return _graph_to_raster_bytes(node, image_format)
 
 
 class RenderService:

@@ -22,7 +22,6 @@ from deckr.core.util.anyio import AsyncMap
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import (
     DECKR_OUTPUT_RASTER,
-    CapabilityRef,
     ControlRef,
     DeviceDescriptor,
     DeviceRef,
@@ -917,38 +916,11 @@ class ControlBindingService:
     def _matched_capabilities(
         self,
         binding: ResolvedControlBinding,
+        action_meta: ActionMetadata,
     ) -> tuple[MatchedCapability, ...]:
-        selected = {
-            "input": binding.input_capability_ids,
-            "output": binding.output_capability_ids,
-            "state": binding.state_capability_ids,
-            "config": binding.config_capability_ids,
-            "diagnostic": binding.diagnostic_capability_ids,
-        }
-        matches: list[MatchedCapability] = []
-        for direction, capability_ids in selected.items():
-            for capability in binding.control.capabilities:
-                if capability.capability_id not in capability_ids:
-                    continue
-                if direction != "diagnostic" and capability.direction != direction:
-                    continue
-                matches.append(
-                    MatchedCapability(
-                        requirementName=direction,
-                        capability=CapabilityRef(
-                            deviceRef=self.hardware_ref,
-                            controlId=binding.control_id,
-                            capabilityId=capability.capability_id,
-                        ),
-                        family=capability.family,
-                        type=capability.capability_type,
-                        direction=capability.direction,
-                        eventTypes=capability.event_types,
-                        commandTypes=capability.command_types,
-                        provenance="native",
-                    )
-                )
-        return tuple(matches)
+        from deckr.controller._capability_matching import matched_capabilities
+
+        return matched_capabilities(binding, action_meta.requirements, self.hardware_ref)
 
     def _action_metadata_with_current_session(
         self,
@@ -1588,6 +1560,11 @@ class ControlBindingService:
             )
             return False
         action_meta = self._action_metadata_with_current_session(action_meta)
+        try:
+            matched_capabilities = self._matched_capabilities(binding, action_meta)
+        except ValueError as exc:
+            logger.warning("Binding requirements are not satisfied: %s", exc)
+            return False
         provider_session_id = action_meta.provider_session_id
         session_key = (
             None
@@ -1650,7 +1627,6 @@ class ControlBindingService:
             action_instance_id=action_instance_id,
         )
         context_id = existing_context_id or make_context_id()
-        matched_capabilities = self._matched_capabilities(binding)
         binding_metadata = BindingMetadata(
             providerInstanceId=action_meta.provider_instance_id,
             providerId=action_meta.provider_id,
@@ -1713,6 +1689,7 @@ class ControlBindingService:
             page_session_id=page_session_id,
             item_key=item_key,
             handler=handler,
+            action_descriptor=action_meta.descriptor,
         )
         self._attachments.add_binding(lease)
         attached = await self._activate_binding(lease)
@@ -1959,6 +1936,7 @@ class ControlBindingService:
         if planned.status in {
             BindingPlanStatus.PENDING,
             BindingPlanStatus.UNAVAILABLE,
+            BindingPlanStatus.INVALID_DEVICE_CONTROL,
         }:
             control = _find_control_surface(
                 self.device,
@@ -2013,7 +1991,7 @@ class ControlBindingService:
         plan: PagePlan,
         planned: PlannedBinding,
     ) -> BindingLease | None:
-        if planned.action_meta is None:
+        if planned.action_meta is None or planned.status != BindingPlanStatus.BOUND:
             return None
         action_meta = self._action_metadata_with_current_session(planned.action_meta)
         raster_capability_id = _selected_raster_capability_id(planned.binding)
@@ -2113,6 +2091,7 @@ class ControlBindingService:
                     page_id=owner_lease.page_id,
                     page_session_id=owner_lease.page_session_id,
                     settings_target=owner_lease.settings_target,
+                    action_descriptor=owner_lease.action_descriptor,
                 ),
             )
             if draft is None or draft.page_session is None:
@@ -2619,7 +2598,20 @@ class ControlBindingService:
             )
             return
         try:
-            await lease.context.on_input(translated.action_event)
+            match = next(
+                (match for match in lease.context.metadata.matched_capabilities
+                 if match.capability.capability_id == translated.capability_id),
+                None,
+            )
+            event = translated.action_event
+            if match is not None:
+                event = event.model_copy(update={
+                    "view": {"projection": "projected", "derivation": "derived"}.get(
+                        match.provenance, match.provenance
+                    ),
+                    "source": match.source,
+                })
+            await lease.context.on_input(event)
         except Exception as e:
             logger.error(
                 "Error delivering input to action %s: %s",

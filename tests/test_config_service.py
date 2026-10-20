@@ -133,28 +133,29 @@ async def test_file_config_slow_subscriber_converges_after_identity_overflow(
 
 @pytest.mark.asyncio
 async def test_invalid_yaml_does_not_emit(config_service, tmp_path):
-    """Invalid YAML or invalid config does not emit; previous config preserved."""
+    """An invalid file change preserves the last valid subscriber state."""
+    from watchfiles import Change
+
     cfg = _make_config("dev1")
-    (tmp_path / "dev1.yml").write_text(_config_to_yaml(cfg))
+    path = tmp_path / "dev1.yml"
+    path.write_text(_config_to_yaml(cfg))
+    stream = config_service.subscribe("dev1")
+    try:
+        assert await anext(stream) == cfg
+        version = config_service._state.version
+        path.write_text("invalid: yaml: [")
+        await config_service._process_changes({(Change.modified, str(path))})
+        assert config_service._state.version == version
+        assert await config_service.get_config("dev1") == cfg
 
-    async with anyio.create_task_group() as tg:
-        ctx = RunContext(tg=tg, stopping=anyio.Event())
-        await config_service.start(ctx)
-        try:
-            stream = config_service.subscribe("dev1")
-            first = await anext(stream)
-            assert first is not None
-
-            (tmp_path / "dev1.yml").write_text("invalid: yaml: [")
-            # Watch may emit; we should not get invalid config. Implementation logs and skips.
-            await anyio.sleep(0.2)
-            (tmp_path / "dev1.yml").write_text(_config_to_yaml(cfg))
-            await anyio.sleep(0.3)
-            second = await anext(stream)
-            assert second is not None
-            assert second.id == "dev1"
-        finally:
-            await config_service.stop()
+        recovered = _make_config("dev1", name="Recovered")
+        path.write_text(_config_to_yaml(recovered))
+        await config_service._process_changes({(Change.modified, str(path))})
+        with anyio.fail_after(1):
+            assert await anext(stream) == recovered
+    finally:
+        await stream.aclose()
+        await config_service.stop()
 
 
 @pytest.mark.asyncio

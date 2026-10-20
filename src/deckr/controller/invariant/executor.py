@@ -12,7 +12,7 @@ from invariant.store.chain import ChainStore
 from invariant.store.disk import DiskStore
 from invariant.store.memory import MemoryStore
 
-from deckr.controller.invariant.ops.encode_jpeg import encode_jpeg
+from deckr.controller.invariant.ops.encode_jpeg import encode_jpeg, encode_raster
 from deckr.controller.invariant.ops.fetch_url import fetch_image_url
 
 L1_MAX_ARTIFACTS = 2_000
@@ -28,6 +28,7 @@ def build_executor(*, cache_dir: Path | str | None = None) -> Executor:
     registry.register_package("stdlib", stdlib)
     registry.register("deckr:fetch_image_url", fetch_image_url)
     registry.register("deckr:encode_jpeg", encode_jpeg)
+    registry.register("deckr:encode_raster", encode_raster)
 
     store = ChainStore(
         l1=MemoryStore(cache="lfu", max_size=L1_MAX_ARTIFACTS),

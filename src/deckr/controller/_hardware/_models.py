@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from deckr.concord import (
@@ -46,6 +46,8 @@ class OwnedHardwareClaim:
     agreement: ConcordAgreementLease
     current_sessions: dict[str, str]
     live: bool = False
+    authority_acquired: bool = False
+    labels: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def contract(self) -> ContractHandle:

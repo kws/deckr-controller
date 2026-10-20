@@ -30,7 +30,7 @@ from deckr.actions.messages import (
     context_subject,
 )
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import controller_address
+from deckr.contracts.messages import controller_address, entity_subject
 from deckr.hardware.descriptors import CapabilityRef, ControlRef, DeviceRef
 
 from deckr.controller._actions import ProviderSessionKey
@@ -83,6 +83,7 @@ def _descriptor(page_id: str = "dynamic-a") -> DynamicPageCommand:
 
 def _lease():
     context = SimpleNamespace(
+        metadata=_binding_metadata(),
         set_raster_image=AsyncMock(),
         clear_raster=AsyncMock(),
         show_overlay=AsyncMock(return_value=True),
@@ -154,7 +155,11 @@ class _Host:
         return None
 
     async def _message_contract_authorized(self, message, key) -> bool:
-        return self.contract_authorized and key == SESSION_KEY and message.contract == CONTRACT
+        return (
+            self.contract_authorized
+            and key == SESSION_KEY
+            and message.contract == CONTRACT
+        )
 
 
 def _message(
@@ -194,13 +199,57 @@ def _ingress():
 
 
 @pytest.mark.asyncio
+async def test_binding_output_routes_from_standard_service_subject() -> None:
+    host, _, ingress = _ingress()
+    body = BindingOutputBody(
+        binding=_binding_metadata(),
+        capability=CapabilityRef(
+            deviceRef=DEVICE_REF, controlId="key-1", capabilityId="raster.bitmap"
+        ),
+        commandType="clear",
+        generation=3,
+    )
+    message = _message(BINDING_OUTPUT, body.to_dict()).model_copy(
+        update={"subject": entity_subject("service", serviceId="runtime")}
+    )
+    await ingress.handle(message)
+    host.lease.context.clear_raster.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "changed", ["capability_device", "binding_device", "config", "control", "page"]
+)
+@pytest.mark.asyncio
+async def test_binding_output_rejects_foreign_scope(changed) -> None:
+    host, _, ingress = _ingress()
+    metadata = _binding_metadata()
+    foreign = DeviceRef(managerId="other-manager", deviceId="other-device")
+    updates = {
+        "binding_device": {"device_ref": foreign},
+        "config": {"config_id": "other-config"},
+        "control": {"control_ref": ControlRef(deviceRef=DEVICE_REF, controlId="key-2")},
+        "page": {"page_session_id": "other-page"},
+    }.get(changed, {})
+    body = BindingOutputBody(
+        binding=metadata.model_copy(update=updates),
+        capability=CapabilityRef(
+            deviceRef=foreign if changed == "capability_device" else DEVICE_REF,
+            controlId="key-1",
+            capabilityId="raster.bitmap",
+        ),
+        commandType="clear",
+        generation=3,
+    )
+    await ingress.handle(_message(BINDING_OUTPUT, body.to_dict()))
+    host.lease.context.clear_raster.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_binding_and_page_commands_dispatch_with_exact_authority() -> None:
     host, _, ingress = _ingress()
     descriptor = _descriptor()
 
-    await ingress.handle(
-        _message(OPEN_PAGE, {"descriptor": descriptor.to_dict()})
-    )
+    await ingress.handle(_message(OPEN_PAGE, {"descriptor": descriptor.to_dict()}))
 
     host.open_page.assert_awaited_once()
     assert host.open_page.await_args.kwargs["binding_id"] == BINDING_ID
@@ -229,9 +278,7 @@ async def test_inactive_binding_and_wrong_page_owner_have_no_authority() -> None
     host, _, ingress = _ingress()
     host.binding_commands_authorized = False
 
-    await ingress.handle(
-        _message(OPEN_PAGE, {"descriptor": _descriptor().to_dict()})
-    )
+    await ingress.handle(_message(OPEN_PAGE, {"descriptor": _descriptor().to_dict()}))
 
     host.open_page.assert_not_awaited()
     host.session = _page_session()
@@ -246,9 +293,7 @@ async def test_contract_mismatch_recovers_binding_but_stale_session_does_not() -
     host, _, ingress = _ingress()
     host.contract_authorized = False
 
-    await ingress.handle(
-        _message(OPEN_PAGE, {"descriptor": _descriptor().to_dict()})
-    )
+    await ingress.handle(_message(OPEN_PAGE, {"descriptor": _descriptor().to_dict()}))
 
     host.recover_binding_provider_session_contract.assert_awaited_once_with(
         host.lease,

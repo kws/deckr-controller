@@ -38,7 +38,7 @@ from deckr.controller._render_dispatcher import (
     RenderDispatcher,
     RenderWorkerImageFetchError,
     ThreadRenderBackend,
-    _render_request_to_jpeg_worker,
+    _render_request_to_frame_worker,
 )
 from deckr.controller._render_observation import (
     ObservingRenderBackend,
@@ -320,7 +320,7 @@ async def test_thread_render_backend_skips_http_image_fetch_failures(
         raise httpx.ReadTimeout("timed out")
 
     monkeypatch.setattr(
-        "deckr.controller._render_dispatcher.render_request_to_jpeg",
+        "deckr.controller._render_dispatcher.render_request_to_frame",
         fail_render,
     )
     caplog.set_level(logging.WARNING, logger="deckr.controller._render_dispatcher")
@@ -347,12 +347,12 @@ def test_render_worker_wraps_http_image_fetch_failures(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "deckr.controller._render_dispatcher.render_request_to_jpeg",
+        "deckr.controller._render_dispatcher.render_request_to_frame",
         fail_render,
     )
 
     with pytest.raises(RenderWorkerImageFetchError, match="503 Service Unavailable"):
-        _render_request_to_jpeg_worker(_solid_request())
+        _render_request_to_frame_worker(_solid_request())
 
 
 @pytest.mark.asyncio

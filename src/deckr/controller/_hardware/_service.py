@@ -9,11 +9,14 @@ from deckr.contracts.messages import (
     HARDWARE_MESSAGES_LANE,
     DeckrMessage,
     hardware_manager_address,
+    message_is_expired,
 )
 from deckr.core.util.anyio import CoalescedTrigger
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.descriptors import DeviceRef
+from deckr.hardware.descriptors import CapabilityRef, DeviceRef
 from deckr.hardware.profiles import HARDWARE_FEATURE_ID
+from deckr.hardware.state import HardwareUnavailable
+from deckr.hardware.validation import resolve_capability, validate_input, validate_value
 from deckr.lanes import EndpointSession
 from deckr.substrates.nats_kv import KvUnavailable
 
@@ -100,7 +103,7 @@ class ControllerHardwareService:
         self._stopping: anyio.Event | None = None
         self.command_service = HardwareCommandService(
             endpoint,
-            route_lookup=self._routes.get,
+            route_lookup=self._claims.authorized_route,
         )
 
     async def start(self, tg: anyio.abc.TaskGroup, stopping: anyio.Event) -> None:
@@ -159,12 +162,34 @@ class ControllerHardwareService:
             async for message in subscribe:
                 if not isinstance(message, DeckrMessage):
                     continue
-                event = hw_messages.hardware_body_from_message(message)
-                ref = hw_messages.hardware_device_ref_from_message(message)
-                if ref is None:
-                    continue
-                live = await self._authorized_ingress_route(ref, message)
-                if live is None:
+                try:
+                    event = hw_messages.hardware_body_from_message(message)
+                    ref = hw_messages.hardware_device_ref_from_message(message)
+                    if ref is None:
+                        continue
+                    live = await self._authorized_ingress_route(ref, message)
+                    if live is None:
+                        continue
+                    capability_ref = CapabilityRef(
+                        deviceRef=event.device_ref,
+                        controlId=event.control_id,
+                        capabilityId=event.capability_id,
+                    )
+                    if message.subject != hw_messages.hardware_subject_for_capability(
+                        capability_ref
+                    ):
+                        continue
+                    capability = resolve_capability(
+                        {live.device.device_id: live.device}, capability_ref
+                    )
+                    if isinstance(event, hw_messages.ControlInputMessage):
+                        validate_input(capability, event.event_type, event.value)
+                    elif isinstance(event, hw_messages.CapabilityStateChangedMessage):
+                        if "emits" not in capability.access:
+                            continue
+                        validate_value(capability, event.value)
+                except (HardwareUnavailable, ValueError, TypeError):
+                    logger.debug("Ignoring invalid hardware input", exc_info=True)
                     continue
                 if isinstance(event, hw_messages.ControlInputMessage):
                     await self._callbacks.on_hardware_control_input(live, message)
@@ -182,24 +207,15 @@ class ControllerHardwareService:
         message: DeckrMessage,
     ) -> LiveDeviceRoute | None:
         live = self._routes.get_by_ref(ref)
-        if live is None or not _route_sender_and_contract_match(live, message):
+        if (
+            live is None
+            or not _route_authorizes_message(live, message)
+            or message_is_expired(message)
+            or getattr(message.recipient, "endpoint", None) != self._endpoint.address
+            or message.recipient_session_id != self._endpoint.session_id
+        ):
             return None
-        if _route_authorizes_message(live, message):
-            return live
-
-        try:
-            await self.reconcile(reason="hardware ingress sender session mismatch")
-        except (ConcordUnavailable, KvUnavailable):
-            logger.warning(
-                "Hardware authority unavailable while reconciling ingress session",
-                exc_info=True,
-            )
-            return None
-
-        refreshed = self._routes.get_by_ref(ref)
-        if refreshed is None or not _route_authorizes_message(refreshed, message):
-            return None
-        return refreshed
+        return self._claims.authorized_route(live.config_id)
 
     async def _directory_snapshot_loop(self, stopping: anyio.Event) -> None:
         async with cancel_on_stopping(stopping):
@@ -258,7 +274,12 @@ class ControllerHardwareService:
             )
 
     async def _reconcile_locked(self, *, reason: str) -> None:
-        candidates = await self._hardware_candidates_from_beacon()
+        try:
+            candidates = await self._hardware_candidates_from_beacon()
+        except KvUnavailable:
+            # Discovery freshness must not delay withdrawal of lost authority.
+            await self._claims.reconcile({}, reason=reason)
+            raise
         self._candidates = candidates
         await self._claims.reconcile(candidates, reason=reason)
 

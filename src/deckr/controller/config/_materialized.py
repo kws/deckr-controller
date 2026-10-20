@@ -9,13 +9,13 @@ import anyio
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.keys import encode_key_token
 from deckr.contracts.models import DeckrModel
-from deckr.core.util.anyio import CoalescedStateBroadcaster
-from deckr.substrates.nats_kv import (
+from deckr.core.kv import (
     KvBucketPolicy,
     KvEntry,
     KvUnavailable,
-    KvWatchBarrier,
 )
+from deckr.core.kv_source import KvMaterializedSource
+from deckr.core.util.anyio import CoalescedStateBroadcaster
 from pydantic import Field, field_serializer, field_validator
 
 from deckr.controller.config._data import DeviceConfig
@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 CONFIG_STATE_BUCKET = "dev_deckr_controller_config_v1"
 CONFIG_PROJECTION_SCHEMA = "dev.deckr.controller.config.materialized.v1"
 CONFIG_RESULT_SCHEMA = "dev.deckr.controller.config.result.v1"
-CONFIG_WATCH_RETRY_SECONDS = 1.0
 
 
 def _labels_match(
@@ -186,19 +185,39 @@ class MaterializedDeviceConfigService(BaseComponent):
         self._config_key = materialized_config_key(controller_id)
         self._result_key = materialized_config_result_key(controller_id)
         self._config_by_id: dict[str, DeviceConfig] = {}
-        self._state = CoalescedStateBroadcaster[str](current=True)
+        self._source = KvMaterializedSource(bucket=bucket, key_prefix=self._config_key)
+        self._started = False
+        self._watch_started = False
+        self._watch_done = anyio.Event()
+        self._reconcile_lock = anyio.Lock()
+        self._state = CoalescedStateBroadcaster[str](current=False)
         self._lock = self._state.lock
         self._stopping: anyio.Event | None = None
 
     async def start(self, ctx: RunContext) -> None:
         self._stopping = ctx.stopping
+        self._started = True
+        self._source.start(ctx.tg)
+        await self._source.wait_current()
         await self._reconcile(reason="startup")
+        self._watch_started = True
         ctx.tg.start_soon(self._watch_loop)
 
     async def stop(self) -> None:
         if self._stopping is not None:
             self._stopping.set()
+        await self._source.aclose()
+        if self._watch_started:
+            await self._watch_done.wait()
         await self._state.aclose()
+
+    @property
+    def is_current(self) -> bool:
+        return self._source.is_current()
+
+    def watch_state(self):
+        """Expose versioned projection snapshots, including freshness changes."""
+        return self._source.subscribe()
 
     async def match_device(
         self,
@@ -251,10 +270,14 @@ class MaterializedDeviceConfigService(BaseComponent):
             ),
         )
         entry = await publisher.publish_configs(tuple(configs.values()))
-        await self._activate_configs(
-            tuple(sorted(configs.values(), key=lambda item: item.id)),
-            source_revision=entry.revision,
-        )
+        if self._started:
+            await self._source.wait_for_revision(self._config_key, entry.revision)
+            await self._reconcile(reason="local write observed")
+        else:
+            await self._activate_configs(
+                tuple(sorted(configs.values(), key=lambda item: item.id)),
+                source_revision=entry.revision,
+            )
         return config
 
     def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
@@ -279,27 +302,21 @@ class MaterializedDeviceConfigService(BaseComponent):
                     return
 
     async def _watch_loop(self) -> None:
-        while self._stopping is None or not self._stopping.is_set():
-            try:
-                async with self._bucket.watch(self._config_key) as stream:
-                    async for change in stream:
-                        if isinstance(change, KvWatchBarrier):
-                            continue
-                        if change.key != self._config_key:
-                            continue
-                        await self._reconcile(
-                            reason=f"watch {change.operation} {change.key}"
-                        )
-            except KvUnavailable:
-                logger.warning("Materialized config state unavailable; retrying")
-                await anyio.sleep(CONFIG_WATCH_RETRY_SECONDS)
+        try:
+            async with self._source.subscribe() as changes:
+                async for _change in changes:
+                    await self._reconcile(reason="materialized projection changed")
+        finally:
+            self._watch_done.set()
 
     async def _reconcile(self, *, reason: str) -> None:
-        try:
-            entry = await self._bucket.get(self._config_key)
-        except KvUnavailable:
-            logger.warning("Could not read materialized config during %s", reason)
-            raise
+        async with self._reconcile_lock:
+            await self._state.publish((), current=self._source.is_current())
+            if not self._source.is_current():
+                return
+            await self._apply_entry(self._source.get_cached(self._config_key))
+
+    async def _apply_entry(self, entry: KvEntry | None) -> None:
         if entry is None:
             await self._clear_configs()
             await self._write_result(

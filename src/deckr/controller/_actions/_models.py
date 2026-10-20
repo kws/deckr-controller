@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from deckr.actions.bindings import CapabilityRequirement
+from deckr.actions.catalog import ActionDescriptor
+
 
 @dataclass(frozen=True, slots=True)
 class ActionIntentKey:
@@ -31,6 +34,11 @@ class ActionMetadata:
     provider_labels: Mapping[str, str] | None = None
     settings_schema: dict | None = None
     provider_settings_schema: dict | None = None
+    descriptor: ActionDescriptor | None = None
+
+    @property
+    def requirements(self) -> tuple[CapabilityRequirement, ...] | None:
+        return self.descriptor.requirements if self.descriptor is not None else None
 
 
 class ActionProviderManager(Protocol):

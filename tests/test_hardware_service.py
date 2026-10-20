@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import io
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -14,20 +16,35 @@ from deckr.contracts.messages import (
     endpoint_target,
     hardware_manager_address,
 )
+from deckr.hardware import HardwareUnavailable
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.capabilities import (
+    button_momentary_value_schema,
+    device_power_command_schema,
+    raster_bitmap_command_schema,
+)
 from deckr.hardware.descriptors import (
     DECKR_DEVICE_POWER,
     CapabilityDescriptor,
     CapabilityRef,
+    ControlDescriptor,
     DeviceDescriptor,
     DeviceRef,
 )
+from PIL import Image
 
 from deckr.controller._hardware import (
     ControllerHardwareService,
     HardwareCommandService,
 )
+from deckr.controller._hardware._models import OwnedHardwareClaim, ref_key
 from deckr.controller._hardware._routes import DeviceRouteRegistry
+
+
+def _image(format="JPEG", size=(72, 72)) -> bytes:
+    stream = io.BytesIO()
+    Image.new("RGB", size).save(stream, format=format)
+    return stream.getvalue()
 
 
 def _endpoint():
@@ -111,6 +128,7 @@ def _device(*, power: bool = False) -> DeviceDescriptor:
                 direction="command",
                 access=("invokable",),
                 commandTypes=("sleep", "wake"),
+                commandSchema=device_power_command_schema(),
             ),
         )
     return DeviceDescriptor(
@@ -118,6 +136,34 @@ def _device(*, power: bool = False) -> DeviceDescriptor:
         fingerprint="fingerprint:device-a",
         displayName="Device A",
         capabilities=capabilities,
+        controls=(
+            ControlDescriptor(
+                controlId="key-1",
+                kind="key",
+                inputCapabilities=(
+                    CapabilityDescriptor(
+                        capabilityId="input",
+                        family="dev.deckr.input.button",
+                        type="momentary",
+                        direction="input",
+                        access=("emits",),
+                        eventTypes=("down", "up"),
+                        valueSchema=button_momentary_value_schema(),
+                    ),
+                ),
+                outputCapabilities=(
+                    CapabilityDescriptor(
+                        capabilityId="raster",
+                        family="dev.deckr.output.raster",
+                        type="bitmap",
+                        direction="output",
+                        access=("settable",),
+                        commandTypes=("set_frame", "clear"),
+                        commandSchema=raster_bitmap_command_schema(),
+                    ),
+                ),
+            ),
+        ),
     )
 
 
@@ -171,6 +217,7 @@ def _hardware_message(
         sender=sender or hardware_manager_address(ref.manager_id),
         senderSessionId=sender_session_id,
         recipient=endpoint_target(controller_address("controller-main")),
+        recipientSessionId="controller-session",
         subject=hw_messages.hardware_subject_for_capability(capability_ref),
         body=hw_messages.hardware_body_to_dict(body),
         contract=contract,
@@ -198,13 +245,25 @@ def _connect_route(service: ControllerHardwareService) -> None:
         contract=_contract(),
         manager_session_id="manager-session",
     )
+    service._claims._owned_claims[ref_key(_ref())] = OwnedHardwareClaim(
+        claim_id="claim-a",
+        config_id="config-a",
+        ref=_ref(),
+        device=_device(),
+        agreement=SimpleNamespace(
+            state=SimpleNamespace(valid=True),
+            contract=SimpleNamespace(contract_id="contract-a", generation=1),
+        ),
+        current_sessions={"hardware_manager:manager-a": "manager-session"},
+        live=True,
+    )
 
 
 @pytest.mark.asyncio
 async def test_set_raster_frame_sends_base64_hardware_command() -> None:
     endpoint = _endpoint()
     service = _service(endpoint)
-    image = b"jpeg-bytes"
+    image = _image()
 
     await service.set_raster_frame("config-a", "key-1", "raster", image)
 
@@ -247,8 +306,7 @@ async def test_sleep_and_wake_send_power_commands_when_advertised() -> None:
 
     assert endpoint.send.await_count == 2
     assert [
-        call.kwargs["body"]["commandType"]
-        for call in endpoint.send.await_args_list
+        call.kwargs["body"]["commandType"] for call in endpoint.send.await_args_list
     ] == ["sleep", "wake"]
 
 
@@ -343,12 +401,13 @@ async def test_hardware_input_loop_routes_input_state_and_rejection_messages() -
         controlId="key-1",
         capabilityId="input",
         eventType="down",
+        value={"eventType": "down"},
     )
     state_body = hw_messages.CapabilityStateChangedMessage(
         deviceRef=_ref(),
         controlId="key-1",
         capabilityId="input",
-        value=True,
+        value={"eventType": "down"},
         stateType="pressed",
     )
     rejected_body = hw_messages.CommandRejectedMessage(
@@ -374,7 +433,7 @@ async def test_hardware_input_loop_routes_input_state_and_rejection_messages() -
     state_event = callbacks.capability_state_changed.await_args.args[1]
     rejected_event = callbacks.command_rejected.await_args.args[1]
     assert state_event.capability_id == "input"
-    assert state_event.value is True
+    assert state_event.value == {"eventType": "down"}
     assert rejected_event.capability_id == "raster"
     assert rejected_event.command_type == "set_frame"
 
@@ -413,7 +472,7 @@ async def test_hardware_input_rejects_wrong_endpoint_or_contract_without_reconci
 
 
 @pytest.mark.asyncio
-async def test_hardware_input_reconciles_stale_session_once_then_drops() -> None:
+async def test_hardware_input_drops_other_session_without_changing_claim() -> None:
     body = hw_messages.ControlInputMessage(
         deviceRef=_ref(),
         controlId="key-1",
@@ -436,14 +495,12 @@ async def test_hardware_input_reconciles_stale_session_once_then_drops() -> None
 
     await service._input_loop(stopping=anyio.Event())
 
-    service.reconcile.assert_awaited_once_with(
-        reason="hardware ingress sender session mismatch"
-    )
+    service.reconcile.assert_not_awaited()
     callbacks.control_input.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_hardware_input_rechecks_refreshed_route_after_session_reconcile() -> None:
+async def test_hardware_input_cannot_refresh_route_to_authorize_sender() -> None:
     body = hw_messages.ControlInputMessage(
         deviceRef=_ref(),
         controlId="key-1",
@@ -476,10 +533,9 @@ async def test_hardware_input_rechecks_refreshed_route_after_session_reconcile()
 
     await service._input_loop(stopping=anyio.Event())
 
-    service.reconcile.assert_awaited_once()
-    callbacks.control_input.assert_awaited_once()
-    refreshed = callbacks.control_input.await_args.args[0]
-    assert refreshed.manager_session_id == "successor-session"
+    service.reconcile.assert_not_awaited()
+    callbacks.control_input.assert_not_awaited()
+    assert service.route_for_config("config-a").manager_session_id == "manager-session"
 
 
 @pytest.mark.asyncio
@@ -516,5 +572,63 @@ async def test_hardware_input_rechecks_complete_route_after_reconcile() -> None:
 
     await service._input_loop(stopping=anyio.Event())
 
-    service.reconcile.assert_awaited_once()
+    service.reconcile.assert_not_awaited()
     callbacks.control_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hardware_input_and_output_fail_closed_before_reconciliation() -> None:
+    body = hw_messages.ControlInputMessage(
+        deviceRef=_ref(),
+        controlId="key-1",
+        capabilityId="input",
+        eventType="down",
+        value={"eventType": "down"},
+    )
+    endpoint = _InputEndpoint([_hardware_message(hw_messages.CONTROL_INPUT, body)])
+    callbacks = _Callbacks()
+    service = _controller_hardware(endpoint, callbacks)
+    _connect_route(service)
+    service._claims._owned_claims[ref_key(_ref())].agreement.state.valid = False
+    await service._input_loop(stopping=anyio.Event())
+    await service.command_service.clear_raster("config-a", "key-1", "raster")
+    callbacks.control_input.assert_not_awaited()
+    endpoint.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"control_id": "missing"},
+        {"capability_id": "missing"},
+        {"value": {"eventType": "up"}},
+    ],
+)
+@pytest.mark.asyncio
+async def test_hardware_input_validates_claimed_descriptor(updates) -> None:
+    body = hw_messages.ControlInputMessage(
+        deviceRef=_ref(),
+        controlId="key-1",
+        capabilityId="input",
+        eventType="down",
+        value={"eventType": "down"},
+    ).model_copy(update=updates)
+    endpoint = _InputEndpoint([_hardware_message(hw_messages.CONTROL_INPUT, body)])
+    callbacks = _Callbacks()
+    service = _controller_hardware(endpoint, callbacks)
+    _connect_route(service)
+    await service._input_loop(stopping=anyio.Event())
+    callbacks.control_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_raster_command_rejects_invalid_bytes_and_preserves_png_encoding() -> (
+    None
+):
+    endpoint = _endpoint()
+    service = _service(endpoint)
+    with pytest.raises(HardwareUnavailable):
+        await service.set_raster_frame("config-a", "key-1", "raster", b"invalid")
+    endpoint.send.assert_not_awaited()
+    await service.set_raster_frame("config-a", "key-1", "raster", _image("PNG"))
+    assert _sent_body(endpoint)["params"]["encoding"] == "png"
