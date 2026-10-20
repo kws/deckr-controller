@@ -127,6 +127,14 @@ class HardwareClaimCoordinator:
                 continue
 
             if not owned.live and pending_hardware_claim_validity(validity):
+                if owned_manager_session_id(owned) != candidate.payload.session_id:
+                    # The proposal has no accepted hardware authority. Discovery
+                    # can select a new negotiation, never revoke a valid claim.
+                    await self._revoke_owned_claim(
+                        owned,
+                        cancel_contract=True,
+                        reason="pending hardware proposal selected a new session",
+                    )
                 continue
 
             await self._revoke_terminal_owned_claim(

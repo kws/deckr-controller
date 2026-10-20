@@ -214,3 +214,25 @@ async def test_terminal_state_cancels_and_allows_successor_claim() -> None:
     assert claims[0].claim_id != owned.claim_id
     assert owned.agreement.cancelled is True
     assert len(concord.proposals) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_old_session_is_cancelled_before_successor_proposal() -> None:
+    concord = _Concord()
+    coordinator = _coordinator(concord)
+    owned = _seed_claim(
+        coordinator,
+        _Agreement(ContractValidity(ContractValidityStatus.NOT_YET_FULFILLED)),
+    )
+    owned.current_sessions[str(hardware_manager_address("room-a"))] = "old-session"
+    candidate = _candidate()
+
+    await coordinator.reconcile(
+        {ref_key(candidate.ref): candidate}, reason="replacement discovery"
+    )
+
+    assert owned.agreement.cancelled is True
+    assert owned.agreement.closed is True
+    assert coordinator.snapshot()[0].claim_id != owned.claim_id
+    assert len(concord.proposals) == 1
+    assert concord.proposals[0].participant_sessions[str(hardware_manager_address("room-a"))] == "manager-session"
