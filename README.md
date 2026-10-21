@@ -1,160 +1,79 @@
 # deckr-controller
 
-`deckr-controller` is the Python controller runtime for the Deckr ecosystem.
+`deckr-controller` is the Python controller runtime for Deckr.
+It selects device configurations, connects actions to controls, and manages pages, input, and output.
 
-It owns the controller-specific parts of the system:
+Read [Controller architecture](docs/architecture.md) for the current components, state flows, authority checks, and test map.
 
-- configuration loading and runtime services
-- device management and remote hardware integration
-- command routing, navigation, and persistence
-- rendering and plugin execution context
+Shared specifications belong in [deckr](https://github.com/kws/deckr).
+The Python `deckr` package comes from [deckr-core-python](https://github.com/kws/deckr-core-python).
 
-The specification lives in [`deckr`](https://github.com/kws/deckr).
-The Python implementation is the `deckr` distribution, developed in
-[`deckr-core-python`](https://github.com/kws/deckr-core-python).
+## Development
 
-## Repository Layout
+Use Python 3.11 or later and `uv`.
+Check out `deckr-core-python` beside this repository.
+The source override in `pyproject.toml` uses that checkout as an editable dependency.
 
-```text
-src/deckr/controller/
-  config/      Configuration models and file-backed services
-  invariant/   Rendering helpers and invariant integrations
-  _hardware/   Controller policy and routes over managed core hardware
-  _actions/    Action Runtime service integration
-  action_provider/  Controller-side action lookup and builtins
-tests/
-```
-
-## Requirements
-
-- Python 3.11+
-- `uv`
-
-## Quick Start
-
-Check out `deckr-core-python` beside this repository, then install the project
-and development tooling. The uv source override uses that sibling checkout
-as an editable dependency while the core API is in alpha:
+Install dependencies and run the checks:
 
 ```bash
 uv sync
-```
-
-CI checks out the core revision recorded in `.deckr-core-revision` and installs
-the locked dependencies. When adopting a new core revision, update that file
-and `uv.lock` together after running the controller checks against that checkout.
-The local source override does not change the published dependency requirement.
-
-Run the default validation suite:
-
-```bash
 uv run ruff check .
 uv run pytest
+uv run python scripts/check_spec_conformance.py
 ```
 
-## Managed runtime integration
+The reference check requires the sibling `deckr` checkout.
+Set `DECKR_SPEC_ROOT` to use another location.
 
-The controller targets the alpha Action Runtime contract at the core source revision in
-`.deckr-core-revision`. Hardware discovery, agreements, recovery, event authorization,
-and command validation use the public `DeckrHardware` managed API. Controller
-code selects configurations and owns device routes. Material descriptor changes
-require a new hardware agreement; discovery refreshes do not replace a live claim.
-Each successor agreement revalidates configuration selection against its candidate's
-fingerprint and labels before installing a route. Unmatched or ambiguous successors
-remain unrouted until a matching configuration is available.
+CI selects the core commit from `.deckr-core-revision`.
+It selects the specification commit from the core checkout's `.deckr-spec-revision`.
+Update `.deckr-core-revision` and `uv.lock` together when the controller adopts a new core commit.
+Check the controller against that commit before the update.
 
-Action Runtime commands use canonical `services/serviceMessage` envelopes and
-public managed service authorization. `open_page` accepts a binding or page-session
-target; `replace_page` and `close_page` require a page-session target. Targets carry
-an expected generation. The controller serializes transitions and checks the
-retained owner, generation, hardware authority, and service agreement again after
-planning, immediately before committing. A successor agreement does not inherit
-a previous agreement's dynamic page. Capability selection uses the core matcher
-within the configured control scope. Omitted, null, and empty requirements grant
-no capabilities; actions must explicitly declare the capabilities they use.
+Managed integration tests start isolated NATS brokers with temporary storage and authentication.
+The development dependencies include the NATS binary.
+A separate broker is not necessary.
 
-The default test suite includes managed hardware and Action Runtime integration
-on both the in-process transport and a real NATS JetStream broker. The development
-dependencies include the pinned NATS binary. Tests start isolated brokers on
-localhost with temporary storage and authentication, then shut them down; no
-running broker is required. The focused integration command is:
+The optional language workload uses Python, TypeScript, and Rust provider processes.
+Run `scripts/controller_action_runtime.py` from the sibling
+[deckr-integration-tests](https://github.com/kws/deckr-integration-tests) repository.
+Use an environment with this controller and the sibling core package installed as editable dependencies.
+The runner requires native toolchains and records evidence for each provider language.
+Ordinary controller test runs skip this workload.
+
+Build distributions:
 
 ```bash
-uv run pytest tests/test_hardware_service.py tests/test_hardware_endpoint_routing.py tests/test_action_runtime_integration.py
+uv build
 ```
 
-Coverage includes input and command validation, label-based configuration,
-agreement loss and recovery, descriptor replacement, distinct manager identities,
-page target and generation checks, control scope, lifecycle delivery, authority
-loss during planning, and shutdown.
+## Component configuration
 
-An additional opt-in workload runs this controller with Python, TypeScript and
-Rust provider processes over isolated NATS brokers. Run
-`scripts/controller_action_runtime.py` in
-[`deckr-integration-tests`](https://github.com/kws/deckr-integration-tests#native-action-runtime-workloads)
-using a Python environment with this controller and the sibling core installed
-editable. It runs ten scenarios for each language: lifecycle/matching/input and
-output, page generations, render formats and errors, completion order, direct
-frames, overlays, hardware rejections, hardware loss, provider recovery, and
-service loss during page planning. The runner retains source hashes and per-peer
-evidence and rejects incomplete or skipped coverage. The test module is skipped
-in ordinary controller runs because the foreign peers require their own native
-toolchains and sibling checkouts.
-
-Rendering follows the [Action Runtime rendering specification](https://github.com/kws/deckr/blob/main/docs/deckr-action-runtime-rendering.md).
-Binding attachment advertises named raster targets, logical canvas dimensions,
-and fixed limits. The controller accepts plain text and inline PNG/JPEG content
-through `binding_render`. It also advertises the optional owner-defined
-[`com.k-si.deckr.render.invariant.v1` extension](https://github.com/kws/deckr/blob/main/docs/deckr-render-invariant-extension.md).
-Extension graphs use an explicit operation allowlist, bounded dimensions and
-intermediate images, packaged icons and fonts, and bounded HTTP(S) image fetches.
-Execution runs in cancellable worker processes with no persistent graph cache.
-The protocol carries structured content; graph and image URLs are never accepted
-as direct hardware frames. `binding_output.set_frame`
-accepts encoded image bytes, with descriptor dimensions and encoding checks.
-
-Base renders, direct frames, clears, overlays, and fallback output share output
-ordering. New admitted base content supersedes unfinished older work even if the
-new content fails. Base changes preserve overlays, and failures retain the last
-successfully dispatched base. Final dispatch rechecks the binding, service
-agreement, hardware claim, and output revisions. Results distinguish local
-dispatch from a correlated hardware rejection; neither is a display acknowledgement.
-
-Limits per advertised target are 262,144 envelope bytes, 131,072 image-file bytes,
-1,048,576 source pixels, 1,024 text code points, and 2,000 ms from admission to
-local dispatch. Admission allows at most two active jobs per control and eight
-across the process. Obsolete workers keep their slot until they finish. No pending
-base queue is allocated. Retained request records are bounded at 512 per device;
-hardware rejection mappings are bounded at 1,024 and expire after 60 seconds.
-
-Run `uv run pytest tests/test_rendering_contract.py` for rendering integration
-checks. Run `uv run python scripts/check_spec_conformance.py` for the reference
-content and ordering vectors over memory and NATS. The latter reads `../deckr`,
-or the checkout selected by `DECKR_SPEC_ROOT`, and fails on missing artifacts.
-It verifies content geometry and limits, reverse completion, clear supersession,
-failure supersession, rejection ordering, and exact hardware-command correlation.
-The full suite additionally covers overlays, duplicate delivery, deadlines,
-capacity, authority loss, page hiding, direct frames, and late hardware rejection.
-
-## Materialized Config
-
-Local monolith runs can use the direct file-backed config service:
+The controller component ID is `dev.deckr.controller`.
+The component requires a `controller` endpoint slot.
+This file-source example uses the component configuration model:
 
 ```toml
+[deckr.components.instances.controller_main]
+component = "dev.deckr.controller"
+instance_id = "main"
+
+[deckr.components.instances.controller_main.endpoints]
+controller = "controller-main"
+
 [deckr.components.instances.controller_main.config.device_config.file]
 path = "settings"
 ```
 
-For a controller that consumes config from NATS KV, configure the materialized
-source instead:
+To use materialized config, replace the file-source section with this section:
 
 ```toml
 [deckr.components.instances.controller_main.config.device_config.materialized]
 bucket = "dev_deckr_controller_config_v1"
 ```
 
-To push local files to a remote broker, configure the same file-backed watcher
-as a standalone Deckr component instance in a normal `deckr.toml`:
+A separate config watcher can send local YAML configurations to a remote NATS broker:
 
 ```toml
 [deckr.runtime.substrate]
@@ -170,50 +89,22 @@ path = "settings"
 target_controller_id = "controller-main"
 ```
 
-The watcher has no endpoint slots and does not register a Deckr endpoint. It
-writes the whole projection to
-`dev_deckr_controller_config_v1/config.controllers.<controller-id>.materialized`.
-
-Build distributables:
-
-```bash
-uv build
-```
-
-## Relationship To `deckr`
-
-`deckr-controller` depends on `deckr`.
-
-Keep the boundary clean:
-
-- shared contracts belong in the `deckr` specification
-- reusable Python APIs and wire models belong in `deckr-core-python`
-- controller orchestration and runtime policy belong here
-
-If a controller change needs a new shared contract, release `deckr` first, then
-update the `deckr` dependency range in this repo before cutting the controller
-release.
+The watcher publishes a complete projection for the target controller.
+See [configuration and settings](docs/architecture.md#3-configuration-and-settings) for storage and activation behavior.
 
 ## Releases
 
-This repository releases a single distribution: `deckr-controller`.
+The root `pyproject.toml` owns the published `deckr-controller` version.
+Stable releases use PEP 440 versions and tags of the form `deckr-controller-vX.Y.Z`.
 
-- The source of truth for the published version is the root `pyproject.toml`.
-- Use package tags in the form `deckr-controller-vX.Y.Z`.
-- Stable releases use normal PEP 440 versions such as `0.3.0`.
-- After each stable release, bump immediately to the next development line,
-  e.g. `0.4.0.dev0`, in a separate follow-up commit.
-
-### Release Flow
-
-1. Update `version` in `pyproject.toml` to the stable release number.
-2. If needed, update the `deckr` dependency constraint to the newly released
-   core version.
-3. Run the validation suite:
+1. Set `version` in `pyproject.toml` to the stable version.
+2. Update the `deckr` dependency if the controller requires a new core package release.
+3. Run the checks:
 
    ```bash
    uv run ruff check .
    uv run pytest
+   uv run python scripts/check_spec_conformance.py
    ```
 
 4. Refresh the lockfile:
@@ -222,31 +113,16 @@ This repository releases a single distribution: `deckr-controller`.
    uv lock --refresh
    ```
 
-5. Commit the release, for example:
+5. Commit the release changes.
+6. Tag the release commit as `deckr-controller-vX.Y.Z`.
+7. Build from the tag:
 
    ```bash
-   git commit -am "chore(deckr-controller): release v0.3.0"
-   ```
-
-6. Tag the release commit:
-
-   ```bash
-   git tag deckr-controller-v0.3.0
-   ```
-
-7. Build from the tag so the artifacts match the stable version exactly:
-
-   ```bash
-   git checkout deckr-controller-v0.3.0
+   git checkout deckr-controller-vX.Y.Z
    uv build
    git checkout -
    ```
 
-8. Publish the wheel and sdist using your usual PyPI workflow.
-9. Immediately bump `pyproject.toml` to the next development version, refresh
-   the lockfile, and commit that separately:
-
-   ```bash
-   uv lock --refresh
-   git commit -am "chore(deckr-controller): bump to development release 0.4.0.dev0"
-   ```
+8. Publish the wheel and source distribution with the usual PyPI workflow.
+9. Set the next development version to `X.(Y+1).0.dev0` in a separate commit.
+   Refresh `uv.lock` after this version change.
