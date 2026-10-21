@@ -655,7 +655,7 @@ async def test_hardware_input_and_provider_output_cross_production_boundaries(
         )
         await h.channel.send("binding_output", output)
         await eventually(lambda: h.commands.await_count == 1)
-        command = h.commands.await_args.args[0]
+        command = h.commands.await_args.args[0].message
         assert command.contract == live.contract
         assert command.body["commandType"] == "clear"
         assert command.body["capabilityId"] == "raster"

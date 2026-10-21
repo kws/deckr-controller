@@ -18,7 +18,7 @@ async def test_raster_and_power_commands_use_managed_descriptor_validation(
         image = _image(format="PNG")
         await output.set_raster_frame("config-a", "key-1", "raster", image)
         await eventually(lambda: h.commands.await_count == 1)
-        command = h.commands.await_args.args[0]
+        command = h.commands.await_args.args[0].message
         assert command.contract == h.service.route_for_config("config-a").contract
         assert command.body["params"]["image"] == base64.b64encode(image).decode()
         assert command.body["params"]["encoding"] == "png"
@@ -27,7 +27,7 @@ async def test_raster_and_power_commands_use_managed_descriptor_validation(
         await output.wake_device("config-a")
         await eventually(lambda: h.commands.await_count == 4)
         assert [
-            call.args[0].body["commandType"] for call in h.commands.await_args_list
+            call.args[0].message.body["commandType"] for call in h.commands.await_args_list
         ] == ["set_frame", "clear", "sleep", "wake"]
         for capability, data in (("missing", image), ("raster", b"invalid")):
             with pytest.raises((ValueError, HardwareUnavailable)):

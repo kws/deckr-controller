@@ -77,7 +77,7 @@ async def test_support_render_dispatch_and_clear(managed_substrate):
         result = await result_for(h, request)
         assert result["status"] == "dispatched", result
         await eventually(lambda: h.commands.await_count == 1)
-        hardware = h.commands.await_args.args[0]
+        hardware = h.commands.await_args.args[0].message
         assert hardware.message_id == result["commandMessageId"]
         assert hardware.body["commandType"] == "set_frame"
         with Image.open(
@@ -95,7 +95,7 @@ async def test_support_render_dispatch_and_clear(managed_substrate):
         )
         assert (await result_for(h, request))["status"] == "dispatched"
         await eventually(lambda: h.commands.await_count == 2)
-        assert h.commands.await_args.args[0].body["commandType"] == "clear"
+        assert h.commands.await_args.args[0].message.body["commandType"] == "clear"
 
 
 @pytest.mark.asyncio
@@ -164,7 +164,7 @@ async def test_old_render_cannot_overwrite_newer_clear(managed_substrate):
             lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0
         )
         assert h.commands.await_count == 1
-        assert h.commands.await_args.args[0].body["commandType"] == "clear"
+        assert h.commands.await_args.args[0].message.body["commandType"] == "clear"
 
 
 @pytest.mark.asyncio
@@ -276,7 +276,7 @@ async def test_direct_frame_shares_order_and_requires_image_bytes(managed_substr
         await h.channel.send("binding_output", data)
         await eventually(lambda: h.commands.await_count == 1)
         assert (
-            h.commands.await_args.args[0].body["params"]["image"]
+            h.commands.await_args.args[0].message.body["params"]["image"]
             == data["params"]["image"]
         )
         backend.gates[0].set()
@@ -336,13 +336,13 @@ async def test_overlay_change_during_base_render_and_clear_preserves_overlay(
         await eventually(lambda: len(backend.started) == 4)
         backend.gates[3].set()
         assert (await result_for(h, clear))["status"] == "dispatched"
-        assert h.commands.await_args.args[0].body["commandType"] == "set_frame"
+        assert h.commands.await_args.args[0].message.body["commandType"] == "set_frame"
         await h.channel.send(
             "binding_overlay_clear",
             {"binding": binding, "generation": 2, "overlayId": "test"},
         )
         await eventually(lambda: h.commands.await_count == 3)
-        assert h.commands.await_args.args[0].body["commandType"] == "clear"
+        assert h.commands.await_args.args[0].message.body["commandType"] == "clear"
 
 
 @pytest.mark.asyncio
@@ -425,7 +425,7 @@ async def test_late_hardware_rejection_is_correlated_without_rollback(
         old = await h.channel.send("binding_render", parameters(h, text="old"))
         await result_for(h, old)
         await eventually(lambda: h.commands.await_count == 1)
-        command = h.commands.await_args.args[0]
+        command = h.commands.await_args.args[0].message
         newer = await h.channel.send("binding_render", parameters(h, text="new"))
         await result_for(h, newer)
         await eventually(lambda: h.commands.await_count == 2)
@@ -552,7 +552,7 @@ async def test_overlay_update_waits_for_in_progress_send(
         await eventually(lambda: h.commands.await_count == 2)
         assert router._store.overlay.template == "ok"
         images = [
-            call.args[0].body["params"]["image"] for call in h.commands.await_args_list
+            call.args[0].message.body["params"]["image"] for call in h.commands.await_args_list
         ]
         assert images[0] != images[1]
 
@@ -607,7 +607,7 @@ async def test_direct_frames_do_not_require_rendering_support(
         h.commands.reset_mock()
         await h.channel.send("binding_output", direct_parameters(h))
         await eventually(lambda: h.commands.await_count == 1)
-        assert h.commands.await_args.args[0].body["commandType"] == "set_frame"
+        assert h.commands.await_args.args[0].message.body["commandType"] == "set_frame"
         request = await h.channel.send("binding_render", parameters(h))
         assert (await result_for(h, request))["code"] == "unsupported_target"
 

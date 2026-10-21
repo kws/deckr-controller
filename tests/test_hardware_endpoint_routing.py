@@ -142,7 +142,7 @@ async def test_successor_revalidates_configuration_match(changed, managed_substr
         )
         await h.service.command_service.clear_raster("replacement", "key-1", "raster")
         await eventually(lambda: h.commands.await_count == 1)
-        assert h.commands.await_args.args[0].contract == successor
+        assert h.commands.await_args.args[0].message.contract == successor
 
 
 @pytest.mark.asyncio
