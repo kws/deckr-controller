@@ -85,5 +85,5 @@ async def test_reference_ordering(managed_substrate, case):
         ]
         await eventually(lambda: h.commands.await_count == len(expected))
         assert [
-            call.args[0].message_id for call in h.commands.await_args_list
+            call.args[0].message.message_id for call in h.commands.await_args_list
         ] == expected
