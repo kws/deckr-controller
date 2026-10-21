@@ -9,7 +9,6 @@ from deckr.actions.messages import (
     PageChildBindingTarget,
 )
 
-from deckr.controller._actions import ActionMetadata
 from deckr.controller._binding_planner import PagePlan
 from deckr.controller._pages import (
     PageOwnerBinding,
@@ -344,29 +343,3 @@ def test_timeout_detection_and_activity_reset_use_clock(device_config):
     assert session.last_activity == 0.150
     now = 0.249
     assert service.expired_session() is None
-
-
-def test_move_owner_provider_session_updates_active_session(device_config):
-    service = PageSessionService(device_config, clock=lambda: 0.0)
-    root = service.begin_set_page(profile="default", page=0)
-    assert root is not None
-    service.commit(root, _plan(root.entry))
-    opened = service.begin_open_page(
-        descriptor=_dynamic_page("dynamic-page", "1,0"),
-        owner=_owner(),
-    )
-    assert opened is not None and opened.page_session is not None
-    session = opened.page_session
-    service.commit(opened, _plan(opened.entry, page_session=session))
-
-    moved = service.move_owner_provider_session(
-        ActionMetadata(
-            uuid="action.owner",
-            provider_instance_id="python",
-            provider_id="test.provider",
-            provider_session_id="successor",
-        )
-    )
-
-    assert moved
-    assert session.owner_provider_session_id == "successor"

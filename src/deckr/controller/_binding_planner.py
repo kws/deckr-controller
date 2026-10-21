@@ -179,6 +179,7 @@ class BindingPlanner:
 
             planned_binding = self._plan_binding(
                 binding=resolved.binding,
+                device=device,
                 action_instance_id=self._static_action_instance_id(
                     entry,
                     resolved.binding,
@@ -297,6 +298,7 @@ class BindingPlanner:
 
             planned_binding = self._plan_binding(
                 binding=resolved.binding,
+                device=device,
                 action_instance_id=self._dynamic_child_action_instance_id(
                     page_session=page_session,
                     page_session_generation=page_session_generation,
@@ -357,6 +359,7 @@ class BindingPlanner:
         self,
         *,
         binding: ResolvedControlBinding,
+        device: DeviceDescriptor,
         action_instance_id: str,
         action_metadata: Mapping[ActionIntentKey, ActionMetadata],
         action_status: Mapping[ActionIntentKey, BindingPlanStatus],
@@ -385,20 +388,19 @@ class BindingPlanner:
         )
         if action_meta is not None:
             try:
-                matches = select_requirements(binding, action_meta.requirements)
+                matches = select_requirements(binding, action_meta.requirements, device)
             except ValueError:
                 status = BindingPlanStatus.INVALID_DEVICE_CONTROL
             else:
-                if action_meta.requirements is not None:
-                    selected = frozenset(cap.capability_id for _name, cap in matches)
-                    binding = replace(binding, **{
-                        name: getattr(binding, name) & selected
-                        for name in (
-                            "input_capability_ids", "output_capability_ids",
-                            "state_capability_ids", "config_capability_ids",
-                            "diagnostic_capability_ids",
-                        )
-                    })
+                selected = frozenset(cap.capability_id for _name, cap in matches)
+                binding = replace(binding, **{
+                    name: getattr(binding, name) & selected
+                    for name in (
+                        "input_capability_ids", "output_capability_ids",
+                        "state_capability_ids", "config_capability_ids",
+                        "diagnostic_capability_ids",
+                    )
+                })
         return PlannedBinding(
             binding=binding,
             action_instance_id=action_instance_id,

@@ -156,8 +156,9 @@ class _RuntimeLease:
             name=name,
         )
 
-    def _authority_pointer(self) -> ContractPointer:
-        return self._contract
+    @property
+    def state(self):
+        return SimpleNamespace(contract=self._contract, local_authority=True)
 
 
 def _availability_view(

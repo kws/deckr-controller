@@ -228,6 +228,7 @@ def test_action_requirement_preference_and_named_matches_are_preserved():
         planned.binding,
         metadata.requirements,
         DeviceRef(managerId="manager", deviceId="test-device"),
+        _device("0,0"),
     )
     assert [(m.requirement_name, m.capability.capability_id) for m in matches] == [
         ("activate", "button.momentary")

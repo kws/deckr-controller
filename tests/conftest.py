@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import pytest
+import pytest_asyncio
 from deckr.contracts.lanes import (
     ACTION_MESSAGE_TYPES,
     CORE_LANE_CONTRACTS,
@@ -157,3 +158,21 @@ class EndpointHarness:
     async def subscribe(self, lane: str | None = None) -> AsyncIterator:
         async with self._session.subscribe(lane or self._lane_name) as stream:
             yield stream
+
+
+@pytest_asyncio.fixture(params=("memory", "nats"))
+async def managed_substrate(request, tmp_path):
+    """Run managed controller integration against both supported test transports."""
+    from deckr.bindings.nats import DeckrNatsSubstrate
+    from deckr.substrates.nats_server import NatsServerSupervisor
+
+    contracts = MessageContractRegistry(CORE_LANE_CONTRACTS.values())
+    if request.param == "memory":
+        yield MemoryLaneSubstrate(lane_contracts=contracts)
+        return
+    supervisor = NatsServerSupervisor(port=-1, runtime_dir=tmp_path)
+    handle = await supervisor.start()
+    try:
+        yield DeckrNatsSubstrate(url=handle.url, auth_token=handle.auth_token, lane_contracts=contracts)
+    finally:
+        await supervisor.stop()

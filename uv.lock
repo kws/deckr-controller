@@ -417,6 +417,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "deckr-nats-server-bin" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -444,6 +445,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "deckr-nats-server-bin", specifier = ">=2.14.0,<2.15.0" },
     { name = "pytest", specifier = ">=9.0.2,<10.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.3.0,<2.0.0" },
     { name = "pytest-cov", specifier = ">=6.0.0,<7.0.0" },
@@ -460,6 +462,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a5/74/472c72df927f9f7680f5cbdb8c777b96781716181ca4f28bfcb0377ddbbd/deckr_fonts-0.2.0.tar.gz", hash = "sha256:c63bf56141df90750ec12d34d26b3e00d5903b47b0fa80098490cf41643fc64c", size = 11078293, upload-time = "2026-02-14T17:04:38.955Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6d/5f/208ea99cf900af5fc9e69382559e7256af743264d2373599876ee1da27b0/deckr_fonts-0.2.0-py3-none-any.whl", hash = "sha256:6b3801ebb5c91c731a8677842097fbc77d448952201e0f39612bd0860ef52560", size = 11166695, upload-time = "2026-02-14T17:04:27.628Z" },
+]
+
+[[package]]
+name = "deckr-nats-server-bin"
+version = "2.14.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/64/3410747dedf4356746612531a10740ce17c1b7a19629bf9069165101d550/deckr_nats_server_bin-2.14.0-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:e9d7fdbef007bb8c50e38c954ebd592ba86d1bb56db2b708b73925c601c8f863", size = 6791625, upload-time = "2026-05-03T13:36:49.692Z" },
+    { url = "https://files.pythonhosted.org/packages/80/ce/4c2470644ecd329f78634084d2cb2edb439bd07f8b07986665994012e00c/deckr_nats_server_bin-2.14.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:0e3dc1ffdc30b7c11fff9213670ba899f5bfcfb289863df37d613b91fbdd5d4a", size = 6242013, upload-time = "2026-05-03T13:36:51.857Z" },
+    { url = "https://files.pythonhosted.org/packages/90/71/85b1a0b0d08f4f75e4ac2be5774404329bd90e505277024d7c8ee39ad9b9/deckr_nats_server_bin-2.14.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2ece918643c7e3e03cb6bcd277982df72ca736e5332b8526920e3ea01350fd75", size = 6058260, upload-time = "2026-05-03T13:36:53.921Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/4f/19fcd8cd0b1fe7587894dc4f904d7c43b00755e8fcd61badd9dd6b690bdb/deckr_nats_server_bin-2.14.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3b0d9e19a53ca9583caa947a0c608b1c27f677d34d96da2c70c8d77babd72da1", size = 6741998, upload-time = "2026-05-03T13:36:55.692Z" },
+    { url = "https://files.pythonhosted.org/packages/10/17/23dde829d01fb935201d0a49f2c42254b2c1a67801a23b3b7ebfff8e43cd/deckr_nats_server_bin-2.14.0-py3-none-win_amd64.whl", hash = "sha256:f3c3c556ce974830c8b9eac9933b8a031e1ae50133eb616efe9229f38f870fab", size = 6904701, upload-time = "2026-05-03T13:36:57.702Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/83/3aca8048feef733fc090dd6f1932591e81c1cf678f3199cf4721a947138a/deckr_nats_server_bin-2.14.0-py3-none-win_arm64.whl", hash = "sha256:b7c78779767a7633b4707f3ba5432168d7e747de4d86485a78a93621e0c987f4", size = 6141877, upload-time = "2026-05-03T13:36:59.691Z" },
 ]
 
 [[package]]

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from deckr.contracts.authority import ContractPointer
+    from deckr.contracts.messages import DeckrMessage
 
     from deckr.controller._action_interest import ActionInterestSnapshot
     from deckr.controller._actions._models import (
@@ -61,6 +62,14 @@ class BindingActionService(LifecycleAvailabilityRecorder, Protocol):
         self,
         provider_session_key: ProviderSessionKey | None,
     ) -> ContractPointer | None: ...
+
+    async def authorize_runtime_message(
+        self, key: ProviderSessionKey | None, message: DeckrMessage
+    ) -> bool: ...
+
+    async def authorize_decoded_message(
+        self, key: ProviderSessionKey | None, message: DeckrMessage
+    ) -> bool: ...
 
     async def send_runtime_message(
         self,

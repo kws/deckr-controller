@@ -14,6 +14,7 @@ from deckr.actions.messages import (
     make_dynamic_page_id,
     make_page_session_id,
 )
+from deckr.contracts.authority import ContractPointer
 
 from deckr.controller._actions._models import ActionMetadata
 from deckr.controller._binding_resolution import ConfiguredControlBinding
@@ -56,6 +57,7 @@ class DynamicPageSession:
     last_activity: float
     settings_target: SettingsTargetRef | None
     generation: int = 0
+    owner_contract: ContractPointer | None = None
 
 
 @dataclass(slots=True)
@@ -80,6 +82,7 @@ class PageOwnerBinding:
     page_session_id: str | None
     settings_target: SettingsTargetRef | None
     action_descriptor: ActionDescriptor | None = None
+    contract: ContractPointer | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +296,7 @@ class PageSessionService:
             last_activity=self._clock(),
             settings_target=owner.settings_target,
             generation=0,
+            owner_contract=owner.contract,
         )
         draft = self.begin_set_page(
             descriptor=concrete_descriptor,
@@ -512,26 +516,6 @@ class PageSessionService:
         if elapsed_ms >= session.timeout_ms:
             return session
         return None
-
-    def move_owner_provider_session(self, action_meta: ActionMetadata) -> bool:
-        session = self.active_dynamic_session()
-        if session is None:
-            return False
-        if (
-            action_meta.uuid != session.owner_action_uuid
-            or action_meta.provider_instance_id
-            != session.owner_provider_instance_id
-        ):
-            return False
-        if (
-            action_meta.provider_id == session.owner_provider_id
-            and action_meta.provider_session_id == session.owner_provider_session_id
-        ):
-            return False
-        session.owner_provider_id = action_meta.provider_id
-        session.owner_provider_session_id = action_meta.provider_session_id
-        session.owner_action_meta = action_meta
-        return True
 
     def _page_control_session(
         self,

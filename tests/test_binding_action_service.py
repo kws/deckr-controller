@@ -161,6 +161,17 @@ class _BindingActionServiceHarness:
             return None
         return self._contracts.get(provider_session_key)
 
+    async def authorize_decoded_message(self, key, message):
+        return key is not None and self.current_contract(key) == message.contract
+
+    async def authorize_runtime_message(self, key, message):
+        from deckr.action_runtime import validate_action_runtime_message
+        try:
+            validate_action_runtime_message(message)
+        except ValueError:
+            return False
+        return key is not None and self.current_contract(key) == message.contract and key.provider_session_id == message.sender_session_id
+
     async def send_runtime_message(
         self,
         provider_session_key: ProviderSessionKey,
@@ -369,6 +380,7 @@ class _BindingActionServiceHarness:
             provider_instance_id=key.provider_instance_id,
             provider_id=provider_id,
             name=descriptor.name if descriptor is not None else None,
+            descriptor=descriptor,
             provider_session_id=provider_session_id,
             provider_labels=provider_labels,
             settings_schema=(
@@ -563,6 +575,26 @@ def _action_instance_body(metadata: ActionInstanceSnapshot) -> dict:
     }
 
 
+def _page_wire_message(message_type, payload, target, *, sender_session_id=PROVIDER_SESSION_ID, contract=None):
+    from deckr.action_runtime import (
+        ACTION_RUNTIME_SERVICE_NAMESPACE,
+        action_runtime_message_name,
+    )
+    from deckr.contracts.messages import entity_subject
+    from deckr.services import ServiceMessageBody
+    from deckr.services.messages import service_message
+    name = action_runtime_message_name(message_type)
+    return service_message(
+        sender="service:action-runtime.python", sender_session_id=sender_session_id,
+        recipient=CONTROLLER_ADDR, recipient_session_id="controller-session",
+        subject=entity_subject("service", serviceId="action-runtime.python", namespace=ACTION_RUNTIME_SERVICE_NAMESPACE, name=name),
+        contract=contract or _contract_pointer_for_provider_session(sender_session_id),
+        body=ServiceMessageBody(serviceNamespace=ACTION_RUNTIME_SERVICE_NAMESPACE,
+            name=name, intent="command", exchangePattern="one_way",
+            params={**(payload or {}), "target": target}),
+    )
+
+
 def _action_command(
     message_type: str,
     payload: dict | None = None,
@@ -573,7 +605,10 @@ def _action_command(
     binding_id: str,
     page_session_id: str | None = None,
     contract: ContractPointer | None = None,
+    generation: int = 0,
 ) -> DeckrMessage:
+    if message_type in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
+        return _page_wire_message(message_type, payload, {"kind": "binding", "bindingId": binding_id, "generation": generation}, contract=contract)
     return action_message(
         sender=PROVIDER_ADDR,
         sender_session_id=PROVIDER_SESSION_ID,
@@ -593,6 +628,11 @@ def _action_command(
     )
 
 
+def _requirements():
+    return tuple({"name": name, "required": False, "preferences": [{"direction": direction}]}
+                 for name, direction in (("input", "input"), ("output", "output")))
+
+
 def _metadata(
     uuid: str,
     *,
@@ -605,6 +645,7 @@ def _metadata(
         provider_instance_id=provider_instance_id,
         provider_id=provider_id,
         provider_session_id=provider_session_id,
+        descriptor=ActionDescriptor(actionId=uuid, requirements=_requirements()),
     )
 
 
@@ -624,6 +665,7 @@ def _availability_entry(action_uuid: str) -> ActionAvailabilityEntry:
         descriptor=ActionDescriptor(
             actionId=action_uuid,
             providerId=PROVIDER_ID,
+            requirements=_requirements(),
         ),
     )
 
@@ -645,6 +687,7 @@ def _seed_action_availability(
                     descriptor=ActionDescriptor(
                         actionId=metadata.uuid,
                         providerId=metadata.provider_id,
+                        requirements=_requirements(),
                     ),
                 ),
             ),
@@ -712,6 +755,7 @@ async def _action_command_for_active_binding(
         action_instance_id=ctx.action_instance_id,
         binding_id=ctx.binding_id,
         page_session_id=ctx.page_session_id,
+        generation=ctx.metadata.output_generation,
     )
 
 
@@ -753,24 +797,30 @@ def _page_session_command(
     config_id: str = "test-device",
     sender_session_id: str = PROVIDER_SESSION_ID,
     contract: ContractPointer | None = None,
+    generation: int = 0,
 ) -> DeckrMessage:
-    return action_message(
-        sender=PROVIDER_ADDR,
-        sender_session_id=sender_session_id,
-        recipient=CONTROLLER_ADDR,
-        message_type=message_type,
-        body=payload,
-        subject=context_subject(
-            context_id,
-            provider_instance_id=PROVIDER_INSTANCE_ID,
-            provider_id=PROVIDER_ID,
-            config_id=config_id,
-            action_instance_id=action_instance_id,
-            page_session_id=session_id,
-        ),
-        contract=contract
-        or _contract_pointer_for_provider_session(sender_session_id),
-    )
+    if message_type not in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
+        return action_message(
+            sender=PROVIDER_ADDR,
+            sender_session_id=sender_session_id,
+            recipient=CONTROLLER_ADDR,
+            message_type=message_type,
+            body=payload,
+            subject=context_subject(
+                context_id,
+                provider_instance_id=PROVIDER_INSTANCE_ID,
+                provider_id=PROVIDER_ID,
+                config_id=config_id,
+                action_instance_id=action_instance_id,
+                page_session_id=session_id,
+            ),
+            contract=contract
+            or _contract_pointer_for_provider_session(sender_session_id),
+        )
+
+    return _page_wire_message(message_type, payload,
+        {"kind": "page_session", "pageSessionId": session_id, "generation": generation},
+        sender_session_id=sender_session_id, contract=contract)
 
 
 def _make_control(
@@ -980,6 +1030,9 @@ def _hardware_input(
 
 
 class FakeHardwareCommandService:
+    def has_authority(self, config_id, device_ref):
+        return True
+
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
@@ -2405,7 +2458,7 @@ async def test_attached_binding_survives_nonterminal_provider_session_unavailabl
 
 
 @pytest.mark.asyncio
-async def test_dynamic_page_owner_moves_to_successor_provider_session(
+async def test_dynamic_page_retires_when_owner_agreement_is_replaced(
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -2447,7 +2500,6 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
             assert child_ctx is not None
             child_lease = _binding_lease_for_control(manager, "1,0")
             assert child_lease is not None
-            action_instance = manager.snapshot().action_instances[session.action_instance_id]
             assert session.owner_provider_session_id == PROVIDER_SESSION_ID
             await _drain_action_messages(stream)
 
@@ -2465,47 +2517,13 @@ async def test_dynamic_page_owner_moves_to_successor_provider_session(
                     provider_session_id=successor_session_id,
                 ),
             )
+            old_key = ProviderSessionKey(PROVIDER_INSTANCE_ID, PROVIDER_ID, PROVIDER_SESSION_ID)
+            _action_service_for(manager)._contracts.pop(old_key)
             await manager.on_action_availability_changed(changed)
-
-            replacement_child_ctx = manager.context_for_control("1,0")
-            assert replacement_child_ctx is not None
-            assert replacement_child_ctx is not child_ctx
-            assert replacement_child_ctx.provider_session_id == successor_session_id
-            replacement_lease = _binding_lease_for_control(manager, "1,0")
-            assert replacement_lease is not None
-            assert replacement_lease.binding_id != child_lease.binding_id
-            assert replacement_lease.provider_session_id == successor_session_id
-            assert manager.active_page_session() is session
-            assert session.owner_provider_session_id == successor_session_id
-            assert (
-                manager.snapshot().action_instances[session.action_instance_id]
-                == action_instance
-            )
-            action_session = manager.snapshot().provider_session_keys[
-                session.action_instance_id
-            ]
-            assert action_session is not None
-            assert action_session.provider_session_id == successor_session_id
-
-            await manager.handle_provider_command(
-                _page_session_command(
-                    CLOSE_PAGE,
-                    {},
-                    session_id=session.page_session_id,
-                    context_id=session.context_id,
-                    action_instance_id=session.action_instance_id,
-                    sender_session_id=successor_session_id,
-                    contract=_contract_pointer_for_provider_session(
-                        successor_session_id
-                    ),
-                )
-            )
-
             assert manager.active_page_session() is None
             restored_ctx = manager.context_for_control("0,0")
             assert restored_ctx is not None
             assert restored_ctx.provider_session_id == successor_session_id
-
         tg.cancel_scope.cancel()
 
 

@@ -18,7 +18,8 @@ from deckr.actions.messages import (
     CLOSE_PAGE,
     ActionAvailabilityEntry,
     ActionDescriptor,
-    EmptyActionBody,
+    ClosePageBody,
+    PageSessionCommandTarget,
     context_subject,
 )
 from deckr.contracts.authority import ContractPointer
@@ -124,8 +125,9 @@ class _RuntimeLease:
             generation=generation,
         )
 
-    def _authority_pointer(self) -> ContractPointer:
-        return self._contract
+    @property
+    def state(self):
+        return SimpleNamespace(contract=self._contract, local_authority=True)
 
     async def send(self, name, *, params=None, event=None):
         return await self._services.send(
@@ -374,7 +376,7 @@ async def test_controller_action_service_registers_stops_and_restarts_runtime_ac
 
 
 @pytest.mark.asyncio
-async def test_controller_action_service_decodes_runtime_context_subject_messages():
+async def test_controller_action_service_rejects_runtime_context_subject_messages():
     descriptor = _service_descriptor(
         provider_session_id="provider-session-1",
         advertisement_id="first",
@@ -388,7 +390,7 @@ async def test_controller_action_service_decodes_runtime_context_subject_message
         services=services,
     )
     name = action_runtime_message_name(CLOSE_PAGE)
-    params, event = action_runtime_payload(name, EmptyActionBody())
+    params, event = action_runtime_payload(name, ClosePageBody(target=PageSessionCommandTarget(kind="page_session", pageSessionId="page-1", generation=0)))
     subject = context_subject(
         "ctx-1",
         provider_instance_id=PROVIDER_INSTANCE_ID,
@@ -427,11 +429,8 @@ async def test_controller_action_service_decodes_runtime_context_subject_message
             )
         )
 
-        assert decoded is not None
-        assert decoded.message_type == CLOSE_PAGE
-        assert decoded.subject == subject
-        assert decoded.body == {}
-        assert services.subject_kinds == ["context", "service"]
+        assert decoded is None
+        assert services.subject_kinds == []
         stopping.set()
         await service.aclose()
         tg.cancel_scope.cancel()

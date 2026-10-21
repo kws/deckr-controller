@@ -59,8 +59,7 @@ def _service(
 ) -> ControllerService:
     return ControllerService(
         endpoint=endpoint or _Endpoint(),
-        beacon=MagicMock(),
-        concord=MagicMock(),
+        hardware=MagicMock(),
         config_service=MagicMock(),
         settings_service=MagicMock(),
         controller_id=CONTROLLER_ID,

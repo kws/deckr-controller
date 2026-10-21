@@ -45,30 +45,6 @@ class DeviceRouteRegistry:
         self._config_by_ref[ref_key(ref)] = config_id
         return live
 
-    def update_descriptor(
-        self,
-        *,
-        ref: DeviceRef,
-        device: DeviceDescriptor,
-        contract: ContractPointer | None = None,
-        manager_session_id: str | None = None,
-    ) -> LiveDeviceRoute | None:
-        config_id = self._config_by_ref.get(ref_key(ref))
-        if config_id is None:
-            return None
-        current = self._devices_by_config.get(config_id)
-        live = LiveDeviceRoute(
-            config_id=config_id,
-            ref=ref,
-            device=device,
-            contract=contract if contract is not None else current.contract,
-            manager_session_id=manager_session_id
-            if manager_session_id is not None
-            else (current.manager_session_id if current is not None else None),
-        )
-        self._devices_by_config[config_id] = live
-        return live
-
     def disconnect_config(self, config_id: str) -> LiveDeviceRoute | None:
         live = self._devices_by_config.pop(config_id, None)
         if live is not None:

@@ -19,7 +19,7 @@ The Python implementation is the `deckr` distribution, developed in
 src/deckr/controller/
   config/      Configuration models and file-backed services
   invariant/   Rendering helpers and invariant integrations
-  _hardware/   Hardware discovery, claims, and controller routing
+  _hardware/   Controller policy and routes over managed core hardware
   _actions/    Action Runtime service integration
   action_provider/  Controller-side action lookup and builtins
 tests/
@@ -51,6 +51,40 @@ Run the default validation suite:
 uv run ruff check .
 uv run pytest
 ```
+
+## Managed runtime integration
+
+The controller targets Action Runtime **alpha.2** at the core source revision in
+`.deckr-core-revision`. Hardware discovery, agreements, recovery, event authorization,
+and command validation use the public `DeckrHardware` managed API. Controller
+code selects configurations and owns device routes. Material descriptor changes
+require a new hardware agreement; discovery refreshes do not replace a live claim.
+
+Action Runtime commands use canonical `services/serviceMessage` envelopes and
+public managed service authorization. `open_page` accepts a binding or page-session
+target; `replace_page` and `close_page` require a page-session target. Targets carry
+an expected generation. The controller serializes transitions and checks the
+retained owner, generation, hardware authority, and service agreement again after
+planning, immediately before committing. A successor agreement does not inherit
+a previous agreement's dynamic page. Capability selection uses the core matcher
+within the configured control scope. Omitted, null, and empty requirements grant
+no capabilities; actions must explicitly declare the capabilities they use.
+
+The default test suite includes managed hardware and Action Runtime integration
+on both the in-process transport and a real NATS JetStream broker. The development
+dependencies include the pinned NATS binary. Tests start isolated brokers on
+localhost with temporary storage and authentication, then shut them down; no
+running broker is required. The focused integration command is:
+
+```bash
+uv run pytest tests/test_hardware_service.py tests/test_hardware_endpoint_routing.py tests/test_action_runtime_integration.py
+```
+
+Coverage includes input and command validation, label-based configuration,
+agreement loss and recovery, descriptor replacement, distinct manager identities,
+page target and generation checks, control scope, lifecycle delivery, authority
+loss during planning, and shutdown. Rendering contract changes are a separate
+proposal; the existing controller rendering policy remains in place.
 
 ## Materialized Config
 

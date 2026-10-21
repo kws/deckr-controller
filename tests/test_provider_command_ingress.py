@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 from deckr.actions.endpoints import (
-    BUILTIN_ACTION_PROVIDER_ID,
     action_provider_address,
 )
 from deckr.actions.messages import (
@@ -245,105 +244,16 @@ async def test_binding_output_rejects_foreign_scope(changed) -> None:
 
 
 @pytest.mark.asyncio
-async def test_binding_and_page_commands_dispatch_with_exact_authority() -> None:
+@pytest.mark.parametrize("message_type", [OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE])
+async def test_legacy_page_ingress_cannot_bypass_service_boundary(message_type):
     host, _, ingress = _ingress()
-    descriptor = _descriptor()
-
-    await ingress.handle(_message(OPEN_PAGE, {"descriptor": descriptor.to_dict()}))
-
-    host.open_page.assert_awaited_once()
-    assert host.open_page.await_args.kwargs["binding_id"] == BINDING_ID
-
-    host.session = _page_session()
-    await ingress.handle(
-        _message(
-            REPLACE_PAGE,
-            {"descriptor": _descriptor("replacement").to_dict()},
-            binding=False,
-            page=True,
-        )
-    )
-    await ingress.handle(_message(CLOSE_PAGE, {}, binding=False, page=True))
-
-    host.replace_page.assert_awaited_once()
-    host.close_page.assert_awaited_once_with(
-        context_id=CONTEXT_ID,
-        reason="close",
-        causation_id=host.close_page.await_args.kwargs["causation_id"],
-    )
-
-
-@pytest.mark.asyncio
-async def test_inactive_binding_and_wrong_page_owner_have_no_authority() -> None:
-    host, _, ingress = _ingress()
-    host.binding_commands_authorized = False
-
-    await ingress.handle(_message(OPEN_PAGE, {"descriptor": _descriptor().to_dict()}))
-
-    host.open_page.assert_not_awaited()
-    host.session = _page_session()
-    host.session.owner_provider_instance_id = "provider-b"
-    await ingress.handle(_message(CLOSE_PAGE, {}, binding=False, page=True))
-
-    host.close_page.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_contract_mismatch_recovers_binding_but_stale_session_does_not() -> None:
-    host, _, ingress = _ingress()
-    host.contract_authorized = False
-
-    await ingress.handle(_message(OPEN_PAGE, {"descriptor": _descriptor().to_dict()}))
-
-    host.recover_binding_provider_session_contract.assert_awaited_once_with(
-        host.lease,
-        reason="openPage_contract_mismatch",
-    )
-    host.open_page.assert_not_awaited()
-
-    host.recover_binding_provider_session_contract.reset_mock()
-    host.message_contract_authorized.reset_mock()
-    await ingress.handle(
-        _message(
-            OPEN_PAGE,
-            {"descriptor": _descriptor().to_dict()},
-            sender_session_id="stale-session",
-        )
-    )
-
-    host.message_contract_authorized.assert_not_awaited()
-    host.recover_binding_provider_session_contract.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    "rejection_kind",
-    ("reserved_sender", "subject_mismatch"),
-)
-@pytest.mark.asyncio
-async def test_reserved_or_subject_mismatched_provider_is_rejected(
-    rejection_kind,
-) -> None:
-    host, _, ingress = _ingress()
-    message = _message(
-        OPEN_PAGE,
-        {"descriptor": _descriptor().to_dict()},
-        subject_provider_instance_id=(
-            "provider-b"
-            if rejection_kind == "subject_mismatch"
-            else PROVIDER_INSTANCE_ID
-        ),
-    )
-    if rejection_kind == "reserved_sender":
-        message = message.model_copy(
-            update={
-                "sender": f"action_provider:{BUILTIN_ACTION_PROVIDER_ID}",
-            }
-        )
-
+    body = BindingOutputBody(binding=_binding_metadata(), capability=CapabilityRef(
+        deviceRef=DEVICE_REF, controlId="key-1", capabilityId="raster.bitmap"), commandType="clear", generation=3)
+    message = _message(BINDING_OUTPUT, body.to_dict()).model_copy(update={"message_type": message_type})
     await ingress.handle(message)
-
-    host.message_contract_authorized.assert_not_awaited()
     host.open_page.assert_not_awaited()
+    host.replace_page.assert_not_awaited()
+    host.close_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio

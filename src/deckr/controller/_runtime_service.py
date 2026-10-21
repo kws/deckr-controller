@@ -127,8 +127,7 @@ class ControllerRuntimeService(BaseComponent):
 
             controller_service = ControllerService(
                 endpoint=self._endpoint,
-                beacon=self._beacon,
-                concord=self._concord,
+                hardware=self._context.hardware(self._endpoint),
                 config_service=config_service,
                 settings_service=settings_service,
                 controller_id=self._runtime.controller_id,

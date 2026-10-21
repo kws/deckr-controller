@@ -5,8 +5,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from deckr.contracts.messages import HARDWARE_MESSAGES_LANE, hardware_manager_address
-from deckr.hardware import messages as hw_messages
+from deckr.hardware import ManagedHardwareClaim
 from deckr.hardware.capabilities import (
     RasterBitmapEncoding,
     device_power_command_params,
@@ -16,9 +15,8 @@ from deckr.hardware.descriptors import (
     DECKR_DEVICE_POWER,
     CapabilityRef,
     DeviceDescriptor,
+    DeviceRef,
 )
-from deckr.hardware.validation import resolve_capability, validate_command
-from deckr.lanes import EndpointSession
 
 from deckr.controller._hardware._routes import LiveDeviceRoute
 
@@ -30,11 +28,11 @@ class HardwareCommandService:
 
     def __init__(
         self,
-        endpoint: EndpointSession,
         *,
         route_lookup: Callable[[str], LiveDeviceRoute | None],
+        claim_lookup: Callable[[str], ManagedHardwareClaim | None],
     ) -> None:
-        self._endpoint = endpoint
+        self._claim_lookup = claim_lookup
         self._route_lookup = route_lookup
 
     async def _live_for(self, config_id: str) -> LiveDeviceRoute | None:
@@ -140,28 +138,23 @@ class HardwareCommandService:
         command_type: str,
         params: Mapping[str, Any],
     ) -> None:
-        device = ref.device_ref
-        if device is None:
-            raise ValueError("hardware control commands require deviceRef")
-        body = hw_messages.ControlCommandMessage(
-            deviceRef=device,
-            controlId=ref.control_id,
-            capabilityId=ref.capability_id,
-            commandType=command_type,
-            params=dict(params),
-        )
-        capability = resolve_capability({device.device_id: live.device}, ref)
-        validate_command(capability, command_type, params)
-        if self._route_lookup(live.config_id) != live:
+        claim = self._claim_lookup(live.config_id)
+        if claim is None or claim.state.contract != live.contract:
             return
-        await self._endpoint.send(
-            lane=HARDWARE_MESSAGES_LANE,
-            recipient=hardware_manager_address(device.manager_id),
-            recipient_session_id=live.manager_session_id,
-            message_type=hw_messages.CONTROL_COMMAND,
-            body=hw_messages.hardware_body_to_dict(body),
-            subject=hw_messages.hardware_subject_for_capability(ref),
-            contract=live.contract,
+        await claim.command(
+            ref.device_ref.device_id,
+            ref.capability_id,
+            command_type,
+            control_id=ref.control_id,
+            params=params,
+        )
+
+    def has_authority(self, config_id: str, device_ref: DeviceRef) -> bool:
+        live = self._route_lookup(config_id)
+        return (
+            live is not None
+            and live.ref == device_ref
+            and self._claim_lookup(config_id) is not None
         )
 
 

@@ -13,6 +13,7 @@ import anyio
 from deckr.action_runtime import (
     ACTION_RUNTIME_SERVICE_NAMESPACE,
     ACTION_RUNTIME_SERVICE_PROTOCOL,
+    EVENT_MESSAGES,
     RUNTIME_TO_CONTROLLER_MESSAGES,
     ActionRuntimeAvailabilityViewPayload,
     action_availability_view_ref,
@@ -21,11 +22,16 @@ from deckr.action_runtime import (
     action_runtime_payload,
     action_runtime_provider_instance_id,
     legacy_action_message_type,
+    validate_action_runtime_message,
 )
 from deckr.actions.endpoints import RESERVED_BUILTIN_PROVIDER_IDS
-from deckr.actions.messages import ActionAvailabilityEntry, ActionMessageBody
+from deckr.actions.messages import (
+    ActionAvailabilityEntry,
+    ActionMessageBody,
+    action_body,
+)
 from deckr.contracts.authority import ContractPointer
-from deckr.contracts.messages import DeckrMessage, entity_subject, parse_service_address
+from deckr.contracts.messages import DeckrMessage, parse_service_address
 from deckr.services import (
     DeckrServices,
     ManagedService,
@@ -179,11 +185,57 @@ class ControllerActionService:
         if state is None:
             return None
         try:
-            if state.lease.descriptor.session_id != provider_session_key.provider_session_id:
+            if (
+                state.lease.descriptor.session_id
+                != provider_session_key.provider_session_id
+            ):
                 return None
-            return state.lease._authority_pointer()  # noqa: SLF001
+            return (
+                state.lease.state.contract
+                if state.lease.state.local_authority
+                else None
+            )
         except ServiceUnavailable:
             return None
+
+    async def authorize_runtime_message(
+        self,
+        key: ProviderSessionKey | None,
+        message: DeckrMessage,
+    ) -> bool:
+        state = self._runtime_leases.get(key)
+        if state is None:
+            return False
+        try:
+            validate_action_runtime_message(message)
+            body = ServiceMessageBody.from_wire(message.body)
+            await state.lease.authorize_inbound_message(message, name=body.name)
+        except (ServiceUnavailable, ValueError, TypeError):
+            return False
+        return True
+
+    async def authorize_decoded_message(
+        self,
+        key: ProviderSessionKey | None,
+        message: DeckrMessage,
+    ) -> bool:
+        try:
+            name = action_runtime_message_name(message.message_type)
+            params, event = action_runtime_payload(name, action_body(message))
+            body = ServiceMessageBody(
+                serviceNamespace=ACTION_RUNTIME_SERVICE_NAMESPACE,
+                name=name,
+                intent="event" if name in EVENT_MESSAGES else "command",
+                exchangePattern="one_way",
+                params=params,
+                event=event,
+            )
+            envelope = message.model_copy(
+                update={"message_type": "serviceMessage", "body": body.to_dict()}
+            )
+        except (ValueError, TypeError):
+            return False
+        return await self.authorize_runtime_message(key, envelope)
 
     async def send_runtime_message(
         self,
@@ -235,7 +287,9 @@ class ControllerActionService:
         try:
             body = service_body(deckr_message)
         except (TypeError, ValueError):
-            logger.warning("Ignoring invalid Action Runtime service message", exc_info=True)
+            logger.warning(
+                "Ignoring invalid Action Runtime service message", exc_info=True
+            )
             return None
         if body.service_namespace != ACTION_RUNTIME_SERVICE_NAMESPACE:
             return None
@@ -261,6 +315,8 @@ class ControllerActionService:
                     deckr_message,
                     body,
                 )
+            except ValueError:
+                return None
             except ServiceUnavailable as exc:
                 if service_unavailable_ends_service_use(exc):
                     self._drop_runtime_lease(state.key, state)
@@ -669,7 +725,9 @@ class ControllerActionService:
             )
             if provider_instance_id is None:
                 continue
-            candidates_by_service.setdefault(descriptor.service_id, []).append(descriptor)
+            candidates_by_service.setdefault(descriptor.service_id, []).append(
+                descriptor
+            )
         for service_id, candidates in sorted(candidates_by_service.items()):
             if service_id in self._service_watch_generations:
                 # The managed use owns its winner and recovery. Beacon changes
@@ -722,7 +780,8 @@ class ControllerActionService:
                     try:
                         async with services.use_matching(
                             ACTION_RUNTIME_SERVICE_PROTOCOL,
-                            predicate=lambda candidate: candidate.service_id == service_id,
+                            predicate=lambda candidate: candidate.service_id
+                            == service_id,
                             timeout_seconds=10.0,
                         ) as lease:
                             descriptor = lease.descriptor
@@ -1035,14 +1094,15 @@ class ControllerActionService:
             return None
         return ActionMetadata(
             uuid=key.action_uuid,
-            descriptor=descriptor or (
+            descriptor=descriptor
+            or (
                 existing_metadata.descriptor if existing_metadata is not None else None
             ),
             provider_instance_id=key.provider_instance_id,
             provider_id=provider_id,
-            name=descriptor.name if descriptor is not None else (
-                existing_metadata.name if existing_metadata is not None else None
-            ),
+            name=descriptor.name
+            if descriptor is not None
+            else (existing_metadata.name if existing_metadata is not None else None),
             provider_session_id=provider_session_id,
             provider_labels=(
                 existing_metadata.provider_labels
@@ -1081,32 +1141,8 @@ async def _authorize_inbound_action_runtime_message(
     message: DeckrMessage,
     body: ServiceMessageBody,
 ) -> ServiceMessageBody:
-    try:
-        return await state.lease.authorize_inbound_message(
-            message,
-            name=body.name,
-        )
-    except ServiceUnavailable as exc:
-        if exc.code != "invalid_service_response" or message.subject.kind != "context":
-            raise
-
-    # Runtime commands keep their action context subject for downstream routing;
-    # validate the service-use envelope by temporarily applying its service subject.
-    descriptor = state.lease.descriptor
-    service_scoped_message = message.model_copy(
-        update={
-            "subject": entity_subject(
-                "service",
-                serviceId=descriptor.service_id,
-                namespace=descriptor.namespace,
-                name=body.name,
-            )
-        }
-    )
-    return await state.lease.authorize_inbound_message(
-        service_scoped_message,
-        name=body.name,
-    )
+    validate_action_runtime_message(message)
+    return await state.lease.authorize_inbound_message(message, name=body.name)
 
 
 def _provider_id_from_descriptor(descriptor: ServiceDescriptor) -> str | None:

@@ -3,23 +3,24 @@ from collections.abc import Callable
 
 import anyio
 from deckr.actions.messages import (
+    CLOSE_PAGE,
     COMMAND_MESSAGE_TYPES,
-    subject_config_id,
+    OPEN_PAGE,
+    REPLACE_PAGE,
 )
-from deckr.beacon import Beacon
 from deckr.components import BaseComponent, RunContext
-from deckr.concord import Concord
 from deckr.contracts.messages import (
     SERVICES_LANE,
     DeckrMessage,
 )
 from deckr.core.util.anyio import AsyncMap
+from deckr.hardware import DeckrHardware
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor
 from deckr.lanes import EndpointSession
 
 from deckr.controller._actions import ControllerActionService, ProviderActionKey
-from deckr.controller._actions._routing import contextualize_action_command
+from deckr.controller._actions._routing import action_command_metadata
 from deckr.controller._device_manager import DeviceManager
 from deckr.controller._hardware import (
     ControllerHardwareService,
@@ -41,8 +42,7 @@ class ControllerService(BaseComponent):
     def __init__(
         self,
         endpoint: EndpointSession,
-        beacon: Beacon,
-        concord: Concord,
+        hardware: DeckrHardware,
         config_service: DeviceConfigService,
         settings_service: SettingsService,
         *,
@@ -58,9 +58,7 @@ class ControllerService(BaseComponent):
         self._controller_id = controller_id
         self._session_id = endpoint.session_id
         self._hardware = ControllerHardwareService(
-            endpoint=endpoint,
-            beacon=beacon,
-            concord=concord,
+            hardware=hardware,
             config_service=config_service,
             callbacks=self,
         )
@@ -77,15 +75,23 @@ class ControllerService(BaseComponent):
         self._render_backend = render_backend
         self._stopping: anyio.Event | None = None
 
-    async def _handle_action_command(self, msg: DeckrMessage) -> None:
+    async def _handle_action_command(
+        self, msg: DeckrMessage, *, service_message: DeckrMessage | None = None
+    ) -> None:
         """Route command messages to the appropriate DeviceManager."""
         if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
-        msg = contextualize_action_command(msg)
-        config_id = subject_config_id(msg.subject)
+        if msg.message_type in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
+            if service_message is not None:
+                for context in await self._controller_contexts.values():
+                    if await context.handle_page_command(service_message):
+                        break
+            return
+        metadata = action_command_metadata(msg)
+        config_id = metadata.config_id if metadata is not None else None
         if config_id is None:
             logger.warning(
-                "Ignoring action command %s without config subject from %s",
+                "Ignoring action command %s without routing metadata from %s",
                 msg.message_type,
                 msg.sender,
             )
@@ -127,7 +133,9 @@ class ControllerService(BaseComponent):
                     if action_runtime_message is None:
                         continue
                     if action_runtime_message.message_type in COMMAND_MESSAGE_TYPES:
-                        await self._handle_action_command(action_runtime_message)
+                        await self._handle_action_command(
+                            action_runtime_message, service_message=event
+                        )
                 except Exception:
                     if isinstance(event, DeckrMessage):
                         logger.exception(

@@ -40,7 +40,8 @@ async def test_action_registry_loads_builtin_actions() -> None:
     descriptor = await registry.get_action_descriptor(BUILTIN_ACTION_UUID)
     assert descriptor is not None
     assert descriptor.requirements is not None
-    assert descriptor.requirements[0].event_types == ("up", "press", "tap")
+    assert descriptor.requirements[0].event_types == ()
+    assert [p.event_types for p in descriptor.requirements[0].preferences] == [("up",), ("press",), ("tap",)]
 
 
 @pytest.mark.asyncio

@@ -119,6 +119,7 @@ def _page_metadata(session: DynamicPageSession) -> PageSessionMetadata:
         configId=CONFIG_ID,
         pageId=session.page_id,
         pageSessionId=session.page_session_id,
+        generation=session.generation,
         contextId=session.context_id,
         ownerBindingId=session.owner_binding_id,
     )

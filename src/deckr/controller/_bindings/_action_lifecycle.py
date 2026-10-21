@@ -19,7 +19,6 @@ from deckr.actions.messages import (
     ActionLifecycleRejectedBody,
     PageSessionLifecycleBody,
     PageSessionMetadata,
-    subject_action_instance_id,
 )
 from deckr.contracts.authority import ContractPointer
 from deckr.contracts.messages import DeckrMessage
@@ -175,6 +174,7 @@ def _page_session_matches_metadata(
         and metadata.action_instance_id == session.action_instance_id
         and metadata.page_id == session.page_id
         and metadata.page_session_id == session.page_session_id
+        and metadata.generation == session.generation
         and metadata.context_id == session.context_id
         and metadata.owner_binding_id == session.owner_binding_id
     )
@@ -649,12 +649,6 @@ class ActionInstanceLifecycleService:
         if metadata.config_id != self._config_id or metadata.context_id != context_id:
             return False
         if metadata.provider_instance_id != sender_provider_instance_id:
-            return False
-        action_instance_id = subject_action_instance_id(msg.subject)
-        if (
-            action_instance_id is not None
-            and action_instance_id != metadata.action_instance_id
-        ):
             return False
         stored = self._action_instances.get(metadata.action_instance_id)
         if stored is None or not _action_instance_matches_metadata(stored, metadata):

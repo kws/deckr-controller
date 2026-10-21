@@ -1,6 +1,6 @@
 import logging
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -320,6 +320,7 @@ class ControlBindingService:
         page_timeout_check_interval: float = 0.25,
     ):
         self._controller_id = controller_id
+        self._endpoint = actions_bus
         self.device = device
         self.hardware_ref = hardware_ref
         self.config_id = config.id
@@ -920,7 +921,7 @@ class ControlBindingService:
     ) -> tuple[MatchedCapability, ...]:
         from deckr.controller._capability_matching import matched_capabilities
 
-        return matched_capabilities(binding, action_meta.requirements, self.hardware_ref)
+        return matched_capabilities(binding, action_meta.requirements, self.hardware_ref, self.device)
 
     def _action_metadata_with_current_session(
         self,
@@ -1206,8 +1207,7 @@ class ControlBindingService:
         msg: DeckrMessage,
         key: ProviderSessionKey | None,
     ) -> bool:
-        expected = self.current_contract(key)
-        return expected is not None and msg.contract == expected
+        return await self._action_service.authorize_decoded_message(key, msg)
 
     def _provider_lifecycle_recovery_key(
         self,
@@ -1740,6 +1740,7 @@ class ControlBindingService:
             configId=self.config_id,
             pageId=session.page_id,
             pageSessionId=session.page_session_id,
+            generation=session.generation,
             contextId=session.context_id,
             ownerBindingId=session.owner_binding_id,
             bindings=bindings,
@@ -1784,6 +1785,7 @@ class ControlBindingService:
         *,
         causation_id: str | None = None,
         apply_effects: bool = True,
+        validate_commit: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[bool, PageTransitionEffects | None]:
         plan = await self._build_page_plan(
             draft.entry,
@@ -1794,12 +1796,14 @@ class ControlBindingService:
         )
         if plan is None:
             return False, None
-        await self._commit_page_plan(
-            plan,
-            departing=draft.departing,
+        if validate_commit is not None:
+            await validate_commit()
+        commit = self._prepare_page_commit(
+            plan, departing=draft.departing,
             preserve_rebound_outputs=draft.preserve_rebound_outputs,
         )
         effects = self._pages.commit(draft, plan)
+        await self._apply_page_commit(commit)
         self._sync_top_frame_state()
         if apply_effects:
             await self._apply_page_transition_effects(
@@ -2092,6 +2096,7 @@ class ControlBindingService:
                     page_session_id=owner_lease.page_session_id,
                     settings_target=owner_lease.settings_target,
                     action_descriptor=owner_lease.action_descriptor,
+                    contract=owner_lease.context.contract,
                 ),
             )
             if draft is None or draft.page_session is None:
@@ -2135,6 +2140,7 @@ class ControlBindingService:
             )
             if ok:
                 self._pages.record_activity()
+                await self._lifecycle.emit_page_opened(draft.page_session, causation_id=causation_id)
 
     async def close_page(
         self,
@@ -2260,6 +2266,18 @@ class ControlBindingService:
         """Refresh the current page availability overlay after provider availability changes."""
         changed_key_set = frozenset(changed_keys)
         async with self._nav_lock:
+            session = self.active_page_session()
+            if session is not None and session.owner_contract is not None:
+                key = self.provider_session_key_for_session(
+                    provider_instance_id=session.owner_provider_instance_id,
+                    provider_id=session.owner_provider_id,
+                    provider_session_id=session.owner_provider_session_id,
+                )
+                if self.current_contract(key) != session.owner_contract:
+                    await self._close_page_locked(
+                        context_id=session.context_id, reason="owner_agreement_lost",
+                    )
+                    return
             draft = self._pages.begin_refresh_current(
                 refresh_actions=True,
                 preserve_rebound_outputs=False,
@@ -2439,10 +2457,6 @@ class ControlBindingService:
         reason: str = "provider_session_changed",
     ) -> None:
         action_instance_id = lease.action_instance_id
-        preserve_page_owner = self._lease_is_active_dynamic_page_owner(
-            lease,
-            planned.action_meta,
-        )
         await self._revoke_binding(
             lease.binding_id,
             clear_output=False,
@@ -2450,55 +2464,10 @@ class ControlBindingService:
             reason=reason,
             clear_held_input=True,
         )
-        if preserve_page_owner and planned.action_meta is not None:
-            self._move_dynamic_page_owner_provider_session(planned.action_meta)
-            self._lifecycle.move_action_instance_provider_session(
-                action_instance_id,
-                planned.action_meta,
-            )
-        else:
-            await self._lifecycle.destroy_action_instance(
-                action_instance_id,
-                reason=reason,
-                notify_provider=True,
-            )
+        await self._lifecycle.destroy_action_instance(
+            action_instance_id, reason=reason, notify_provider=True,
+        )
         await self._install_planned_binding(plan, planned)
-
-    def _lease_is_active_dynamic_page_owner(
-        self,
-        lease: BindingLease,
-        action_meta: ActionMetadata | None,
-    ) -> bool:
-        session = self._pages.active_dynamic_session()
-        return (
-            session is not None
-            and action_meta is not None
-            and lease.page_session_id == session.page_session_id
-            and lease.action_instance_id == session.action_instance_id
-            and action_meta.uuid == session.owner_action_uuid
-            and action_meta.provider_instance_id == session.owner_provider_instance_id
-        )
-
-    def _move_dynamic_page_owner_provider_session(
-        self,
-        action_meta: ActionMetadata,
-    ) -> None:
-        session = self._pages.active_dynamic_session()
-        if session is None:
-            return
-        old_provider_session_id = session.owner_provider_session_id
-        if not self._pages.move_owner_provider_session(action_meta):
-            return
-        logger.info(
-            "Moving dynamic page owner provider session config=%s pageSession=%s "
-            "action=%s provider=%s oldSession=%s newSession=%s",
-            self.config_id,
-            session.page_session_id,
-            session.owner_action_uuid,
-            session.owner_provider_instance_id,
-            old_provider_session_id,
-            action_meta.provider_session_id,
-        )
 
     async def on_config_changed(self, config: DeviceConfig | None) -> None:
         """Handle config update or removal."""
@@ -2534,8 +2503,15 @@ class ControlBindingService:
                 self._sync_top_frame_state()
                 return
 
+    async def handle_page_command(self, message: DeckrMessage) -> bool:
+        from deckr.controller._bindings._page_commands import handle_page_command
+        return await handle_page_command(self, message)
+
     async def handle_provider_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from an action provider."""
+        if msg.lane == "services" and msg.message_type == "serviceMessage":
+            await self.handle_page_command(msg)
+            return
         await self._command_ingress.handle(msg)
 
     async def handle_hardware_input(self, message: DeckrMessage):

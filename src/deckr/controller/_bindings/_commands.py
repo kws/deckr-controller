@@ -28,12 +28,6 @@ from deckr.actions.messages import (
     BindingOverlayClearBody,
     DynamicPageCommand,
     action_body_dict,
-    subject_action_instance_id,
-    subject_binding_id,
-    subject_config_id,
-    subject_context_id,
-    subject_page_session_id,
-    subject_provider_instance_id,
 )
 from deckr.contracts.messages import DeckrMessage, parse_service_address
 from deckr.hardware.capabilities import (
@@ -43,7 +37,7 @@ from deckr.hardware.capabilities import (
 from pydantic import ValidationError
 
 from deckr.controller._actions import ProviderSessionKey
-from deckr.controller._actions._routing import contextualize_action_command
+from deckr.controller._actions._routing import action_command_metadata
 from deckr.controller._bindings._action_lifecycle import (
     ActionInstanceLifecycleService,
 )
@@ -118,22 +112,6 @@ class ProviderCommandHost(Protocol):
         reason: str = "close",
         causation_id: str | None = None,
     ) -> None: ...
-
-
-def _descriptor_from_payload(data: dict) -> DynamicPageCommand | None:
-    """Validate a dynamic page descriptor from a bus payload."""
-    if not data:
-        return None
-    bindings_data = data.get("bindings")
-    if not bindings_data:
-        return None
-    try:
-        return DynamicPageCommand.model_validate(data)
-    except ValidationError:
-        logger.warning(
-            "Ignoring invalid dynamic page descriptor payload", exc_info=True
-        )
-        return None
 
 
 def _binding_output_image_source(params: Mapping[str, Any]) -> str | None:
@@ -241,7 +219,7 @@ class ProviderCommandIngress:
     async def handle(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from an action provider."""
         try:
-            msg = contextualize_action_command(msg)
+            metadata = action_command_metadata(msg)
             payload = action_body_dict(msg)
         except (ValidationError, ValueError):
             self._logger.warning(
@@ -252,11 +230,13 @@ class ProviderCommandIngress:
             )
             return
         msg_type = msg.message_type
+        if msg_type in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
+            return
 
-        context_id = subject_context_id(msg.subject) or ""
+        context_id = metadata.context_id if metadata is not None else ""
         if not context_id:
             return
-        config_id = subject_config_id(msg.subject)
+        config_id = metadata.config_id if metadata is not None else None
         if config_id != self._host.config_id:
             return
 
@@ -291,55 +271,6 @@ class ProviderCommandIngress:
             context_id=context_id,
         )
         if authorization is None:
-            return
-
-        if msg_type == OPEN_PAGE:
-            if authorization.binding is None:
-                self._logger.warning(
-                    "Ignoring open_page without binding authority for %s",
-                    context_id,
-                )
-                return
-            desc_data = payload.get("descriptor")
-            descriptor = _descriptor_from_payload(desc_data) if desc_data else None
-            if descriptor is not None:
-                await self._host.open_page(
-                    descriptor=descriptor,
-                    context_id=context_id,
-                    binding_id=authorization.binding.binding_id,
-                    causation_id=msg.message_id,
-                )
-            return
-
-        if msg_type == REPLACE_PAGE:
-            if authorization.page_session is None:
-                self._logger.warning(
-                    "Ignoring replace_page without page-session authority for %s",
-                    context_id,
-                )
-                return
-            desc_data = payload.get("descriptor")
-            descriptor = _descriptor_from_payload(desc_data) if desc_data else None
-            if descriptor is not None:
-                await self._host.replace_page(
-                    descriptor=descriptor,
-                    context_id=authorization.page_session.context_id,
-                    causation_id=msg.message_id,
-                )
-            return
-
-        if msg_type == CLOSE_PAGE:
-            if authorization.page_session is None:
-                self._logger.warning(
-                    "Ignoring close_page without page-session authority for %s",
-                    context_id,
-                )
-                return
-            await self._host.close_page(
-                context_id=authorization.page_session.context_id,
-                reason="close",
-                causation_id=msg.message_id,
-            )
             return
 
         if msg_type == BINDING_OUTPUT:
@@ -405,19 +336,22 @@ class ProviderCommandIngress:
         if sender_provider_instance_id is None:
             return None
 
-        action_instance_id = subject_action_instance_id(msg.subject)
-        binding_id = subject_binding_id(msg.subject)
-        page_session_id = subject_page_session_id(msg.subject)
-        subject_provider_id = subject_provider_instance_id(msg.subject)
+        metadata = action_command_metadata(msg)
+        if metadata is None:
+            return None
+        action_instance_id = metadata.action_instance_id
+        binding_id = getattr(metadata, "binding_id", None)
+        page_session_id = getattr(metadata, "page_session_id", None)
+        metadata_provider_id = metadata.provider_instance_id
         if (
-            subject_provider_id is not None
-            and subject_provider_id != sender_provider_instance_id
+            metadata_provider_id is not None
+            and metadata_provider_id != sender_provider_instance_id
         ):
             self._logger.warning(
-                "Ignoring action command %s from %s with mismatched subject provider %s",
+                "Ignoring action command %s from %s with mismatched metadata provider %s",
                 msg.message_type,
                 msg.sender,
-                subject_provider_id,
+                metadata_provider_id,
             )
             return None
 

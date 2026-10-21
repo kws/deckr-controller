@@ -13,7 +13,6 @@ from deckr.actions.messages import (
     CapabilityRequirementSelector,
 )
 from deckr.hardware.descriptors import (
-    CONTROL_ACTIVATION_EVENTS,
     DECKR_INPUT_BUTTON,
     DECKR_INPUT_TOUCH,
 )
@@ -96,6 +95,5 @@ def _activation_input_requirement() -> CapabilityRequirement:
                 eventTypes=("tap",),
             ),
         ),
-        eventTypes=CONTROL_ACTIVATION_EVENTS,
         views=("native",),
     )

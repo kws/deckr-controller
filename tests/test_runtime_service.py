@@ -246,6 +246,7 @@ async def test_controller_runtime_keeps_controller_endpoint_open_until_children_
             concord=deckr.concord,
             kv_bucket_for=deckr.kv_bucket,
             endpoint_for=open_endpoint,
+            hardware_for=deckr.hardware,
         )
         service = ControllerRuntimeService(
             runtime_name="dev.deckr.controller:main",
