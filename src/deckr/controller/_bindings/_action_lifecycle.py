@@ -231,17 +231,6 @@ class ActionInstanceLifecycleService:
             return existing.context_id
         return None
 
-    def move_action_instance_provider_session(
-        self,
-        action_instance_id: str,
-        action_meta: ActionMetadata,
-    ) -> None:
-        self._action_instance_provider_sessions[action_instance_id] = (
-            None
-            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-            else provider_session_key(action_meta)
-        )
-
     async def ensure_action_instance(
         self,
         *,
@@ -251,10 +240,20 @@ class ActionInstanceLifecycleService:
     ) -> None:
         existing = self._action_instances.get(action_instance_id)
         had_existing = existing is not None
-        if existing is not None and _action_instance_matches_action(
-            existing,
-            action_meta,
-            config_id=self._config_id,
+        session_key = (
+            None
+            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+            else provider_session_key(action_meta)
+        )
+        if (
+            existing is not None
+            and _action_instance_matches_action(
+                existing,
+                action_meta,
+                config_id=self._config_id,
+            )
+            and self._action_instance_provider_sessions.get(action_instance_id)
+            == session_key
         ):
             return
         if existing is not None:
@@ -274,11 +273,7 @@ class ActionInstanceLifecycleService:
         self._action_instance_providers[action_instance_id] = (
             action_meta.provider_instance_id
         )
-        provider_session_key_for_action = (
-            None
-            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
-            else provider_session_key(action_meta)
-        )
+        provider_session_key_for_action = session_key
         self._action_instance_provider_sessions[action_instance_id] = (
             provider_session_key_for_action
         )

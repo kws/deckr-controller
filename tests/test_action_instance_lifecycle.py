@@ -268,7 +268,7 @@ def _rejection_message(
 
 
 @pytest.mark.asyncio
-async def test_create_destroy_and_provider_session_movement() -> None:
+async def test_provider_restart_recreates_instance_for_new_session() -> None:
     host, sender, _, lifecycle = _service()
 
     await lifecycle.ensure_action_instance(
@@ -280,16 +280,28 @@ async def test_create_destroy_and_provider_session_movement() -> None:
     assert lifecycle.has_action_instance(ACTION_INSTANCE_ID)
     assert sender.messages[0].message_type == ACTION_INSTANCE_CREATED
     assert sender.messages[0].provider_session_key == _session_key()
+    # An already-created instance is idempotent within this live session.
+    await lifecycle.ensure_action_instance(
+        action_meta=_action_metadata(),
+        action_instance_id=ACTION_INSTANCE_ID,
+        context_id=CONTEXT_ID,
+    )
+    assert len(sender.messages) == 1
 
     successor_key = _session_key("provider-session-b")
     host.contracts[successor_key] = ContractPointer(
         contractId="contract-b",
         generation=1,
     )
-    lifecycle.move_action_instance_provider_session(
-        ACTION_INSTANCE_ID,
-        _action_metadata(session_id=successor_key.provider_session_id),
+    host.contracts.pop(_session_key())
+    await lifecycle.ensure_action_instance(
+        action_meta=_action_metadata(session_id=successor_key.provider_session_id),
+        action_instance_id=ACTION_INSTANCE_ID,
+        context_id=CONTEXT_ID,
     )
+    assert len(sender.messages) == 2
+    assert sender.messages[-1].message_type == ACTION_INSTANCE_CREATED
+    assert sender.messages[-1].provider_session_key == successor_key
     await lifecycle.destroy_action_instance(ACTION_INSTANCE_ID, reason="test")
 
     assert not lifecycle.has_action_instance(ACTION_INSTANCE_ID)
