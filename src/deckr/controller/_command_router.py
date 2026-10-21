@@ -88,6 +88,7 @@ class DeviceOutput:
             self._control_id,
             self._capability_id,
             frame,
+            **({"expected_claim": self._claim} if self._claim is not None else {}),
         )
         self.last_frame = frame
 
@@ -101,6 +102,7 @@ class DeviceOutput:
             self._config_id,
             self._control_id,
             self._capability_id,
+            **({"expected_claim": self._claim} if self._claim is not None else {}),
         )
         self.last_frame = None
 
@@ -153,6 +155,22 @@ class CommandRouter:
         self._output = output
         self._image_format = image_format
         self._start_soon = start_soon
+
+    @property
+    def store(self):
+        return self._store
+
+    @property
+    def output(self):
+        return self._output
+
+    @property
+    def render_service(self):
+        return self._render_service
+
+    @property
+    def image_format(self):
+        return self._image_format
 
     async def _render(
         self,

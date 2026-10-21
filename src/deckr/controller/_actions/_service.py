@@ -142,6 +142,14 @@ class ControllerActionService:
             await self._services.aclose()
             self._services = None
 
+    def _sync_local_catalog(self) -> None:
+        catalog = getattr(self.manager, "catalog_snapshot", None)
+        if catalog is not None:
+            snapshot = catalog()
+            if isinstance(snapshot, tuple | list):
+                for metadata in snapshot:
+                    self._cache.record_available(metadata, now=self._clock())
+
     def planning_snapshot(
         self,
         intents: Iterable[ActionIntentKey],
@@ -149,6 +157,7 @@ class ControllerActionService:
         existing_provider_keys: Iterable[ProviderActionKey] = (),
         now: float | None = None,
     ) -> ActionPlanningSnapshot:
+        self._sync_local_catalog()
         return self._cache.planning_snapshot(
             intents,
             stale_provider_keys=existing_provider_keys,
@@ -165,6 +174,7 @@ class ControllerActionService:
         provider_labels: Mapping[str, str] | None = None,
         now: float | None = None,
     ) -> SettingsActionMetadata:
+        self._sync_local_catalog()
         return self._cache.settings_metadata_for_intent(
             ActionIntentKey(
                 action_uuid=action_uuid,

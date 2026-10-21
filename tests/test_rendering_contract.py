@@ -2,6 +2,7 @@
 
 import base64
 import io
+from dataclasses import replace
 
 import anyio
 import pytest
@@ -46,8 +47,9 @@ def parameters(h, *, text="Kitchen", operation="set"):
 
 def real_backend(h, backend=None):
     backend = backend or ThreadRenderBackend()
-    h.device._bindings._render_backend = backend
-    h.device._bindings._render_dispatcher._backend = backend
+    h.device._render_backend = backend
+    h.device._rendering.ports = replace(h.device._rendering.ports, backend=backend)
+    h.device._render_dispatcher._backend = backend
     return backend
 
 
@@ -165,9 +167,7 @@ async def test_old_render_cannot_overwrite_newer_clear(managed_substrate):
         assert (await result_for(h, clear))["status"] == "dispatched"
         assert (await result_for(h, old))["status"] == "superseded"
         backend.gates[0].set()
-        await eventually(
-            lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0
-        )
+        await eventually(lambda: h.device._rendering.active.get("key-1", 0) == 0)
         assert h.commands.await_count == 1
         assert h.commands.await_args.args[0].message.body["commandType"] == "clear"
 
@@ -188,9 +188,7 @@ async def test_newer_failure_does_not_restore_old_render(managed_substrate):
         assert (await result_for(h, newer))["status"] == "failed"
         assert (await result_for(h, old))["status"] == "superseded"
         backend.gates[0].set()
-        await eventually(
-            lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0
-        )
+        await eventually(lambda: h.device._rendering.active.get("key-1", 0) == 0)
         assert h.commands.await_count == 0
 
 
@@ -241,7 +239,7 @@ def direct_parameters(h, *, image=None, operation="set_frame"):
 
 
 async def drained(h):
-    await eventually(lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0)
+    await eventually(lambda: h.device._rendering.active.get("key-1", 0) == 0)
 
 
 @pytest.mark.asyncio
@@ -331,9 +329,7 @@ async def test_overlay_change_during_base_render_and_clear_preserves_overlay(
         assert result["status"] == "dispatched", result
         backend.gates[1].set()  # The previous retained base must not return.
         await eventually(
-            lambda: h.device._bindings._render_dispatcher._controls[
-                "key-1"
-            ].active_render_count
+            lambda: h.device._render_dispatcher._controls["key-1"].active_render_count
             == 0
         )
         assert h.commands.await_count == 1
@@ -385,7 +381,7 @@ async def test_authority_rechecked_after_output_lock(managed_substrate, monkeypa
         h.commands.reset_mock()
         request = await h.channel.send("binding_render", parameters(h))
         await eventually(lambda: len(backend.started) == 1)
-        host = h.device._bindings
+        host = h.device
         async with host._render_dispatcher._controls["key-1"].io_lock:
             backend.gates[0].set()
             await eventually(
@@ -510,13 +506,13 @@ def test_non_square_orientation_and_static_image_validation():
 
 
 @pytest.mark.asyncio
-async def test_overlay_update_waits_for_in_progress_send(
+async def test_overlay_update_commits_during_send_and_recomposes_accepted_base(
     managed_substrate, monkeypatch
 ):
     async with running_controller(managed_substrate, with_output=True) as h:
         real_backend(h)
         h.commands.reset_mock()
-        host = h.device._bindings
+        host = h.device
         router = h.device.context_for_control("key-1")._router
         sending, release, overlay_attempt = anyio.Event(), anyio.Event(), anyio.Event()
         send = host._command_service.set_raster_frame
@@ -551,13 +547,16 @@ async def test_overlay_update_waits_for_in_progress_send(
         )
         with anyio.fail_after(1):
             await overlay_attempt.wait()
-        assert router._store.overlay is None
+        await eventually(lambda: router.store.overlay is not None)
+        assert h.commands.await_count == 0
         release.set()
         assert (await result_for(h, request))["status"] == "dispatched"
         await eventually(lambda: h.commands.await_count == 2)
         assert router._store.overlay.template == "ok"
+        assert router.store.content.image is not None
         images = [
-            call.args[0].message.body["params"]["image"] for call in h.commands.await_args_list
+            call.args[0].message.body["params"]["image"]
+            for call in h.commands.await_args_list
         ]
         assert images[0] != images[1]
 
@@ -575,16 +574,14 @@ async def test_deadline_cancels_waiting_local_send(managed_substrate, monkeypatc
         real_backend(h)
         h.commands.reset_mock()
         entered, release = anyio.Event(), anyio.Event()
-        send = h.device._bindings._command_service.set_raster_frame
+        send = h.device._command_service.set_raster_frame
 
         async def blocked_send(*args, **kwargs):
             entered.set()
             await release.wait()
             await send(*args, **kwargs)
 
-        monkeypatch.setattr(
-            h.device._bindings._command_service, "set_raster_frame", blocked_send
-        )
+        monkeypatch.setattr(h.device._command_service, "set_raster_frame", blocked_send)
         request = await h.channel.send("binding_render", parameters(h))
         with anyio.fail_after(1):
             await entered.wait()
@@ -621,14 +618,14 @@ async def test_direct_frames_do_not_require_rendering_support(
 async def test_concurrent_duplicate_admission_is_atomic(managed_substrate):
     async with running_controller(managed_substrate, with_output=True) as h:
         backend = real_backend(h, GatedBackend())
-        host = h.device._bindings
+        host = h.device
         h.commands.reset_mock()
         async with anyio.create_task_group() as tg:
-            async with host._nav_lock:
+            async with host.boundary:
                 request = await h.channel.send("binding_render", parameters(h))
                 tg.start_soon(host.handle_render_command, request)
                 tg.start_soon(host.handle_render_command, request)
-                await eventually(lambda: host._nav_lock.statistics().tasks_waiting >= 2)
+                await eventually(lambda: host.boundary.statistics().tasks_waiting >= 2)
             await eventually(lambda: len(backend.started) == 1)
             backend.gates[0].set()
             assert (await result_for(h, request))["status"] == "dispatched"

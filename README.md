@@ -90,7 +90,7 @@ target_controller_id = "controller-main"
 ```
 
 The watcher publishes a complete projection for the target controller.
-See [configuration and settings](docs/architecture.md#3-configuration-and-settings) for storage and activation behavior.
+See [configuration and recovery policies](docs/architecture.md#disconnection-configuration-and-recovery-policies) for storage and activation behavior.
 
 ## Releases
 

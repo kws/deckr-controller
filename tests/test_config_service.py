@@ -1,5 +1,7 @@
 """Tests for FileBackedDeviceConfigService subscribe and matching behavior."""
 
+from unittest.mock import AsyncMock
+
 import anyio
 import pytest
 import yaml
@@ -7,6 +9,62 @@ from deckr.components import RunContext
 
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.config._service import FileBackedDeviceConfigService
+
+
+@pytest.mark.asyncio
+async def test_materialized_snapshot_retries_failure_without_source_changes(tmp_path):
+    config = _make_config("dev1")
+    (tmp_path / "dev1.yml").write_text(_config_to_yaml(config))
+    publisher = AsyncMock()
+    publisher.publish_configs.side_effect = [RuntimeError("offline"), None]
+    service = FileBackedDeviceConfigService(tmp_path, materialized_publisher=publisher)
+    await service.refresh()
+    await service.refresh()
+    await service.refresh()
+    assert publisher.publish_configs.await_count == 2
+    publisher.publish_configs.assert_awaited_with((config,))
+
+
+@pytest.mark.asyncio
+async def test_materialized_initial_empty_snapshot_requires_a_successful_scan(tmp_path):
+    source = tmp_path / "configs"
+    publisher = AsyncMock()
+    service = FileBackedDeviceConfigService(source, materialized_publisher=publisher)
+    await service.refresh()
+    publisher.publish_configs.assert_not_awaited()
+    source.mkdir()
+    await service.refresh()
+    await service.refresh()
+    publisher.publish_configs.assert_awaited_once_with(())
+
+
+@pytest.mark.asyncio
+async def test_materialized_snapshot_publication_preserves_source_order(tmp_path):
+    first = _make_config("dev1")
+    second = _make_config("dev1", name="Changed")
+    path = tmp_path / "dev1.yml"
+    path.write_text(_config_to_yaml(first))
+    entered, release = anyio.Event(), anyio.Event()
+    publications = []
+
+    async def publish(configs):
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        publications.append(configs)
+
+    publisher = AsyncMock()
+    publisher.publish_configs.side_effect = publish
+    service = FileBackedDeviceConfigService(tmp_path, materialized_publisher=publisher)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(service.refresh)
+        await entered.wait()
+        path.write_text(_config_to_yaml(second))
+        tg.start_soon(service.refresh)
+        while await service.get_config("dev1") != second:
+            await anyio.sleep(0)
+        release.set()
+    assert publications == [(first,), (second,)]
 
 
 @pytest.fixture
@@ -196,3 +254,39 @@ async def test_match_device_rejects_ambiguous_same_specificity(
             fingerprint="serial-a",
             labels={"location": "room-a"},
         )
+
+
+@pytest.mark.asyncio
+async def test_scan_retains_last_validated_config_when_file_is_unreadable(
+    config_service, tmp_path
+):
+    config = _make_config("retained")
+    path = tmp_path / "retained.yml"
+    path.write_text(_config_to_yaml(config))
+    await config_service.refresh()
+    path.write_text("profiles: [broken yaml")
+    await config_service.refresh()
+    assert await config_service.get_config("retained") == config
+    path.unlink()
+    await config_service.refresh()
+    assert await config_service.get_config("retained") is None
+
+
+@pytest.mark.asyncio
+async def test_scan_retains_snapshot_when_source_directory_disappears(
+    config_service, tmp_path
+):
+    config = _make_config("retained")
+    (tmp_path / "retained.yml").write_text(_config_to_yaml(config))
+    await config_service.refresh()
+    moved = tmp_path.with_name(tmp_path.name + "-offline")
+    tmp_path.rename(moved)
+    try:
+        await config_service.refresh()
+        assert await config_service.get_config("retained") == config
+        assert not config_service.source_available
+    finally:
+        moved.rename(tmp_path)
+    await config_service.refresh()
+    assert config_service.source_available
+    assert await config_service.get_config("retained") == config

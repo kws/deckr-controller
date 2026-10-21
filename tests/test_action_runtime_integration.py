@@ -256,7 +256,7 @@ async def open_page(h):
         },
     )
     await eventually(lambda: len(notifications(h, "page_session_opened")) == 1)
-    return h.device._bindings.active_page_session()
+    return h.device.active_page_session()
 
 
 @pytest.mark.asyncio
@@ -311,7 +311,7 @@ async def test_page_targets_generations_and_lifecycle_over_managed_services(
         assert (
             notifications(h, "page_session_closed")[0]["pageSession"]["generation"] == 1
         )
-        assert h.device._bindings.active_page_session() is None
+        assert h.device.active_page_session() is None
 
 
 @pytest.mark.asyncio
@@ -332,7 +332,7 @@ async def test_page_session_can_open_a_successor_without_visible_opener(
             },
         )
         await eventually(lambda: len(notifications(h, "page_session_opened")) == 2)
-        current = h.device._bindings.active_page_session()
+        current = h.device.active_page_session()
         assert (
             current.page_id == "nested"
             and current.page_session_id != old.page_session_id
@@ -347,9 +347,9 @@ async def test_page_commit_rechecks_service_authority_after_planning(
 ):
     async with running_controller(managed_substrate) as h:
         session = await open_page(h)
-        bindings = h.device._bindings
+        bindings = h.device
         entered, release = anyio.Event(), anyio.Event()
-        original = bindings._build_page_plan
+        original = bindings.planning._build_page_plan
 
         async def delayed(*args, **kwargs):
             result = await original(*args, **kwargs)
@@ -357,7 +357,13 @@ async def test_page_commit_rechecks_service_authority_after_planning(
             await release.wait()
             return result
 
-        monkeypatch.setattr(bindings, "_build_page_plan", delayed)
+        from dataclasses import replace
+
+        monkeypatch.setattr(
+            bindings.navigation,
+            "bindings",
+            replace(bindings.navigation.bindings, build_plan=delayed),
+        )
         await h.channel.send(
             "replace_page",
             {
@@ -456,9 +462,9 @@ async def test_page_commit_rechecks_hardware_authority_after_planning(
 ):
     async with running_controller(managed_substrate) as h:
         session = await open_page(h)
-        bindings = h.device._bindings
+        bindings = h.device
         entered, release, finished = anyio.Event(), anyio.Event(), anyio.Event()
-        original = bindings._build_page_plan
+        original = bindings.planning._build_page_plan
 
         async def delayed(*args, **kwargs):
             result = await original(*args, **kwargs)
@@ -467,7 +473,13 @@ async def test_page_commit_rechecks_hardware_authority_after_planning(
             finished.set()
             return result
 
-        monkeypatch.setattr(bindings, "_build_page_plan", delayed)
+        from dataclasses import replace
+
+        monkeypatch.setattr(
+            bindings.navigation,
+            "bindings",
+            replace(bindings.navigation.bindings, build_plan=delayed),
+        )
         await h.channel.send(
             "replace_page",
             {
@@ -526,7 +538,7 @@ async def test_replace_page_requires_a_page_session_target(managed_substrate):
         )
         await eventually(lambda: len(notifications(h, "page_session_opened")) == 2)
         assert session.generation == 1
-        assert h.device._bindings.active_page_session() is session
+        assert h.device.active_page_session() is session
 
 
 @pytest.mark.asyncio
@@ -552,7 +564,7 @@ async def test_lifecycle_events_keep_the_service_envelope(
         )
         await eventually(lambda: h.device.context_for_control("key-1") is None)
         assert h.controller._hardware.route_for_config("config-a") is not None
-        assert h.device._bindings.binding_by_id(binding.binding_id) is None
+        assert h.device.binding_by_id(binding.binding_id) is None
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ class BindingLease:
     page_id: str
     settings_target: SettingsTargetRef | None
     context: ControlContext
+    ready: bool = True
     page_session_id: str | None = None
     item_key: str | None = None
     handler: str | None = None
@@ -48,9 +49,16 @@ def binding_body_matches_lease(lease: BindingLease, binding: BindingMetadata) ->
     return all(
         getattr(binding, name) == getattr(stored, name)
         for name in (
-            "provider_instance_id", "provider_id", "action_id", "context_id",
-            "binding_id", "action_instance_id", "config_id", "device_ref",
-            "control_ref", "page_session_id",
+            "provider_instance_id",
+            "provider_id",
+            "action_id",
+            "context_id",
+            "binding_id",
+            "action_instance_id",
+            "config_id",
+            "device_ref",
+            "control_ref",
+            "page_session_id",
         )
     )
 
@@ -168,8 +176,7 @@ class ControlAttachmentState:
     def binding_output_authorized(self, lease: BindingLease) -> bool:
         return (
             self.binding_command_authorized(lease)
-            and self.active_output_by_control.get(lease.control_id)
-            == lease.binding_id
+            and self.active_output_by_control.get(lease.control_id) == lease.binding_id
             and self._output_generation_by_control.get(lease.control_id, 0)
             == lease.output_route_generation
         )
@@ -210,7 +217,11 @@ class ControlAttachmentState:
             self._suppressed_release_keys.discard(key)
 
         lease = self.active_input_lease(control_id)
-        if lease is None or capability_id not in lease.input_capability_ids:
+        if (
+            lease is None
+            or not lease.ready
+            or capability_id not in lease.input_capability_ids
+        ):
             return None
         return lease
 

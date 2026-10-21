@@ -13,11 +13,11 @@ Use public core APIs for hardware and services.
 
 | Directory | Responsibility |
 | --- | --- |
-| `src/deckr/controller` | Runtime construction and controller coordination. |
+| `src/deckr/controller` | Runtime construction, device-session state boundaries, effects, and rendering dispatch. |
 | `src/deckr/controller/_hardware` | Config selection, managed hardware uses, routes, and commands. |
-| `src/deckr/controller/_actions` | Managed Action Runtime services and availability. |
+| `src/deckr/controller/_actions` | Common action requests/adapters, managed Action Runtime services, and availability. |
 | `src/deckr/controller/_pages` | Page frames, sessions, and transition decisions. |
-| `src/deckr/controller/_bindings` | Binding coordination, authority, lifecycle, commands, and render admission. |
+| `src/deckr/controller/_bindings` | Binding reconciliation, input ownership, lifecycle, presentation, and render admission. |
 | `src/deckr/controller/config` | Config models, YAML storage, and materialized projections. |
 | `src/deckr/controller/settings` | Read-only settings snapshots and stable action identities. |
 | `src/deckr/controller/action_provider` | Builtin action lookup and navigation actions. |

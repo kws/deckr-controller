@@ -76,6 +76,12 @@ class ActionRegistry(BaseComponent):
             return None
         return self._builtin_action_registry.get(meta.uuid)
 
+    def catalog_snapshot(self) -> tuple[ActionMetadata, ...]:
+        return tuple(
+            _metadata(descriptor)
+            for descriptor in self._builtin_action_registry.values()
+        )
+
     def get_builtin_action(self, uuid: str) -> BuiltinAction | None:
         return self._builtin_registry.get_action(uuid)
 

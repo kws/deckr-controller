@@ -1,4 +1,4 @@
-"""Builtin actions: run in controller with privileged access."""
+"""Local actions with explicit capability requirements and scoped grants."""
 
 from typing import Protocol
 
@@ -15,6 +15,7 @@ from deckr.actions.messages import (
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_INPUT_TOUCH,
+    DECKR_OUTPUT_RASTER,
 )
 
 from deckr.controller.action_provider.builtin._context import ControllerActionContext
@@ -68,7 +69,20 @@ class BuiltinRegistry:
             actionId=action.uuid,
             name=getattr(action, "name", None),
             providerId=getattr(action, "provider_id", BUILTIN_ACTION_PROVIDER_ID),
-            requirements=(_activation_input_requirement(),),
+            requirements=(
+                _activation_input_requirement(),
+                CapabilityRequirement(
+                    name="display",
+                    required=False,
+                    preferences=(
+                        CapabilityRequirementSelector(
+                            family=DECKR_OUTPUT_RASTER,
+                            type="bitmap",
+                            direction="output",
+                        ),
+                    ),
+                ),
+            ),
         )
 
 

@@ -228,14 +228,20 @@ def test_close_restores_prior_frame_and_returns_closed_session_effects(device_co
 def test_invalid_dynamic_requests_are_noops(device_config):
     service = PageSessionService(device_config, clock=lambda: 0.0)
 
-    assert service.begin_replace_page(
-        descriptor=_dynamic_page("dynamic-page", "1,0"),
-        context_id="missing",
-    ) is None
+    assert (
+        service.begin_replace_page(
+            descriptor=_dynamic_page("dynamic-page", "1,0"),
+            context_id="missing",
+        )
+        is None
+    )
     assert service.begin_close_page(context_id="missing") is None
-    assert service.begin_set_page(
-        descriptor=_dynamic_page("dynamic-page", "1,0"),
-    ) is None
+    assert (
+        service.begin_set_page(
+            descriptor=_dynamic_page("dynamic-page", "1,0"),
+        )
+        is None
+    )
 
 
 def test_open_dismisses_existing_dynamic_session(device_config):
@@ -343,3 +349,46 @@ def test_timeout_detection_and_activity_reset_use_clock(device_config):
     assert session.last_activity == 0.150
     now = 0.249
     assert service.expired_session() is None
+
+
+def test_stale_timeout_and_close_do_not_affect_later_page_occurrence(device_config):
+    now = 0.0
+    service = PageSessionService(device_config, clock=lambda: now)
+    root = service.begin_set_page()
+    service.commit(root, _plan(root.entry))
+    first = service.begin_open_page(
+        descriptor=_dynamic_page("same", "1,0"), owner=_owner()
+    )
+    service.commit(first, _plan(first.entry, page_session=first.page_session))
+    old_deadline = service.deadline()
+    second = service.begin_open_page(
+        descriptor=_dynamic_page("same", "1,0"), owner=_owner()
+    )
+    service.commit(second, _plan(second.entry, page_session=second.page_session))
+    assert first.page_session.page_session_id != second.page_session.page_session_id
+    assert service.begin_close_page(context_id=first.page_session.context_id) is None
+    assert service.accept_expiry(old_deadline, now=10) is None
+    assert service.active_dynamic_session() is second.page_session
+
+
+def test_activity_invalidates_a_queued_expiry_but_page_updates_do_not(device_config):
+    now = 0.0
+    service = PageSessionService(device_config, clock=lambda: now)
+    root = service.begin_set_page()
+    service.commit(root, _plan(root.entry))
+    opened = service.begin_open_page(
+        descriptor=_dynamic_page("same", "1,0"), owner=_owner()
+    )
+    service.commit(opened, _plan(opened.entry, page_session=opened.page_session))
+    old = service.deadline()
+    now = 0.075
+    service.record_activity()
+    assert service.accept_expiry(old, now=0.11) is None
+    current = service.deadline()
+    updated = service.begin_replace_page(
+        descriptor=_dynamic_page("same", "0,0"),
+        context_id=opened.page_session.context_id,
+    )
+    service.commit(updated, _plan(updated.entry, page_session=updated.page_session))
+    assert service.deadline() == current
+    assert service.accept_expiry(current, now=0.2) is opened.page_session

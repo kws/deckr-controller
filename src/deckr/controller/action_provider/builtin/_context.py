@@ -1,69 +1,76 @@
-"""Controller action context: thin facade for builtin action page/output commands."""
+"""Immutable action identity and a narrow port for controller requests."""
 
 from collections.abc import Mapping
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import Any
 
 from deckr.actions.messages import BindingMetadata, DynamicPageCommand
+from deckr.contracts.models import freeze_json
 
-from deckr.controller._command_router import CommandRouter
+from deckr.controller._actions._requests import (
+    ActionRequestPort,
+    ClosePage,
+    Navigate,
+    OpenPage,
+    PageGrant,
+    SetRasterImage,
+    SetTitle,
+    UpdatePage,
+)
 
-if TYPE_CHECKING:
-    from deckr.controller._bindings import PageCommandPort
+
+@dataclass(frozen=True, slots=True)
+class SettingsView:
+    _values: Mapping[str, Any]
+
+    def __getattr__(self, name):
+        try:
+            return self._values[name]
+        except KeyError:
+            raise AttributeError(name) from None
 
 
 class ControllerActionContext:
-    """Thin facade for builtin actions: delegates to router and page commands."""
-
     def __init__(
         self,
-        router: CommandRouter,
-        page_command_port: "PageCommandPort",
-        context_id: str,
+        request_port: ActionRequestPort,
         binding_metadata: BindingMetadata,
         settings: Mapping[str, Any],
     ):
-        self._router = router
-        self._page_command_port = page_command_port
-        self._context_id = context_id
+        self._requests = request_port
         self.binding_metadata = binding_metadata
-        self.settings = SimpleNamespace(**settings)
-        self._page_session_context_id: str | None = None
+        self.replace_settings(settings)
+        self._page_grant: PageGrant | None = None
+
+    @property
+    def settings(self) -> SettingsView:
+        return self._settings
+
+    def replace_settings(self, settings: Mapping[str, Any]) -> None:
+        self._settings = SettingsView(freeze_json(settings))
 
     async def set_title(self, text: str) -> None:
-        await self._router.set_title(text)
+        await self._requests.request(SetTitle(text))
 
     async def set_raster_image(self, image: str) -> None:
-        await self._router.set_raster_image(image)
+        await self._requests.request(SetRasterImage(image))
 
-    async def set_page(
-        self,
-        *,
-        profile: str = "default",
-        page: int = 0,
-    ) -> None:
-        await self._page_command_port.set_page(profile=profile, page=page)
+    async def set_page(self, *, profile: str = "default", page: int = 0) -> None:
+        await self._requests.request(Navigate(profile, page))
 
     async def open_page(self, descriptor: DynamicPageCommand) -> None:
-        session = await self._page_command_port.open_page(
-            descriptor=descriptor,
-            context_id=self._context_id,
-            binding_id=self.binding_metadata.binding_id,
-        )
-        if session is not None:
-            self._page_session_context_id = session.context_id
+        grant = await self._requests.request(OpenPage(descriptor))
+        if isinstance(grant, PageGrant):
+            self._page_grant = grant
 
     async def replace_page(self, descriptor: DynamicPageCommand) -> None:
-        if self._page_session_context_id is None:
-            return
-        await self._page_command_port.replace_page(
-            descriptor=descriptor,
-            context_id=self._page_session_context_id,
-        )
+        if self._page_grant is not None:
+            grant = await self._requests.request(
+                UpdatePage(self._page_grant, descriptor)
+            )
+            if isinstance(grant, PageGrant):
+                self._page_grant = grant
 
     async def close_page(self) -> None:
-        if self._page_session_context_id is None:
-            return
-        await self._page_command_port.close_page(
-            context_id=self._page_session_context_id
-        )
+        if self._page_grant is not None:
+            await self._requests.request(ClosePage(self._page_grant))

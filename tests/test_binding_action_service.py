@@ -1,5 +1,6 @@
 """ControlBindingService tests. Uses mock devices (no VirtualDevice)."""
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
@@ -78,7 +79,7 @@ from deckr.controller._bindings import (
     BindingLeaseSnapshot,
     ControlBindingService,
 )
-from deckr.controller._bindings import _service as binding_service_module
+from deckr.controller._bindings import _reconcile as binding_service_module
 from deckr.controller._hardware import HardwareCommandService
 from deckr.controller._render import RenderResult
 from deckr.controller._render_dispatcher import RenderBackend
@@ -104,6 +105,24 @@ def _contract_pointer_for_provider_session(
         contractId=f"provider-session:{provider_instance_id}:{provider_id}:{provider_session_id}",
         generation=1,
     )
+
+
+@pytest_asyncio.fixture
+async def session_tasks():
+    tasks = set()
+
+    def start_soon(fn, *args):
+        task = asyncio.create_task(fn(*args))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    try:
+        yield start_soon
+    finally:
+        pending = tuple(tasks)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 class _BindingActionServiceHarness:
@@ -166,11 +185,16 @@ class _BindingActionServiceHarness:
 
     async def authorize_runtime_message(self, key, message):
         from deckr.action_runtime import validate_action_runtime_message
+
         try:
             validate_action_runtime_message(message)
         except ValueError:
             return False
-        return key is not None and self.current_contract(key) == message.contract and key.provider_session_id == message.sender_session_id
+        return (
+            key is not None
+            and self.current_contract(key) == message.contract
+            and key.provider_session_id == message.sender_session_id
+        )
 
     async def send_runtime_message(
         self,
@@ -387,9 +411,7 @@ class _BindingActionServiceHarness:
                 descriptor.settings_schema if descriptor is not None else None
             ),
             provider_settings_schema=(
-                descriptor.provider_settings_schema
-                if descriptor is not None
-                else None
+                descriptor.provider_settings_schema if descriptor is not None else None
             ),
         )
 
@@ -575,7 +597,14 @@ def _action_instance_body(metadata: ActionInstanceSnapshot) -> dict:
     }
 
 
-def _page_wire_message(message_type, payload, target, *, sender_session_id=PROVIDER_SESSION_ID, contract=None):
+def _page_wire_message(
+    message_type,
+    payload,
+    target,
+    *,
+    sender_session_id=PROVIDER_SESSION_ID,
+    contract=None,
+):
     from deckr.action_runtime import (
         ACTION_RUNTIME_SERVICE_NAMESPACE,
         action_runtime_message_name,
@@ -583,15 +612,27 @@ def _page_wire_message(message_type, payload, target, *, sender_session_id=PROVI
     from deckr.contracts.messages import entity_subject
     from deckr.services import ServiceMessageBody
     from deckr.services.messages import service_message
+
     name = action_runtime_message_name(message_type)
     return service_message(
-        sender="service:action-runtime.python", sender_session_id=sender_session_id,
-        recipient=CONTROLLER_ADDR, recipient_session_id="controller-session",
-        subject=entity_subject("service", serviceId="action-runtime.python", namespace=ACTION_RUNTIME_SERVICE_NAMESPACE, name=name),
+        sender="service:action-runtime.python",
+        sender_session_id=sender_session_id,
+        recipient=CONTROLLER_ADDR,
+        recipient_session_id="controller-session",
+        subject=entity_subject(
+            "service",
+            serviceId="action-runtime.python",
+            namespace=ACTION_RUNTIME_SERVICE_NAMESPACE,
+            name=name,
+        ),
         contract=contract or _contract_pointer_for_provider_session(sender_session_id),
-        body=ServiceMessageBody(serviceNamespace=ACTION_RUNTIME_SERVICE_NAMESPACE,
-            name=name, intent="command", exchangePattern="one_way",
-            params={**(payload or {}), "target": target}),
+        body=ServiceMessageBody(
+            serviceNamespace=ACTION_RUNTIME_SERVICE_NAMESPACE,
+            name=name,
+            intent="command",
+            exchangePattern="one_way",
+            params={**(payload or {}), "target": target},
+        ),
     )
 
 
@@ -608,7 +649,12 @@ def _action_command(
     generation: int = 0,
 ) -> DeckrMessage:
     if message_type in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
-        return _page_wire_message(message_type, payload, {"kind": "binding", "bindingId": binding_id, "generation": generation}, contract=contract)
+        return _page_wire_message(
+            message_type,
+            payload,
+            {"kind": "binding", "bindingId": binding_id, "generation": generation},
+            contract=contract,
+        )
     return action_message(
         sender=PROVIDER_ADDR,
         sender_session_id=PROVIDER_SESSION_ID,
@@ -629,8 +675,10 @@ def _action_command(
 
 
 def _requirements():
-    return tuple({"name": name, "required": False, "preferences": [{"direction": direction}]}
-                 for name, direction in (("input", "input"), ("output", "output")))
+    return tuple(
+        {"name": name, "required": False, "preferences": [{"direction": direction}]}
+        for name, direction in (("input", "input"), ("output", "output"))
+    )
 
 
 def _metadata(
@@ -782,8 +830,7 @@ def _action_instance_command(
             config_id=config_id,
             action_instance_id=action_instance_id,
         ),
-        contract=contract
-        or _contract_pointer_for_provider_session(sender_session_id),
+        contract=contract or _contract_pointer_for_provider_session(sender_session_id),
     )
 
 
@@ -818,9 +865,13 @@ def _page_session_command(
             or _contract_pointer_for_provider_session(sender_session_id),
         )
 
-    return _page_wire_message(message_type, payload,
+    return _page_wire_message(
+        message_type,
+        payload,
         {"kind": "page_session", "pageSessionId": session_id, "generation": generation},
-        sender_session_id=sender_session_id, contract=contract)
+        sender_session_id=sender_session_id,
+        contract=contract,
+    )
 
 
 def _make_control(
@@ -989,9 +1040,15 @@ def _make_mars_msd_two_device() -> DeviceDescriptor:
             events=["rotate", "momentary"],
             has_display=False,
         ),
-        _make_control("B1", row=2, col=0, kind="button", events=["momentary"], has_display=False),
-        _make_control("B2", row=2, col=1, kind="button", events=["momentary"], has_display=False),
-        _make_control("B3", row=2, col=2, kind="button", events=["momentary"], has_display=False),
+        _make_control(
+            "B1", row=2, col=0, kind="button", events=["momentary"], has_display=False
+        ),
+        _make_control(
+            "B2", row=2, col=1, kind="button", events=["momentary"], has_display=False
+        ),
+        _make_control(
+            "B3", row=2, col=2, kind="button", events=["momentary"], has_display=False
+        ),
     ]
     return DeviceDescriptor(
         deviceId="mars-gaming-msd-two",
@@ -1128,6 +1185,19 @@ class ControlledFrameBackend:
         self._events: dict[int, anyio.Event] = {}
 
     async def render(self, request) -> RenderResult:
+        # These tests gate action/status results; preparing frames are transient
+        # progress output, so let them finish without occupying a worker slot.
+        if (
+            request.source is not None
+            and request.source.command_type == "binding_preparing"
+        ):
+            return RenderResult(
+                context_id=request.context_id,
+                binding_id=request.binding_id,
+                control_id=request.control_id,
+                generation=request.generation,
+                frame=None,
+            )
         self.calls.append(request.generation)
         self.requests.append(request)
         event = self._events.setdefault(request.generation, anyio.Event())
@@ -1325,6 +1395,7 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
             _metadata("action.child", provider_instance_id=PROVIDER_INSTANCE_ID),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         static_snapshot = manager.action_interest_snapshot(now=20.0)
         assert any(
             record.source == ActionInterestSource.VISIBLE_BINDING
@@ -1344,6 +1415,7 @@ async def test_device_manager_tracks_visible_and_dynamic_page_action_interest():
             ),
             context_id=owner.id,
         )
+        await manager.wait_idle()
 
         dynamic_snapshot = manager.action_interest_snapshot(now=20.0)
         assert any(
@@ -1418,7 +1490,6 @@ def _settings_reload_selector_only_config() -> DeviceConfig:
     )
 
 
-
 @pytest.mark.asyncio
 async def test_unsupported_action_message_for_active_binding_is_ignored():
     config_service = MemoryConfigService(_settings_reload_config())
@@ -1450,6 +1521,7 @@ async def test_unsupported_action_message_for_active_binding_is_ignored():
         )
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             old_ctx = manager.context_for_control("0,0")
             assert old_ctx is not None
             assert old_ctx.settings == {"label": "old"}
@@ -1478,6 +1550,7 @@ async def test_unsupported_action_message_for_active_binding_is_ignored():
                     contract=_contract_pointer_for_provider_session(),
                 )
             )
+            await manager.wait_idle()
 
             new_ctx = manager.context_for_control("0,0")
             assert new_ctx is old_ctx
@@ -1560,6 +1633,7 @@ async def test_missing_action_renders_missing_unavailable_fallback():
         )
 
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         request = await _wait_for_render_request(render_backend)
         assert request.source is not None
         assert request.source.command_type == "controller_fallback"
@@ -1613,8 +1687,8 @@ async def test_service_view_service_unavailable_renders_service_fallback():
             render_backend=render_backend,
         )
         _record_lifecycle_unavailable(
-                manager,
-                provider_instance_id=PROVIDER_INSTANCE_ID,
+            manager,
+            provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
             action_uuid=ACTION_X_UUID,
             provider_session_id=PROVIDER_SESSION_ID,
@@ -1622,6 +1696,7 @@ async def test_service_view_service_unavailable_renders_service_fallback():
         )
 
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         request = await _wait_for_render_request(render_backend)
         assert request.source is not None
         assert request.source.content_kind == "overlay:unavailable_service"
@@ -1663,11 +1738,12 @@ async def test_provider_session_invalidation_renders_session_fallback(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         lease = _binding_lease_for_control(manager, "0,0")
         assert lease is not None
         key = _record_lifecycle_unavailable(
-                manager,
-                provider_instance_id=PROVIDER_INSTANCE_ID,
+            manager,
+            provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
             provider_session_id=PROVIDER_SESSION_ID,
             action_uuid=SetRasterImageOnAppearAction.uuid,
@@ -1676,6 +1752,7 @@ async def test_provider_session_invalidation_renders_session_fallback(
         )
 
         await manager.on_action_availability_changed(frozenset({key}))
+        await manager.wait_idle()
         request = await _wait_for_render_request(render_backend)
         assert request.source is not None
         assert request.source.content_kind == "overlay:unavailable_session"
@@ -1715,6 +1792,7 @@ async def test_nonterminal_lifecycle_rejection_renders_rejected_fallback(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         ctx = manager.context_for_control("0,0")
         assert ctx is not None
 
@@ -1732,6 +1810,7 @@ async def test_nonterminal_lifecycle_rejection_renders_rejected_fallback(
             },
         )
         await manager.handle_provider_command(msg)
+        await manager.wait_idle()
 
         request = await _wait_for_render_request(render_backend)
         assert request.source is not None
@@ -1785,6 +1864,7 @@ async def test_binding_overlay_and_clear_source_reaches_render_request(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         ctx = manager.context_for_control("0,0")
         assert ctx is not None
         binding = ctx.metadata.model_copy(update={"output_generation": 1})
@@ -1811,6 +1891,7 @@ async def test_binding_overlay_and_clear_source_reaches_render_request(
             },
         )
         await manager.handle_provider_command(overlay_msg)
+        await manager.wait_idle()
         await wait_for_render_count(2)
         overlay_request = render_backend.requests[-1]
         await release_and_wait_for_frame(2)
@@ -1829,6 +1910,7 @@ async def test_binding_overlay_and_clear_source_reaches_render_request(
             },
         )
         await manager.handle_provider_command(clear_msg)
+        await manager.wait_idle()
         await wait_for_render_count(3)
         clear_request = render_backend.requests[-1]
         await release_and_wait_for_frame(3)
@@ -1885,6 +1967,7 @@ async def test_binding_without_live_provider_session_remains_pending(
                 ),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             ctx = manager.context_for_control("0,0")
             assert ctx is None
             assert manager.snapshot().binding_leases == {}
@@ -1895,6 +1978,7 @@ async def test_binding_without_live_provider_session_remains_pending(
 
 @pytest.mark.asyncio
 async def test_binding_activation_timeout_does_not_block_static_page_bind_loop(
+    session_tasks,
     monkeypatch,
 ):
     blocked_action = "test.virtual.blocked"
@@ -1944,7 +2028,7 @@ async def test_binding_activation_timeout_does_not_block_static_page_bind_loop(
         config=config,
         manager=registry,
         actions_bus=_actions_session(action_bus),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
     )
     _seed_action_availability(
         manager,
@@ -1957,13 +2041,16 @@ async def test_binding_activation_timeout_does_not_block_static_page_bind_loop(
 
     with anyio.fail_after(1):
         await manager.set_page(profile="default", page=0)
+        blocked_lease = _binding_lease_for_control(manager, "0,0")
+        await manager.wait_idle()
 
-    blocked_lease = _binding_lease_for_control(manager, "0,0")
     resolved_lease = _binding_lease_for_control(manager, "1,0")
     assert blocked_lease is not None
     assert not blocked_lease.attached
     assert manager.context_for_control("0,0") is None
-    assert blocked_lease.action_instance_id not in manager.snapshot().action_instances
+    assert manager.state.binding_status[blocked_lease.binding_id] == "retired"
+    assert manager.binding_by_id(blocked_lease.binding_id) is None
+    assert not manager.state.operations
     assert resolved_lease is not None
     assert resolved_lease.attached
     assert manager.context_for_control("1,0") is not None
@@ -1971,6 +2058,7 @@ async def test_binding_activation_timeout_does_not_block_static_page_bind_loop(
 
 @pytest.mark.asyncio
 async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
+    session_tasks,
     monkeypatch,
 ):
     class HangingSettingsService:
@@ -2022,7 +2110,7 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
         config=config,
         manager=registry,
         actions_bus=_actions_session(action_bus),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
         settings_service=HangingSettingsService(),
     )
     _seed_action_availability(
@@ -2033,6 +2121,7 @@ async def test_settings_snapshot_timeout_does_not_block_static_page_bind_loop(
 
     with anyio.fail_after(1):
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
 
     first = manager.context_for_control("0,0")
     second = manager.context_for_control("1,0")
@@ -2086,6 +2175,7 @@ async def test_static_binding_lifecycle_messages_carry_settings_only_on_attach()
         async with action_bus.subscribe(PROVIDER_ADDR) as stream:
             _seed_action_availability(manager, _metadata(ACTION_X_UUID))
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
 
             messages = await _collect_action_messages(stream)
 
@@ -2135,13 +2225,14 @@ async def test_service_view_pending_preserves_attached_binding(
                 _metadata(SetRasterImageOnAppearAction.uuid),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             ctx = manager.context_for_control("0,0")
             lease = _binding_lease_for_control(manager, "0,0")
             assert ctx is not None
             assert lease is not None
             assert lease.attached
             await _drain_action_messages(stream)
-            manager._render_pending_to_control = AsyncMock()
+            manager.presentation._render_pending_to_control = AsyncMock()
 
             changed = _ingest_provider_entries(
                 manager,
@@ -2165,13 +2256,14 @@ async def test_service_view_pending_preserves_attached_binding(
                 }
             )
             await manager.on_action_availability_changed(changed)
+            await manager.wait_idle()
 
             assert manager.context_for_control("0,0") is ctx
             preserved = _binding_lease_for_control(manager, "0,0")
             assert preserved is not None
             assert preserved.binding_id == lease.binding_id
             assert lease.attached
-            manager._render_pending_to_control.assert_not_awaited()
+            manager.presentation._render_pending_to_control.assert_not_awaited()
             await _assert_no_action_message(stream)
 
         tg.cancel_scope.cancel()
@@ -2207,6 +2299,7 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
                 _metadata(SetRasterImageOnAppearAction.uuid),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             ctx = manager.context_for_control("0,0")
             lease = _binding_lease_for_control(manager, "0,0")
             assert ctx is not None
@@ -2236,6 +2329,7 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
             assert record.requires_provider_lifecycle_recovery
 
             await manager.on_action_availability_changed(changed)
+            await manager.wait_idle()
 
             replacement_ctx = manager.context_for_control("0,0")
             replacement_lease = _binding_lease_for_control(manager, "0,0")
@@ -2245,26 +2339,20 @@ async def test_service_view_availability_recovers_same_session_after_invalidated
             assert replacement_lease.binding_id != lease.binding_id
             assert replacement_lease.provider_session_id == PROVIDER_SESSION_ID
             assert replacement_lease.attached
-            assert not _action_service_for(manager).provider_lifecycle_recovery_required(key)
+            assert not _action_service_for(
+                manager
+            ).provider_lifecycle_recovery_required(key)
 
             await _collect_action_messages(stream)
             messages = runtime_sender.messages
             created = [
-                msg
-                for msg in messages
-                if msg.message_type == ACTION_INSTANCE_CREATED
+                msg for msg in messages if msg.message_type == ACTION_INSTANCE_CREATED
             ]
             destroyed = [
-                msg
-                for msg in messages
-                if msg.message_type == ACTION_INSTANCE_DESTROYED
+                msg for msg in messages if msg.message_type == ACTION_INSTANCE_DESTROYED
             ]
-            attached = [
-                msg for msg in messages if msg.message_type == BINDING_ATTACHED
-            ]
-            detached = [
-                msg for msg in messages if msg.message_type == BINDING_DETACHED
-            ]
+            attached = [msg for msg in messages if msg.message_type == BINDING_ATTACHED]
+            detached = [msg for msg in messages if msg.message_type == BINDING_DETACHED]
             assert len(created) == 1
             assert len(destroyed) == 1
             assert len(attached) == 1
@@ -2286,8 +2374,12 @@ async def test_provider_session_contract_change_replaces_matching_binding(
     metadata = _metadata(SetRasterImageOnAppearAction.uuid)
     registry.get_action = AsyncMock(return_value=metadata)
     action_bus = _actions_bus()
-    first_contract = ContractPointer(contractId="provider-session-contract-1", generation=1)
-    next_contract = ContractPointer(contractId="provider-session-contract-2", generation=1)
+    first_contract = ContractPointer(
+        contractId="provider-session-contract-1", generation=1
+    )
+    next_contract = ContractPointer(
+        contractId="provider-session-contract-2", generation=1
+    )
     async with anyio.create_task_group() as tg:
         manager = _make_binding_service(
             controller_id=CONTROLLER_ID,
@@ -2306,8 +2398,11 @@ async def test_provider_session_contract_change_replaces_matching_binding(
                 manager,
                 metadata,
             )
-            _record_provider_runtime_contract(manager, metadata, contract=first_contract)
+            _record_provider_runtime_contract(
+                manager, metadata, contract=first_contract
+            )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             ctx = manager.context_for_control("0,0")
             lease = _binding_lease_for_control(manager, "0,0")
             assert ctx is not None
@@ -2325,6 +2420,7 @@ async def test_provider_session_contract_change_replaces_matching_binding(
                     )
                 }
             )
+            await manager.wait_idle()
 
             replacement_ctx = manager.context_for_control("0,0")
             replacement_lease = _binding_lease_for_control(manager, "0,0")
@@ -2339,13 +2435,9 @@ async def test_provider_session_contract_change_replaces_matching_binding(
             await _collect_action_messages(stream)
             messages = runtime_sender.messages
             created = [
-                msg
-                for msg in messages
-                if msg.message_type == ACTION_INSTANCE_CREATED
+                msg for msg in messages if msg.message_type == ACTION_INSTANCE_CREATED
             ]
-            attached = [
-                msg for msg in messages if msg.message_type == BINDING_ATTACHED
-            ]
+            attached = [msg for msg in messages if msg.message_type == BINDING_ATTACHED]
             assert len(created) == 1
             assert len(attached) == 1
             assert created[0].contract == next_contract
@@ -2356,6 +2448,7 @@ async def test_provider_session_contract_change_replaces_matching_binding(
 
 @pytest.mark.asyncio
 async def test_attached_binding_survives_nonterminal_provider_session_unavailable(
+    session_tasks,
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -2372,13 +2465,14 @@ async def test_attached_binding_survives_nonterminal_provider_session_unavailabl
         config=device_config_set_raster_image,
         manager=registry,
         actions_bus=_actions_session(_actions_bus()),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
     )
     _seed_action_availability(
         manager,
         _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
+    await manager.wait_idle()
     ctx = manager.context_for_control("0,0")
     assert ctx is not None
     lease = _binding_lease_for_control(manager, "0,0")
@@ -2389,6 +2483,7 @@ async def test_attached_binding_survives_nonterminal_provider_session_unavailabl
     await manager.on_action_availability_changed(
         {ProviderActionKey(PROVIDER_INSTANCE_ID, SetRasterImageOnAppearAction.uuid)}
     )
+    await manager.wait_idle()
 
     assert manager.context_for_control("0,0") is ctx
     preserved = _binding_lease_for_control(manager, "0,0")
@@ -2422,13 +2517,18 @@ async def test_attached_binding_survives_nonterminal_provider_session_unavailabl
     await manager.handle_provider_command(
         command.model_copy(update={"sender_session_id": "stale"})
     )
+    await manager.wait_idle()
     command_service.clear_raster.assert_not_awaited()
 
     await manager.handle_provider_command(command)
+    await manager.wait_idle()
 
     manager.render_direct_output.assert_awaited_once()
-    assert manager.render_direct_output.await_args.args[0].binding_id == lease.binding_id
+    assert (
+        manager.render_direct_output.await_args.args[0].binding_id == lease.binding_id
+    )
     assert manager.render_direct_output.await_args.args[1].command_type == "clear"
+
 
 @pytest.mark.asyncio
 async def test_dynamic_page_retires_when_owner_agreement_is_replaced(
@@ -2459,6 +2559,7 @@ async def test_dynamic_page_retires_when_owner_agreement_is_replaced(
                 _metadata(SetRasterImageOnAppearAction.uuid),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             owner_ctx = manager.context_for_control("0,0")
             assert owner_ctx is not None
             await _drain_action_messages(stream)
@@ -2467,6 +2568,7 @@ async def test_dynamic_page_retires_when_owner_agreement_is_replaced(
                 descriptor=_dynamic_page("dynamic-page", "1,0"),
                 context_id=owner_ctx.id,
             )
+            await manager.wait_idle()
             session = manager.active_page_session()
             assert session is not None
             child_ctx = manager.context_for_control("1,0")
@@ -2490,9 +2592,12 @@ async def test_dynamic_page_retires_when_owner_agreement_is_replaced(
                     provider_session_id=successor_session_id,
                 ),
             )
-            old_key = ProviderSessionKey(PROVIDER_INSTANCE_ID, PROVIDER_ID, PROVIDER_SESSION_ID)
+            old_key = ProviderSessionKey(
+                PROVIDER_INSTANCE_ID, PROVIDER_ID, PROVIDER_SESSION_ID
+            )
             _action_service_for(manager)._contracts.pop(old_key)
             await manager.on_action_availability_changed(changed)
+            await manager.wait_idle()
             assert manager.active_page_session() is None
             restored_ctx = manager.context_for_control("0,0")
             assert restored_ctx is not None
@@ -2527,6 +2632,7 @@ async def test_close_dynamic_page_restores_cached_static_plan_without_metadata_l
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
 
@@ -2534,6 +2640,7 @@ async def test_close_dynamic_page_restores_cached_static_plan_without_metadata_l
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         child_ctx = manager.context_for_control("1,0")
@@ -2545,6 +2652,7 @@ async def test_close_dynamic_page_restores_cached_static_plan_without_metadata_l
         registry.get_action.return_value = None
         registry.get_action.reset_mock()
         await manager.close_page(context_id=session.context_id)
+        await manager.wait_idle()
 
         registry.get_action.assert_not_awaited()
         restored_ctx = manager.context_for_control("0,0")
@@ -2584,6 +2692,7 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
         registry.get_action.reset_mock()
@@ -2591,6 +2700,7 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
             descriptor=_dynamic_page("dynamic-page", "0,0", "1,0"),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         assert registry.get_action.await_count == 0
         session = manager.active_page_session()
         assert session is not None
@@ -2600,6 +2710,7 @@ async def test_dynamic_page_replace_preserves_rebound_control_outputs(
             descriptor=_dynamic_page(session.page_id, "0,0", "1,0"),
             context_id=session.context_id,
         )
+        await manager.wait_idle()
 
         command_service.clear_raster.assert_not_awaited()
         tg.cancel_scope.cancel()
@@ -2610,7 +2721,7 @@ async def test_action_availability_refresh_repaints_existing_binding_output(
     device_config_set_raster_image, persistence_tmp_dir, caplog
 ):
     """Existing leases must repaint cached output during availability reconciliation."""
-    caplog.set_level(logging.DEBUG, logger="deckr.controller._bindings._service")
+    caplog.set_level(logging.DEBUG, logger="deckr.controller")
     caplog.set_level(logging.DEBUG, logger="deckr.controller._command_router")
     device = _make_mock_device()
     action_bus = _actions_bus()
@@ -2638,6 +2749,7 @@ async def test_action_availability_refresh_repaints_existing_binding_output(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         ctx = manager.context_for_control("0,0")
         assert ctx is not None
 
@@ -2656,6 +2768,7 @@ async def test_action_availability_refresh_repaints_existing_binding_output(
         caplog.clear()
 
         await manager.on_action_availability_changed()
+        await manager.wait_idle()
 
         with anyio.fail_after(5.0):
             while len(render_backend.calls) <= baseline_render_calls:
@@ -2719,6 +2832,7 @@ async def test_mars_same_control_dynamic_page_rebinds_opener_slot(persistence_tm
                 _metadata(SetRasterImageOnAppearAction.uuid),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             await _drain_action_messages(stream)
             owner_ctx = manager.context_for_control("1,0")
             assert owner_ctx is not None
@@ -2726,6 +2840,7 @@ async def test_mars_same_control_dynamic_page_rebinds_opener_slot(persistence_tm
             await manager.handle_hardware_input(
                 _hardware_input("1,0", "down", sequence=1, device_id=device.device_id)
             )
+            await manager.wait_idle()
             body = await _next_capability_input(stream)
             assert body.event.event_type == "down"
             assert body.binding.binding_id == owner_ctx.binding_id
@@ -2734,6 +2849,7 @@ async def test_mars_same_control_dynamic_page_rebinds_opener_slot(persistence_tm
                 descriptor=_dynamic_page("album-page", "1,0", "2,0"),
                 context_id=owner_ctx.id,
             )
+            await manager.wait_idle()
             child_ctx = manager.context_for_control("1,0")
             assert child_ctx is not None
             assert child_ctx.binding_id != owner_ctx.binding_id
@@ -2745,11 +2861,13 @@ async def test_mars_same_control_dynamic_page_rebinds_opener_slot(persistence_tm
             await manager.handle_hardware_input(
                 _hardware_input("1,0", "up", sequence=2, device_id=device.device_id)
             )
+            await manager.wait_idle()
             await _assert_no_action_message(stream)
 
             await manager.handle_hardware_input(
                 _hardware_input("1,0", "down", sequence=3, device_id=device.device_id)
             )
+            await manager.wait_idle()
             body = await _next_capability_input(stream)
             assert body.event.event_type == "down"
             assert body.binding.binding_id == child_ctx.binding_id
@@ -2757,6 +2875,7 @@ async def test_mars_same_control_dynamic_page_rebinds_opener_slot(persistence_tm
             await manager.handle_hardware_input(
                 _hardware_input("1,0", "up", sequence=4, device_id=device.device_id)
             )
+            await manager.wait_idle()
             body = await _next_capability_input(stream)
             assert body.event.event_type == "up"
             assert body.binding.binding_id == child_ctx.binding_id
@@ -2791,16 +2910,21 @@ async def test_held_input_cancelled_when_config_is_removed(
                 _metadata(SetRasterImageOnAppearAction.uuid),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             await _drain_action_messages(stream)
             ctx = manager.context_for_control("0,0")
             assert ctx is not None
 
-            await manager.handle_hardware_input(_hardware_input("0,0", "down", sequence=1))
+            await manager.handle_hardware_input(
+                _hardware_input("0,0", "down", sequence=1)
+            )
+            await manager.wait_idle()
             body = await _next_capability_input(stream)
             assert body.event.event_type == "down"
             assert body.binding.binding_id == ctx.binding_id
 
             await manager.on_config_changed(None)
+            await manager.wait_idle()
 
             body = await _next_capability_input(stream)
             assert body.event.event_type == "cancel"
@@ -2809,9 +2933,14 @@ async def test_held_input_cancelled_when_config_is_removed(
             assert not manager.config_active
             assert manager.context_for_control("0,0") is None
             assert manager.snapshot().binding_leases == {}
-            assert not _action_service_for(manager).has_config_interest(manager.config_id)
+            assert not _action_service_for(manager).has_config_interest(
+                manager.config_id
+            )
 
-            await manager.handle_hardware_input(_hardware_input("0,0", "up", sequence=2))
+            await manager.handle_hardware_input(
+                _hardware_input("0,0", "up", sequence=2)
+            )
+            await manager.wait_idle()
             await _assert_no_action_message(stream)
         tg.cancel_scope.cancel()
 
@@ -2848,6 +2977,7 @@ async def test_close_dynamic_page_restores_when_close_notification_fails(
             "provider offline"
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
 
@@ -2855,10 +2985,12 @@ async def test_close_dynamic_page_restores_when_close_notification_fails(
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
 
         await manager.close_page(context_id=session.context_id)
+        await manager.wait_idle()
 
         assert manager.active_page_session() is None
         assert manager.context_for_control("0,0") is not None
@@ -2897,6 +3029,7 @@ async def test_close_dynamic_page_destroys_external_action_child(
                 _metadata("test.virtual.child"),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             owner_ctx = manager.context_for_control("0,0")
             assert owner_ctx is not None
             await _drain_action_messages(stream)
@@ -2910,6 +3043,7 @@ async def test_close_dynamic_page_destroys_external_action_child(
                 ),
                 context_id=owner_ctx.id,
             )
+            await manager.wait_idle()
             session = manager.active_page_session()
             assert session is not None
             child_lease = _binding_lease_for_control(manager, "1,0")
@@ -2919,6 +3053,7 @@ async def test_close_dynamic_page_destroys_external_action_child(
             await _drain_action_messages(stream)
 
             await manager.close_page(context_id=session.context_id)
+            await manager.wait_idle()
 
             messages = await _collect_action_messages(stream)
             destroyed = [
@@ -2973,6 +3108,7 @@ async def test_replace_dynamic_page_remounts_all_external_action_children(
                 _metadata("test.virtual.drop"),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             owner_ctx = manager.context_for_control("0,0")
             assert owner_ctx is not None
             await _drain_action_messages(stream)
@@ -2985,6 +3121,7 @@ async def test_replace_dynamic_page_remounts_all_external_action_children(
                 ),
                 context_id=owner_ctx.id,
             )
+            await manager.wait_idle()
             session = manager.active_page_session()
             assert session is not None
             keep_lease = _binding_lease_for_control(manager, "1,0")
@@ -3002,11 +3139,15 @@ async def test_replace_dynamic_page_remounts_all_external_action_children(
                 ),
                 context_id=session.context_id,
             )
+            await manager.wait_idle()
 
             replacement_keep = _binding_lease_for_control(manager, "1,0")
             assert replacement_keep is not None
             assert replacement_keep.action_instance_id != keep_action_instance_id
-            assert replacement_keep.action_instance_id in manager.snapshot().action_instances
+            assert (
+                replacement_keep.action_instance_id
+                in manager.snapshot().action_instances
+            )
             assert keep_action_instance_id not in manager.snapshot().action_instances
             assert drop_action_instance_id not in manager.snapshot().action_instances
 
@@ -3065,6 +3206,7 @@ async def test_dynamic_page_external_child_lifecycle_attach_carries_settings(
                 _metadata(child_action_id),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             owner_ctx = manager.context_for_control("0,0")
             assert owner_ctx is not None
             await _drain_action_messages(stream)
@@ -3087,6 +3229,7 @@ async def test_dynamic_page_external_child_lifecycle_attach_carries_settings(
                 ),
                 context_id=owner_ctx.id,
             )
+            await manager.wait_idle()
 
             messages = await _collect_action_messages(stream)
 
@@ -3143,6 +3286,7 @@ async def test_external_action_child_owner_survives_successor_dynamic_page(
                 _metadata("test.virtual.child"),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             owner_ctx = manager.context_for_control("0,0")
             assert owner_ctx is not None
             await _drain_action_messages(stream)
@@ -3156,6 +3300,7 @@ async def test_external_action_child_owner_survives_successor_dynamic_page(
                 ),
                 context_id=owner_ctx.id,
             )
+            await manager.wait_idle()
             first_session = manager.active_page_session()
             assert first_session is not None
             child_ctx = manager.context_for_control("1,0")
@@ -3167,6 +3312,7 @@ async def test_external_action_child_owner_survives_successor_dynamic_page(
                 descriptor=_dynamic_page("successor-page", "0,0"),
                 context_id=child_ctx.id,
             )
+            await manager.wait_idle()
 
             successor_session = manager.active_page_session()
             assert successor_session is not None
@@ -3229,6 +3375,7 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
             ),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
         await manager.open_page(
@@ -3240,6 +3387,7 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
             ),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         first_session = manager.active_page_session()
         assert first_session is not None
         child_ctx = manager.context_for_control("1,0")
@@ -3249,6 +3397,7 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
             descriptor=_dynamic_page("second-page", "0,0"),
             context_id=child_ctx.id,
         )
+        await manager.wait_idle()
 
         second_session = manager.active_page_session()
         assert second_session is not None
@@ -3258,6 +3407,7 @@ async def test_open_page_from_dynamic_child_dismisses_previous_owner(
         assert second_session.owner_provider_instance_id == "python-child"
 
         await manager.close_page(context_id=second_session.context_id)
+        await manager.wait_idle()
 
         assert manager.active_page_session() is None
         restored_owner_ctx = manager.context_for_control("0,0")
@@ -3293,6 +3443,7 @@ async def test_stale_opener_binding_cannot_open_page_after_transition(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
         stale_open = _action_command(
@@ -3313,6 +3464,7 @@ async def test_stale_opener_binding_cannot_open_page_after_transition(
             descriptor=_dynamic_page("active-page", "1,0"),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         assert session.page_id == "active-page"
@@ -3320,6 +3472,7 @@ async def test_stale_opener_binding_cannot_open_page_after_transition(
         assert child_ctx is not None
 
         await manager.handle_provider_command(stale_open)
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is child_ctx
@@ -3362,6 +3515,7 @@ async def test_replace_page_from_non_owner_is_noop(
             ),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
         await manager.open_page(
@@ -3373,6 +3527,7 @@ async def test_replace_page_from_non_owner_is_noop(
             ),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         child_ctx = manager.context_for_control("1,0")
@@ -3382,6 +3537,7 @@ async def test_replace_page_from_non_owner_is_noop(
             descriptor=_dynamic_page(session.page_id, "0,0"),
             context_id=child_ctx.id,
         )
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is child_ctx
@@ -3424,6 +3580,7 @@ async def test_close_page_from_non_owner_is_noop(
             ),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
         await manager.open_page(
@@ -3435,12 +3592,14 @@ async def test_close_page_from_non_owner_is_noop(
             ),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         child_ctx = manager.context_for_control("1,0")
         assert child_ctx is not None
 
         await manager.close_page(context_id=child_ctx.id)
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is child_ctx
@@ -3475,12 +3634,14 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
         await manager.open_page(
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         child_ctx = manager.context_for_control("1,0")
@@ -3499,6 +3660,7 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
             control_id="1,0",
         )
         await manager.handle_provider_command(child_replace)
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is child_ctx
@@ -3510,6 +3672,7 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
             control_id="1,0",
         )
         await manager.handle_provider_command(child_close)
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is child_ctx
@@ -3524,6 +3687,7 @@ async def test_child_binding_commands_cannot_close_or_replace_page_session(
                 action_instance_id=session.action_instance_id,
             )
         )
+        await manager.wait_idle()
 
         assert manager.active_page_session() is None
         assert manager.context_for_control("0,0") is not None
@@ -3591,6 +3755,7 @@ async def test_builtin_context_replaces_and_closes_opened_dynamic_page():
             _builtin_metadata(child_action.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_context = owner_action.contexts[-1]
 
         await owner_context.open_page(
@@ -3601,6 +3766,7 @@ async def test_builtin_context_replaces_and_closes_opened_dynamic_page():
                 provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
             )
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         assert manager.context_for_control("1,0") is not None
@@ -3613,12 +3779,14 @@ async def test_builtin_context_replaces_and_closes_opened_dynamic_page():
                 provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
             )
         )
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is None
         assert manager.context_for_control("0,0") is not None
 
         await owner_context.close_page()
+        await manager.wait_idle()
 
         assert manager.active_page_session() is None
         restored = manager.context_for_control("0,0")
@@ -3688,6 +3856,7 @@ async def test_builtin_child_context_cannot_control_parent_page_session():
             _builtin_metadata(child_action.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_context = owner_action.contexts[-1]
         await owner_context.open_page(
             _dynamic_page_with_action_child(
@@ -3697,6 +3866,7 @@ async def test_builtin_child_context_cannot_control_parent_page_session():
                 provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
             )
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         child_context = child_action.contexts[-1]
@@ -3711,12 +3881,14 @@ async def test_builtin_child_context_cannot_control_parent_page_session():
                 provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
             )
         )
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is child_ctx
         assert manager.context_for_control("0,0") is None
 
         await child_context.close_page()
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is child_ctx
@@ -3726,6 +3898,7 @@ async def test_builtin_child_context_cannot_control_parent_page_session():
 
 @pytest.mark.asyncio
 async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
+    session_tasks,
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3743,19 +3916,21 @@ async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
         config=device_config_set_raster_image,
         manager=registry,
         actions_bus=_actions_session(action_bus),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
     )
     _seed_action_availability(
         manager,
         _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
+    await manager.wait_idle()
     owner_ctx = manager.context_for_control("0,0")
     assert owner_ctx is not None
     await manager.open_page(
         descriptor=_dynamic_page("dynamic-page", "1,0"),
         context_id=owner_ctx.id,
     )
+    await manager.wait_idle()
     session = manager.active_page_session()
     assert session is not None
     child_ctx = manager.context_for_control("1,0")
@@ -3764,6 +3939,7 @@ async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
     await manager.on_action_availability_changed(
         {ProviderActionKey(PROVIDER_INSTANCE_ID, SetRasterImageOnAppearAction.uuid)}
     )
+    await manager.wait_idle()
 
     replacement = _dynamic_page(session.page_id, "0,0")
     await manager.handle_provider_command(
@@ -3781,6 +3957,7 @@ async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
             action_instance_id=session.action_instance_id,
         )
     )
+    await manager.wait_idle()
 
     assert manager.active_page_session() is session
     assert manager.context_for_control("1,0") is None
@@ -3789,6 +3966,7 @@ async def test_dynamic_page_replace_from_owner_during_nonterminal_unavailable(
 
 @pytest.mark.asyncio
 async def test_action_lifecycle_rejected_binding_detaches_only_that_binding(
+    session_tasks,
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3807,13 +3985,14 @@ async def test_action_lifecycle_rejected_binding_detaches_only_that_binding(
         config=device_config_set_raster_image,
         manager=registry,
         actions_bus=_actions_session(action_bus),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
     )
     _seed_action_availability(
         manager,
         _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
+    await manager.wait_idle()
     ctx = manager.context_for_control("0,0")
     assert ctx is not None
 
@@ -3831,6 +4010,7 @@ async def test_action_lifecycle_rejected_binding_detaches_only_that_binding(
         },
     )
     await manager.handle_provider_command(msg)
+    await manager.wait_idle()
 
     assert manager.context_for_control("0,0") is None
     assert manager.snapshot().binding_leases == {}
@@ -3839,6 +4019,7 @@ async def test_action_lifecycle_rejected_binding_detaches_only_that_binding(
 
 @pytest.mark.asyncio
 async def test_terminal_action_lifecycle_rejected_action_instance_destroys_affected_bindings(
+    session_tasks,
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3856,13 +4037,14 @@ async def test_terminal_action_lifecycle_rejected_action_instance_destroys_affec
         config=device_config_set_raster_image,
         manager=registry,
         actions_bus=_actions_session(action_bus),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
     )
     _seed_action_availability(
         manager,
         _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
+    await manager.wait_idle()
     ctx = manager.context_for_control("0,0")
     assert ctx is not None
     metadata = manager.snapshot().action_instances[ctx.action_instance_id]
@@ -3879,6 +4061,7 @@ async def test_terminal_action_lifecycle_rejected_action_instance_destroys_affec
             action_instance_id=metadata.action_instance_id,
         )
     )
+    await manager.wait_idle()
 
     assert manager.context_for_control("0,0") is None
     assert manager.snapshot().binding_leases == {}
@@ -3888,6 +4071,7 @@ async def test_terminal_action_lifecycle_rejected_action_instance_destroys_affec
 
 @pytest.mark.asyncio
 async def test_action_instance_rejection_from_owner_during_nonterminal_unavailable_replans(
+    session_tasks,
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -3905,13 +4089,14 @@ async def test_action_instance_rejection_from_owner_during_nonterminal_unavailab
         config=device_config_set_raster_image,
         manager=registry,
         actions_bus=_actions_session(action_bus),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
     )
     _seed_action_availability(
         manager,
         _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
+    await manager.wait_idle()
     ctx = manager.context_for_control("0,0")
     assert ctx is not None
     metadata = manager.snapshot().action_instances[ctx.action_instance_id]
@@ -3919,6 +4104,7 @@ async def test_action_instance_rejection_from_owner_during_nonterminal_unavailab
     await manager.on_action_availability_changed(
         {ProviderActionKey(PROVIDER_INSTANCE_ID, SetRasterImageOnAppearAction.uuid)}
     )
+    await manager.wait_idle()
 
     payload = {
         "targetKind": "action_instance",
@@ -3934,6 +4120,7 @@ async def test_action_instance_rejection_from_owner_during_nonterminal_unavailab
             sender_session_id="stale",
         )
     )
+    await manager.wait_idle()
 
     assert manager.context_for_control("0,0") is ctx
     assert ctx.action_instance_id in manager.snapshot().action_instances
@@ -3946,6 +4133,7 @@ async def test_action_instance_rejection_from_owner_during_nonterminal_unavailab
             action_instance_id=metadata.action_instance_id,
         )
     )
+    await manager.wait_idle()
 
     assert manager.context_for_control("0,0") is None
     assert manager.snapshot().binding_leases == {}
@@ -3982,6 +4170,7 @@ async def test_delayed_unavailable_status_does_not_write_after_binding_restored(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         ctx = manager.context_for_control("0,0")
         assert ctx is not None
 
@@ -4000,6 +4189,7 @@ async def test_delayed_unavailable_status_does_not_write_after_binding_restored(
             },
         )
         await manager.handle_provider_command(msg)
+        await manager.wait_idle()
 
         assert manager.context_for_control("0,0") is None
         with anyio.fail_after(5.0):
@@ -4009,13 +4199,14 @@ async def test_delayed_unavailable_status_does_not_write_after_binding_restored(
         assert render_backend.requests[-1].binding_id is None
 
         changed = _ingest_provider_entries(
-                manager,
-                provider_instance_id=PROVIDER_INSTANCE_ID,
+            manager,
+            provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
             provider_session_id=PROVIDER_SESSION_ID,
             entries=[_availability_entry(SetRasterImageOnAppearAction.uuid)],
         )
         await manager.on_action_availability_changed(changed)
+        await manager.wait_idle()
 
         restored_ctx = manager.context_for_control("0,0")
         assert restored_ctx is not None
@@ -4058,12 +4249,14 @@ async def test_action_lifecycle_rejected_page_session_resource_unavailable_repla
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         owner_ctx = manager.context_for_control("0,0")
         assert owner_ctx is not None
         await manager.open_page(
             descriptor=_dynamic_page("dynamic-page", "1,0"),
             context_id=owner_ctx.id,
         )
+        await manager.wait_idle()
         session = manager.active_page_session()
         assert session is not None
         child_ctx = manager.context_for_control("1,0")
@@ -4094,6 +4287,7 @@ async def test_action_lifecycle_rejected_page_session_resource_unavailable_repla
                 action_instance_id=session.action_instance_id,
             )
         )
+        await manager.wait_idle()
 
         assert manager.active_page_session() is session
         assert manager.context_for_control("1,0") is None
@@ -4132,6 +4326,7 @@ async def test_stale_lifecycle_rejection_from_current_session_recovers_binding(
                 _metadata(SetRasterImageOnAppearAction.uuid),
             )
             await manager.set_page(profile="default", page=0)
+            await manager.wait_idle()
             ctx = manager.context_for_control("0,0")
             lease = _binding_lease_for_control(manager, "0,0")
             assert ctx is not None
@@ -4152,6 +4347,7 @@ async def test_stale_lifecycle_rejection_from_current_session_recovers_binding(
                 },
             )
             await manager.handle_provider_command(msg)
+            await manager.wait_idle()
 
             messages = await _collect_action_messages(stream)
             created = [
@@ -4171,6 +4367,7 @@ async def test_stale_lifecycle_rejection_from_current_session_recovers_binding(
             assert recovered.stale_lifecycle_recoveries == 1
 
             await manager.handle_provider_command(msg)
+            await manager.wait_idle()
             await _assert_no_action_message(stream)
 
         tg.cancel_scope.cancel()
@@ -4178,6 +4375,7 @@ async def test_stale_lifecycle_rejection_from_current_session_recovers_binding(
 
 @pytest.mark.asyncio
 async def test_action_lifecycle_rejected_from_stale_provider_session_is_ignored(
+    session_tasks,
     device_config_set_raster_image,
 ):
     device = _make_mock_device()
@@ -4195,13 +4393,14 @@ async def test_action_lifecycle_rejected_from_stale_provider_session_is_ignored(
         config=device_config_set_raster_image,
         manager=registry,
         actions_bus=_actions_session(action_bus),
-        start_soon=lambda fn, *a, **k: None,
+        start_soon=session_tasks,
     )
     _seed_action_availability(
         manager,
         _metadata(SetRasterImageOnAppearAction.uuid),
     )
     await manager.set_page(profile="default", page=0)
+    await manager.wait_idle()
     ctx = manager.context_for_control("0,0")
     assert ctx is not None
 
@@ -4218,7 +4417,10 @@ async def test_action_lifecycle_rejected_from_stale_provider_session_is_ignored(
             "reason": "stale_lifecycle",
         },
     )
-    await manager.handle_provider_command(msg.model_copy(update={"sender_session_id": "stale"}))
+    await manager.handle_provider_command(
+        msg.model_copy(update={"sender_session_id": "stale"})
+    )
+    await manager.wait_idle()
 
     assert manager.context_for_control("0,0") is ctx
     assert manager.snapshot().binding_leases
@@ -4255,6 +4457,7 @@ async def test_set_raster_image_last_write_wins_same_control(
             _metadata(SetRasterImageOnAppearAction.uuid),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         ctx = manager.context_for_control("0,0")
         assert ctx is not None
         binding = ctx.metadata.model_copy(update={"output_generation": 1})
@@ -4282,6 +4485,7 @@ async def test_set_raster_image_last_write_wins_same_control(
         )
 
         await manager.handle_provider_command(msg)
+        await manager.wait_idle()
 
         command_service.set_raster_frame.assert_not_awaited()
         tg.cancel_scope.cancel()
@@ -4327,10 +4531,8 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
         config_service=config_service,
     )
 
-    async with anyio.create_task_group():
-
-        def start_soon(*args, **kwargs):
-            pass
+    async with anyio.create_task_group() as tg:
+        start_soon = tg.start_soon
 
         manager = _make_binding_service(
             controller_id=CONTROLLER_ID,
@@ -4345,6 +4547,7 @@ async def test_settings_isolated_by_control_same_action(persistence_tmp_dir):
         )
         _seed_action_availability(manager, _metadata(NoopAction.uuid))
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         await anyio.sleep(0.05)
         control_a = manager.context_for_control("0,0")
         control_b = manager.context_for_control("1,0")
@@ -4408,10 +4611,8 @@ async def test_config_reload_replaces_read_only_settings_snapshot(persistence_tm
         ],
     )
 
-    async with anyio.create_task_group():
-
-        def start_soon(*args, **kwargs):
-            pass
+    async with anyio.create_task_group() as tg:
+        start_soon = tg.start_soon
 
         manager = _make_binding_service(
             controller_id=CONTROLLER_ID,
@@ -4425,6 +4626,7 @@ async def test_config_reload_replaces_read_only_settings_snapshot(persistence_tm
         )
         _seed_action_availability(manager, _metadata(NoopAction.uuid))
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         ctx = manager.context_for_control("0,0")
         assert ctx is not None
         settings = ctx.controller_context.settings
@@ -4432,10 +4634,13 @@ async def test_config_reload_replaces_read_only_settings_snapshot(persistence_tm
         assert settings.nested == {"role": {"page": "root"}}
 
         await manager.on_config_changed(reloaded_config)
+        await manager.wait_idle()
         reloaded_ctx = manager.context_for_control("0,0")
         assert reloaded_ctx is not None
         reloaded_settings = reloaded_ctx.controller_context.settings
-        assert vars(reloaded_settings) == {"label": "from-reload"}
+        assert reloaded_settings.label == "from-reload"
+        with pytest.raises(TypeError):
+            reloaded_settings._values["label"] = "mutated"
 
 
 class ConfigurableActionRegistry:
@@ -4514,10 +4719,8 @@ async def test_service_view_availability_resolves_unavailable_control(
         ],
     )
 
-    async with anyio.create_task_group():
-
-        def start_soon(*args, **kwargs):
-            pass
+    async with anyio.create_task_group() as tg:
+        start_soon = tg.start_soon
 
         manager = _make_binding_service(
             controller_id=CONTROLLER_ID,
@@ -4530,14 +4733,15 @@ async def test_service_view_availability_resolves_unavailable_control(
             start_soon=start_soon,
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         await anyio.sleep(0.05)
 
         ctx_before = manager.context_for_control("0,0")
         assert ctx_before is None
 
         changed = _ingest_provider_entries(
-                manager,
-                provider_instance_id="test-provider",
+            manager,
+            provider_instance_id="test-provider",
             provider_id="test",
             provider_session_id=PROVIDER_SESSION_ID,
             entries=[_availability_entry(ACTION_X_UUID)],
@@ -4551,6 +4755,7 @@ async def test_service_view_availability_resolves_unavailable_control(
             ),
         )
         await manager.on_action_availability_changed(changed)
+        await manager.wait_idle()
 
         ctx_after = manager.context_for_control("0,0")
         assert ctx_after is not None
@@ -4615,6 +4820,7 @@ async def test_unrelated_availability_change_does_not_rebuild_current_page(
             ),
         )
         await manager.set_page(profile="default", page=0)
+        await manager.wait_idle()
         ctx_before = manager.context_for_control("0,0")
         assert ctx_before is not None
 
@@ -4623,6 +4829,7 @@ async def test_unrelated_availability_change_does_not_rebuild_current_page(
         await manager.on_action_availability_changed(
             {ProviderActionKey("other-provider", "test.action.unrelated")}
         )
+        await manager.wait_idle()
 
         command_service.clear_raster.assert_not_awaited()
         assert manager.context_for_control("0,0") is ctx_before

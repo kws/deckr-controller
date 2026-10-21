@@ -9,7 +9,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import anyio
 import anyio.to_process
@@ -41,6 +43,20 @@ from deckr.controller._render_content import (
     decode_image,
     render_content,
 )
+from deckr.controller._render_dispatcher import render_with_retry
+
+if TYPE_CHECKING:
+    from deckr.contracts.authority import ContractPointer
+    from deckr.contracts.messages import DeckrMessage
+    from deckr.hardware.descriptors import DeviceRef
+    from deckr.lanes import EndpointSession
+
+    from deckr.controller._actions import ProviderSessionKey
+    from deckr.controller._bindings._attachments import BindingLease
+    from deckr.controller._bindings._ports import BindingActionService
+    from deckr.controller._hardware import HardwareCommandService
+    from deckr.controller._render_dispatcher import RenderBackend, RenderDispatcher
+    from deckr.controller._session_boundary import SessionBoundary
 from deckr.controller._render_graph import (
     INVARIANT_FORMAT,
     render_graph,
@@ -110,9 +126,33 @@ class _Job:
     result_emitted: bool = False
 
 
+@dataclass(frozen=True)
+class RenderingPorts:
+    """Dependencies of rendering, with no mutable session or binding-host access."""
+
+    endpoint: EndpointSession
+    hardware: HardwareCommandService
+    actions: BindingActionService
+    dispatcher: RenderDispatcher
+    backend: RenderBackend
+    boundary: SessionBoundary
+    start_soon: Callable
+    notify: Callable[[DeckrMessage, BindingRenderResultBody], None]
+    config_id: str
+    hardware_ref: DeviceRef
+    is_active: Callable[[], bool]
+    binding_by_id: Callable[[str], BindingLease | None]
+    binding_output_authorized: Callable[[BindingLease], bool]
+    current_contract: Callable[[ProviderSessionKey | None], ContractPointer | None]
+
+    @property
+    def config_active(self):
+        return self.is_active()
+
+
 class BindingRenderer:
-    def __init__(self, host):
-        self.host = host
+    def __init__(self, ports: RenderingPorts):
+        self.ports = ports
         self.jobs = OrderedDict()
         self.active = {}
 
@@ -124,25 +164,25 @@ class BindingRenderer:
         return job is not None
 
     def _context(self, message, lease):
-        host = self.host
+        ports = self.ports
         state = RenderBindingState(
             binding=lease.context.metadata,
             rendering=lease.context.rendering,
-            active=host.config_active and host.binding_output_authorized(lease),
+            active=ports.config_active and ports.binding_output_authorized(lease),
             contract=lease.context.contract,
             runtimeEndpoint=f"service:action-runtime.{lease.provider_instance_id}",
             runtimeSessionId=lease.provider_session_id,
         )
         return RenderCommandContext(
             contract=message.contract,
-            controllerEndpoint=str(host._endpoint.address),
-            controllerSessionId=host._endpoint.session_id,
+            controllerEndpoint=str(ports.endpoint.address),
+            controllerSessionId=ports.endpoint.session_id,
             runtimeEndpoint=f"service:action-runtime.{lease.provider_instance_id}",
             runtimeSessionId=lease.provider_session_id,
-            localAuthority=host.current_contract(lease.provider_session_key)
+            localAuthority=ports.current_contract(lease.provider_session_key)
             == message.contract,
-            hardwareAuthority=host._command_service.has_authority(
-                host.config_id, host.hardware_ref
+            hardwareAuthority=ports.hardware.has_authority(
+                ports.config_id, ports.hardware_ref
             ),
             bindings={lease.binding_id: state},
             messageBytes=message.wire_size_bytes,
@@ -160,13 +200,7 @@ class BindingRenderer:
             **({"code": code} if code else {}),
             **({"command_message_id": command_id} if command_id else {}),
         )
-        try:
-            with anyio.move_on_after(1):
-                await self.host._action_service.send_render_result(message, result)
-        except Exception:
-            logger.warning(
-                "Could not send render result for %s", message.message_id, exc_info=True
-            )
+        self.ports.notify(message, result)
 
     async def handle(self, message):
         try:
@@ -177,10 +211,10 @@ class BindingRenderer:
             target = BindingCommandTarget.from_wire(params["target"])
         except (ValueError, TypeError, KeyError):
             return False
-        lease = self.host.binding_by_id(target.binding_id)
+        lease = self.ports.binding_by_id(target.binding_id)
         if lease is None:
             return False
-        key = await self.host._action_service.render_message_key(message)
+        key = await self.ports.actions.render_message_key(message)
         if key is None:
             return True
         if (
@@ -221,7 +255,7 @@ class BindingRenderer:
         )
         if self._retained(cache_key):
             return True
-        async with self.host._nav_lock:
+        async with self.ports.boundary:
             try:
                 if lease.context.contract is None or lease.provider_session_id is None:
                     raise RenderRejection("target_not_current")
@@ -247,12 +281,12 @@ class BindingRenderer:
             return True
         self.active[control_id] = self.active.get(control_id, 0) + 1
         try:
-            router = lease.context._router
-            ticket = await self.host._render_dispatcher.reserve_base(
+            router = lease.context.presentation
+            ticket = await self.ports.dispatcher.reserve_base(
                 control_id=control_id,
                 context_id=lease.context_id,
                 binding_id=lease.binding_id,
-                output=router._output,
+                output=router.output,
             )
             job = _Job(
                 message,
@@ -272,8 +306,8 @@ class BindingRenderer:
                     len(self.jobs) > 512 or old.deadline + 60 < time.monotonic()
                 ):
                     self.jobs.pop(key, None)
-            self.host._start_soon(self._run, job)
-            self.host._start_soon(self._expire, job)
+            self.ports.start_soon(self._run, job)
+            self.ports.start_soon(self._expire, job)
         except BaseException:
             self.active[control_id] -= 1
             _WORKERS.release()
@@ -370,7 +404,7 @@ class BindingRenderer:
         )
         if self._retained(key):
             return
-        async with self.host._nav_lock:
+        async with self.ports.boundary:
             try:
                 self._validate_direct(envelope, lease, support)
             except (ValueError, TypeError):
@@ -446,7 +480,7 @@ class BindingRenderer:
     async def _authorize(self, job):
         if job.done or time.monotonic() >= job.deadline:
             raise ContentFailure("deadline_exceeded")
-        if not await self.host._action_service.authorize_runtime_message(
+        if not await self.ports.actions.authorize_runtime_message(
             job.lease.provider_session_key, job.message
         ):
             raise RenderRejection("target_not_current")
@@ -458,8 +492,8 @@ class BindingRenderer:
             raise ContentFailure("deadline_exceeded")
 
     async def _run(self, job):
-        router = job.lease.context._router
-        dispatcher = self.host._render_dispatcher
+        router = job.lease.context.presentation
+        dispatcher = self.ports.dispatcher
         try:
             if job.body.operation == "clear":
                 image = None
@@ -497,16 +531,16 @@ class BindingRenderer:
                     await self._finish(job, "superseded", "newer_output")
                     return
                 revision = dispatcher.composition_revision(job.ticket)
-                overlay = router._store.overlay
+                overlay = router.store.overlay
                 model = RenderModel(
                     image=image_uri,
                     overlay_type=overlay.template if overlay else None,
                     overlay_title=overlay.title if overlay else None,
                 )
-                request = router._render_service.build_request(
+                request = router.render_service.build_request(
                     model,
-                    router._image_format,
-                    config_id=self.host.config_id,
+                    router.image_format,
+                    config_id=self.ports.config_id,
                     generation=revision,
                     source=RenderSource(
                         provider_instance_id=job.lease.provider_instance_id,
@@ -538,37 +572,46 @@ class BindingRenderer:
                             job.body.content.data["image"], validate=True
                         )
                     else:
-                        result = await self.host._render_backend.render(request)
+                        result = await render_with_retry(
+                            self.ports.backend,
+                            request,
+                            is_current=lambda: not job.done
+                            and dispatcher.base_is_current(job.ticket),
+                            timeout=max(0, job.deadline - time.monotonic()),
+                        )
+                        if result is None:
+                            await self._finish(job, "superseded", "newer_output")
+                            return
                         if result.frame is None:
                             raise ContentFailure("render_failed")
                         frame = result.frame
                 if job.done:
                     return
-                async with self.host._nav_lock:
-                    await self._authorize(job)
-                    job.command_id = str(uuid.uuid4())
-                    self.host._command_service.observe_render_command(
-                        job.command_id,
-                        self.host.config_id,
-                        job.lease.control_id,
-                        job.lease.raster_capability_id,
-                        "clear" if frame is None else "set_frame",
-                        lambda message: self._hardware_rejection(job, message),
+                await self._authorize(job)
+                job.command_id = str(uuid.uuid4())
+                self.ports.hardware.observe_render_command(
+                    job.command_id,
+                    self.ports.config_id,
+                    job.lease.control_id,
+                    job.lease.raster_capability_id,
+                    "clear" if frame is None else "set_frame",
+                    lambda message: self._hardware_rejection(job, message),
+                )
+
+                def committed():
+                    router.store.content.image = image_uri
+                    router.store.content.title = None
+
+                with anyio.fail_after(max(0, job.deadline - time.monotonic())):
+                    sent = await dispatcher.publish_base(
+                        job.ticket,
+                        revision,
+                        frame,
+                        message_id=job.command_id,
+                        authorize=lambda: self._authorize(job),
+                        committed=committed,
+                        recompose=router.render,
                     )
-
-                    def committed():
-                        router._store.content.image = image_uri
-                        router._store.content.title = None
-
-                    with anyio.fail_after(max(0, job.deadline - time.monotonic())):
-                        sent = await dispatcher.publish_base(
-                            job.ticket,
-                            revision,
-                            frame,
-                            message_id=job.command_id,
-                            authorize=lambda: self._authorize(job),
-                            committed=committed,
-                        )
                 if sent:
                     await self._finish(job, "dispatched")
                     return

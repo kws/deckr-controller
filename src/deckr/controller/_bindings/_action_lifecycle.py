@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol
@@ -40,6 +40,7 @@ from deckr.controller._bindings._attachments import (
 from deckr.controller._bindings._context import RuntimeMessageSender
 from deckr.controller._bindings._ports import LifecycleAvailabilityRecorder
 from deckr.controller._pages import DynamicPageSession
+from deckr.controller._session_effects import Effect, SessionEffects
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 
 logger = logging.getLogger(__name__)
@@ -189,13 +190,22 @@ class ActionInstanceLifecycleService:
         availability_recorder: LifecycleAvailabilityRecorder,
         host: BindingLifecycleHost,
         clock: Callable[[], float],
+        notification_sender: RuntimeMessageSender | None = None,
+        effects: SessionEffects | None = None,
+        authority_current: Callable[[], bool] = lambda: True,
+        schedule_recovery: Callable[[BindingLease], Awaitable[None]] | None = None,
     ) -> None:
+        self._effects = effects
+        self._authority_current = authority_current
+        self._schedule_recovery = schedule_recovery
         self._config_id = config_id
         self._runtime_sender = runtime_sender
+        self._notification_sender = notification_sender or runtime_sender
         self._availability_recorder = availability_recorder
         self._host = host
         self._clock = clock
         self._action_instances: dict[str, ActionInstanceMetadata] = {}
+        self._started_instances: dict[str, ActionInstanceMetadata] = {}
         self._action_instance_providers: dict[str, str] = {}
         self._action_instance_provider_sessions: dict[
             str,
@@ -230,6 +240,71 @@ class ActionInstanceLifecycleService:
         ):
             return existing.context_id
         return None
+
+    def reserve_action_instance(
+        self,
+        *,
+        action_meta: ActionMetadata,
+        action_instance_id: str,
+        context_id: str,
+    ) -> ActionInstanceMetadata:
+        """Record desired instance identity before starting adapter work."""
+        existing = self._action_instances.get(action_instance_id)
+        key = (
+            None
+            if action_meta.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID
+            else provider_session_key(action_meta)
+        )
+        if (
+            existing is not None
+            and _action_instance_matches_action(
+                existing, action_meta, config_id=self._config_id
+            )
+            and self._action_instance_provider_sessions.get(action_instance_id) == key
+        ):
+            return existing
+        metadata = ActionInstanceMetadata(
+            providerInstanceId=action_meta.provider_instance_id,
+            providerId=action_meta.provider_id,
+            actionId=action_meta.uuid,
+            actionInstanceId=action_instance_id,
+            configId=self._config_id,
+            contextId=context_id,
+        )
+        self._action_instances[action_instance_id] = metadata
+        self._action_instance_providers[action_instance_id] = (
+            action_meta.provider_instance_id
+        )
+        self._action_instance_provider_sessions[action_instance_id] = key
+        return metadata
+
+    def instance_is_current(self, metadata, key) -> bool:
+        return (
+            self._action_instances.get(metadata.action_instance_id) is metadata
+            and self._action_instance_provider_sessions.get(metadata.action_instance_id)
+            == key
+        )
+
+    def instance_started(self, metadata) -> bool:
+        return self._started_instances.get(metadata.action_instance_id) is metadata
+
+    def invalidate_instance_started(self, metadata) -> None:
+        if self.instance_started(metadata):
+            self._started_instances.pop(metadata.action_instance_id, None)
+
+    def accept_instance_started(self, metadata, key) -> None:
+        if self.instance_is_current(metadata, key):
+            self._started_instances[metadata.action_instance_id] = metadata
+
+    async def start_reserved_instance(self, metadata, key) -> bool:
+        """Adapter work only; the device decides whether to accept its result."""
+        if metadata.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return True
+        return await self._runtime_sender.send_action_runtime_message(
+            provider_session_key=key,
+            message_type=ACTION_INSTANCE_CREATED,
+            body=ActionInstanceLifecycleBody(metadata=metadata),
+        )
 
     async def ensure_action_instance(
         self,
@@ -329,6 +404,7 @@ class ActionInstanceLifecycleService:
         notify_provider: bool = True,
     ) -> None:
         metadata = self._action_instances.pop(action_instance_id, None)
+        self._started_instances.pop(action_instance_id, None)
         provider_instance_id = self._action_instance_providers.pop(
             action_instance_id,
             None,
@@ -354,7 +430,7 @@ class ActionInstanceLifecycleService:
                 provider_instance_id,
             )
             return
-        sent = await self._runtime_sender.send_action_runtime_message(
+        sent = await self._notification_sender.send_action_runtime_message(
             provider_session_key=provider_session_key_for_action,
             message_type=ACTION_INSTANCE_DESTROYED,
             body=ActionInstanceLifecycleBody(metadata=metadata, reason=reason),
@@ -406,10 +482,38 @@ class ActionInstanceLifecycleService:
             lease.binding_id,
             reason,
         )
-        await self._publish_action_instance_created(
-            metadata=metadata,
-            provider_session_key_for_action=lease.provider_session_key,
+        if self._schedule_recovery is not None:
+            await self._schedule_recovery(lease)
+        elif self._effects is not None:
+            admitted = self._effects.submit(
+                lease.action_instance_id,
+                Effect(
+                    "recover attachment",
+                    lambda: self._recover_attachment(metadata, lease),
+                    timeout=2,
+                ),
+            )
+            if not admitted:
+                lease.stale_lifecycle_recoveries -= 1
+        else:
+            await self._recover_attachment(metadata, lease)
+
+    def _recovery_current(self, lease) -> bool:
+        return (
+            self._authority_current()
+            and self._host.binding_by_id(lease.binding_id) is lease
+            and self._host.current_contract(lease.provider_session_key)
+            == lease.context.contract
         )
+
+    async def _recover_attachment(self, metadata, lease) -> None:
+        if not self._recovery_current(lease):
+            return
+        started = await self.start_reserved_instance(
+            metadata, lease.provider_session_key
+        )
+        if not started or not self._recovery_current(lease):
+            return
         with anyio.move_on_after(BINDING_ATTACH_NOTIFY_TIMEOUT_SECONDS) as scope:
             await lease.context.on_binding_attached()
         if scope.cancel_called:
@@ -449,7 +553,7 @@ class ActionInstanceLifecycleService:
             )
             return
         try:
-            await self._runtime_sender.send_action_runtime_message(
+            await self._notification_sender.send_action_runtime_message(
                 provider_session_key=session_key,
                 message_type=PAGE_SESSION_OPENED,
                 body=PageSessionLifecycleBody(
@@ -489,7 +593,7 @@ class ActionInstanceLifecycleService:
             )
             return
         try:
-            await self._runtime_sender.send_action_runtime_message(
+            await self._notification_sender.send_action_runtime_message(
                 provider_session_key=session_key,
                 message_type=PAGE_SESSION_CLOSED,
                 body=PageSessionLifecycleBody(

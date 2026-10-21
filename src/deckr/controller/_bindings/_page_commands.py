@@ -1,5 +1,11 @@
 """Page commands resolved against retained state at a serialized commit."""
 
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 from deckr.action_runtime import (
     PageCommandContext,
     PageTargetState,
@@ -18,7 +24,61 @@ from deckr.actions.messages import (
 from deckr.contracts.messages import service_address
 from deckr.services import ServiceMessageBody
 
+from deckr.controller._actions._requests import (
+    ClosePage,
+    OpenPage,
+    PageGrant,
+    UpdatePage,
+)
 from deckr.controller._pages import PageOwnerBinding
+
+if TYPE_CHECKING:
+    from deckr.contracts.authority import ContractPointer
+    from deckr.lanes import EndpointSession
+
+    from deckr.controller._actions import ProviderSessionKey
+    from deckr.controller._bindings._attachments import BindingLease
+    from deckr.controller._bindings._ports import BindingActionService
+    from deckr.controller._hardware import HardwareCommandService
+    from deckr.controller._pages._navigation import DeviceNavigation
+    from deckr.controller._session_boundary import SessionBoundary
+    from deckr.controller._session_state import DeviceState
+
+
+@dataclass(frozen=True)
+class PageCommandPorts:
+    endpoint: EndpointSession
+    hardware: HardwareCommandService
+    actions: BindingActionService
+    navigation: DeviceNavigation
+    boundary: SessionBoundary
+    state: DeviceState
+    binding_by_id: Callable[[str], BindingLease | None]
+    binding_command_authorized: Callable[[BindingLease], bool]
+    provider_session_key_for_session: Callable[..., ProviderSessionKey | None]
+    current_contract: Callable[[ProviderSessionKey | None], ContractPointer | None]
+    emit_page_opened: Callable[..., Awaitable[None]]
+
+    @property
+    def config_active(self):
+        return self.state.navigation.config_active and self.state.hardware_current(
+            self.hardware
+        )
+
+    @property
+    def config_id(self):
+        return self.state.config.id
+
+    @property
+    def hardware_ref(self):
+        return self.state.identity.hardware
+
+    @property
+    def device(self):
+        return self.state.device
+
+    def active_page_session(self):
+        return self.state.navigation.active_dynamic_session()
 
 
 def _owner_from_binding(lease):
@@ -104,15 +164,15 @@ def _observations(host, message, owner, target):
             )
     return PageCommandContext(
         contract=message.contract,
-        controllerEndpoint=str(host._endpoint.address),
-        controllerSessionId=host._endpoint.session_id,
+        controllerEndpoint=str(host.endpoint.address),
+        controllerSessionId=host.endpoint.session_id,
         runtimeEndpoint=str(
             service_address(action_runtime_service_id(owner.provider_instance_id))
         ),
         runtimeSessionId=owner.provider_session_id,
         localAuthority=current_contract is not None
         and current_contract == message.contract,
-        hardwareAuthority=host._command_service.has_authority(
+        hardwareAuthority=host.hardware.has_authority(
             host.config_id, host.hardware_ref
         ),
         bindings=bindings,
@@ -131,51 +191,79 @@ async def handle_page_command(host, message) -> bool:
     if not isinstance(body, OpenPageBody | ReplacePageBody | ClosePageBody):
         return False
     target = body.target
-    async with host._nav_lock:
-        if isinstance(target, BindingCommandTarget):
-            lease = host.binding_by_id(target.binding_id)
-            if lease is None:
-                return False
-            owner = _owner_from_binding(lease)
-        else:
-            session = host.active_page_session()
-            if session is None or session.page_session_id != target.page_session_id:
-                return False
-            owner = _owner_from_session(session)
+    if isinstance(target, BindingCommandTarget):
+        lease = host.binding_by_id(target.binding_id)
+        if lease is None:
+            return False
+        owner = _owner_from_binding(lease)
+    else:
+        session = host.active_page_session()
+        if session is None or session.page_session_id != target.page_session_id:
+            return False
+        owner = _owner_from_session(session)
 
-        async def validate():
+    key = host.provider_session_key_for_session(
+        provider_instance_id=owner.provider_instance_id,
+        provider_id=owner.provider_id,
+        provider_session_id=owner.provider_session_id,
+    )
+    if not await host.actions.authorize_runtime_message(key, message):
+        return True
+    async with host.boundary:
+
+        def validate():
             key = host.provider_session_key_for_session(
                 provider_instance_id=owner.provider_instance_id,
                 provider_id=owner.provider_id,
                 provider_session_id=owner.provider_session_id,
             )
-            if not await host._action_service.authorize_runtime_message(key, message):
+            if host.current_contract(key) != message.contract:
                 raise ValueError("Page command lost managed service authority")
             validate_page_command(message, _observations(host, message, owner, target))
 
         try:
-            await validate()
+            validate()
             if isinstance(body, OpenPageBody):
-                draft = host._pages.begin_open_page(
-                    descriptor=body.descriptor, owner=owner
-                )
-            elif isinstance(body, ReplacePageBody):
-                draft = host._pages.begin_replace_page(
-                    descriptor=body.descriptor, context_id=owner.context_id
-                )
+                request = OpenPage(body.descriptor)
             else:
-                draft = host._pages.begin_close_page(context_id=owner.context_id)
+                grant = PageGrant(
+                    host.state.identity.session_id,
+                    target.page_session_id,
+                    owner.context_id,
+                    owner.action_instance_id,
+                    target.generation,
+                )
+                request = (
+                    UpdatePage(grant, body.descriptor)
+                    if isinstance(body, ReplacePageBody)
+                    else ClosePage(grant)
+                )
+            draft = host.state.navigation.begin_action_request(request, owner=owner)
             if draft is None:
                 return True
-            ok, _ = await host._execute_page_draft(
+            revision = host.state.navigation.state.revision
+            plan = await host.navigation.build_transition_plan(draft)
+        except (ValueError, TypeError):
+            return True
+    # Managed authority can change independently of the device event stream.
+    # Reauthorize after planning without holding the device boundary, then reject
+    # a superseded local transition before committing the resulting plan.
+    if plan is None or not await host.actions.authorize_runtime_message(key, message):
+        return True
+    async with host.boundary:
+        if host.state.navigation.state.revision != revision:
+            return True
+        try:
+            validate()
+            ok, _ = await host.navigation.commit_page_draft(
                 draft,
+                plan,
                 causation_id=message.message_id,
-                validate_commit=validate,
             )
         except (ValueError, TypeError):
             return True
         if ok and not isinstance(body, ClosePageBody):
-            await host._lifecycle.emit_page_opened(
+            await host.emit_page_opened(
                 draft.page_session, causation_id=message.message_id
             )
         return True

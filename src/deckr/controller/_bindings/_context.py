@@ -3,13 +3,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
 from deckr.actions.messages import (
-    BINDING_ATTACHED,
-    BINDING_DETACHED,
-    CAPABILITY_INPUT,
-    BindingAttachedBody,
-    BindingDetachedBody,
     BindingMetadata,
-    CapabilityInputBody,
     CapabilityInputEvent,
     DynamicPageCommand,
     SettingsTargetRef,
@@ -19,6 +13,12 @@ from deckr.contracts.models import thaw_json
 from deckr.hardware.descriptors import DeviceDescriptor
 
 from deckr.controller._actions import ProviderSessionKey
+from deckr.controller._actions._gateway import (
+    ActionGateway,
+    LocalActionAdapter,
+    RemoteActionAdapter,
+)
+from deckr.controller._actions._requests import ActionRequestPort
 from deckr.controller._command_router import CommandRouter, DeviceOutput
 from deckr.controller._device_layout import ControlSurface
 from deckr.controller._hardware import HardwareCommandService
@@ -96,7 +96,6 @@ class ControlContext:
         settings: Mapping[str, Any],
         internal: Mapping[str, Any],
         runtime_sender: RuntimeMessageSender,
-        page_command_port: PageCommandPort,
         start_soon: Callable[..., None],
         render_dispatcher: RenderDispatcher,
         context_settings_target: SettingsTargetRef | None,
@@ -107,6 +106,7 @@ class ControlContext:
         page_id: str,
         builtin_action: "BuiltinAction | None" = None,
         metadata: BindingMetadata,
+        request_port: ActionRequestPort,
     ):
         self._controller_id = controller_id
         self.device = device
@@ -125,7 +125,6 @@ class ControlContext:
         self.metadata = metadata
         self.control = control
         self.runtime_sender = runtime_sender
-        self.page_command_port = page_command_port
         self.profile_id = profile_id
         self.page_id = page_id
         self.settings_target = context_settings_target
@@ -156,14 +155,36 @@ class ControlContext:
             start_soon=start_soon,
         )
         from deckr.controller._bindings._rendering import rendering_support
+
         self.rendering = rendering_support(self)
         self.controller_context = ControllerActionContext(
-            router=self._router,
-            page_command_port=page_command_port,
-            context_id=self.id,
+            request_port=request_port,
             binding_metadata=metadata,
             settings=self._store.settings,
         )
+
+        self.gateway = ActionGateway(
+            LocalActionAdapter(builtin_action, self.controller_context)
+            if builtin_action is not None
+            else RemoteActionAdapter(
+                metadata,
+                self._publish,
+                lambda: dict(
+                    binding=self.metadata,
+                    rendering=self.rendering,
+                    settings=self.settings,
+                    internal=self.internal,
+                ),
+            )
+        )
+
+    @property
+    def presentation(self) -> CommandRouter:
+        return self._router
+
+    def replace_settings(self, settings: Mapping[str, Any]) -> None:
+        self._store.settings = dict(thaw_json(settings))
+        self.controller_context.replace_settings(settings)
 
     @property
     def id(self) -> str:
@@ -226,38 +247,19 @@ class ControlContext:
             self.binding_id,
             message_type,
         )
+        raise RuntimeError(f"Action runtime delivery refused: {message_type}")
 
     async def on_binding_attached(self) -> None:
-        if self._builtin_action is not None:
-            await self._builtin_action.on_bind(self.controller_context)
-            return
-        await self._publish(
-            BINDING_ATTACHED,
-            BindingAttachedBody(
-                binding=self.metadata,
-                rendering=self.rendering,
-                settings=self._store.settings,
-                internal=self._internal,
-            ),
-        )
+        await self.gateway.attach()
 
     async def on_binding_detached(self, reason: str) -> None:
-        if self._builtin_action is not None:
-            await self._builtin_action.on_unbind(self.controller_context, reason)
-            return
-        await self._publish(
-            BINDING_DETACHED,
-            BindingDetachedBody(binding=self.metadata, reason=reason),
-        )
+        await self.gateway.detach(reason)
 
     async def on_input(self, event: CapabilityInputEvent) -> None:
-        if self._builtin_action is not None:
-            await self._builtin_action.on_input(self.controller_context, event)
-            return
-        await self._publish(
-            CAPABILITY_INPUT,
-            CapabilityInputBody(binding=self.metadata, event=event),
-        )
+        await self.gateway.input(event)
+
+    async def set_title(self, text: str) -> None:
+        await self._router.set_title(text)
 
     async def set_raster_image(
         self,

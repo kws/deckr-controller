@@ -21,7 +21,7 @@ from deckr.lanes import EndpointSession
 
 from deckr.controller._actions import ControllerActionService, ProviderActionKey
 from deckr.controller._actions._routing import action_command_metadata
-from deckr.controller._device_manager import DeviceManager
+from deckr.controller._device_session import DeviceSession
 from deckr.controller._hardware import (
     ControllerHardwareService,
     LiveDeviceRoute,
@@ -63,7 +63,7 @@ class ControllerService(BaseComponent):
             callbacks=self,
         )
         self._command_service = self._hardware.command_service
-        self._controller_contexts = AsyncMap[str, DeviceManager]()
+        self._controller_contexts = AsyncMap[str, DeviceSession]()
         self._device_disconnect_events: dict[str, anyio.Event] = {}
         self._action_registry = action_registry
         self._action_service = action_service
@@ -78,7 +78,7 @@ class ControllerService(BaseComponent):
     async def _handle_action_command(
         self, msg: DeckrMessage, *, service_message: DeckrMessage | None = None
     ) -> None:
-        """Route command messages to the appropriate DeviceManager."""
+        """Route command messages to the appropriate DeviceSession."""
         if msg.message_type not in COMMAND_MESSAGE_TYPES:
             return
         if msg.message_type in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
@@ -123,7 +123,10 @@ class ControllerService(BaseComponent):
         body = ServiceMessageBody.from_wire(message.body)
         if body.name != "binding_render":
             return False
-        if self._action_service is None or await self._action_service.render_message_key(message) is None:
+        if (
+            self._action_service is None
+            or await self._action_service.render_message_key(message) is None
+        ):
             return True
         for context in await self._controller_contexts.values():
             if await context.handle_render_command(message):
@@ -132,8 +135,11 @@ class ControllerService(BaseComponent):
             target = BindingCommandTarget.from_wire(body.params["target"])
             requirement = body.params["requirementName"]
             result = BindingRenderResultBody(
-                requestMessageId=message.message_id, target=target,
-                requirementName=requirement, stage="controller", status="rejected",
+                requestMessageId=message.message_id,
+                target=target,
+                requirementName=requirement,
+                stage="controller",
+                status="rejected",
                 code="target_not_current",
             )
         except (KeyError, TypeError, ValueError):
@@ -201,12 +207,12 @@ class ControllerService(BaseComponent):
     ) -> None:
         ctrl_ctx = await self._controller_contexts.pop(config_id)
         disconnect_ev = self._device_disconnect_events.get(config_id)
-        if disconnect_ev is not None:
-            disconnect_ev.set()
         try:
             if ctrl_ctx is not None:
-                await ctrl_ctx.clear_page(clear_outputs=False)
+                await ctrl_ctx.aclose()
         finally:
+            if disconnect_ev is not None:
+                disconnect_ev.set()
             logger.info(
                 "Stopped controller service for config %s (reason: %s)",
                 config_id,
@@ -274,7 +280,7 @@ class ControllerService(BaseComponent):
             self._stopping.set()
         await self._hardware.aclose()
         for ctrl_ctx in await self._controller_contexts.values():
-            await ctrl_ctx.clear_page(clear_outputs=False)
+            await ctrl_ctx.aclose()
         await self._controller_contexts.clear()
         if self._action_service is not None:
             await self._action_service.aclose()
@@ -308,7 +314,7 @@ class ControllerService(BaseComponent):
             ):
                 return
 
-            ctrl_ctx = DeviceManager(
+            ctrl_ctx = DeviceSession(
                 controller_id=self._controller_id,
                 device=live.device,
                 hardware_ref=live.ref,

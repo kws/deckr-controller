@@ -1,4 +1,4 @@
-"""Page stack, dynamic page sessions, and transition decisions."""
+"""Pure navigation rules for a configured route and one temporary page."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from deckr.actions.messages import (
 from deckr.contracts.authority import ContractPointer
 
 from deckr.controller._actions._models import ActionMetadata
+from deckr.controller._actions._requests import ClosePage, OpenPage, UpdatePage
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller.config._data import DeviceConfig, Profile
 from deckr.controller.settings import static_action_identity_fallback
@@ -58,6 +59,10 @@ class DynamicPageSession:
     settings_target: SettingsTargetRef | None
     generation: int = 0
     owner_contract: ContractPointer | None = None
+    deadline_revision: int = 0
+    source: Literal["provider", "configuration"] = "provider"
+    presentation: Literal["temporary", "route"] = "temporary"
+    lifetime_owner: Literal["action_instance", "controller"] = "action_instance"
 
 
 @dataclass(slots=True)
@@ -65,6 +70,28 @@ class PageFrame:
     entry: PageStackEntry
     page_session: DynamicPageSession | None
     committed_plan: PagePlan
+
+
+@dataclass(slots=True)
+class NavigationState:
+    configured_route: PageFrame | None = None
+    temporary_page: PageFrame | None = None
+    revision: int = 0
+
+    @property
+    def frames(self) -> tuple[PageFrame, ...]:
+        return tuple(
+            frame
+            for frame in (self.configured_route, self.temporary_page)
+            if frame is not None
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PageDeadline:
+    page_session_id: str
+    revision: int
+    due_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +144,7 @@ class PageTransitionEffects:
 
 
 class PageSessionService:
-    """Owns controller page stack and dynamic-page session state."""
+    """Navigation model owned and mutated by one device session; no adapters."""
 
     def __init__(
         self,
@@ -128,17 +155,48 @@ class PageSessionService:
         self._config = config
         self._clock = clock
         self._config_active = True
-        self._frames: list[PageFrame] = []
+        self.state = NavigationState()
 
     @property
     def config_active(self) -> bool:
         return self._config_active
 
+    def begin_action_request(
+        self,
+        request: OpenPage | UpdatePage | ClosePage,
+        *,
+        owner: PageOwnerBinding | None = None,
+    ) -> PageTransitionDraft | None:
+        """Normalize local and wire-adapted page intents into the same rules."""
+        if isinstance(request, OpenPage):
+            if owner is None:
+                return None
+            return self.begin_open_page(descriptor=request.definition, owner=owner)
+        session = self.active_dynamic_session()
+        grant = request.grant
+        if session is None or (
+            grant.page_session_id,
+            grant.context_id,
+            grant.action_instance_id,
+            grant.revision,
+        ) != (
+            session.page_session_id,
+            session.context_id,
+            session.action_instance_id,
+            session.generation,
+        ):
+            return None
+        if isinstance(request, UpdatePage):
+            return self.begin_replace_page(
+                descriptor=request.definition, context_id=grant.context_id
+            )
+        return self.begin_close_page(context_id=grant.context_id)
+
     def snapshot(self) -> PageSnapshot:
         current_frame = self.current_frame()
         return PageSnapshot(
             config_active=self._config_active,
-            frames=tuple(self._frames),
+            frames=tuple(self.state.frames),
             current_frame=current_frame,
             current_plan=current_frame.committed_plan
             if current_frame is not None
@@ -147,14 +205,14 @@ class PageSessionService:
         )
 
     def current_frame(self) -> PageFrame | None:
-        return self._frames[-1] if self._frames else None
+        return self.state.frames[-1] if self.state.frames else None
 
     def current_plan(self) -> PagePlan | None:
         frame = self.current_frame()
         return frame.committed_plan if frame is not None else None
 
     def active_dynamic_session(self) -> DynamicPageSession | None:
-        for frame in reversed(self._frames):
+        for frame in reversed(self.state.frames):
             if frame.page_session is not None:
                 return frame.page_session
         return None
@@ -364,13 +422,16 @@ class PageSessionService:
         session = self._page_control_session(context_id)
         if session is None:
             return None
-        if len(self._frames) < 2 or self._frames[-1].page_session is not session:
+        if (
+            len(self.state.frames) < 2
+            or self.state.frames[-1].page_session is not session
+        ):
             return None
-        departing_frame = self._frames[-1]
+        departing_frame = self.state.frames[-1]
         restore_frame = next(
             (
                 frame
-                for frame in reversed(self._frames[:-1])
+                for frame in reversed(self.state.frames[:-1])
                 if frame.page_session is None
             ),
             None,
@@ -382,7 +443,7 @@ class PageSessionService:
             entry=restore_frame.entry,
             page_session=restore_frame.page_session,
             departing=departing_frame.entry,
-            retained_plan=restore_frame.committed_plan,
+            retained_plan=None,
             preserve_rebound_outputs=True,
             refresh_actions=False,
             sessions_to_close=self._dynamic_sessions(reverse=True),
@@ -414,43 +475,18 @@ class PageSessionService:
         draft: PageTransitionDraft,
         plan: PagePlan,
     ) -> PageTransitionEffects:
-        if (
-            draft.page_session is not None
-            and draft.page_session_generation is not None
-        ):
+        if draft.page_session is not None and draft.page_session_generation is not None:
             draft.page_session.generation = draft.page_session_generation
         if plan.page_session is not draft.page_session:
             plan.page_session = draft.page_session
 
         frame = PageFrame(draft.entry, draft.page_session, plan)
-        if draft.kind == "close":
-            static_frames = [
-                existing for existing in self._frames if existing.page_session is None
-            ]
-            if static_frames:
-                static_frames[-1] = frame
-                self._frames = static_frames
-            else:
-                self._frames = [frame]
-        elif draft.kind == "refresh":
-            if self._frames:
-                self._frames[-1] = frame
-            else:
-                self._frames = [frame]
-        elif isinstance(draft.entry, StaticPageRef):
-            self._frames = [frame]
-        elif draft.kind == "replace":
-            if self._frames:
-                self._frames[-1] = frame
-            else:
-                self._frames = [frame]
-        elif draft.kind == "open":
-            self._frames = [
-                existing for existing in self._frames if existing.page_session is None
-            ]
-            self._frames.append(frame)
+        if isinstance(draft.entry, StaticPageRef):
+            self.state.configured_route = frame
+            self.state.temporary_page = None
         else:
-            self._frames.append(frame)
+            self.state.temporary_page = frame
+        self.state.revision += 1
 
         return PageTransitionEffects(
             sessions_to_close=draft.sessions_to_close,
@@ -466,12 +502,10 @@ class PageSessionService:
     ) -> PageTransitionEffects:
         previous_dynamic_plans = self._committed_dynamic_page_plans(reverse=True)
         sessions_to_close = self._dynamic_sessions(reverse=True)
-        if dynamic_only:
-            self._frames = [
-                frame for frame in self._frames if frame.page_session is None
-            ]
-        else:
-            self._frames.clear()
+        self.state.temporary_page = None
+        if not dynamic_only:
+            self.state.configured_route = None
+        self.state.revision += 1
         return PageTransitionEffects(
             sessions_to_close=sessions_to_close,
             previous_dynamic_plans=previous_dynamic_plans,
@@ -507,15 +541,29 @@ class PageSessionService:
         session = self.active_dynamic_session()
         if session is not None:
             session.last_activity = self._clock()
+            session.deadline_revision += 1
 
-    def expired_session(self) -> DynamicPageSession | None:
+    def deadline(self) -> PageDeadline | None:
         session = self.active_dynamic_session()
         if session is None or session.timeout_ms <= 0:
             return None
-        elapsed_ms = int((self._clock() - session.last_activity) * 1000)
-        if elapsed_ms >= session.timeout_ms:
-            return session
-        return None
+        return PageDeadline(
+            session.page_session_id,
+            session.deadline_revision,
+            session.last_activity + session.timeout_ms / 1000,
+        )
+
+    def accept_expiry(
+        self, deadline: PageDeadline, *, now: float
+    ) -> DynamicPageSession | None:
+        current = self.deadline()
+        if current != deadline or now < deadline.due_at:
+            return None
+        return self.active_dynamic_session()
+
+    def expired_session(self) -> DynamicPageSession | None:
+        deadline = self.deadline()
+        return self.accept_expiry(deadline, now=self._clock()) if deadline else None
 
     def _page_control_session(
         self,
@@ -550,11 +598,9 @@ class PageSessionService:
         *,
         reverse: bool = False,
     ) -> tuple[DynamicPageSession, ...]:
-        frames = reversed(self._frames) if reverse else self._frames
+        frames = reversed(self.state.frames) if reverse else self.state.frames
         return tuple(
-            frame.page_session
-            for frame in frames
-            if frame.page_session is not None
+            frame.page_session for frame in frames if frame.page_session is not None
         )
 
     def _committed_dynamic_page_plans(
@@ -562,9 +608,7 @@ class PageSessionService:
         *,
         reverse: bool = False,
     ) -> tuple[PagePlan, ...]:
-        frames = reversed(self._frames) if reverse else self._frames
+        frames = reversed(self.state.frames) if reverse else self.state.frames
         return tuple(
-            frame.committed_plan
-            for frame in frames
-            if frame.page_session is not None
+            frame.committed_plan for frame in frames if frame.page_session is not None
         )

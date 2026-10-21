@@ -117,7 +117,6 @@ class ControllerRuntimeService(BaseComponent):
                 self._runtime.config,
                 controller_id=self._runtime.controller_id,
                 config_service=config_service,
-                action_provider=action_registry.get_action,
                 availability_service=action_service,
             )
             render_backend = _build_render_backend(

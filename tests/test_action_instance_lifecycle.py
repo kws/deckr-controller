@@ -137,7 +137,11 @@ def _lease():
         provider_session_key=_session_key(),
         control_id="key-1",
         stale_lifecycle_recoveries=0,
-        context=SimpleNamespace(on_binding_attached=AsyncMock(), metadata=_binding_metadata()),
+        context=SimpleNamespace(
+            on_binding_attached=AsyncMock(),
+            metadata=_binding_metadata(),
+            contract=CONTRACT,
+        ),
         planned_intent=ActionIntentKey(ACTION_ID, PROVIDER_INSTANCE_ID, ()),
     )
 
@@ -254,9 +258,7 @@ def _rejection_message(
             provider_id=PROVIDER_ID,
             config_id=CONFIG_ID,
             action_instance_id=ACTION_INSTANCE_ID,
-            binding_id=(
-                body.binding.binding_id if body.binding is not None else None
-            ),
+            binding_id=(body.binding.binding_id if body.binding is not None else None),
             page_session_id=(
                 body.page_session.page_session_id
                 if body.page_session is not None
@@ -371,7 +373,9 @@ async def test_stale_lifecycle_recovery_republishes_and_reattaches_once() -> Non
 
 
 @pytest.mark.asyncio
-async def test_terminal_and_retryable_rejections_route_destructive_and_overlay_state() -> None:
+async def test_terminal_and_retryable_rejections_route_destructive_and_overlay_state() -> (
+    None
+):
     host, _, recorder, lifecycle = _service()
     lease = _lease()
     host.leases.append(lease)
@@ -435,7 +439,9 @@ async def test_terminal_and_retryable_rejections_route_destructive_and_overlay_s
 
 
 @pytest.mark.asyncio
-async def test_action_instance_rejection_requires_current_session_and_contract() -> None:
+async def test_action_instance_rejection_requires_current_session_and_contract() -> (
+    None
+):
     host, _, _, lifecycle = _service()
     await lifecycle.ensure_action_instance(
         action_meta=_action_metadata(),

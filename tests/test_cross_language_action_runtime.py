@@ -9,6 +9,7 @@ import io
 import os
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -342,7 +343,7 @@ async def test_page_targets_generations_and_notifications(language, tmp_path):
             "pageSession"
         ]
         assert closed["generation"] == 1
-        assert h.device._bindings.active_page_session() is None
+        assert h.device.active_page_session() is None
         assert await h.foreign.events("binding_detached")
 
 
@@ -426,9 +427,7 @@ async def test_render_reverse_completion_and_clear(language, tmp_path):
         assert (await h.foreign.result(clear))["status"] == "dispatched"
         backend.gates[2].set()
         assert (await h.foreign.result(pending))["status"] == "superseded"
-        await eventually(
-            lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0
-        )
+        await eventually(lambda: h.device._rendering.active.get("key-1", 0) == 0)
         assert h.commands.await_count == 2
 
 
@@ -498,9 +497,7 @@ async def test_failed_render_and_direct_frame_supersede_older_work(language, tmp
         assert (await h.foreign.result(failed))["status"] == "failed"
         backend.gates[0].set()
         assert (await h.foreign.result(old))["status"] == "superseded"
-        await eventually(
-            lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0
-        )
+        await eventually(lambda: h.device._rendering.active.get("key-1", 0) == 0)
         assert h.commands.await_count == 0
         pending = await h.foreign.send("binding_render", parameters(h))
         await eventually(lambda: len(backend.started) == 2)
@@ -544,9 +541,7 @@ async def test_overlay_composition_during_render_and_clear(language, tmp_path):
         assert (await h.foreign.result(base))["status"] == "dispatched"
         backend.gates[1].set()
         await eventually(
-            lambda: h.device._bindings._render_dispatcher._controls[
-                "key-1"
-            ].active_render_count
+            lambda: h.device._render_dispatcher._controls["key-1"].active_render_count
             == 0
         )
         assert h.commands.await_count == 1
@@ -575,9 +570,7 @@ async def test_hardware_loss_fences_queued_render(language, tmp_path):
         )
         await h.foreign.event("binding_detached")
         backend.gates[0].set()
-        await eventually(
-            lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0
-        )
+        await eventually(lambda: h.device._rendering.active.get("key-1", 0) == 0)
         assert h.commands.await_count == 0
         assert (await h.foreign.peer.command("status"))["contract"] == attached[
             "contract"
@@ -598,9 +591,7 @@ async def test_provider_successor_fences_queued_render_and_old_binding(
         await h.foreign.peer.stop()
         await eventually(lambda: h.device.context_for_control("key-1") is None)
         backend.gates[0].set()
-        await eventually(
-            lambda: h.device._bindings._rendering.active.get("key-1", 0) == 0
-        )
+        await eventually(lambda: h.device._rendering.active.get("key-1", 0) == 0)
         assert h.commands.await_count == 0
         h.foreign.peer = Peer(
             language, h.peer_config, h.evidence / "provider-successor"
@@ -632,10 +623,10 @@ async def test_service_loss_during_page_planning(language, tmp_path, monkeypatch
             {"target": parameters(h)["target"], "descriptor": page_descriptor()},
         )
         await h.foreign.event("page_session_opened")
-        session = h.device._bindings.active_page_session()
-        bindings = h.device._bindings
+        session = h.device.active_page_session()
+        bindings = h.device
         entered, release = anyio.Event(), anyio.Event()
-        original = bindings._build_page_plan
+        original = bindings.planning._build_page_plan
 
         async def delayed(*args, **kwargs):
             result = await original(*args, **kwargs)
@@ -643,7 +634,11 @@ async def test_service_loss_during_page_planning(language, tmp_path, monkeypatch
             await release.wait()
             return result
 
-        monkeypatch.setattr(bindings, "_build_page_plan", delayed)
+        monkeypatch.setattr(
+            bindings.navigation,
+            "bindings",
+            replace(bindings.navigation.bindings, build_plan=delayed),
+        )
         await h.foreign.send(
             "replace_page",
             {

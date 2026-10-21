@@ -106,7 +106,11 @@ class FileBackedDeviceConfigService(BaseComponent):
         self._config_by_id: dict[str, DeviceConfig] = {}
         self._state = CoalescedStateBroadcaster[str](current=True)
         self._lock = self._state.lock
+        self._publish_lock = anyio.Lock()
+        self._published_version: int | None = None
+        self._has_snapshot = False
         self._stop_event: anyio.Event | None = None
+        self.source_available = True
 
     async def start(self, ctx: RunContext) -> None:
         logger.debug(
@@ -176,8 +180,7 @@ class FileBackedDeviceConfigService(BaseComponent):
         data = config.model_dump(by_alias=True, exclude_none=True, mode="json")
         tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
         os.replace(tmp_path, path)
-        await self._cache_and_notify(path, config)
-        await self._publish_materialized_snapshot()
+        await self.refresh()
         return config
 
     async def refresh(self) -> None:
@@ -226,15 +229,33 @@ class FileBackedDeviceConfigService(BaseComponent):
 
     async def _scan_configs(self) -> None:
         """Scan config_dir for .yml files and update caches."""
+        # A failed read is not a deletion. Only a successful directory listing
+        # can establish that a previously validated file has been removed.
+        try:
+            paths = tuple(
+                path
+                for path in self._config_dir.iterdir()
+                if path.suffix in {".yml", ".yaml"}
+            )
+        except OSError:
+            self.source_available = False
+            logger.warning(
+                "Config source unavailable; retaining validated snapshots",
+                exc_info=True,
+            )
+            return
+        self.source_available = True
         path_to_config: dict[Path, str] = {}
         config_by_id: dict[str, DeviceConfig] = {}
-        for path in self._config_dir.glob("*.yml"):
+        for path in paths:
             cfg = _load_config_file(path)
-            if cfg is not None:
-                path_to_config[path] = cfg.id
-                config_by_id[cfg.id] = cfg
-        for path in self._config_dir.glob("*.yaml"):
-            cfg = _load_config_file(path)
+            if cfg is None:
+                previous_id = self._path_to_config.get(path)
+                cfg = (
+                    self._config_by_id.get(previous_id)
+                    if previous_id is not None
+                    else None
+                )
             if cfg is not None:
                 path_to_config[path] = cfg.id
                 config_by_id[cfg.id] = cfg
@@ -246,6 +267,7 @@ class FileBackedDeviceConfigService(BaseComponent):
             }
             self._path_to_config = path_to_config
             self._config_by_id = config_by_id
+            self._has_snapshot = True
             if affected_config_ids:
                 self._state.publish_locked(affected_config_ids)
 
@@ -254,64 +276,51 @@ class FileBackedDeviceConfigService(BaseComponent):
         await self.refresh()
         if self._stop_event is None:
             return
-        try:
-            async for changes in awatch(
-                self._config_dir,
-                watch_filter=_yaml_filter,
-                recursive=False,
-                stop_event=self._stop_event,
-            ):
-                await self._process_changes(changes)
-        except anyio.get_cancelled_exc_class():
-            raise
-        except Exception:
-            logger.exception("Config watch loop failed")
+        while not self._stop_event.is_set():
+            try:
+                async for changes in awatch(
+                    self._config_dir,
+                    watch_filter=_yaml_filter,
+                    recursive=False,
+                    stop_event=self._stop_event,
+                    yield_on_timeout=True,
+                    rust_timeout=500,
+                ):
+                    await self._process_changes(changes)
+            except anyio.get_cancelled_exc_class():
+                raise
+            except OSError:
+                # A missing mount/directory ends a native watch. Keep the last
+                # snapshot and retry so restoration needs no controller restart.
+                await self.refresh()
+                await anyio.sleep(0.5)
 
     async def _process_changes(self, changes: set[tuple[Change, str]]) -> None:
-        """Process file changes and notify affected subscribers."""
-        observations = [
-            (
-                change,
-                Path(path_str),
-                None
-                if change == Change.deleted
-                else _load_config_file(Path(path_str)),
-            )
-            for change, path_str in changes
-        ]
-        async with self._lock:
-            affected_config_ids: set[str] = set()
-            for change, path, cfg in observations:
-                if change == Change.deleted:
-                    config_id = self._path_to_config.pop(path, None)
-                    if config_id is not None:
-                        self._config_by_id.pop(config_id, None)
-                        affected_config_ids.add(config_id)
-                else:
-                    # added or modified
-                    old_config_id = self._path_to_config.get(path)
-                    if cfg is not None:
-                        if old_config_id is not None and old_config_id != cfg.id:
-                            affected_config_ids.add(old_config_id)
-                        self._path_to_config[path] = cfg.id
-                        self._config_by_id[cfg.id] = cfg
-                        affected_config_ids.add(cfg.id)
-                    elif old_config_id is not None:
-                        # Parse error: keep previous config, do not emit
-                        pass
-            if affected_config_ids:
-                self._state.publish_locked(affected_config_ids)
-        await self._publish_materialized_snapshot()
+        """Treat notifications as hints; a successful scan establishes deletion.
+
+        Periodic scans also cover events lost while a native watch starts or
+        reconnects. Invalid files and an unavailable source retain prior values.
+        """
+        await self.refresh()
 
     async def _publish_materialized_snapshot(self) -> None:
         if self._materialized_publisher is None:
             return
-        async with self._lock:
-            configs = tuple(self._config_by_id.values())
-        try:
-            await self._materialized_publisher.publish_configs(configs)
-        except Exception:
-            logger.exception("Failed to publish materialized config snapshot")
+        # Serialize writes so a slow, older snapshot cannot replace a newer one.
+        # Acknowledge only successful publication; periodic refresh retries failures,
+        # including the initial empty snapshot that removes stale remote configs.
+        async with self._publish_lock:
+            async with self._lock:
+                version = self._state.version
+                if not self._has_snapshot or version == self._published_version:
+                    return
+                configs = tuple(self._config_by_id.values())
+            try:
+                await self._materialized_publisher.publish_configs(configs)
+            except Exception:
+                logger.exception("Failed to publish materialized config snapshot")
+            else:
+                self._published_version = version
 
 
 class NullDeviceConfigService(BaseComponent):

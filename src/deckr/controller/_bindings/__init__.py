@@ -6,13 +6,21 @@ from deckr.controller._bindings._context import (
     PageCommandPort,
     RuntimeMessageSender,
 )
-from deckr.controller._bindings._service import (
-    BindingActionSnapshot,
-    BindingLeaseSnapshot,
-    ControlBindingService,
-    ControlContextSnapshot,
-    HeldInputSnapshot,
-)
+
+
+def __getattr__(name):
+    if name in {
+        "BindingActionSnapshot",
+        "BindingLeaseSnapshot",
+        "ControlBindingService",
+        "ControlContextSnapshot",
+        "HeldInputSnapshot",
+    }:
+        from deckr.controller._bindings import _service
+
+        return getattr(_service, name)
+    raise AttributeError(name)
+
 
 __all__ = [
     "ActionInstanceSnapshot",

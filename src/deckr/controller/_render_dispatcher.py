@@ -10,7 +10,7 @@ from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import anyio
 import httpx
@@ -37,6 +37,27 @@ class ControlOutput(Protocol):
 
 logger = logging.getLogger(__name__)
 MAX_ACTIVE_RENDERS_PER_CONTROL = 2
+RENDER_TIMEOUT_SECONDS = 2.0
+
+
+async def render_with_retry(
+    backend, request, *, is_current, timeout=RENDER_TIMEOUT_SECONDS
+):
+    """Retry pure worker work once; never retry a hardware send or action input."""
+    with anyio.fail_after(timeout):
+        for attempt in range(2):
+            if not is_current():
+                return None
+            try:
+                result = await backend.render(request)
+            except Exception:
+                if attempt:
+                    raise
+            else:
+                if not result.error or attempt:
+                    return result
+            await anyio.sleep(0)
+    return None
 
 
 def _init_render_worker() -> None:
@@ -208,6 +229,13 @@ class _ControlRenderState:
     io_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
+class RenderTicket(NamedTuple):
+    control_id: str
+    context_id: str
+    binding_id: str
+    base_revision: int
+
+
 class RenderDispatcher:
     """Per-device dispatcher that enforces last-write-wins by control generation."""
 
@@ -219,32 +247,29 @@ class RenderDispatcher:
         backend: RenderBackend,
         start_soon,
         result_authorizer: Callable[[str, str | None, str | None], bool] | None = None,
-        ownership_lock: anyio.Lock | None = None,
+        completion_transaction: Callable | None = None,
     ):
         self._command_service = command_service
         self._config_id = config_id
         self._backend = backend
         self._start_soon = start_soon
         self._result_authorizer = result_authorizer
-        self._ownership_lock = ownership_lock
+        self._completion_transaction = completion_transaction
         self._lock = anyio.Lock()
         self._controls: dict[str, _ControlRenderState] = {}
+        self._pending_clears: dict[str, int] = {}
+        self._clearing: set[str] = set()
+
+    def set_runner(self, start_soon) -> None:
+        self._start_soon = start_soon
 
     @asynccontextmanager
     async def output_transaction(self):
-        """Serialize state changes and sends with binding/page ownership changes.
-
-        Lifecycle callers already own this lock. Re-entry by that same task is
-        safe; worker and overlay-expiry tasks must acquire it before proceeding.
-        """
-        lock = self._ownership_lock
-        owner = lock.statistics().owner if lock is not None else None
-        if lock is None or (
-            owner is not None and owner.id == anyio.get_current_task().id
-        ):
+        """Enter the application's presentation-result admission boundary."""
+        if self._completion_transaction is None:
             yield
         else:
-            async with lock:
+            async with self._completion_transaction():
                 yield
 
     async def reserve_base(self, *, control_id, context_id, binding_id, output):
@@ -257,7 +282,7 @@ class RenderDispatcher:
             state.binding_id = binding_id
             state.output = output
             state.pending_request = None
-            return (control_id, context_id, binding_id, state.base_revision)
+            return RenderTicket(control_id, context_id, binding_id, state.base_revision)
 
     def base_is_current(self, ticket):
         control_id, context_id, binding_id, revision = ticket
@@ -276,29 +301,49 @@ class RenderDispatcher:
         return self._controls[ticket[0]].generation
 
     async def publish_base(
-        self, ticket, composition_revision, frame, *, message_id, authorize, committed
+        self,
+        ticket,
+        composition_revision,
+        frame,
+        *,
+        message_id,
+        authorize,
+        committed,
+        recompose,
     ):
-        """Return False to recompose; obsolete bases cannot enter hardware dispatch."""
-        state = self._controls[ticket[0]]
+        """Validate at ordered handoff, then send without holding device state.
+
+        The per-control output lock orders dispatched bytes. A revoked queued
+        result is refused before handoff. An initiated send cannot be recalled.
+        """
+        state = self._controls[ticket.control_id]
         async with state.io_lock:
             await authorize()
-            async with self._lock:
+            async with self.output_transaction(), self._lock:
                 if not self.base_is_current(ticket):
                     raise ValueError("superseded")
                 if state.generation != composition_revision:
                     return False
                 output = state.output
-            if output is None:
-                raise ValueError("target_not_current")
+                if output is None:
+                    raise ValueError("target_not_current")
             if frame is None:
                 await output.clear_tagged(message_id)
             else:
                 await output.write_tagged(frame, message_id)
-            # A composition of the previous retained base may still be running.
-            # Invalidate it before committing the new base to the local store.
-            state.generation += 1
-            state.pending_request = None
-            committed()
+            async with self.output_transaction():
+                changed = False
+                async with self._lock:
+                    if self.base_is_current(ticket):
+                        changed = state.generation != composition_revision
+                        state.generation += 1
+                        state.pending_request = None
+                        committed()
+                if changed:
+                    # Overlay changes may commit while bytes are in flight.
+                    # Recompose with the newly accepted base, invalidating the
+                    # overlay render that still contained the previous base.
+                    await recompose()
             return True
 
     async def submit_request(
@@ -400,8 +445,6 @@ class RenderDispatcher:
             if output is not None:
                 state.output = output
             state.pending_request = None
-            io_lock = state.io_lock
-            target_output = state.output
 
         logger.debug(
             "Render dispatcher clear queued config=%s control=%s binding=%s "
@@ -415,28 +458,54 @@ class RenderDispatcher:
         )
 
         if clear_output:
-            async with self.output_transaction(), io_lock:
-                async with self._lock:
-                    state = self._controls.get(control_id)
-                    if state is None or state.generation != generation:
-                        return generation
-                    if (
-                        self._result_authorizer is not None
-                        and not self._result_authorizer(
-                            control_id, state.binding_id, state.context_id
-                        )
-                    ):
-                        return generation
-                if target_output is not None:
-                    await target_output.clear()
+            self._pending_clears[control_id] = generation
+            if control_id not in self._clearing:
+                self._clearing.add(control_id)
+                self._start_soon(self._clear_output, control_id)
         return generation
+
+    async def _clear_output(self, control_id: str) -> None:
+        try:
+            while control_id in self._pending_clears:
+                generation = self._pending_clears.pop(control_id)
+                try:
+                    state = self._controls[control_id]
+                    async with state.io_lock:
+                        async with self.output_transaction(), self._lock:
+                            if state.generation != generation:
+                                continue
+                            if (
+                                self._result_authorizer is not None
+                                and not self._result_authorizer(
+                                    control_id, state.binding_id, state.context_id
+                                )
+                            ):
+                                continue
+                            output = state.output
+                        if output is not None:
+                            with anyio.fail_after(2):
+                                await output.clear()
+                except Exception:
+                    logger.warning(
+                        "Hardware clear failed for %s", control_id, exc_info=True
+                    )
+        finally:
+            self._clearing.discard(control_id)
 
     async def _run_control(self, control_id: str, request: RenderRequest) -> None:
         current = request
         while True:
             try:
-                result = await self._backend.render(current)
-                await self._apply_result(result)
+
+                def is_current(current=current):
+                    state = self._controls.get(control_id)
+                    return state is not None and state.generation == current.generation
+
+                result = await render_with_retry(
+                    self._backend, current, is_current=is_current
+                )
+                if result is not None:
+                    await self._apply_result(result)
             except Exception:
                 logger.warning(
                     "Render or output failed for %s", control_id, exc_info=True
@@ -461,8 +530,8 @@ class RenderDispatcher:
             io_lock = state.io_lock
             target_output = state.output
 
-        async with self.output_transaction(), io_lock:
-            async with self._lock:
+        async with io_lock:
+            async with self.output_transaction(), self._lock:
                 state = self._controls.get(result.control_id)
                 if state is None:
                     return
@@ -485,4 +554,5 @@ class RenderDispatcher:
             if result.frame is None:
                 return
             if target_output is not None:
-                await target_output.write(result.frame)
+                with anyio.fail_after(2):
+                    await target_output.write(result.frame)
