@@ -8,6 +8,7 @@ import os
 import signal
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
 
@@ -28,6 +29,10 @@ class ControlOutput(Protocol):
     async def write(self, frame: bytes) -> None: ...
 
     async def clear(self) -> None: ...
+
+    async def write_tagged(self, frame: bytes, message_id: str) -> None: ...
+
+    async def clear_tagged(self, message_id: str) -> None: ...
 
 
 logger = logging.getLogger(__name__)
@@ -179,7 +184,9 @@ async def _run_in_process_pool(
     """
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, _render_request_to_frame_worker, request)
+    return await loop.run_in_executor(
+        executor, _render_request_to_frame_worker, request
+    )
 
 
 def _render_request_to_frame_worker(request: RenderRequest) -> bytes:
@@ -192,6 +199,7 @@ def _render_request_to_frame_worker(request: RenderRequest) -> bytes:
 @dataclass(slots=True)
 class _ControlRenderState:
     generation: int = 0
+    base_revision: int = 0
     context_id: str | None = None
     binding_id: str | None = None
     output: ControlOutput | None = None
@@ -211,14 +219,87 @@ class RenderDispatcher:
         backend: RenderBackend,
         start_soon,
         result_authorizer: Callable[[str, str | None, str | None], bool] | None = None,
+        ownership_lock: anyio.Lock | None = None,
     ):
         self._command_service = command_service
         self._config_id = config_id
         self._backend = backend
         self._start_soon = start_soon
         self._result_authorizer = result_authorizer
+        self._ownership_lock = ownership_lock
         self._lock = anyio.Lock()
         self._controls: dict[str, _ControlRenderState] = {}
+
+    @asynccontextmanager
+    async def output_transaction(self):
+        """Serialize state changes and sends with binding/page ownership changes.
+
+        Lifecycle callers already own this lock. Re-entry by that same task is
+        safe; worker and overlay-expiry tasks must acquire it before proceeding.
+        """
+        lock = self._ownership_lock
+        owner = lock.statistics().owner if lock is not None else None
+        if lock is None or (
+            owner is not None and owner.id == anyio.get_current_task().id
+        ):
+            yield
+        else:
+            async with lock:
+                yield
+
+    async def reserve_base(self, *, control_id, context_id, binding_id, output):
+        """Admit a base update; even a later decoder failure invalidates old work."""
+        async with self._lock:
+            state = self._controls.setdefault(control_id, _ControlRenderState())
+            state.base_revision += 1
+            state.generation += 1
+            state.context_id = context_id
+            state.binding_id = binding_id
+            state.output = output
+            state.pending_request = None
+            return (control_id, context_id, binding_id, state.base_revision)
+
+    def base_is_current(self, ticket):
+        control_id, context_id, binding_id, revision = ticket
+        state = self._controls.get(control_id)
+        return bool(
+            state is not None
+            and (state.context_id, state.binding_id, state.base_revision)
+            == (context_id, binding_id, revision)
+            and (
+                self._result_authorizer is None
+                or self._result_authorizer(control_id, binding_id, context_id)
+            )
+        )
+
+    def composition_revision(self, ticket):
+        return self._controls[ticket[0]].generation
+
+    async def publish_base(
+        self, ticket, composition_revision, frame, *, message_id, authorize, committed
+    ):
+        """Return False to recompose; obsolete bases cannot enter hardware dispatch."""
+        state = self._controls[ticket[0]]
+        async with state.io_lock:
+            await authorize()
+            async with self._lock:
+                if not self.base_is_current(ticket):
+                    raise ValueError("superseded")
+                if state.generation != composition_revision:
+                    return False
+                output = state.output
+            if output is None:
+                raise ValueError("target_not_current")
+            if frame is None:
+                await output.clear_tagged(message_id)
+            else:
+                await output.write_tagged(frame, message_id)
+            # A composition of the previous retained base may still be running.
+            # Invalidate it before committing the new base to the local store.
+            state.generation += 1
+            state.pending_request = None
+            committed()
+            return True
 
     async def submit_request(
         self,
@@ -228,11 +309,14 @@ class RenderDispatcher:
         binding_id: str | None = None,
         request: RenderRequest | None,
         output: ControlOutput | None = None,
+        base_update: bool = True,
     ) -> int:
         """Submit a request for a control, replacing any older pending work."""
 
         async with self._lock:
             state = self._controls.setdefault(control_id, _ControlRenderState())
+            if base_update:
+                state.base_revision += 1
             state.generation += 1
             generation = state.generation
             state.context_id = context_id
@@ -300,11 +384,14 @@ class RenderDispatcher:
         binding_id: str | None = None,
         output: ControlOutput | None = None,
         clear_output: bool = True,
+        base_update: bool = True,
     ) -> int:
         """Invalidate queued/running renders for a control and clear its output."""
 
         async with self._lock:
             state = self._controls.setdefault(control_id, _ControlRenderState())
+            if base_update:
+                state.base_revision += 1
             state.generation += 1
             generation = state.generation
             if context_id is not None:
@@ -328,7 +415,18 @@ class RenderDispatcher:
         )
 
         if clear_output:
-            async with io_lock:
+            async with self.output_transaction(), io_lock:
+                async with self._lock:
+                    state = self._controls.get(control_id)
+                    if state is None or state.generation != generation:
+                        return generation
+                    if (
+                        self._result_authorizer is not None
+                        and not self._result_authorizer(
+                            control_id, state.binding_id, state.context_id
+                        )
+                    ):
+                        return generation
                 if target_output is not None:
                     await target_output.clear()
         return generation
@@ -336,8 +434,13 @@ class RenderDispatcher:
     async def _run_control(self, control_id: str, request: RenderRequest) -> None:
         current = request
         while True:
-            result = await self._backend.render(current)
-            await self._apply_result(result)
+            try:
+                result = await self._backend.render(current)
+                await self._apply_result(result)
+            except Exception:
+                logger.warning(
+                    "Render or output failed for %s", control_id, exc_info=True
+                )
 
             async with self._lock:
                 state = self._controls.get(control_id)
@@ -358,7 +461,7 @@ class RenderDispatcher:
             io_lock = state.io_lock
             target_output = state.output
 
-        async with io_lock:
+        async with self.output_transaction(), io_lock:
             async with self._lock:
                 state = self._controls.get(result.control_id)
                 if state is None:

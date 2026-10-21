@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Callable
 from dataclasses import replace
+from functools import wraps
 from typing import TYPE_CHECKING
 
 import anyio
@@ -66,12 +67,22 @@ class DeviceOutput:
         self._control_id = control_id
         self._capability_id = capability_id
         self.last_frame: bytes | None = None
+        self._claim = (
+            command_service.claim_identity(config_id)
+            if hasattr(command_service, "claim_identity")
+            else None
+        )
 
     @property
     def control_id(self) -> str:
         return self._control_id
 
     async def write(self, frame: bytes) -> None:
+        if (
+            self._claim is not None
+            and self._command_service.claim_identity(self._config_id) != self._claim
+        ):
+            raise ValueError("hardware claim changed")
         await self._command_service.set_raster_frame(
             self._config_id,
             self._control_id,
@@ -81,12 +92,47 @@ class DeviceOutput:
         self.last_frame = frame
 
     async def clear(self) -> None:
+        if (
+            self._claim is not None
+            and self._command_service.claim_identity(self._config_id) != self._claim
+        ):
+            raise ValueError("hardware claim changed")
         await self._command_service.clear_raster(
             self._config_id,
             self._control_id,
             self._capability_id,
         )
         self.last_frame = None
+
+    async def write_tagged(self, frame: bytes, message_id: str) -> None:
+        await self._command_service.set_raster_frame(
+            self._config_id,
+            self._control_id,
+            self._capability_id,
+            frame,
+            message_id=message_id,
+            expected_claim=self._claim,
+        )
+        self.last_frame = frame
+
+    async def clear_tagged(self, message_id: str) -> None:
+        await self._command_service.clear_raster(
+            self._config_id,
+            self._control_id,
+            self._capability_id,
+            message_id=message_id,
+            expected_claim=self._claim,
+        )
+        self.last_frame = None
+
+
+def _output_transaction(method):
+    @wraps(method)
+    async def guarded(self, *args, **kwargs):
+        async with self._render_dispatcher.output_transaction():
+            return await method(self, *args, **kwargs)
+
+    return guarded
 
 
 class CommandRouter:
@@ -113,6 +159,7 @@ class CommandRouter:
         *,
         clear_when_empty: bool = False,
         source: RenderSource | None = None,
+        base_update: bool = False,
     ) -> None:
         if self._image_format is None or self._output is None:
             return
@@ -131,6 +178,7 @@ class CommandRouter:
                 context_id=self._store.context_id,
                 binding_id=self._store.binding_id,
                 output=self._output,
+                base_update=base_update,
             )
             logger.debug(
                 "Command router render clear enqueued control=%s binding=%s "
@@ -150,6 +198,7 @@ class CommandRouter:
             binding_id=self._store.binding_id,
             request=request,
             output=self._output,
+            base_update=base_update,
         )
         logger.debug(
             "Command router render enqueue control=%s binding=%s "
@@ -164,6 +213,7 @@ class CommandRouter:
             request is not None,
         )
 
+    @_output_transaction
     async def render(
         self,
         *,
@@ -172,6 +222,7 @@ class CommandRouter:
         """Trigger resolve, encode, and write after state changes."""
         await self._render(source=_source_with_content_kind(source, self._store))
 
+    @_output_transaction
     async def set_title(
         self,
         text: str,
@@ -188,8 +239,9 @@ class CommandRouter:
             or self._store.base_output_generation > previous_generation
         ):
             self._store.overlay = None
-        await self._render()
+        await self._render(base_update=True)
 
+    @_output_transaction
     async def set_raster_image(
         self,
         image: str,
@@ -207,8 +259,9 @@ class CommandRouter:
             or self._store.base_output_generation > previous_generation
         ):
             self._store.overlay = None
-        await self._render(source=source)
+        await self._render(source=source, base_update=True)
 
+    @_output_transaction
     async def clear(self, *, generation: int | None = None) -> None:
         previous_generation = self._store.base_output_generation
         if not self._accept_base_generation(generation):
@@ -222,13 +275,9 @@ class CommandRouter:
             self._store.overlay = None
         if self._output is None:
             return
-        await self._render_dispatcher.clear_control(
-            self._output.control_id,
-            context_id=self._store.context_id,
-            binding_id=self._store.binding_id,
-            output=self._output,
-        )
+        await self._render(clear_when_empty=True, base_update=True)
 
+    @_output_transaction
     async def show_overlay(
         self,
         *,
@@ -276,6 +325,7 @@ class CommandRouter:
             )
         return True
 
+    @_output_transaction
     async def clear_overlay(
         self,
         *,

@@ -202,12 +202,14 @@ class ControllerActionService:
         self,
         key: ProviderSessionKey | None,
         message: DeckrMessage,
+        *,
+        validate_payload: bool = True,
     ) -> bool:
         state = self._runtime_leases.get(key)
         if state is None:
             return False
         try:
-            validate_action_runtime_message(message)
+            validate_action_runtime_message(message, validate_payload=validate_payload)
             body = ServiceMessageBody.from_wire(message.body)
             await state.lease.authorize_inbound_message(message, name=body.name)
         except (ServiceUnavailable, ValueError, TypeError):
@@ -250,7 +252,10 @@ class ControllerActionService:
         name = action_runtime_message_name(message_type)
         params, event = action_runtime_payload(name, body)
         try:
-            await state.lease.send(name, params=params, event=event)
+            options = {}
+            if name == "binding_render_result":
+                options["causation_id"] = body.request_message_id
+            await state.lease.send(name, params=params, event=event, **options)
         except ServiceUnavailable as exc:
             if service_unavailable_ends_service_use(exc):
                 self._drop_runtime_lease(provider_session_key, state)
@@ -274,6 +279,26 @@ class ControllerActionService:
             )
             return False
         return True
+
+    async def render_message_key(self, message):
+        provider_instance_id = _runtime_provider_instance_id_from_message(message)
+        if provider_instance_id is None:
+            return None
+        for state in self._runtime_lease_states_for_inbound(
+            provider_instance_id=provider_instance_id,
+            provider_session_id=message.sender_session_id,
+        ):
+            if await self.authorize_runtime_message(
+                state.key, message, validate_payload=False
+            ):
+                return state.key
+        return None
+
+    async def send_render_result(self, message, body):
+        key = await self.render_message_key(message)
+        if key is None or self.current_contract(key) != message.contract:
+            return False
+        return await self.send_runtime_message(key, "bindingRenderResult", body)
 
     async def decode_inbound_runtime_message(
         self,

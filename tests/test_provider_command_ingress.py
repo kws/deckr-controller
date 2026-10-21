@@ -131,6 +131,7 @@ class _Host:
         self.open_page = AsyncMock()
         self.replace_page = AsyncMock()
         self.close_page = AsyncMock()
+        self.render_direct_output = AsyncMock()
 
     def binding_by_id(self, binding_id: str):
         return self.lease if binding_id == BINDING_ID else None
@@ -212,7 +213,7 @@ async def test_binding_output_routes_from_standard_service_subject() -> None:
         update={"subject": entity_subject("service", serviceId="runtime")}
     )
     await ingress.handle(message)
-    host.lease.context.clear_raster.assert_awaited_once()
+    host.render_direct_output.assert_awaited_once_with(host.lease, body, message)
 
 
 @pytest.mark.parametrize(
@@ -240,7 +241,7 @@ async def test_binding_output_rejects_foreign_scope(changed) -> None:
         generation=3,
     )
     await ingress.handle(_message(BINDING_OUTPUT, body.to_dict()))
-    host.lease.context.clear_raster.assert_not_awaited()
+    host.render_direct_output.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -273,7 +274,7 @@ async def test_output_and_overlay_commands_dispatch_to_authorized_context() -> N
                 binding=metadata,
                 capability=capability,
                 commandType="set_frame",
-                params={"image": "data:image/png;base64,cG5n"},
+                params={"image": "cG5n", "encoding": "png"},
                 generation=3,
             ),
         )
@@ -309,8 +310,8 @@ async def test_output_and_overlay_commands_dispatch_to_authorized_context() -> N
         )
     )
 
-    host.lease.context.set_raster_image.assert_awaited_once()
-    host.lease.context.clear_raster.assert_awaited_once_with(generation=3)
+    assert host.render_direct_output.await_count == 2
+    assert [call.args[1].command_type for call in host.render_direct_output.await_args_list] == ["set_frame", "clear"]
     host.lease.context.show_overlay.assert_awaited_once()
     host.lease.context.clear_overlay.assert_awaited_once()
 

@@ -315,7 +315,10 @@ def _graph_to_raster_bytes(
         deps=[img_name],
     )
 
-    canvas = {"width": image_format.width, "height": image_format.height}
+    width, height = image_format.width, image_format.height
+    if image_format.rotation % 180:
+        width, height = height, width
+    canvas = {"width": width, "height": height}
     context = dict(render_node.context)
     context["canvas"] = canvas
     results = get_executor().execute(graph, ["output"], context=context)

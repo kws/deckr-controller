@@ -115,6 +115,32 @@ class ControllerService(BaseComponent):
         for ctrl_ctx in controller_contexts:
             await ctrl_ctx.on_action_availability_changed(changed_keys)
 
+    async def _handle_render_command(self, message):
+        from deckr.actions.pages import BindingCommandTarget
+        from deckr.actions.rendering import BindingRenderResultBody
+        from deckr.services import ServiceMessageBody
+
+        body = ServiceMessageBody.from_wire(message.body)
+        if body.name != "binding_render":
+            return False
+        if self._action_service is None or await self._action_service.render_message_key(message) is None:
+            return True
+        for context in await self._controller_contexts.values():
+            if await context.handle_render_command(message):
+                return True
+        try:
+            target = BindingCommandTarget.from_wire(body.params["target"])
+            requirement = body.params["requirementName"]
+            result = BindingRenderResultBody(
+                requestMessageId=message.message_id, target=target,
+                requirementName=requirement, stage="controller", status="rejected",
+                code="target_not_current",
+            )
+        except (KeyError, TypeError, ValueError):
+            return True
+        await self._action_service.send_render_result(message, result)
+        return True
+
     async def _actions_subscription_loop(self, stopping: anyio.Event) -> None:
         """Subscribe to Action Runtime service messages and route provider commands."""
         async with (
@@ -124,6 +150,8 @@ class ControllerService(BaseComponent):
             async for event in stream:
                 try:
                     if not isinstance(event, DeckrMessage):
+                        continue
+                    if await self._handle_render_command(event):
                         continue
                     action_runtime_message = (
                         await self._action_service.decode_inbound_runtime_message(event)

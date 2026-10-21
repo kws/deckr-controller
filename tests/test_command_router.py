@@ -269,6 +269,7 @@ async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
     router._store.binding_id = "binding-1"
 
     await router.set_raster_image("https://example.com/img.png")
+    router._render_service.build_request.return_value = None
     await router.clear()
 
     assert router._store.content.image is None
@@ -278,6 +279,7 @@ async def test_clear_invalidates_render_and_clears_content(router_with_mocks):
         context_id=router._store.context_id,
         binding_id="binding-1",
         output=router._output,
+        base_update=True,
     )
 
 

@@ -298,6 +298,7 @@ class ControllerHardwareService:
                                 live, event.body
                             )
                         elif isinstance(event.body, hw.CommandRejectedMessage):
+                            await self.command_service.render_command_rejected(live, event.message)
                             await self._callbacks.on_hardware_command_rejected(
                                 live, event.body
                             )

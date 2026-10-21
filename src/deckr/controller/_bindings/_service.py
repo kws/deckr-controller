@@ -333,12 +333,14 @@ class ControlBindingService:
         self._page_command_port = page_command_port or self
         self._runtime_sender = runtime_sender or self
         self._attachments = ControlAttachmentState()
+        self._nav_lock = anyio.Lock()
         self._render_dispatcher = RenderDispatcher(
             command_service=command_service,
             config_id=self.config_id,
             backend=self._render_backend,
             start_soon=start_soon,
-            result_authorizer=self._attachments.output_render_authorized,
+            result_authorizer=self._render_output_authorized,
+            ownership_lock=self._nav_lock,
         )
         self._settings_service = settings_service
         self.action_contexts = AsyncMap[str, ControlContext]()
@@ -371,7 +373,9 @@ class ControlBindingService:
             lifecycle=self._lifecycle,
         )
         self._page_timeout_check_interval = page_timeout_check_interval
-        self._nav_lock = anyio.Lock()
+        from deckr.controller._bindings._rendering import BindingRenderer
+
+        self._rendering = BindingRenderer(self)
         self._sync_action_interest()
 
     @property
@@ -438,6 +442,25 @@ class ControlBindingService:
 
     def binding_output_authorized(self, lease: BindingLease) -> bool:
         return self._attachments.binding_output_authorized(lease)
+
+    def _render_output_authorized(self, control_id, binding_id, context_id):
+        if not self._attachments.output_render_authorized(
+            control_id, binding_id, context_id
+        ):
+            return False
+        if binding_id is None:
+            return True
+        lease = self.binding_by_id(binding_id)
+        if lease is None:
+            return False
+        if lease.provider_instance_id == BUILTIN_ACTION_PROVIDER_ID:
+            return True
+        return (
+            lease.context.contract is not None
+            and self.current_contract(lease.provider_session_key)
+            == lease.context.contract
+            and self._command_service.has_authority(self.config_id, self.hardware_ref)
+        )
 
     async def _render_unavailable_to_control(
         self,
@@ -704,9 +727,7 @@ class ControlBindingService:
         ):
             if not lease.attached or held.context_id != lease.context_id:
                 continue
-            cancel_event = held.down_event.model_copy(
-                update={"event_type": "cancel"}
-            )
+            cancel_event = held.down_event.model_copy(update={"event_type": "cancel"})
             try:
                 await lease.context.on_input(cancel_event)
             except Exception:
@@ -809,7 +830,9 @@ class ControlBindingService:
         if was_active:
             await self.action_contexts.delete(lease.control_id)
 
-    async def _refresh_binding_output(self, lease: BindingLease, *, reason: str) -> None:
+    async def _refresh_binding_output(
+        self, lease: BindingLease, *, reason: str
+    ) -> None:
         base_output_generation = lease.context.base_output_generation
         metadata_output_generation = getattr(
             lease.context.metadata,
@@ -921,7 +944,9 @@ class ControlBindingService:
     ) -> tuple[MatchedCapability, ...]:
         from deckr.controller._capability_matching import matched_capabilities
 
-        return matched_capabilities(binding, action_meta.requirements, self.hardware_ref, self.device)
+        return matched_capabilities(
+            binding, action_meta.requirements, self.hardware_ref, self.device
+        )
 
     def _action_metadata_with_current_session(
         self,
@@ -1064,9 +1089,7 @@ class ControlBindingService:
         current_plan = self._pages.current_plan()
         if current_plan is None:
             return frozenset()
-        return self._external_dynamic_page_child_action_instance_ids(
-            (current_plan,)
-        )
+        return self._external_dynamic_page_child_action_instance_ids((current_plan,))
 
     def _active_dynamic_page_owner_action_instance_ids(self) -> frozenset[str]:
         return frozenset(
@@ -1148,9 +1171,7 @@ class ControlBindingService:
         refresh_actions: bool,
     ) -> ActionPlanningSnapshot:
         if refresh_actions:
-            await self._action_service.ensure_local_builtin_availability(
-                intents
-            )
+            await self._action_service.ensure_local_builtin_availability(intents)
         snapshot = self._action_service.planning_snapshot(
             intents,
             existing_provider_keys=self._existing_provider_action_keys(),
@@ -1406,10 +1427,7 @@ class ControlBindingService:
             intent: BindingPlanStatus.PENDING for intent in snapshot.pending
         }
         status.update(
-            {
-                intent: BindingPlanStatus.UNAVAILABLE
-                for intent in snapshot.unavailable
-            }
+            {intent: BindingPlanStatus.UNAVAILABLE for intent in snapshot.unavailable}
         )
         return status
 
@@ -1799,7 +1817,8 @@ class ControlBindingService:
         if validate_commit is not None:
             await validate_commit()
         commit = self._prepare_page_commit(
-            plan, departing=draft.departing,
+            plan,
+            departing=draft.departing,
             preserve_rebound_outputs=draft.preserve_rebound_outputs,
         )
         effects = self._pages.commit(draft, plan)
@@ -1955,7 +1974,7 @@ class ControlBindingService:
                         control,
                         planned=planned,
                         page_id=plan.page_id,
-                )
+                    )
             return False
         existing = self._matching_existing_binding_lease(plan, planned)
         if existing is not None:
@@ -2140,7 +2159,9 @@ class ControlBindingService:
             )
             if ok:
                 self._pages.record_activity()
-                await self._lifecycle.emit_page_opened(draft.page_session, causation_id=causation_id)
+                await self._lifecycle.emit_page_opened(
+                    draft.page_session, causation_id=causation_id
+                )
 
     async def close_page(
         self,
@@ -2176,7 +2197,9 @@ class ControlBindingService:
             causation_id=causation_id,
         )
         if not ok:
-            logger.warning("Dynamic page close rejected because restore frame is invalid")
+            logger.warning(
+                "Dynamic page close rejected because restore frame is invalid"
+            )
         return ok
 
     async def clear_page(
@@ -2275,7 +2298,8 @@ class ControlBindingService:
                 )
                 if self.current_contract(key) != session.owner_contract:
                     await self._close_page_locked(
-                        context_id=session.context_id, reason="owner_agreement_lost",
+                        context_id=session.context_id,
+                        reason="owner_agreement_lost",
                     )
                     return
             draft = self._pages.begin_refresh_current(
@@ -2465,7 +2489,9 @@ class ControlBindingService:
             clear_held_input=True,
         )
         await self._lifecycle.destroy_action_instance(
-            action_instance_id, reason=reason, notify_provider=True,
+            action_instance_id,
+            reason=reason,
+            notify_provider=True,
         )
         await self._install_planned_binding(plan, planned)
 
@@ -2491,9 +2517,7 @@ class ControlBindingService:
                 draft.previous_dynamic_plans,
                 reason="config_change",
             )
-            await self._lifecycle.destroy_all_action_instances(
-                reason="config_change"
-            )
+            await self._lifecycle.destroy_all_action_instances(reason="config_change")
             ok, _ = await self._execute_page_draft(
                 draft,
                 apply_effects=False,
@@ -2503,13 +2527,22 @@ class ControlBindingService:
                 self._sync_top_frame_state()
                 return
 
+    async def render_direct_output(self, lease, body, message):
+        await self._rendering.direct_output(lease, body, message)
+
+    async def handle_render_command(self, message: DeckrMessage) -> bool:
+        return await self._rendering.handle(message)
+
     async def handle_page_command(self, message: DeckrMessage) -> bool:
         from deckr.controller._bindings._page_commands import handle_page_command
+
         return await handle_page_command(self, message)
 
     async def handle_provider_command(self, msg: DeckrMessage) -> None:
         """Handle a canonical command message from an action provider."""
         if msg.lane == "services" and msg.message_type == "serviceMessage":
+            if await self.handle_render_command(msg):
+                return
             await self.handle_page_command(msg)
             return
         await self._command_ingress.handle(msg)
@@ -2575,18 +2608,24 @@ class ControlBindingService:
             return
         try:
             match = next(
-                (match for match in lease.context.metadata.matched_capabilities
-                 if match.capability.capability_id == translated.capability_id),
+                (
+                    match
+                    for match in lease.context.metadata.matched_capabilities
+                    if match.capability.capability_id == translated.capability_id
+                ),
                 None,
             )
             event = translated.action_event
             if match is not None:
-                event = event.model_copy(update={
-                    "view": {"projection": "projected", "derivation": "derived"}.get(
-                        match.provenance, match.provenance
-                    ),
-                    "source": match.source,
-                })
+                event = event.model_copy(
+                    update={
+                        "view": {
+                            "projection": "projected",
+                            "derivation": "derived",
+                        }.get(match.provenance, match.provenance),
+                        "source": match.source,
+                    }
+                )
             await lease.context.on_input(event)
         except Exception as e:
             logger.error(

@@ -1789,29 +1789,7 @@ async def test_binding_overlay_and_clear_source_reaches_render_request(
         assert ctx is not None
         binding = ctx.metadata.model_copy(update={"output_generation": 1})
 
-        base_msg = await _action_command_for_active_binding(
-            manager,
-            BINDING_OUTPUT,
-            {
-                "binding": binding.model_dump(
-                    by_alias=True,
-                    exclude_none=True,
-                    mode="json",
-                ),
-                "capability": {
-                    "deviceRef": {
-                        "managerId": "manager-main",
-                        "deviceId": "test-device",
-                    },
-                    "controlId": "0,0",
-                    "capabilityId": "raster.bitmap",
-                },
-                "commandType": "set_frame",
-                "params": {"image": _solid_key_image()},
-                "generation": 1,
-            },
-        )
-        await manager.handle_provider_command(base_msg)
+        await ctx._router.set_raster_image(_solid_key_image(), generation=1)
         await wait_for_render_count(1)
         base_request = render_backend.requests[-1]
         await release_and_wait_for_frame(1)
@@ -1856,10 +1834,7 @@ async def test_binding_overlay_and_clear_source_reaches_render_request(
         await release_and_wait_for_frame(3)
         tg.cancel_scope.cancel()
 
-    assert base_request.source is not None
-    assert base_request.source.command_type == "set_frame"
-    assert base_request.source.content_kind == "invariant_graph"
-    assert base_request.source.overlay_generation is None
+    assert base_request.source is None
 
     assert overlay_request.source is not None
     assert overlay_request.source.command_type == BINDING_OVERLAY
@@ -2422,6 +2397,7 @@ async def test_attached_binding_survives_nonterminal_provider_session_unavailabl
     assert lease.attached
     command_service.clear_raster.assert_not_awaited()
 
+    manager.render_direct_output = AsyncMock()
     command = await _action_command_for_active_binding(
         manager,
         BINDING_OUTPUT,
@@ -2450,12 +2426,9 @@ async def test_attached_binding_survives_nonterminal_provider_session_unavailabl
 
     await manager.handle_provider_command(command)
 
-    command_service.clear_raster.assert_awaited_once_with(
-        "test-device",
-        "0,0",
-        "raster.bitmap",
-    )
-
+    manager.render_direct_output.assert_awaited_once()
+    assert manager.render_direct_output.await_args.args[0].binding_id == lease.binding_id
+    assert manager.render_direct_output.await_args.args[1].command_type == "clear"
 
 @pytest.mark.asyncio
 async def test_dynamic_page_retires_when_owner_agreement_is_replaced(
@@ -2668,30 +2641,7 @@ async def test_action_availability_refresh_repaints_existing_binding_output(
         ctx = manager.context_for_control("0,0")
         assert ctx is not None
 
-        binding = ctx.metadata.model_copy(update={"output_generation": 1})
-        msg = await _action_command_for_active_binding(
-            manager,
-            BINDING_OUTPUT,
-            {
-                "binding": binding.model_dump(
-                    by_alias=True,
-                    exclude_none=True,
-                    mode="json",
-                ),
-                "capability": {
-                    "deviceRef": {
-                        "managerId": "manager-main",
-                        "deviceId": "test-device",
-                    },
-                    "controlId": "0,0",
-                    "capabilityId": "raster.bitmap",
-                },
-                "commandType": "set_frame",
-                "params": {"image": "ZnJhbWU=", "encoding": "jpeg"},
-                "generation": 1,
-            },
-        )
-        await manager.handle_provider_command(msg)
+        await ctx._router.set_raster_image(_solid_key_image(), generation=1)
 
         with anyio.fail_after(5.0):
             while not render_backend.calls:

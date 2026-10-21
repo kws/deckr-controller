@@ -155,6 +155,8 @@ class ControlContext:
             image_format=control.image_format,
             start_soon=start_soon,
         )
+        from deckr.controller._bindings._rendering import rendering_support
+        self.rendering = rendering_support(self)
         self.controller_context = ControllerActionContext(
             router=self._router,
             page_command_port=page_command_port,
@@ -233,6 +235,7 @@ class ControlContext:
             BINDING_ATTACHED,
             BindingAttachedBody(
                 binding=self.metadata,
+                rendering=self.rendering,
                 settings=self._store.settings,
                 internal=self._internal,
             ),

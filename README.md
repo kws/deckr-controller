@@ -54,7 +54,7 @@ uv run pytest
 
 ## Managed runtime integration
 
-The controller targets Action Runtime **alpha.2** at the core source revision in
+The controller targets Action Runtime **alpha.3** at the core source revision in
 `.deckr-core-revision`. Hardware discovery, agreements, recovery, event authorization,
 and command validation use the public `DeckrHardware` managed API. Controller
 code selects configurations and owns device routes. Material descriptor changes
@@ -83,8 +83,37 @@ uv run pytest tests/test_hardware_service.py tests/test_hardware_endpoint_routin
 Coverage includes input and command validation, label-based configuration,
 agreement loss and recovery, descriptor replacement, distinct manager identities,
 page target and generation checks, control scope, lifecycle delivery, authority
-loss during planning, and shutdown. Rendering contract changes are a separate
-proposal; the existing controller rendering policy remains in place.
+loss during planning, and shutdown.
+
+Rendering follows the [Action Runtime rendering specification](https://github.com/kws/deckr/blob/main/docs/deckr-action-runtime-rendering.md).
+Binding attachment advertises named raster targets, logical canvas dimensions,
+and fixed limits. The controller accepts plain text and inline PNG/JPEG content
+through `binding_render`; URL and Invariant formats are not advertised. Internal
+controller recipes can still use those facilities. `binding_output.set_frame`
+accepts encoded image bytes, with descriptor dimensions and encoding checks.
+
+Base renders, direct frames, clears, overlays, and fallback output share output
+ordering. New admitted base content supersedes unfinished older work even if the
+new content fails. Base changes preserve overlays, and failures retain the last
+successfully dispatched base. Final dispatch rechecks the binding, service
+agreement, hardware claim, and output revisions. Results distinguish local
+dispatch from a correlated hardware rejection; neither is a display acknowledgement.
+
+Limits per advertised target are 262,144 envelope bytes, 131,072 image-file bytes,
+1,048,576 source pixels, 1,024 text code points, and 2,000 ms from admission to
+local dispatch. Admission allows at most two active jobs per control and eight
+across the process. Obsolete workers keep their slot until they finish. No pending
+base queue is allocated. Retained request records are bounded at 512 per device;
+hardware rejection mappings are bounded at 1,024 and expire after 60 seconds.
+
+Run `uv run pytest tests/test_rendering_contract.py` for rendering integration
+checks. Run `uv run python scripts/check_spec_conformance.py` for the reference
+content and ordering vectors over memory and NATS. The latter reads `../deckr`,
+or the checkout selected by `DECKR_SPEC_ROOT`, and fails on missing artifacts.
+It verifies content geometry and limits, reverse completion, clear supersession,
+failure supersession, rejection ordering, and exact hardware-command correlation.
+The full suite additionally covers overlays, duplicate delivery, deadlines,
+capacity, authority loss, page hiding, direct frames, and late hardware rejection.
 
 ## Materialized Config
 

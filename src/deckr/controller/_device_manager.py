@@ -206,6 +206,9 @@ class DeviceManager:
     ) -> None:
         await self._bindings.on_action_availability_changed(changed_keys)
 
+    async def handle_render_command(self, message: DeckrMessage) -> bool:
+        return await self._bindings.handle_render_command(message)
+
     async def handle_page_command(self, message: DeckrMessage) -> bool:
         return await self._bindings.handle_page_command(message)
 

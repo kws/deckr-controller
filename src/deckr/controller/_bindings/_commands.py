@@ -31,7 +31,6 @@ from deckr.actions.messages import (
 )
 from deckr.contracts.messages import DeckrMessage, parse_service_address
 from deckr.hardware.capabilities import (
-    RasterBitmapClearParams,
     raster_bitmap_command_params,
 )
 from pydantic import ValidationError
@@ -52,9 +51,6 @@ from deckr.controller._pages import DynamicPageSession
 from deckr.controller._render import RenderSource
 
 logger = logging.getLogger(__name__)
-
-_IMAGE_SOURCE_SCHEMES = ("data:", "http://", "https://")
-
 
 class ProviderCommandHost(Protocol):
     config_id: str
@@ -88,6 +84,8 @@ class ProviderCommandHost(Protocol):
         reason: str,
     ) -> None: ...
 
+    async def render_direct_output(self, lease, body, message) -> None: ...
+
     async def open_page(
         self,
         *,
@@ -114,54 +112,10 @@ class ProviderCommandHost(Protocol):
     ) -> None: ...
 
 
-def _binding_output_image_source(params: Mapping[str, Any]) -> str | None:
-    image = params.get("image")
-    if not isinstance(image, str) or not image:
-        return None
-    if image.startswith(_IMAGE_SOURCE_SCHEMES):
-        return image
-    encoding = params.get("encoding")
-    if encoding in {"jpeg", "png"}:
-        return f"data:image/{encoding};base64,{image}"
-    return None
-
-
-def _image_source_content_kind(image_source: str) -> str:
-    if image_source.startswith("data:application/vnd.invariant.graph"):
-        return "invariant_graph"
-    if image_source.startswith("data:"):
-        return "data_image"
-    if image_source.startswith(("http://", "https://")):
-        return "remote_image"
-    return "image"
-
-
 def _message_trace_payload(msg: DeckrMessage) -> dict[str, Any] | None:
     if msg.trace is None:
         return None
     return msg.trace.model_dump(by_alias=True, exclude_none=True, mode="json")
-
-
-def _binding_output_render_source(
-    body: BindingOutputBody,
-    msg: DeckrMessage,
-    *,
-    image_source: str,
-) -> RenderSource:
-    binding = body.binding
-    return RenderSource(
-        provider_instance_id=binding.provider_instance_id,
-        provider_id=binding.provider_id,
-        provider_session_id=msg.sender_session_id,
-        action_id=binding.action_id,
-        action_instance_id=binding.action_instance_id,
-        action_message_id=msg.message_id,
-        action_causation_id=msg.causation_id,
-        trace=_message_trace_payload(msg),
-        command_type=body.command_type,
-        content_kind=_image_source_content_kind(image_source),
-        binding_output_generation=body.generation,
-    )
 
 
 def _binding_overlay_render_source(
@@ -547,41 +501,13 @@ class ProviderCommandIngress:
             payload_kind,
             payload_hash,
         )
-        if body.command_type == "clear":
-            try:
-                params = raster_bitmap_command_params(body.command_type, body.params)
-            except (ValueError, ValidationError) as exc:
-                self._logger.warning(
-                    "Ignoring invalid raster output command %s on binding %s: %s",
-                    body.command_type,
-                    lease.binding_id,
-                    exc,
-                )
-                return
-            if not isinstance(params, RasterBitmapClearParams):
-                return
-            await lease.context.clear_raster(generation=body.generation)
+        try:
+            raster_bitmap_command_params(body.command_type, body.params)
+        except (ValueError, ValidationError):
             return
-        if body.command_type != "set_frame":
-            self._logger.warning(
-                "Ignoring unsupported raster output command %s on binding %s",
-                body.command_type,
-                lease.binding_id,
-            )
+        if body.generation != lease.context.metadata.output_generation:
             return
-        image_source = _binding_output_image_source(body.params)
-        if image_source is None:
-            self._logger.warning(
-                "Ignoring raster output without a valid image source on binding %s",
-                lease.binding_id,
-            )
-            return
-        source = _binding_output_render_source(body, msg, image_source=image_source)
-        await lease.context.set_raster_image(
-            image_source,
-            generation=body.generation,
-            source=source,
-        )
+        await self._host.render_direct_output(lease, body, msg)
 
     async def _handle_binding_overlay(
         self,
