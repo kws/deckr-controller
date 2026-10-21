@@ -54,7 +54,7 @@ uv run pytest
 
 ## Managed runtime integration
 
-The controller targets Action Runtime **alpha.3** at the core source revision in
+The controller targets the alpha Action Runtime contract at the core source revision in
 `.deckr-core-revision`. Hardware discovery, agreements, recovery, event authorization,
 and command validation use the public `DeckrHardware` managed API. Controller
 code selects configurations and owns device routes. Material descriptor changes
