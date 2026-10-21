@@ -105,7 +105,7 @@ async def test_support_render_dispatch_and_clear(managed_substrate):
         ("stale", "target_not_current"),
         ("unknown", "target_not_current"),
         ("format", "unsupported_format"),
-        ("invalid", "invalid_content"),
+        ("invalid", "invalid_schema"),
         ("text-limit", "limit_exceeded"),
         ("bad-image", "invalid_content"),
     ],
@@ -130,6 +130,11 @@ async def test_render_rejections_preserve_output(managed_substrate, mutation, co
                 "data": {"image": "https://example.org/test.png", "encoding": "png"},
             }
         h.commands.reset_mock()
+        if code == "invalid_schema":
+            with pytest.raises(ValueError, match="Service payload does not match"):
+                await h.channel.send("binding_render", p)
+            assert h.commands.await_count == 0
+            return
         request = await h.channel.send("binding_render", p)
         result = await result_for(h, request)
         assert result["code"] == code

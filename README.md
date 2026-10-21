@@ -88,6 +88,19 @@ agreement loss and recovery, descriptor replacement, distinct manager identities
 page target and generation checks, control scope, lifecycle delivery, authority
 loss during planning, and shutdown.
 
+An additional opt-in workload runs this controller with Python, TypeScript and
+Rust provider processes over isolated NATS brokers. Run
+`scripts/controller_action_runtime.py` in
+[`deckr-integration-tests`](https://github.com/kws/deckr-integration-tests#native-action-runtime-workloads)
+using a Python environment with this controller and the sibling core installed
+editable. It runs ten scenarios for each language: lifecycle/matching/input and
+output, page generations, render formats and errors, completion order, direct
+frames, overlays, hardware rejections, hardware loss, provider recovery, and
+service loss during page planning. The runner retains source hashes and per-peer
+evidence and rejects incomplete or skipped coverage. The test module is skipped
+in ordinary controller runs because the foreign peers require their own native
+toolchains and sibling checkouts.
+
 Rendering follows the [Action Runtime rendering specification](https://github.com/kws/deckr/blob/main/docs/deckr-action-runtime-rendering.md).
 Binding attachment advertises named raster targets, logical canvas dimensions,
 and fixed limits. The controller accepts plain text and inline PNG/JPEG content

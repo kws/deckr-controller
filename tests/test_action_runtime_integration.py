@@ -499,17 +499,20 @@ async def test_replace_page_requires_a_page_session_target(managed_substrate):
     async with running_controller(managed_substrate) as h:
         session = await open_page(h)
         binding = h.device.context_for_control("key-1").metadata
-        await h.channel.send(
-            "replace_page",
-            {
-                "target": {
-                    "kind": "binding",
-                    "bindingId": binding.binding_id,
-                    "generation": binding.output_generation,
+        # The shared declaration now rejects this schema-invalid target before
+        # publication, consistently with the other language cores.
+        with pytest.raises(ValueError, match="Service payload does not match"):
+            await h.channel.send(
+                "replace_page",
+                {
+                    "target": {
+                        "kind": "binding",
+                        "bindingId": binding.binding_id,
+                        "generation": binding.output_generation,
+                    },
+                    "descriptor": page_descriptor(),
                 },
-                "descriptor": page_descriptor(),
-            },
-        )
+            )
         await h.channel.send(
             "replace_page",
             {
