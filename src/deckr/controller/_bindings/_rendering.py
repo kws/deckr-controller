@@ -12,6 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 import anyio
+import anyio.to_process
 from deckr.action_runtime import (
     RenderBindingState,
     RenderCommandContext,
@@ -34,14 +35,20 @@ from deckr.contracts.messages import entity_subject
 from deckr.contracts.models import thaw_json
 from deckr.services import ServiceMessageBody
 
-from deckr.controller._render import RenderModel
+from deckr.controller._render import RenderModel, RenderSource
 from deckr.controller._render_content import (
     ContentFailure,
     decode_image,
     render_content,
 )
+from deckr.controller._render_graph import (
+    INVARIANT_FORMAT,
+    render_graph,
+    validate_graph,
+)
 
 _WORKERS = threading.BoundedSemaphore(8)
+_GRAPH_WORKERS = anyio.CapacityLimiter(4)
 logger = logging.getLogger(__name__)
 DEFAULT_LIMITS = RenderLimits(
     maxMessageBytes=262144,
@@ -74,6 +81,7 @@ def rendering_support(context):
             height=height,
             formats=[
                 {"id": RENDER_TEXT_FORMAT},
+                {"id": INVARIANT_FORMAT},
                 {"id": RENDER_IMAGE_FORMAT, "options": {"encodings": ["png", "jpeg"]}},
             ],
             limits=DEFAULT_LIMITS,
@@ -309,6 +317,7 @@ class BindingRenderer:
                 height=fmt.width if fmt.rotation % 180 else fmt.height,
                 formats=[
                     {"id": RENDER_TEXT_FORMAT},
+                    {"id": INVARIANT_FORMAT},
                     {
                         "id": RENDER_IMAGE_FORMAT,
                         "options": {"encodings": ["png", "jpeg"]},
@@ -456,6 +465,19 @@ class BindingRenderer:
                 image = None
             elif job.direct:
                 image = await anyio.to_thread.run_sync(self._direct_frame, job)
+            elif job.body.content.format == INVARIANT_FORMAT:
+                document = thaw_json(job.body.content.data)
+                validate_graph(document, job.target.limits)
+                with anyio.fail_after(max(0, job.deadline - time.monotonic())):
+                    image = await anyio.to_process.run_sync(
+                        render_graph,
+                        document,
+                        job.target.width,
+                        job.target.height,
+                        job.target.limits,
+                        cancellable=True,
+                        limiter=_GRAPH_WORKERS,
+                    )
             else:
                 image = await anyio.to_thread.run_sync(
                     render_content,
@@ -484,6 +506,27 @@ class BindingRenderer:
                 request = router._render_service.build_request(
                     model,
                     router._image_format,
+                    config_id=self.host.config_id,
+                    generation=revision,
+                    source=RenderSource(
+                        provider_instance_id=job.lease.provider_instance_id,
+                        provider_id=job.lease.context.metadata.provider_id,
+                        provider_session_id=job.message.sender_session_id,
+                        action_id=job.lease.context.metadata.action_id,
+                        action_instance_id=job.lease.context.metadata.action_instance_id,
+                        action_message_id=job.message.message_id,
+                        action_causation_id=job.message.causation_id,
+                        command_type="binding_output"
+                        if job.direct
+                        else "binding_render",
+                        content_kind=job.body.content.format
+                        if job.body.content
+                        else None,
+                        content=thaw_json(job.body.content.data)
+                        if job.body.content
+                        else None,
+                        binding_output_generation=job.body.target.generation,
+                    ),
                     context_id=job.lease.context_id,
                     binding_id=job.lease.binding_id,
                     control_id=job.lease.control_id,

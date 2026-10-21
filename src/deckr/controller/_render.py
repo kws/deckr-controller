@@ -63,6 +63,7 @@ class RenderSource:
     trace: dict[str, Any] | None = None
     command_type: str | None = None
     content_kind: str | None = None
+    content: dict[str, Any] | None = None
     availability_cause: str | None = None
     availability_state: str | None = None
     availability_source: str | None = None

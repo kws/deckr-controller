@@ -364,13 +364,19 @@ async def test_observing_render_backend_records_error(tmp_path: Path):
         options=RenderObservationOptions(path=path),
     )
 
-    result = await backend.render(_request_with_graph({"output": "value"}))
+    request = _request_with_graph({"output": "value"})
+    request = replace(
+        request, source=replace(request.source, content={"text": "private content"})
+    )
+    result = await backend.render(request)
 
     assert result.frame is None
     assert result.error == "boom"
     record = _read_observations(path)[0]
     assert record["frameSha256"] is None
     assert record["error"] == "boom"
+    assert "graph" not in record
+    assert "content" not in record
 
 
 @pytest.mark.asyncio
@@ -388,11 +394,15 @@ async def test_observing_render_backend_can_include_graph_and_context(
         ),
     )
     request = _request_with_graph({"output": {"params": {"title": "Clock"}}})
+    request = replace(
+        request, source=replace(request.source, content={"text": "Clock"})
+    )
 
     await backend.render(request)
 
     record = _read_observations(path)[0]
     assert record["graph"] == request.graph
+    assert record["content"] == {"text": "Clock"}
     assert record["context"] == request.context
     assert record["providerSessionId"] == "provider-session"
 

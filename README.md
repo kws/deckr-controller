@@ -91,8 +91,13 @@ loss during planning, and shutdown.
 Rendering follows the [Action Runtime rendering specification](https://github.com/kws/deckr/blob/main/docs/deckr-action-runtime-rendering.md).
 Binding attachment advertises named raster targets, logical canvas dimensions,
 and fixed limits. The controller accepts plain text and inline PNG/JPEG content
-through `binding_render`; URL and Invariant formats are not advertised. Internal
-controller recipes can still use those facilities. `binding_output.set_frame`
+through `binding_render`. It also advertises the optional owner-defined
+[`com.k-si.deckr.render.invariant.v1` extension](https://github.com/kws/deckr/blob/main/docs/deckr-render-invariant-extension.md).
+Extension graphs use an explicit operation allowlist, bounded dimensions and
+intermediate images, packaged icons and fonts, and bounded HTTP(S) image fetches.
+Execution runs in cancellable worker processes with no persistent graph cache.
+The protocol carries structured content; graph and image URLs are never accepted
+as direct hardware frames. `binding_output.set_frame`
 accepts encoded image bytes, with descriptor dimensions and encoding checks.
 
 Base renders, direct frames, clears, overlays, and fallback output share output

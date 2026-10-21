@@ -77,11 +77,14 @@ class ObservingRenderBackend:
             separators=(",", ":"),
             default=str,
         )
-        async with self._lock, await anyio.open_file(
-            self._options.path,
-            "a",
-            encoding="utf-8",
-        ) as stream:
+        async with (
+            self._lock,
+            await anyio.open_file(
+                self._options.path,
+                "a",
+                encoding="utf-8",
+            ) as stream,
+        ):
             await stream.write(line)
             await stream.write("\n")
 
@@ -130,6 +133,7 @@ class ObservingRenderBackend:
         }
         if self._options.include_graph:
             record["graph"] = request.graph
+            record["content"] = _source_value(source, "content")
         if self._options.include_context:
             record["context"] = request.context
         return record
