@@ -233,7 +233,12 @@ class ControllerHardwareService:
         claim = use.claim
         candidate = use.spec.candidates[0]
         device.candidate = candidate
-        config = await self._config_service.get_config(device.config_id)
+        live = self._routes.get(device.config_id)
+        config = None
+        # Retain configuration selection only within the same routed agreement.
+        # A successor must match its own fingerprint and labels before routing.
+        if live is not None and live.contract == claim.state.contract:
+            config = await self._config_service.get_config(device.config_id)
         if config is None or not config.enabled:
             config = await self._match(candidate)
         if config is None or not config.enabled:

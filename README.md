@@ -59,6 +59,9 @@ The controller targets the alpha Action Runtime contract at the core source revi
 and command validation use the public `DeckrHardware` managed API. Controller
 code selects configurations and owns device routes. Material descriptor changes
 require a new hardware agreement; discovery refreshes do not replace a live claim.
+Each successor agreement revalidates configuration selection against its candidate's
+fingerprint and labels before installing a route. Unmatched or ambiguous successors
+remain unrouted until a matching configuration is available.
 
 Action Runtime commands use canonical `services/serviceMessage` envelopes and
 public managed service authorization. `open_page` accepts a binding or page-session

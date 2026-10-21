@@ -81,6 +81,71 @@ async def test_descriptor_replacement_withdraws_old_route_and_recovers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["fingerprint", "labels"])
+async def test_successor_revalidates_configuration_match(changed, managed_substrate):
+    async with setup(
+        labels={"room": "studio"},
+        config_labels={"room": "studio"},
+        substrate=managed_substrate,
+    ) as h:
+        original = h.service.route_for_config("config-a")
+        claim = h.service.claim_for_config("config-a")
+        descriptor = device_descriptor(power=True)
+        labels = {"room": "studio"}
+        if changed == "fingerprint":
+            descriptor = descriptor.model_copy(update={"fingerprint": "replacement"})
+            await h.manager.set_device(descriptor)
+        else:
+            labels = {"room": "office"}
+            h.manager.labels = labels
+            await h.manager.set_device(descriptor)
+            await eventually(lambda: h.service.snapshot().candidates[0].labels == labels)
+            await h.service.reconcile(reason="labels refreshed")
+            # Discovery metadata alone must not revoke the current agreement.
+            assert h.service.route_for_config("config-a") == original
+            await claim.aclose()
+
+        await eventually(
+            lambda: any(
+                owned.state.local_authority and owned.state.contract != original.contract
+                for owned in h.service.snapshot().owned_claims
+            )
+        )
+        await h.service.reconcile(reason="successor configuration check")
+        successor = h.service.snapshot().owned_claims[0].state.contract
+        assert not claim.state.local_authority
+        assert (await h.config_service.get_config("config-a")).enabled
+        assert h.service.route_for_config("config-a") is None
+        h.callbacks.on_hardware_disconnected.assert_awaited()
+        assert h.callbacks.on_hardware_connected.await_count == 1
+        await h.service.command_service.clear_raster("config-a", "key-1", "raster")
+        h.commands.assert_not_awaited()
+
+        # Reconciliation must keep the unmatched successor unrouted.
+        await h.service.reconcile(reason="still unmatched")
+        assert h.service.route_for_config("config-a") is None
+
+        replacement = _config(
+            config_id="replacement",
+            fingerprint=descriptor.fingerprint,
+            labels=labels,
+        )
+        await h.config_service.write_config(replacement)
+        await h.service.reconcile(reason="matching replacement configuration")
+        live = h.service.route_for_config("replacement")
+        assert live is not None and live.contract == successor
+        assert live.device == descriptor
+        assert h.service.route_for_config("config-a") is None
+        assert h.callbacks.on_hardware_connected.await_count == 2
+        h.callbacks.on_hardware_connected.assert_awaited_with(
+            live, initial_config=replacement
+        )
+        await h.service.command_service.clear_raster("replacement", "key-1", "raster")
+        await eventually(lambda: h.commands.await_count == 1)
+        assert h.commands.await_args.args[0].contract == successor
+
+
+@pytest.mark.asyncio
 async def test_authority_loss_blocks_output_before_controller_reconciliation(
     managed_substrate,
 ):
