@@ -1,7 +1,7 @@
 # AGENTS.md
 
 This file gives repository rules for agents.
-Use [README.md](README.md) for setup, checks, configuration, and releases.
+Use [README.md](README.md) for setup, checks, configuration, and packaging.
 Use [Controller architecture](docs/architecture.md) for current behavior and source links.
 
 ## Code placement
@@ -30,15 +30,15 @@ Use public core APIs for hardware and services.
 Use `uv` for development commands:
 
 ```bash
-uv sync
-uv run ruff check .
-uv run mypy
-uv run pytest
-uv run python scripts/check_spec_conformance.py
+uv sync --locked --dev
+uv run --no-sync ruff check .
+uv run --no-sync mypy
+uv run --no-sync pytest
+uv run --no-sync python scripts/check_spec_conformance.py
 uv build
 ```
 
 Update the architecture reference when component responsibilities or runtime behavior change.
 Describe implemented behavior and link to source code and tests.
-Keep setup and release procedures in README.
+Keep setup and packaging procedures in README.
 Keep personal preferences and context outside this repository.

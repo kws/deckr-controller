@@ -7,8 +7,8 @@ consequences, and adapters perform external work.
 
 The shared specification lives in `deckr`; reusable contracts and managed APIs
 live in `deckr-core-python`. This repository owns orchestration, configuration,
-pages, bindings, input routing, and rendering policy. Setup and release commands
-are in [README](../README.md).
+pages, bindings, input routing, and rendering policy. Setup, validation, dependency
+pins and packaging are documented in [README](../README.md).
 
 ## Ownership and composition
 
@@ -38,7 +38,7 @@ flowchart TB
 | `ControllerActionService` | Composition of `ActionRuntimeSupervisor`, `ActionCatalog` and `ActionRuntimeGateway`; consumers use the declared binding service port. |
 | `DeviceSession` / `DeviceComponents` | Application entry points and explicit composition; one shared device consistency boundary. |
 | `DeviceState` | Physical/session identity, device/config snapshots, navigation, attachments, pending operations and binding statuses. |
-| `PageSessionService` | Pure navigation model, page occurrences, targeted page requests and deadlines. |
+| `PageSessionService` | Navigation state and decisions, page occurrences, targeted requests and deadlines. |
 | `DeviceNavigation` | Commits local navigation decisions through explicit binding and lifecycle ports. |
 | `PagePlanning` / `BindingPlanner` | Resolve desired controls from local snapshots and capability requirements. |
 | `BindingReconciler` / `AvailabilityReconciler` | Apply page commits and pure desired/installed decisions under the device gate. |
@@ -46,15 +46,15 @@ flowchart TB
 | `InputInteractions` | Held-interaction ownership, cancellation and ordered input effects. |
 | `BindingPresentation` | Projects binding readiness, unavailable state and accepted content into render requests. |
 | `BindingRenderer` / `RenderExecution` / `RenderDispatcher` | Atomic admission and correlated results; bounded execution/composition; shared output ordering and handoff. |
-| `InterestDiagnostics` | Reports interest; does not control resource lifetime or watcher selection. |
+| `InterestDiagnostics` | Reports configured, visible and warm interests; protects referenced metadata from cache pruning. |
 
 Attachment, action-instance and presentation records are device-owned components,
 not separate authorities. All device-state mutations enter the same
 `StateGate`. Shared service and hardware authority can change independently;
 managed APIs therefore still validate authority at ingress and output dispatch.
 
-`DeviceSession` is the application entry point. Device composition is explicit in
-`DeviceComponents`; there are no legacy manager/service import aliases.
+`DeviceSession` is the application entry point. `DeviceComponents` constructs its
+collaborators and declares their dependencies.
 
 Sources: [composition](../src/deckr/controller/_runtime_service.py),
 [supervision](../src/deckr/controller/_controller_service.py),
@@ -63,13 +63,13 @@ Sources: [composition](../src/deckr/controller/_runtime_service.py),
 [navigation ports](../src/deckr/controller/_pages/_navigation.py),
 [reconciliation](../src/deckr/controller/_bindings/_reconcile.py).
 
-## Event ordering and asynchronous work
+## Event ordering and resource lifetime
 
-`StateGate` serializes local handlers with a reentrant, cancellation-safe semaphore. Internal rule
-calls can nest within a handler. It is not a separate actor framework or an
-unbounded mailbox. Hardware, configuration, action requests, deadlines and
-operation completions enter this boundary. Local action callbacks execute outside
-it, so a callback can await a navigation request without deadlocking its caller.
+`StateGate` serializes local handlers with a cancellation-safe, reentrant
+semaphore. Internal rule calls can nest within a handler. Hardware events,
+configuration changes, action requests, deadlines and operation completions
+enter this boundary. Local action callbacks execute outside it, so a callback can
+await a navigation request without deadlocking its caller.
 
 A page change reads local snapshots, computes a plan, commits navigation, revokes
 obsolete grants and records new operations. It does not await provider creation,
@@ -101,13 +101,28 @@ Lifecycle recovery uses the same operation ledger and preparing state, disables
 input until attachment succeeds, and rechecks binding, provider and hardware
 authority after instance creation. User input is never retried after an uncertain send.
 
+Lifecycle creation, detach, destruction and page notifications retain the exact
+agreement that owned their instance, binding or page. Queued effects carry that
+agreement; the runtime gateway refuses them if it is no longer current. The core
+managed one-way send captures a concrete service-use lease before awaiting I/O and
+does not replay it after recovery. A successor in the same provider session does
+not inherit old effects. Page notifications preserve command causation.
+
+Controller shutdown attempts every owned close under cancellation shielding and
+reports collected errors after cleanup. Startup failure closes resources constructed
+before their owning component is registered. Render backends cancel their jobs
+and bound their close wait to one second.
+
 Sources: [boundary](../src/deckr/controller/_state_gate.py),
 [effects](../src/deckr/controller/_session_effects.py),
 [preparation](../src/deckr/controller/_bindings/_installation.py).
-Tests: [session boundary acceptance](../tests/test_device_session.py),
-[binding behavior](../tests/test_binding_agreements.py).
+Tests: [session ordering](../tests/test_device_session.py),
+[binding behavior](../tests/test_binding_agreements.py),
+[cancellation-safe gate](../tests/test_state_gate.py),
+[managed effect scope](../tests/test_runtime_scope.py),
+[startup and shutdown](../tests/test_runtime_service.py).
 
-## Identities, bindings and retention
+## Binding reconciliation and snapshots
 
 | Identity | Lifetime |
 | --- | --- |
@@ -119,6 +134,20 @@ Tests: [session boundary acceptance](../tests/test_device_session.py),
 | Page session ID / `PageGrant` | One opened temporary page, owning instance and expected content revision. |
 | `RenderTicket` | Control, binding, context and accepted base revision. |
 | `OperationId` | One asynchronous preparation within one device session. |
+
+`ActionPlanningSnapshot` owns an immutable map of immutable action metadata.
+`BindingLease` represents an installed grant; `ActionInstanceRecord` keeps its
+metadata, provider session, exact agreement and started state together. Page owners
+retain their action instance independently of visible attachments. The pure
+[decision function](../src/deckr/controller/_bindings/_decisions.py) consumes an
+`InstalledBindingFacts` value and desired status to choose retain, install, refresh,
+replace, pending, unavailable or invalid behavior. Applying that decision happens
+under the device gate; preparation owns asynchronous adapter work.
+Initial installation and availability refresh share one compatibility rule for
+the action descriptor, matched requirements and current control geometry. Invalid
+requirements retire the grant; changed valid matches or geometry require a new
+attachment and render target. Planning rejects multiple bindings that resolve
+to the same control before issuing attachments.
 
 The planner distinguishes `bound`, `pending`, `unavailable`, invalid configuration
 and incompatible device controls. A bound plan is a desired resource, not proof of
@@ -140,21 +169,32 @@ record and never grants a replacement binding input authority.
 
 An open page retains its owning action instance, not its launch binding. Dynamic
 child instances are released when neither visible children nor open-page ownership
-need them. Visited static instances retain the existing warm policy until config
-reset, clear or session shutdown. Interest diagnostics do not extend these
+need them. Visited static instances remain warm until config reset, clear or
+session shutdown. Interest diagnostics do not extend these
 lifetimes. Provider replacement issues fresh bindings and a new lifecycle under
 the exact successor provider session/agreement, even when logical names are reused.
+
+Navigation's `PageStateView` is explicitly a borrowed boundary-local view. Its
+frames/page occurrences retain identity and can change at the next commit; it is
+not an immutable diagnostic snapshot. A `PagePlan` has immutable binding choices
+and a borrowed page occurrence. Device diagnostic snapshots copy their maps and
+values. Config services give each reader/subscriber a deep copy so editing one
+view cannot mutate retained source state.
 
 Sources: [planner](../src/deckr/controller/_binding_planner.py),
 [attachments](../src/deckr/controller/_bindings/_attachments.py),
 [instance lifecycle](../src/deckr/controller/_bindings/_action_lifecycle.py),
 [stable identities](../src/deckr/controller/settings/_identity.py).
+Tests: [binding scope](../tests/test_binding_scope.py),
+[pure decisions](../tests/test_binding_decisions.py),
+[snapshots and planning](../tests/test_binding_planner.py),
+[page-owner retention](../tests/test_page_owner_lifetime.py).
 
 ## Navigation and action requests
 
 `NavigationState` contains a configured route, at most one temporary page and a
-revision. There is no general navigation stack. A `PageFrame` is an occurrence
-with a committed plan; a configuration page or provider descriptor is its reusable
+revision. A `PageFrame` is an occurrence with a committed plan; a configuration
+page or provider descriptor is its reusable
 definition. Provider pages explicitly record source, temporary presentation and
 action-instance ownership.
 
@@ -168,7 +208,8 @@ revision without extending its deadline.
 Closing a temporary page replans the configured route against current device,
 config and provider facts. It does not reinstall cached grants. Config replacement
 resets to the first profile/page; reconnecting hardware creates a fresh device
-session and resets navigation. These are intentional preservation policies.
+session and resets navigation. Unknown profiles and out-of-range page indices
+are refused without mutating navigation.
 
 Only translated hardware input counts as page activity. `PageDeadline` carries the
 page ID, deadline revision and due time. The timer posts expiry back through the
@@ -180,14 +221,7 @@ elapsed. Content refreshes cannot keep a temporary page alive indefinitely.
 binding metadata/settings and an `ActionRequestPort` for title/image content,
 navigation and page operations. They receive no mutable session or presentation
 store. Builtin route navigation is an explicit grant permission. Remote adapters
-retain managed service authentication and the shared Action Runtime wire protocol;
-builtins do not need fictitious network agreements.
-
-The descriptor catalog includes builtins and remote actions. Production settings
-projection resolves descriptor/schema metadata through that catalog. Known action
-type, provider availability, instance preparation and binding readiness remain
-different facts. Builtin raster requirements use the same capability matching as
-remote descriptors.
+use managed service authentication and the shared Action Runtime wire protocol.
 
 Sources: [page model](../src/deckr/controller/_pages/_service.py),
 [typed requests](../src/deckr/controller/_actions/_requests.py),
@@ -197,10 +231,55 @@ Sources: [page model](../src/deckr/controller/_pages/_service.py),
 Tests: [page model](../tests/test_page_session_service.py),
 [managed Action Runtime](../tests/test_action_runtime_integration.py).
 
+## Action services and settings
+
+The descriptor catalog includes builtins and remote actions. Production settings
+projection resolves descriptor/schema metadata through that catalog. Known action
+type, provider availability, instance preparation and binding readiness remain
+different facts. Builtin raster requirements use the same capability matching as
+remote descriptors.
+
+[Typed ingress](../src/deckr/controller/_actions/_routing.py) retains the original
+service envelope and the core-decoded body. Routing, binding commands, page commands
+and direct output use that envelope for exact-agreement authorization and causation.
+The [gateway](../src/deckr/controller/_actions/_runtime_gateway.py) owns service
+message authorization; the [supervisor](../src/deckr/controller/_actions/_supervisor.py)
+owns managed uses and watches; the [catalog](../src/deckr/controller/_actions/_catalog.py)
+owns accepted availability projections and selection policy.
+
+Action selection uses local availability snapshots and keeps a usable cached
+provider, otherwise choosing a usable provider by lexical instance ID. The
+supervisor owns watches around public core managed services. Beacon discovers
+candidates; Concord agreements and participant validity govern authority.
+
+Unreferenced metadata expires after five minutes and is capped at 1,024 records;
+live agreements, builtin actions and current interests are protected. Discovery
+loss leaves a live agreement and watch running. Once that agreement ends, an absent
+service's watch record is disposed and is not retried without discovery. See
+[availability supervision](../tests/test_availability_supervision.py) and
+[retention tests](../tests/test_action_availability.py).
+
+Malformed availability projections are logged and ignored without replacing the
+last valid view or ending the managed watch. Later valid updates are consumed.
+
+Settings targets are scoped by controller, config, configured action placement and
+verified provider identity. Previously verified offline metadata may describe a
+stale schema; unknown provider identities do not become settings targets merely
+because their IDs appear in a request. Provider labels are replaced by each
+accepted availability view.
+See [settings scope tests](../tests/test_settings_service.py).
+
+Interest snapshots report connected config and visible page interests plus warm
+retention (four hours by default). They do not select service watches or request
+provider resource allocation. Active interests also protect cached metadata from
+bounded local cache pruning; this does
+not confer provider authority.
+
 ## Input ownership
 
-A press records the original binding, control, capability and context. Release
-completes that interaction only while its contract permits it. Navigation or
+A press records the binding, control, capability, context and routed input,
+including projected or derived provenance. Cancellation copies that routed press.
+Release completes that interaction only while its contract permits it. Navigation or
 provider loss cancels ownership locally and suppresses the corresponding release;
 it cannot become a replacement binding's release. Cancellation notification is an
 ordered, best-effort effect. Queued presses and other nonterminal input recheck
@@ -209,21 +288,37 @@ finish an original interaction after revocation; all events recheck their origin
 provider agreement and cannot cross into a successor incarnation.
 
 Source: [input interactions](../src/deckr/controller/_bindings/_input.py).
-Tests: [binding/input behavior](../tests/test_binding_agreements.py),
+Tests: [input provenance](../tests/test_input_provenance.py),
 [managed input and replacement](../tests/test_action_runtime_integration.py).
 
 ## Rendering and output handoff
+
+The supported output subset is one distinct raster bitmap output per binding.
+Multiple requirement aliases for that same output are allowed. A second matched
+output or a non-raster output rejects the desired binding before attachment.
+An explicit selector can choose one output from a multi-output device. This policy
+is in [capability matching](../src/deckr/controller/_capability_matching.py), with
+coverage in [planner tests](../tests/test_binding_planner.py).
 
 `RenderingPorts` gives the pipeline explicit admission, notification, state-query,
 worker and hardware dependencies. It does not inspect private binding-host fields.
 A scoped completion transaction coordinates local presentation revisions with
 revocation; the renderer does not hold a navigation lock while awaiting output.
 
-Admission reserves a base revision. Newer base requests supersede unfinished old
-ones even when the newer request fails. Base and overlay composition have distinct
+Extension structure and expression syntax are validated before worker admission
+or base-order reservation. Rejected extension content cannot supersede admitted
+work. Once admitted, execution failures preserve the existing newer-output order.
+
+Admission reserves a base revision. Newer admitted base requests supersede
+unfinished work even if their execution later fails. Base and overlay composition have distinct
 revisions. Render workers receive immutable requests; a current result must still
 match its binding, context, base/composition revision, service agreement, deadline
 and hardware authority at handoff.
+
+A retired binding retires its presentation immediately and cancels its overlay
+expiry. Every expiry also carries a local overlay revision, checked inside the
+session output transaction before changing the store or dispatcher. Replacing an
+overlay invalidates its prior timer even when the wire generation is unchanged.
 
 A per-control output lock orders hardware sends. Waiting output revalidates after
 obtaining that lock. Local revocation and navigation can commit while a send is in
@@ -232,14 +327,23 @@ already dispatched cannot be recalled. Successful dispatch commits accepted base
 content only if its ticket remains current. An overlay committed during a send is
 recomposed with that accepted base, invalidating work built from the previous base.
 
-Render worker work can retry once within its deadline while its ticket remains
+Render execution can retry once within its deadline while its ticket remains
 current. Hardware sends and user input are never replayed by this retry policy.
 Failed rendering preserves the last successfully dispatched base.
+
+[Render workers](../src/deckr/controller/_render_workers.py) own cancellable jobs.
+Process execution uses AnyIO's managed, cancellable process pool. Admission is
+bounded across controller instances (eight process jobs and eight local thread
+jobs); ordinary render attempts have a two-second deadline. Retiring bindings,
+replacing base output and closing backends cancel their work. Abandoned local
+threads retain capacity until they actually exit. Provider rendering retains its
+negotiated deadline and admission limits. Output revisions fence every hardware handoff.
 
 | Bound | Policy |
 | --- | --- |
 | Ordinary render requests per control | Two active workers, one coalesced latest pending request. |
 | Ordinary render/send deadlines | Two seconds each. |
+| Shared execution capacity | Eight process jobs and eight local thread jobs across controller instances in the process. |
 | Provider render jobs | Two admitted per control, eight per process; busy work is refused. |
 | Invariant graph workers | Four concurrent executions. |
 | Provider render deadline | Advertised target limit, normally two seconds. |
@@ -257,15 +361,69 @@ Hardware rejection must match the exact command ID, contract, device, control,
 capability and command type. Rejecting an older command never rolls back newer
 accepted presentation.
 
+The Invariant extension uses public executor/graphics APIs and a controller-owned
+[bounded text adapter](../src/deckr/controller/_bounded_text.py). Text fitting uses
+public font metrics before allocation; packed text draws directly onto a bounded
+canvas and clips/truncates at the requested size. Fixed text is limited to 128
+points by graph policy; width fitting searches up to 500 points. The adapter has
+explicit geometry/allocation coverage against `invariant-gfx` 0.4.x. Wire tuples
+are normalized to the executor's recursive list representation so expressions are evaluated before dimension checks; hex
+colours are converted through Pillow's public colour parser.
+
+Diagnostic render observations are best effort: a failed or busy sink cannot
+change the render result. Writes have a 50 ms caller budget and one outstanding
+write per sink; an abandoned write retains its slot. Records report the requested
+raster encoding.
+
 Sources: [pipeline](../src/deckr/controller/_bindings/_rendering.py),
 [dispatcher](../src/deckr/controller/_render_dispatcher.py),
-[presentation store/router](../src/deckr/controller/_presentation.py),
+[presentation](../src/deckr/controller/_presentation.py),
 [hardware commands](../src/deckr/controller/_hardware/_commands.py).
 Tests: [render contract](../tests/test_rendering_contract.py),
 [dispatcher](../tests/test_render_dispatcher.py),
-[reference vectors](../tests/test_rendering_vectors.py).
+[reference vectors](../tests/test_rendering_vectors.py),
+[worker lifetime](../tests/test_render_workers.py),
+[graph admission/allocation](../tests/test_render_graph.py),
+[observation failures](../tests/test_render_observation.py).
 
-## Disconnection, configuration and recovery policies
+## Configuration
+
+Configurations require unique nonempty profile names, at least one profile and
+at least one page per profile; an empty page is valid. Invalid replacements retain
+the prior config and grants.
+
+File configuration observation reads and validates YAML off the event loop, then
+publishes one validated snapshot. Duplicate IDs reject the ambiguous snapshot;
+invalid files retain their previous validated value. Selection is the shared pure
+policy in [config selection](../src/deckr/controller/config/_selection.py), without
+filesystem reads after initialization. File writes serialize and atomically replace
+files within the configured directory. Materialized edits use revision-checked KV
+updates and retry conflicts against the latest projection, preserving other
+editors' changes. Full projection publishers intentionally replace the complete
+snapshot. See [file config tests](../tests/test_config_service.py) and
+[materialized config tests](../tests/test_materialized_config.py).
+
+File config watches are hints; successful directory scans establish deletion.
+Periodic scans cover missed watch events, and missing directories are retried.
+File-to-materialized publication is serialized and acknowledges only successful
+versions. Failed publication retries on the next scan without requiring an edit.
+A successfully scanned empty directory publishes an empty snapshot once; an
+unreadable directory at startup cannot erase the remote projection.
+Materialized config retains validated state while its source is not current; a
+current missing projection is explicit removal. Both sources emit complete
+snapshots, and configuration selects only one source. Config matching requires
+fingerprint and required labels; the most specific match wins, equal specificity
+is an error, and unmatched devices do not create sessions.
+
+Core `KvMaterializedSource` and `CoalescedStateBroadcaster` provide observation
+and state notification primitives. File IDs and resolved destinations are checked
+before writes.
+
+Sources: [file storage](../src/deckr/controller/config/_file_storage.py),
+[file config](../src/deckr/controller/config/_service.py),
+[materialized config](../src/deckr/controller/config/_materialized.py).
+
+## Recovery policies
 
 | Event | Immediate local consequence | Retained state and recovery |
 | --- | --- | --- |
@@ -281,47 +439,23 @@ Tests: [render contract](../tests/test_rendering_contract.py),
 | Config replacement | Revoke old grants and reset navigation. | Plan from the replacement snapshot. |
 | Controller shutdown | Revoke locally before bounded cleanup. | New process/managed incarnations rebuild from current facts. |
 
-File config watches are hints; successful directory scans establish deletion.
-Periodic scans cover missed watch events, and missing directories are retried.
-File-to-materialized publication is serialized and acknowledges only successful
-versions. Failed publication retries on the next scan without requiring an edit.
-A successfully scanned empty directory publishes an empty snapshot once; an
-unreadable directory at startup cannot erase the remote projection.
-Materialized config retains validated state while its source is not current; a
-current missing projection is explicit removal. Both sources emit complete
-snapshots, and configuration selects only one source. Config matching requires
-fingerprint and required labels; the most specific match wins, equal specificity
-is an error, and unmatched devices do not create sessions.
-
-Action selection uses local availability snapshots and keeps a usable cached
-provider, otherwise choosing a usable provider by lexical instance ID. Managed
-service recovery and view watches remain shared service responsibilities.
-Discovery disappearance alone does not end an otherwise authoritative lease.
-
-Interest snapshots report connected config and visible page interests plus warm
-history (four hours by default). They do not select service watches or request provider resource allocation. Active
-interests also protect cached metadata from bounded local cache pruning; this does
-not confer provider authority.
-
-Sources: [file config](../src/deckr/controller/config/_service.py),
-[materialized config](../src/deckr/controller/config/_materialized.py),
-[hardware routing](../src/deckr/controller/_hardware/_service.py),
-[action availability](../src/deckr/controller/_actions/_service.py),
-[interest diagnostics](../src/deckr/controller/_interest_diagnostics.py).
-Tests: [config](../tests/test_config_service.py),
-[hardware](../tests/test_hardware_service.py),
-[availability](../tests/test_action_availability.py),
-[convergence](../tests/test_action_convergence.py).
+Sources: [hardware routing](../src/deckr/controller/_hardware/_service.py),
+[availability reconciliation](../src/deckr/controller/_bindings/_availability_reconcile.py).
+Tests: [hardware routing](../tests/test_hardware_endpoint_routing.py),
+[session recovery](../tests/test_session_recovery.py),
+[action convergence](../tests/test_action_convergence.py).
 
 ## Verification
 
-[Device-session acceptance tests](../tests/test_device_session.py) exercise delayed
-create/attach/settings completions, slow detach, independent page ownership,
-fresh grants after failed preparation, distinct identities and disconnect races.
-The page, input and managed-action suites cover stale page requests/deadlines,
-provider replacement, builtin navigation and press/navigation/release ownership.
-Rendering tests cover reversed completions, duplicate admission, overlay changes
-during dispatch, queued authority loss and exact hardware rejection correlation.
+[Session ordering tests](../tests/test_device_session.py) and
+[preparation tests](../tests/test_binding_preparation.py) cover asynchronous
+completion and refusal. [Session recovery](../tests/test_session_recovery.py),
+[binding scope](../tests/test_binding_scope.py) and
+[managed effect scope](../tests/test_runtime_scope.py) cover stale operations,
+successor agreements, invalid updates and ownership changes. Page and input suites
+exercise deadlines, independent page ownership and press/navigation/release rules.
+Rendering suites cover reversed completions, duplicate admission, overlay changes,
+queued authority loss, worker cancellation and hardware rejection correlation.
 
 Managed integration runs against memory and isolated NATS transports. The optional
 [language workload](../tests/test_cross_language_action_runtime.py) needs the
@@ -329,149 +463,15 @@ external `deckr-integration-tests` runner and Python/TypeScript/Rust toolchains.
 The required validation commands and external spec checkout are documented in
 [README](../README.md).
 
-## Scoped delayed work and invalid input
-
-A retired binding retires its presentation immediately and cancels its overlay
-expiry. Every expiry also carries a local overlay revision, checked inside the
-session output transaction before changing the store or dispatcher. Replacing an
-overlay invalidates its prior timer even when the wire generation is unchanged.
-
-Lifecycle creation, detach, destruction and page notifications retain the exact
-agreement that owned their instance, binding or page. Queued effects carry that
-agreement; the runtime gateway refuses them if it is no longer current. The core
-managed one-way send captures a concrete service-use lease before awaiting I/O and
-does not replay it after recovery. A successor in the same provider session does
-not inherit old effects. Page notifications preserve command causation.
-
-Availability refresh compares the installed descriptor and capability matches
-with the desired plan. Invalid requirements retire the grant; changed valid
-matches require a new attachment. Planning rejects multiple bindings that resolve
-to the same control before issuing any attachment.
-
-Malformed availability projections are logged and ignored while the managed
-agreement remains authoritative. A later valid projection is still consumed.
-Configurations require unique nonempty profile names, at least one profile and
-at least one page per profile; an empty page is valid. Invalid replacements retain
-the prior config and grants. Unknown profiles and out-of-range page indices are
-refused without mutating navigation.
-
-Extension structure and expression syntax are validated before worker admission
-or base-order reservation. Rejected extension content cannot supersede admitted
-work. Once admitted, execution failures preserve the existing newer-output order.
-
-Tests: [binding scope](../tests/test_binding_scope.py),
-[managed effect scope and invalid views](../tests/test_runtime_scope.py),
-[extension admission](../tests/test_render_graph.py).
-
-### Resource ownership and read/write boundaries
-
-Settings targets are scoped by controller, config, configured action placement and
-verified provider identity. Previously verified offline metadata may describe a
-stale schema; unknown provider identities do not become settings targets merely
-because their IDs appear in a request. Provider labels are replaced by each
-accepted availability view. Input cancellation copies the routed press, including
-its projected or derived source. See [settings scope tests](../tests/test_settings_service.py),
-[availability tests](../tests/test_action_availability.py) and
-[input provenance tests](../tests/test_input_provenance.py).
-
-[Render workers](../src/deckr/controller/_render_workers.py) own cancellable jobs.
-Process execution uses AnyIO's managed, cancellable process pool. Admission is
-bounded across controller instances (eight process jobs and eight local thread
-jobs); ordinary render attempts have a two-second deadline. Retiring bindings,
-replacing base output and closing backends cancel their work. Abandoned local
-threads retain capacity until they actually exit. Provider rendering retains its
-negotiated deadline and admission limits. Output revisions still fence every
-hardware handoff. The session boundary uses a cancellable single-token admission gate with
-explicit task reentrancy, so a retiring waiter cannot strand a new transition. See
-[worker tests](../tests/test_render_workers.py),
-[dispatcher tests](../tests/test_render_dispatcher.py) and
-[session tests](../tests/test_device_session.py).
-
-Diagnostic render observations are best effort: a failed or busy sink cannot
-change the render result. Writes have a 50ms caller budget and one outstanding
-write per sink; an abandoned write retains its slot. Records report the requested
-raster encoding. Controller shutdown attempts every owned close and reports
-collected errors after cleanup. Startup failure closes resources constructed
-before their owning component is registered.
-
-File configuration observation reads and validates YAML off the event loop, then
-publishes one validated snapshot. Duplicate IDs reject the ambiguous snapshot;
-invalid files retain their previous validated value. Selection is the shared pure
-policy in [config selection](../src/deckr/controller/config/_selection.py), without
-filesystem reads after initialization. File writes serialize and atomically replace
-files within the configured directory. Materialized edits use revision-checked KV
-updates and retry conflicts against the latest projection, preserving other
-editors' changes. Full projection publishers intentionally replace the complete
-snapshot. See [file config tests](../tests/test_config_service.py) and
-[materialized config tests](../tests/test_materialized_config.py).
-
-
-## Reconciliation values, ingress and supported outputs
-
-`ActionPlanningSnapshot` owns an immutable map of immutable action metadata.
-`BindingLease` represents an installed grant; `ActionInstanceRecord` keeps its
-metadata, provider session, exact agreement and started state together. Page owners
-retain their action instance independently of visible attachments. The pure
-[decision function](../src/deckr/controller/_bindings/_decisions.py) consumes an
-`InstalledBindingFacts` value and desired status to choose retain, prepare,
-replace, pending, unavailable or invalid behavior. Applying that decision happens
-under the existing device gate; preparation owns asynchronous adapter work.
-Initial installation and availability refresh share the same reuse rule, including
-the action descriptor, matched requirements and current control geometry. A geometry
-change replaces the installed render target rather than retaining its old format.
-
-Navigation's `PageStateView` is explicitly a borrowed boundary-local view. Its
-frames/page occurrences retain identity and can change at the next commit; it is
-not an immutable diagnostic snapshot. A `PagePlan` has immutable binding choices
-and a borrowed page occurrence. Device diagnostic snapshots copy their maps and
-values. Config services give each reader/subscriber a deep copy so editing one
-view cannot mutate retained source state.
-
-[Typed ingress](../src/deckr/controller/_actions/_routing.py) retains the original
-service envelope and the core-decoded body. Routing, binding commands, page commands
-and direct output use that envelope for exact-agreement authorization and causation.
-There is no reconstructed legacy action envelope or synthetic render envelope.
-The [gateway](../src/deckr/controller/_actions/_runtime_gateway.py) owns service
-message authorization; the [supervisor](../src/deckr/controller/_actions/_supervisor.py)
-owns managed uses and watches; the [catalog](../src/deckr/controller/_actions/_catalog.py)
-owns accepted availability projections and selection policy.
-
-The supported output subset is one distinct raster bitmap output per binding.
-Multiple requirement aliases for that same output are allowed. A second matched
-output or a non-raster output rejects the desired binding before attachment.
-An explicit selector can choose one output from a multi-output device. This policy
-is in [capability matching](../src/deckr/controller/_capability_matching.py), with
-coverage in [planner tests](../tests/test_binding_planner.py).
-
-Unreferenced metadata expires after five minutes and is capped at 1,024 records;
-live agreements, builtin actions and current interests are protected. Discovery
-loss leaves a live agreement and watch running. Once that agreement ends, an absent
-service's watch record is disposed and is not retried without discovery. See
-[availability supervision](../tests/test_availability_supervision.py) and
-[retention tests](../tests/test_action_availability.py).
-
-## Renderer dependencies and validation boundaries
-
-The Invariant extension uses public executor/graphics APIs and a controller-owned
-[bounded text adapter](../src/deckr/controller/_bounded_text.py). Text fitting uses
-public font metrics before allocation; packed text draws directly onto a bounded
-canvas and clips/truncates at the requested size. Fixed text is limited to 128
-points by graph policy; width fitting searches up to 500 points. The adapter has
-explicit geometry/allocation coverage against `invariant-gfx` 0.4.x and imports no
-private layout functions. Wire tuples are normalized to the executor's recursive
-list representation so expressions are evaluated before dimension checks; hex
-colours are converted through Pillow's public colour parser.
-
 The conformance command consumes shared acceptance, content, ordering and
-Invariant-extension vectors. `.deckr-rendering-spec-revision` independently pins
-the rendering reference, including the extension vectors absent from the core's
-older spec pin. `.deckr-core-revision` still pins the reusable Python implementation.
-The revision combination is validated together; neither checkout's moving branch
-implicitly changes the release dependency.
+Invariant-extension vectors. CI selects the Python implementation from
+`.deckr-core-revision` and the rendering reference from
+`.deckr-rendering-spec-revision`, validating the combination on Python 3.11, 3.12
+and 3.13. Core maintains its own specification pin.
 
 [Import checks](../tests/test_import_boundaries.py) enforce dependency direction,
 ban private core/renderer imports and prohibit cross-test-module imports. Shared
 fixtures live in `test_support`. Mypy checks the application port declarations,
 composition, rendering dependencies and concrete implementations' conformance to
-those ports; it is not a claim of whole-repository strict typing. CI runs the same
-checks on Python 3.11, 3.12 and 3.13. Setup commands belong in [README](../README.md).
+those ports. The configured type-checking scope is six source files. Validation
+commands belong in [README](../README.md).

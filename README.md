@@ -24,11 +24,11 @@ for example `uv run python -m pytest`.
 Install dependencies and run the checks:
 
 ```bash
-uv sync
-uv run ruff check .
-uv run mypy
-uv run pytest
-uv run python scripts/check_spec_conformance.py
+uv sync --locked --dev
+uv run --no-sync ruff check .
+uv run --no-sync mypy
+uv run --no-sync pytest
+uv run --no-sync python scripts/check_spec_conformance.py
 ```
 
 The reference check requires the sibling `deckr` checkout.
@@ -52,12 +52,6 @@ Run `scripts/controller_action_runtime.py` from the sibling
 Use an environment with this controller and the sibling core package installed as editable dependencies.
 The runner requires native toolchains and records evidence for each provider language.
 Ordinary controller test runs skip this workload.
-
-Build distributions:
-
-```bash
-uv build
-```
 
 ## Component configuration
 
@@ -101,40 +95,18 @@ target_controller_id = "controller-main"
 ```
 
 The watcher publishes a complete projection for the target controller.
-See [configuration and recovery policies](docs/architecture.md#disconnection-configuration-and-recovery-policies) for storage and activation behavior.
+See [configuration](docs/architecture.md#configuration) and
+[recovery policies](docs/architecture.md#recovery-policies) for storage and activation behavior.
 
-## Releases
+## Packaging
 
-The root `pyproject.toml` owns the published `deckr-controller` version.
-Stable releases use PEP 440 versions and tags of the form `deckr-controller-vX.Y.Z`.
+Deckr is under active alpha development. Ordinary changes use Git commits as
+revisions and leave package versions unchanged. Version changes, release tags and
+publication require an explicit release request.
 
-1. Set `version` in `pyproject.toml` to the stable version.
-2. Update the `deckr` dependency if the controller requires a new core package release.
-3. Run the checks:
+The root `pyproject.toml` owns the distribution version. Build a source distribution
+and wheel after running the development checks:
 
-   ```bash
-   uv run ruff check .
-   uv run mypy
-   uv run pytest
-   uv run python scripts/check_spec_conformance.py
-   ```
-
-4. Refresh the lockfile:
-
-   ```bash
-   uv lock --refresh
-   ```
-
-5. Commit the release changes.
-6. Tag the release commit as `deckr-controller-vX.Y.Z`.
-7. Build from the tag:
-
-   ```bash
-   git checkout deckr-controller-vX.Y.Z
-   uv build
-   git checkout -
-   ```
-
-8. Publish the wheel and source distribution with the usual PyPI workflow.
-9. Set the next development version to `X.(Y+1).0.dev0` in a separate commit.
-   Refresh `uv.lock` after this version change.
+```bash
+uv build
+```
