@@ -30,7 +30,7 @@ __all__ = [
 
 
 class BuiltinAction(Protocol):
-    uuid: str
+    action_id: str
 
     async def on_bind(self, context: ControllerActionContext) -> None: ...
     async def on_unbind(
@@ -50,23 +50,23 @@ class BuiltinRegistry:
         self._goto_page_action = GoToPageAction()
         self._nav_home_action = NavHomeAction()
         self._actions: dict[str, BuiltinAction] = {
-            self._goto_page_action.uuid: self._goto_page_action,
-            self._nav_home_action.uuid: self._nav_home_action,
+            self._goto_page_action.action_id: self._goto_page_action,
+            self._nav_home_action.action_id: self._nav_home_action,
         }
 
-    def get_action(self, uuid: str) -> BuiltinAction | None:
-        return self._actions.get(uuid)
+    def get_action(self, action_id: str) -> BuiltinAction | None:
+        return self._actions.get(action_id)
 
     def provides_actions(self) -> list[str]:
         return list(self._actions.keys())
 
-    def get_action_descriptor(self, uuid: str) -> ActionDescriptor | None:
+    def get_action_descriptor(self, action_id: str) -> ActionDescriptor | None:
         """Return action registration descriptor."""
-        action = self._actions.get(uuid)
+        action = self._actions.get(action_id)
         if action is None:
             return None
         return ActionDescriptor(
-            actionId=action.uuid,
+            actionId=action.action_id,
             name=getattr(action, "name", None),
             providerId=getattr(action, "provider_id", BUILTIN_ACTION_PROVIDER_ID),
             requirements=(

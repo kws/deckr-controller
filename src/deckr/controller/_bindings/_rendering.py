@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import base64
-import io
 import logging
-import threading
 import time
-import uuid
 from collections import OrderedDict
-from collections.abc import Callable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import anyio
@@ -19,8 +13,8 @@ from deckr.action_runtime import (
     RenderBindingState,
     RenderCommandContext,
     RenderRejection,
+    action_runtime_service_id,
     validate_render_command,
-    validate_rendering_support,
 )
 from deckr.actions.pages import BindingCommandTarget
 from deckr.actions.rendering import (
@@ -28,131 +22,42 @@ from deckr.actions.rendering import (
     RENDER_TEXT_FORMAT,
     BindingRenderBody,
     BindingRenderResultBody,
-    RenderImage,
-    RenderingSupport,
-    RenderLimits,
     RenderTargetSupport,
 )
-from deckr.contracts.messages import entity_subject
+from deckr.contracts.messages import service_address
 from deckr.contracts.models import thaw_json
 from deckr.services import ServiceMessageBody
 
-from deckr.controller._render import RenderModel, RenderSource
 from deckr.controller._render_content import (
     ContentFailure,
-    decode_image,
-    render_content,
 )
-from deckr.controller._render_dispatcher import render_with_retry
 
 if TYPE_CHECKING:
-    from deckr.contracts.authority import ContractPointer
-    from deckr.contracts.messages import DeckrMessage
-    from deckr.hardware.descriptors import DeviceRef
-    from deckr.lanes import EndpointSession
-
-    from deckr.controller._actions import ProviderSessionKey
-    from deckr.controller._bindings._attachments import BindingLease
-    from deckr.controller._bindings._ports import BindingActionService
-    from deckr.controller._hardware import HardwareCommandService
-    from deckr.controller._render_dispatcher import RenderBackend, RenderDispatcher
-    from deckr.controller._session_boundary import SessionBoundary
+    pass
+from deckr.controller._bindings._render_execution import RenderExecution
+from deckr.controller._bindings._render_policy import (
+    _WORKERS,
+    DEFAULT_LIMITS,
+    RenderingPorts,
+    _Job,
+)
 from deckr.controller._render_graph import (
     INVARIANT_FORMAT,
-    render_graph,
     validate_graph,
 )
 
-_WORKERS = threading.BoundedSemaphore(8)
-_GRAPH_WORKERS = anyio.CapacityLimiter(4)
 logger = logging.getLogger(__name__)
-DEFAULT_LIMITS = RenderLimits(
-    maxMessageBytes=262144,
-    maxImageBytes=131072,
-    maxImagePixels=1048576,
-    maxTextCodePoints=1024,
-    maxRenderTimeMs=2000,
-)
-
-
-def rendering_support(context):
-    fmt = context.control.image_format
-    if (
-        fmt is None
-        or fmt.width < 1
-        or fmt.height < 1
-        or fmt.width * fmt.height > DEFAULT_LIMITS.max_image_pixels
-    ):
-        return RenderingSupport(version=1, targets=[])
-    targets = []
-    for match in context.metadata.matched_capabilities:
-        if match.capability.capability_id != context.control.raster_capability_id:
-            continue
-        width, height = (
-            (fmt.height, fmt.width) if fmt.rotation % 180 else (fmt.width, fmt.height)
-        )
-        candidate = dict(
-            requirementName=match.requirement_name,
-            width=width,
-            height=height,
-            formats=[
-                {"id": RENDER_TEXT_FORMAT},
-                {"id": INVARIANT_FORMAT},
-                {"id": RENDER_IMAGE_FORMAT, "options": {"encodings": ["png", "jpeg"]}},
-            ],
-            limits=DEFAULT_LIMITS,
-        )
-        try:
-            support = RenderingSupport(version=1, targets=[candidate])
-            validate_rendering_support(context.metadata, support)
-        except ValueError:
-            continue
-        targets.append(candidate)
-    return RenderingSupport(version=1, targets=targets)
-
-
-@dataclass
-class _Job:
-    message: object
-    body: BindingRenderBody
-    lease: object
-    target: object
-    ticket: tuple
-    deadline: float
-    direct: bool = False
-    done: bool = False
-    command_id: str | None = None
-    rejection: object = None
-    result_emitted: bool = False
-
-
-@dataclass(frozen=True)
-class RenderingPorts:
-    """Dependencies of rendering, with no mutable session or binding-host access."""
-
-    endpoint: EndpointSession
-    hardware: HardwareCommandService
-    actions: BindingActionService
-    dispatcher: RenderDispatcher
-    backend: RenderBackend
-    boundary: SessionBoundary
-    start_soon: Callable
-    notify: Callable[[DeckrMessage, BindingRenderResultBody], None]
-    config_id: str
-    hardware_ref: DeviceRef
-    is_active: Callable[[], bool]
-    binding_by_id: Callable[[str], BindingLease | None]
-    binding_output_authorized: Callable[[BindingLease], bool]
-    current_contract: Callable[[ProviderSessionKey | None], ContractPointer | None]
-
-    @property
-    def config_active(self):
-        return self.is_active()
 
 
 class BindingRenderer:
     def __init__(self, ports: RenderingPorts):
         self.ports = ports
+        self.execution = RenderExecution(
+            ports=lambda: self.ports,
+            authorize=self._authorize,
+            finish=self._finish,
+            hardware_rejection=self._hardware_rejection,
+        )
         self.jobs = OrderedDict()
         self.active = {}
 
@@ -170,14 +75,18 @@ class BindingRenderer:
             rendering=lease.context.rendering,
             active=ports.config_active and ports.binding_output_authorized(lease),
             contract=lease.context.contract,
-            runtimeEndpoint=f"service:action-runtime.{lease.provider_instance_id}",
+            runtimeEndpoint=str(
+                service_address(action_runtime_service_id(lease.provider_instance_id))
+            ),
             runtimeSessionId=lease.provider_session_id,
         )
         return RenderCommandContext(
             contract=message.contract,
             controllerEndpoint=str(ports.endpoint.address),
             controllerSessionId=ports.endpoint.session_id,
-            runtimeEndpoint=f"service:action-runtime.{lease.provider_instance_id}",
+            runtimeEndpoint=str(
+                service_address(action_runtime_service_id(lease.provider_instance_id))
+            ),
             runtimeSessionId=lease.provider_session_id,
             localAuthority=ports.current_contract(lease.provider_session_key)
             == message.contract,
@@ -274,6 +183,12 @@ class BindingRenderer:
         # The outer check can race concurrent deliveries waiting on the nav lock.
         if self._retained(cache_key):
             return True
+        if body.content is not None and body.content.format == INVARIANT_FORMAT:
+            try:
+                validate_graph(thaw_json(body.content.data), support.limits)
+            except ContentFailure as exc:
+                await self._result(message, body, "rejected", exc.code)
+                return True
         control_id = lease.control_id
         if self.active.get(control_id, 0) >= 2 or not _WORKERS.acquire(blocking=False):
             if not direct:
@@ -377,24 +292,6 @@ class BindingRenderer:
             render_body = BindingRenderBody.from_wire(params)
         except (ValueError, TypeError):
             return
-        envelope = message.model_copy(
-            update={
-                "message_type": "serviceMessage",
-                "subject": entity_subject(
-                    "service",
-                    serviceId=f"action-runtime.{lease.provider_instance_id}",
-                    namespace="dev.deckr.action_runtime.provider",
-                    name="binding_render",
-                ),
-                "body": ServiceMessageBody(
-                    serviceNamespace="dev.deckr.action_runtime.provider",
-                    name="binding_render",
-                    intent="command",
-                    exchangePattern="one_way",
-                    params=render_body.to_dict(),
-                ).to_dict(),
-            }
-        )
         key = (
             str(message.sender),
             message.sender_session_id,
@@ -406,17 +303,14 @@ class BindingRenderer:
             return
         async with self.ports.boundary:
             try:
-                self._validate_direct(envelope, lease, support)
+                self._validate_direct(message, render_body, lease, support)
             except (ValueError, TypeError):
                 return
-            await self._admit(envelope, render_body, lease, support, key, direct=True)
+            await self._admit(message, render_body, lease, support, key, direct=True)
 
-    def _validate_direct(self, message, lease, support):
+    def _validate_direct(self, message, body, lease, support):
         facts = self._context(message, lease)
         state = facts.bindings[lease.binding_id]
-        body = BindingRenderBody.from_wire(
-            thaw_json(ServiceMessageBody.from_wire(message.body).params)
-        )
         if (
             not facts.local_authority
             or not facts.hardware_authority
@@ -428,24 +322,11 @@ class BindingRenderer:
         if message.wire_size_bytes > support.limits.max_message_bytes:
             raise RenderRejection("limit_exceeded")
 
-    @staticmethod
-    def _direct_frame(job):
-        data = RenderImage.from_wire(thaw_json(job.body.content.data))
-        source = decode_image(data, job.target.limits)
-        fmt = job.lease.control.image_format
-        if source.size != (fmt.width, fmt.height):
-            raise ContentFailure("invalid_content")
-        # The managed hardware boundary validates descriptor encoding constraints.
-        if fmt.rotation:
-            source = source.rotate(-fmt.rotation, expand=True)
-        out = io.BytesIO()
-        source.convert("RGB").save(out, format="PNG")
-        return out.getvalue()
-
     async def _finish(self, job, status, code=None):
         if job.done:
             return
         job.done = True
+        job.timer.cancel()
         if not job.direct:
             await self._result(
                 job.message,
@@ -457,10 +338,17 @@ class BindingRenderer:
         job.result_emitted = True
         if job.rejection is not None:
             await self._hardware_rejection(job, job.rejection)
+        job.scope.cancel()
+
+    async def retire_binding(self, binding_id):
+        for job in tuple(self.jobs.values()):
+            if job.lease.binding_id == binding_id:
+                await self._finish(job, "superseded", "target_not_current")
 
     async def _expire(self, job):
-        await anyio.sleep(max(0, job.deadline - time.monotonic()))
-        await self._finish(job, "failed", "deadline_exceeded")
+        with job.timer:
+            await anyio.sleep(max(0, job.deadline - time.monotonic()))
+            await self._finish(job, "failed", "deadline_exceeded")
 
     async def _hardware_rejection(self, job, message):
         if not job.result_emitted:
@@ -485,154 +373,17 @@ class BindingRenderer:
         ):
             raise RenderRejection("target_not_current")
         if job.direct:
-            self._validate_direct(job.message, job.lease, job.target)
+            self._validate_direct(job.message, job.body, job.lease, job.target)
         else:
             validate_render_command(job.message, self._context(job.message, job.lease))
         if job.done or time.monotonic() >= job.deadline:
             raise ContentFailure("deadline_exceeded")
 
     async def _run(self, job):
-        router = job.lease.context.presentation
-        dispatcher = self.ports.dispatcher
         try:
-            if job.body.operation == "clear":
-                image = None
-            elif job.direct:
-                image = await anyio.to_thread.run_sync(self._direct_frame, job)
-            elif job.body.content.format == INVARIANT_FORMAT:
-                document = thaw_json(job.body.content.data)
-                validate_graph(document, job.target.limits)
-                with anyio.fail_after(max(0, job.deadline - time.monotonic())):
-                    image = await anyio.to_process.run_sync(
-                        render_graph,
-                        document,
-                        job.target.width,
-                        job.target.height,
-                        job.target.limits,
-                        cancellable=True,
-                        limiter=_GRAPH_WORKERS,
-                    )
-            else:
-                image = await anyio.to_thread.run_sync(
-                    render_content,
-                    job.body.content,
-                    job.target.width,
-                    job.target.height,
-                    job.target.limits,
-                )
-            image_uri = (
-                "data:image/png;base64," + base64.b64encode(image).decode("ascii")
-                if image is not None
-                else None
-            )
-            while not job.done:
-                await self._authorize(job)
-                if not dispatcher.base_is_current(job.ticket):
-                    await self._finish(job, "superseded", "newer_output")
-                    return
-                revision = dispatcher.composition_revision(job.ticket)
-                overlay = router.store.overlay
-                model = RenderModel(
-                    image=image_uri,
-                    overlay_type=overlay.template if overlay else None,
-                    overlay_title=overlay.title if overlay else None,
-                )
-                request = router.render_service.build_request(
-                    model,
-                    router.image_format,
-                    config_id=self.ports.config_id,
-                    generation=revision,
-                    source=RenderSource(
-                        provider_instance_id=job.lease.provider_instance_id,
-                        provider_id=job.lease.context.metadata.provider_id,
-                        provider_session_id=job.message.sender_session_id,
-                        action_id=job.lease.context.metadata.action_id,
-                        action_instance_id=job.lease.context.metadata.action_instance_id,
-                        action_message_id=job.message.message_id,
-                        action_causation_id=job.message.causation_id,
-                        command_type="binding_output"
-                        if job.direct
-                        else "binding_render",
-                        content_kind=job.body.content.format
-                        if job.body.content
-                        else None,
-                        content=thaw_json(job.body.content.data)
-                        if job.body.content
-                        else None,
-                        binding_output_generation=job.body.target.generation,
-                    ),
-                    context_id=job.lease.context_id,
-                    binding_id=job.lease.binding_id,
-                    control_id=job.lease.control_id,
-                )
-                frame = None
-                if request is not None:
-                    if job.direct and overlay is None:
-                        frame = base64.b64decode(
-                            job.body.content.data["image"], validate=True
-                        )
-                    else:
-                        result = await render_with_retry(
-                            self.ports.backend,
-                            request,
-                            is_current=lambda: not job.done
-                            and dispatcher.base_is_current(job.ticket),
-                            timeout=max(0, job.deadline - time.monotonic()),
-                        )
-                        if result is None:
-                            await self._finish(job, "superseded", "newer_output")
-                            return
-                        if result.frame is None:
-                            raise ContentFailure("render_failed")
-                        frame = result.frame
-                if job.done:
-                    return
-                await self._authorize(job)
-                job.command_id = str(uuid.uuid4())
-                self.ports.hardware.observe_render_command(
-                    job.command_id,
-                    self.ports.config_id,
-                    job.lease.control_id,
-                    job.lease.raster_capability_id,
-                    "clear" if frame is None else "set_frame",
-                    lambda message: self._hardware_rejection(job, message),
-                )
-
-                def committed():
-                    router.store.content.image = image_uri
-                    router.store.content.title = None
-
-                with anyio.fail_after(max(0, job.deadline - time.monotonic())):
-                    sent = await dispatcher.publish_base(
-                        job.ticket,
-                        revision,
-                        frame,
-                        message_id=job.command_id,
-                        authorize=lambda: self._authorize(job),
-                        committed=committed,
-                        recompose=router.render,
-                    )
-                if sent:
-                    await self._finish(job, "dispatched")
-                    return
-        except RenderRejection:
-            await self._finish(job, "superseded", "target_not_current")
-        except ContentFailure as exc:
-            await self._finish(job, "failed", exc.code)
-        except TimeoutError:
-            await self._finish(job, "failed", "deadline_exceeded")
-        except Exception:
-            logger.warning(
-                "Rendering failed for %s", job.message.message_id, exc_info=True
-            )
-            if dispatcher.base_is_current(job.ticket):
-                await self._finish(
-                    job,
-                    "failed",
-                    "dispatch_failed" if job.command_id else "render_failed",
-                )
-            else:
-                await self._finish(job, "superseded", "newer_output")
+            with job.scope:
+                if not job.done:
+                    await self.execution.execute(job)
         finally:
             self.active[job.lease.control_id] -= 1
             _WORKERS.release()

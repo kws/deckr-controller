@@ -2,12 +2,6 @@ import logging
 from collections.abc import Callable
 
 import anyio
-from deckr.actions.messages import (
-    CLOSE_PAGE,
-    COMMAND_MESSAGE_TYPES,
-    OPEN_PAGE,
-    REPLACE_PAGE,
-)
 from deckr.components import BaseComponent, RunContext
 from deckr.contracts.messages import (
     SERVICES_LANE,
@@ -20,18 +14,15 @@ from deckr.hardware.descriptors import DeviceDescriptor
 from deckr.lanes import EndpointSession
 
 from deckr.controller._actions import ControllerActionService, ProviderActionKey
-from deckr.controller._actions._routing import action_command_metadata
+from deckr.controller._actions._routing import ActionRuntimeCommand
 from deckr.controller._device_session import DeviceSession
 from deckr.controller._hardware import (
     ControllerHardwareService,
     LiveDeviceRoute,
 )
-from deckr.controller._render_dispatcher import (
-    ProcessPoolRenderBackend,
-    RenderBackend,
-)
+from deckr.controller._render_workers import ProcessPoolRenderBackend, RenderBackend
 from deckr.controller._stop_aware import cancel_on_stopping
-from deckr.controller.action_provider.action_registry import ActionRegistry
+from deckr.controller.action_provider.builtin_registry import BuiltinActionRegistry
 from deckr.controller.config import DeviceConfigService
 from deckr.controller.settings import SettingsService
 
@@ -47,7 +38,7 @@ class ControllerService(BaseComponent):
         settings_service: SettingsService,
         *,
         controller_id: str,
-        action_registry: ActionRegistry | None = None,
+        action_registry: BuiltinActionRegistry | None = None,
         action_service: ControllerActionService | None = None,
         render_backend: RenderBackend | None = None,
     ):
@@ -75,30 +66,19 @@ class ControllerService(BaseComponent):
         self._render_backend = render_backend
         self._stopping: anyio.Event | None = None
 
-    async def _handle_action_command(
-        self, msg: DeckrMessage, *, service_message: DeckrMessage | None = None
-    ) -> None:
-        """Route command messages to the appropriate DeviceSession."""
-        if msg.message_type not in COMMAND_MESSAGE_TYPES:
+    async def _handle_action_command(self, command: ActionRuntimeCommand) -> None:
+        """Route a typed command while preserving its original service envelope."""
+        if command.name in {"open_page", "replace_page", "close_page"}:
+            for context in await self._controller_contexts.values():
+                if await context.handle_page_command(command.envelope):
+                    break
             return
-        if msg.message_type in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
-            if service_message is not None:
-                for context in await self._controller_contexts.values():
-                    if await context.handle_page_command(service_message):
-                        break
+        metadata = command.metadata
+        if metadata is None:
             return
-        metadata = action_command_metadata(msg)
-        config_id = metadata.config_id if metadata is not None else None
-        if config_id is None:
-            logger.warning(
-                "Ignoring action command %s without routing metadata from %s",
-                msg.message_type,
-                msg.sender,
-            )
-            return
-        ctrl_ctx = await self._controller_contexts.get(config_id)
-        if ctrl_ctx is not None:
-            await ctrl_ctx.handle_provider_command(msg)
+        context = await self._controller_contexts.get(metadata.config_id)
+        if context is not None:
+            await context.handle_action_command(command)
 
     async def _handle_internal_action_availability_changed(
         self,
@@ -166,10 +146,7 @@ class ControllerService(BaseComponent):
                     )
                     if action_runtime_message is None:
                         continue
-                    if action_runtime_message.message_type in COMMAND_MESSAGE_TYPES:
-                        await self._handle_action_command(
-                            action_runtime_message, service_message=event
-                        )
+                    await self._handle_action_command(action_runtime_message)
                 except Exception:
                     if isinstance(event, DeckrMessage):
                         logger.exception(
@@ -278,14 +255,25 @@ class ControllerService(BaseComponent):
     async def stop(self):
         if self._stopping is not None:
             self._stopping.set()
-        await self._hardware.aclose()
-        for ctrl_ctx in await self._controller_contexts.values():
-            await ctrl_ctx.aclose()
-        await self._controller_contexts.clear()
-        if self._action_service is not None:
-            await self._action_service.aclose()
-        if self._render_backend is not None:
-            await self._render_backend.aclose()
+        errors = []
+        with anyio.CancelScope(shield=True):
+            sessions = await self._controller_contexts.values()
+            closes = [
+                self._hardware.aclose,
+                *(session.aclose for session in sessions),
+                self._controller_contexts.clear,
+            ]
+            if self._action_service is not None:
+                closes.append(self._action_service.aclose)
+            if self._render_backend is not None:
+                closes.append(self._render_backend.aclose)
+            for close in closes:
+                try:
+                    await close()
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise ExceptionGroup("Controller cleanup failed", errors)
 
     async def _device_lifecycle(
         self,

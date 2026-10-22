@@ -3,144 +3,39 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
-from deckr.actions.catalog import ActionDescriptor
 from deckr.actions.messages import (
     DynamicPageCommand,
-    SettingsTargetRef,
     make_context_id,
     make_dynamic_page_id,
     make_page_session_id,
 )
-from deckr.contracts.authority import ContractPointer
 
 from deckr.controller._actions._models import ActionMetadata
 from deckr.controller._actions._requests import ClosePage, OpenPage, UpdatePage
 from deckr.controller._binding_resolution import ConfiguredControlBinding
+from deckr.controller._pages._configured import configured_bindings
 from deckr.controller.config._data import DeviceConfig, Profile
-from deckr.controller.settings import static_action_identity_fallback
 
 if TYPE_CHECKING:
-    from deckr.controller._binding_planner import PagePlan
+    from deckr.controller._binding_plan import PagePlan
 
 
-DEFAULT_WIDGET_TIMEOUT_MS = 60_000
-
-
-@dataclass(frozen=True, slots=True)
-class StaticPageRef:
-    profile_name: str
-    page_index: int
-
-
-PageStackEntry = StaticPageRef | DynamicPageCommand
-
-
-@dataclass(slots=True)
-class DynamicPageSession:
-    page_id: str
-    page_session_id: str
-    context_id: str
-    action_instance_id: str
-    owner_context_id: str
-    owner_binding_id: str
-    owner_control_id: str
-    owner_action_uuid: str
-    owner_provider_instance_id: str
-    owner_provider_id: str
-    owner_provider_session_id: str | None
-    owner_action_meta: ActionMetadata
-    owner_profile: str
-    owner_page: int
-    timeout_ms: int
-    last_activity: float
-    settings_target: SettingsTargetRef | None
-    generation: int = 0
-    owner_contract: ContractPointer | None = None
-    deadline_revision: int = 0
-    source: Literal["provider", "configuration"] = "provider"
-    presentation: Literal["temporary", "route"] = "temporary"
-    lifetime_owner: Literal["action_instance", "controller"] = "action_instance"
-
-
-@dataclass(slots=True)
-class PageFrame:
-    entry: PageStackEntry
-    page_session: DynamicPageSession | None
-    committed_plan: PagePlan
-
-
-@dataclass(slots=True)
-class NavigationState:
-    configured_route: PageFrame | None = None
-    temporary_page: PageFrame | None = None
-    revision: int = 0
-
-    @property
-    def frames(self) -> tuple[PageFrame, ...]:
-        return tuple(
-            frame
-            for frame in (self.configured_route, self.temporary_page)
-            if frame is not None
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class PageDeadline:
-    page_session_id: str
-    revision: int
-    due_at: float
-
-
-@dataclass(frozen=True, slots=True)
-class PageOwnerBinding:
-    context_id: str
-    binding_id: str
-    control_id: str
-    action_uuid: str
-    provider_instance_id: str
-    provider_id: str
-    provider_session_id: str | None
-    action_instance_id: str
-    profile_id: str
-    page_id: str
-    page_session_id: str | None
-    settings_target: SettingsTargetRef | None
-    action_descriptor: ActionDescriptor | None = None
-    contract: ContractPointer | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PageSnapshot:
-    config_active: bool
-    frames: tuple[PageFrame, ...]
-    current_frame: PageFrame | None
-    current_plan: PagePlan | None
-    active_dynamic_session: DynamicPageSession | None
-
-
-@dataclass(frozen=True, slots=True)
-class PageTransitionDraft:
-    kind: Literal["set", "open", "replace", "close", "refresh"]
-    entry: PageStackEntry
-    page_session: DynamicPageSession | None
-    departing: PageStackEntry | None
-    retained_plan: PagePlan | None
-    preserve_rebound_outputs: bool
-    refresh_actions: bool
-    sessions_to_close: tuple[DynamicPageSession, ...] = ()
-    previous_dynamic_plans: tuple[PagePlan, ...] = ()
-    cleanup_reason: str = "navigate"
-    page_session_generation: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PageTransitionEffects:
-    sessions_to_close: tuple[DynamicPageSession, ...] = ()
-    previous_dynamic_plans: tuple[PagePlan, ...] = ()
-    cleanup_reason: str = "navigate"
+from deckr.controller._pages._models import (
+    DEFAULT_WIDGET_TIMEOUT_MS,
+    DynamicPageSession,
+    NavigationState,
+    PageDeadline,
+    PageFrame,
+    PageOwnerBinding,
+    PageRef,
+    PageStateView,
+    PageTransitionDraft,
+    PageTransitionEffects,
+    StaticPageRef,
+)
 
 
 class PageSessionService:
@@ -192,9 +87,9 @@ class PageSessionService:
             )
         return self.begin_close_page(context_id=grant.context_id)
 
-    def snapshot(self) -> PageSnapshot:
+    def view(self) -> PageStateView:
         current_frame = self.current_frame()
-        return PageSnapshot(
+        return PageStateView(
             config_active=self._config_active,
             frames=tuple(self.state.frames),
             current_frame=current_frame,
@@ -218,27 +113,9 @@ class PageSessionService:
         return None
 
     def resolve_static_bindings(
-        self,
-        ref: StaticPageRef,
+        self, ref: StaticPageRef
     ) -> list[ConfiguredControlBinding]:
-        profile = self._find_profile(ref.profile_name)
-        page = profile.pages[ref.page_index]
-        return [
-            ConfiguredControlBinding(
-                selector=control.selector,
-                action_uuid=control.action,
-                provider_instance_id=control.provider_instance_id,
-                provider_labels=dict(control.provider_labels),
-                settings=dict(control.settings),
-                stable_id=control.id,
-                identity_fallback=static_action_identity_fallback(
-                    selector_control_id=control.selector.control_id,
-                    control_index=control_index,
-                ),
-                template_overrides=dict(control.template_overrides),
-            )
-            for control_index, control in enumerate(page.controls)
-        ]
+        return configured_bindings(self._config, ref)
 
     def begin_set_page(
         self,
@@ -249,18 +126,24 @@ class PageSessionService:
         page_session: DynamicPageSession | None = None,
         close_dynamic: bool = True,
         close_reason: str = "navigate",
-        refresh_actions: bool = True,
     ) -> PageTransitionDraft | None:
         if not self._config_active:
             return None
         if descriptor is not None:
             if page_session is None:
                 return None
-            entry: PageStackEntry = descriptor
+            entry: PageRef = descriptor
         else:
-            profile_name = profile or "default"
+            profile_name = (
+                profile if profile is not None else self._config.profiles[0].name
+            )
             page_index = page if page is not None else 0
-            profile_obj = self._find_profile(profile_name)
+            try:
+                profile_obj = self._find_profile(profile_name)
+            except ValueError:
+                return None
+            if not 0 <= page_index < len(profile_obj.pages):
+                return None
             entry = StaticPageRef(
                 profile_name=profile_obj.name,
                 page_index=page_index,
@@ -294,7 +177,6 @@ class PageSessionService:
             departing=departing,
             retained_plan=retained_plan,
             preserve_rebound_outputs=preserve_rebound_outputs,
-            refresh_actions=refresh_actions,
             sessions_to_close=(
                 self._dynamic_sessions(reverse=True) if close_dynamic else ()
             ),
@@ -329,7 +211,7 @@ class PageSessionService:
             bindings=descriptor.bindings,
         )
         owner_action_meta = ActionMetadata(
-            uuid=owner.action_uuid,
+            action_id=owner.action_id,
             provider_instance_id=owner.provider_instance_id,
             provider_id=owner.provider_id,
             provider_session_id=owner.provider_session_id,
@@ -343,7 +225,7 @@ class PageSessionService:
             owner_context_id=owner.context_id,
             owner_binding_id=owner.binding_id,
             owner_control_id=owner.control_id,
-            owner_action_uuid=owner.action_uuid,
+            owner_action_id=owner.action_id,
             owner_provider_instance_id=owner.provider_instance_id,
             owner_provider_id=owner.provider_id,
             owner_provider_session_id=owner.provider_session_id,
@@ -371,7 +253,6 @@ class PageSessionService:
             departing=draft.departing,
             retained_plan=draft.retained_plan,
             preserve_rebound_outputs=draft.preserve_rebound_outputs,
-            refresh_actions=draft.refresh_actions,
             sessions_to_close=draft.sessions_to_close,
             previous_dynamic_plans=draft.previous_dynamic_plans,
             cleanup_reason=draft.cleanup_reason,
@@ -407,7 +288,6 @@ class PageSessionService:
             departing=current_frame.entry,
             retained_plan=None,
             preserve_rebound_outputs=True,
-            refresh_actions=True,
             previous_dynamic_plans=self._committed_dynamic_page_plans(),
             cleanup_reason="page_child_removed",
             page_session_generation=session.generation + 1,
@@ -445,7 +325,6 @@ class PageSessionService:
             departing=departing_frame.entry,
             retained_plan=None,
             preserve_rebound_outputs=True,
-            refresh_actions=False,
             sessions_to_close=self._dynamic_sessions(reverse=True),
             previous_dynamic_plans=self._committed_dynamic_page_plans(),
             cleanup_reason=reason,
@@ -454,7 +333,6 @@ class PageSessionService:
     def begin_refresh_current(
         self,
         *,
-        refresh_actions: bool,
         preserve_rebound_outputs: bool,
     ) -> PageTransitionDraft | None:
         current_frame = self.current_frame()
@@ -467,7 +345,6 @@ class PageSessionService:
             departing=current_frame.entry,
             retained_plan=current_frame.committed_plan,
             preserve_rebound_outputs=preserve_rebound_outputs,
-            refresh_actions=refresh_actions,
         )
 
     def commit(
@@ -478,7 +355,7 @@ class PageSessionService:
         if draft.page_session is not None and draft.page_session_generation is not None:
             draft.page_session.generation = draft.page_session_generation
         if plan.page_session is not draft.page_session:
-            plan.page_session = draft.page_session
+            plan = replace(plan, page_session=draft.page_session)
 
         frame = PageFrame(draft.entry, draft.page_session, plan)
         if isinstance(draft.entry, StaticPageRef):
@@ -528,7 +405,6 @@ class PageSessionService:
                 current_frame.entry if current_frame is not None else None,
                 DynamicPageCommand,
             ),
-            refresh_actions=True,
             sessions_to_close=self._dynamic_sessions(reverse=True),
             previous_dynamic_plans=self._committed_dynamic_page_plans(reverse=True),
             cleanup_reason="config_change",
@@ -580,7 +456,7 @@ class PageSessionService:
         for profile in self._config.profiles:
             if profile.name == profile_name:
                 return profile
-        return self._config.profiles[0]
+        raise ValueError(f"Unknown configured profile: {profile_name}")
 
     def _resolve_widget_timeout_ms(self, profile_name: str, page_index: int) -> int:
         profile = self._find_profile(profile_name)

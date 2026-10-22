@@ -350,3 +350,31 @@ async def test_config_watcher_component_publishes_materialized_snapshot(
 
     assert entry.value["deviceConfigs"][0]["name"] == "Component"
     assert entry.value["producer"]["kind"] == "file_watcher"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_materialized_editors_preserve_both_updates():
+    class RacingBucket(MemoryJsonKvBucket):
+        def __init__(self):
+            super().__init__(bucket="config")
+            self.readers = 0
+            self.ready = anyio.Event()
+
+        async def get(self, key):
+            entry = await super().get(key)
+            if key == materialized_config_key(CONTROLLER_ID) and self.readers < 2:
+                self.readers += 1
+                if self.readers == 2:
+                    self.ready.set()
+                await self.ready.wait()
+            return entry
+
+    bucket = RacingBucket()
+    first = MaterializedDeviceConfigService(controller_id=CONTROLLER_ID, bucket=bucket)
+    second = MaterializedDeviceConfigService(controller_id=CONTROLLER_ID, bucket=bucket)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(first.write_config, _config("first"))
+        tg.start_soon(second.write_config, _config("second"))
+    entry = await bucket.get(materialized_config_key(CONTROLLER_ID))
+    projection = MaterializedConfigProjection.model_validate(entry.value)
+    assert {config.id for config in projection.device_configs} == {"first", "second"}

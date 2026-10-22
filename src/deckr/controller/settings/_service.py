@@ -26,7 +26,7 @@ ActionProvider = Callable[..., Awaitable[ActionMetadata | None]]
 class ActionMetadataResolver(Protocol):
     def settings_action_metadata(
         self,
-        action_uuid: str,
+        action_id: str,
         *,
         provider_instance_id: str | None = None,
         provider_id: str | None = None,
@@ -119,10 +119,12 @@ class ConfigBackedSettingsService:
             )
             if provider_instance_id is None or provider_id is None:
                 continue
-            provider_targets[(provider_instance_id, provider_id)] = self.provider_target(
-                config,
-                provider_instance_id=provider_instance_id,
-                provider_id=provider_id,
+            provider_targets[(provider_instance_id, provider_id)] = (
+                self.provider_target(
+                    config,
+                    provider_instance_id=provider_instance_id,
+                    provider_id=provider_id,
+                )
             )
             descriptions.append(
                 await self.describe_target(
@@ -141,7 +143,7 @@ class ConfigBackedSettingsService:
     async def describe_target(
         self, target: SettingsTargetRef
     ) -> SettingsTargetDescription:
-        config = await self._require_config(target.config_id)
+        config = await self._require_target_config(target)
         if target.scope == "action_provider_instance":
             metadata = await self._action_for_target(target)
             return SettingsTargetDescription(
@@ -179,7 +181,7 @@ class ConfigBackedSettingsService:
         return True
 
     async def get(self, target: SettingsTargetRef) -> SettingsSnapshot:
-        config = await self._require_config(target.config_id)
+        config = await self._require_target_config(target)
         if target.scope == "action_provider_instance":
             metadata = await self._action_for_target(target)
             settings = _settings_copy(
@@ -242,6 +244,11 @@ class ConfigBackedSettingsService:
             raise KeyError(f"Unknown device config {config_id!r}")
         return config
 
+    async def _require_target_config(self, target: SettingsTargetRef) -> DeviceConfig:
+        if target.controller_id != self._controller_id:
+            raise KeyError("Settings target belongs to another controller")
+        return await self._require_config(target.config_id)
+
     async def _action_metadata(
         self,
         action_id: str,
@@ -296,7 +303,7 @@ class ConfigBackedSettingsService:
                     and action.provider_id == target.provider_id
                 ):
                     return metadata
-            return SettingsActionMetadata(action=None, stale=True)
+            raise KeyError(f"Unknown provider settings target {target.key()!r}")
         if not target.action_id:
             return SettingsActionMetadata(action=None, stale=True)
         return await self._action_metadata(
@@ -366,12 +373,23 @@ class ConfigBackedSettingsService:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
         if target.stable_id != location.control.id:
             raise KeyError(f"Unknown action settings target {target.key()!r}")
+        if (
+            location.control.provider_instance_id is not None
+            and location.control.provider_instance_id != target.provider_instance_id
+        ):
+            raise KeyError("Settings target does not match the configured provider")
         metadata = await self._action_metadata(
             location.control.action,
             provider_instance_id=target.provider_instance_id,
             provider_id=target.provider_id,
             provider_labels=location.control.provider_labels,
         )
+        action = metadata.action
+        if action is None or (action.provider_instance_id, action.provider_id) != (
+            target.provider_instance_id,
+            target.provider_id,
+        ):
+            raise KeyError(f"Unknown action settings target {target.key()!r}")
         return location, metadata
 
     def _action_provenance(self, control: Control) -> tuple[SettingsProvenance, ...]:

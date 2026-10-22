@@ -14,20 +14,31 @@ Use Python 3.11 or later and `uv`.
 Check out `deckr-core-python` beside this repository.
 The source override in `pyproject.toml` uses that checkout as an editable dependency.
 
+The Invariant renderer also needs the Cairo system library (`libcairo2` on
+Debian/Ubuntu, or `brew install cairo` on macOS). If a managed Python on macOS
+cannot locate Homebrew's library, set `DYLD_FALLBACK_LIBRARY_PATH` to the Homebrew
+library directory, for example `/opt/homebrew/lib` on Apple Silicon.
+If a console-script launcher drops that variable, invoke its Python module instead,
+for example `uv run python -m pytest`.
+
 Install dependencies and run the checks:
 
 ```bash
 uv sync
 uv run ruff check .
+uv run mypy
 uv run pytest
 uv run python scripts/check_spec_conformance.py
 ```
 
 The reference check requires the sibling `deckr` checkout.
-Set `DECKR_SPEC_ROOT` to use another location.
+Set `DECKR_SPEC_ROOT` to use another location. It runs acceptance, content, ordering
+and Invariant-extension cases; the selected reference must include all four files.
 
 CI selects the core commit from `.deckr-core-revision`.
-It selects the specification commit from the core checkout's `.deckr-spec-revision`.
+It selects the rendering reference from `.deckr-rendering-spec-revision`, including
+the advertised Invariant extension vectors. The core implementation keeps its own
+specification pin. CI validates this combination on Python 3.11, 3.12 and 3.13.
 Update `.deckr-core-revision` and `uv.lock` together when the controller adopts a new core commit.
 Check the controller against that commit before the update.
 
@@ -103,6 +114,7 @@ Stable releases use PEP 440 versions and tags of the form `deckr-controller-vX.Y
 
    ```bash
    uv run ruff check .
+   uv run mypy
    uv run pytest
    uv run python scripts/check_spec_conformance.py
    ```

@@ -11,7 +11,7 @@ from deckr.actions.messages import BindingMetadata, SettingsTargetRef
 
 from deckr.controller._actions._models import ProviderSessionKey
 from deckr.controller._bindings._context import ControlContext
-from deckr.controller._device_layout import ControlSurface
+from deckr.controller._device_layout import ControlLayout
 from deckr.controller._pages import DynamicPageSession
 
 
@@ -20,14 +20,14 @@ class BindingLease:
     binding_id: str
     context_id: str
     action_instance_id: str
-    action_uuid: str
+    action_id: str
     provider_instance_id: str
     provider_id: str
     provider_session_id: str | None
     provider_session_key: ProviderSessionKey | None
     attached: bool
     control_id: str
-    control: ControlSurface
+    control: ControlLayout
     input_capability_ids: frozenset[str]
     raster_capability_id: str | None
     profile_id: str

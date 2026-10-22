@@ -9,7 +9,7 @@ from deckr.actions.messages import (
     PageChildBindingTarget,
 )
 
-from deckr.controller._binding_planner import PagePlan
+from deckr.controller._binding_plan import PagePlan
 from deckr.controller._pages import (
     PageOwnerBinding,
     PageSessionService,
@@ -101,7 +101,7 @@ def _owner() -> PageOwnerBinding:
         context_id="owner-context",
         binding_id="owner-binding",
         control_id="0,0",
-        action_uuid="action.owner",
+        action_id="action.owner",
         provider_instance_id="python",
         provider_id="test.provider",
         provider_session_id="provider-session",
@@ -121,10 +121,10 @@ def test_resolve_static_bindings_returns_control_bindings(device_config):
 
     assert len(bindings) == 2
     assert bindings[0].control_id == "0,0"
-    assert bindings[0].action_uuid == "action.a"
+    assert bindings[0].action_id == "action.a"
     assert bindings[0].settings == {"x": 1}
     assert bindings[1].control_id == "0,1"
-    assert bindings[1].action_uuid == "action.b"
+    assert bindings[1].action_id == "action.b"
 
 
 def test_static_page_draft_commit_creates_root_frame(device_config):
@@ -136,7 +136,7 @@ def test_static_page_draft_commit_creates_root_frame(device_config):
 
     effects = service.commit(draft, plan)
 
-    snapshot = service.snapshot()
+    snapshot = service.view()
     assert snapshot.current_frame is not None
     assert snapshot.current_frame.entry == StaticPageRef("default", 0)
     assert snapshot.current_plan is plan
@@ -159,7 +159,7 @@ def test_dynamic_open_creates_session_and_pushes_frame(device_config):
 
     service.commit(draft, dynamic_plan)
 
-    snapshot = service.snapshot()
+    snapshot = service.view()
     assert len(snapshot.frames) == 2
     assert snapshot.active_dynamic_session is draft.page_session
     assert snapshot.current_frame is not None
@@ -217,7 +217,7 @@ def test_close_restores_prior_frame_and_returns_closed_session_effects(device_co
     assert close is not None
     effects = service.commit(close, root_plan)
 
-    snapshot = service.snapshot()
+    snapshot = service.view()
     assert snapshot.current_plan is root_plan
     assert snapshot.active_dynamic_session is None
     assert effects.sessions_to_close == (session,)
@@ -275,7 +275,7 @@ def test_open_dismisses_existing_dynamic_session(device_config):
 
     effects = service.commit(second, second_plan)
 
-    snapshot = service.snapshot()
+    snapshot = service.view()
     assert len(snapshot.frames) == 2
     assert snapshot.frames[0].page_session is None
     assert snapshot.frames[0].committed_plan is root_plan
@@ -301,7 +301,7 @@ def test_clear_returns_dynamic_sessions_and_finalized_plans(device_config):
 
     effects = service.clear(reason="clear")
 
-    assert service.snapshot().frames == ()
+    assert service.view().frames == ()
     assert effects.sessions_to_close == (opened.page_session,)
     assert effects.previous_dynamic_plans == (dynamic_plan,)
     assert effects.cleanup_reason == "clear"
@@ -313,11 +313,11 @@ def test_config_inactive_blocks_transitions_and_update_reactivates(device_config
     service.mark_config_inactive()
 
     assert service.begin_set_page(profile="default", page=0) is None
-    assert not service.snapshot().config_active
+    assert not service.view().config_active
 
     draft = service.update_config(device_config)
 
-    assert service.snapshot().config_active
+    assert service.view().config_active
     assert draft.entry == StaticPageRef("default", 0)
 
 

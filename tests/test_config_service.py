@@ -170,15 +170,10 @@ async def test_file_config_slow_subscriber_converges_after_identity_overflow(
 
     for index in range(257):
         config = _make_config(f"config-{index:03d}", name=f"Version {index}")
-        await config_service._cache_and_notify(  # noqa: SLF001
-            tmp_path / f"config-{index:03d}.yml",
-            config,
-        )
+        (tmp_path / f"{config.id}.yml").write_text(_config_to_yaml(config))
+    await config_service.refresh()
     final = _make_config("config-256", name="Final")
-    await config_service._cache_and_notify(  # noqa: SLF001
-        tmp_path / "config-256.yml",
-        final,
-    )
+    await config_service.write_config(final)
 
     with anyio.fail_after(1):
         converged = await anext(stream)
@@ -290,3 +285,51 @@ async def test_scan_retains_snapshot_when_source_directory_disappears(
     await config_service.refresh()
     assert config_service.source_available
     assert await config_service.get_config("retained") == config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config_id", ["../outside", "subdir/file", "subdir\\file", ".", ".."]
+)
+async def test_config_write_rejects_path_components(
+    config_service, tmp_path, config_id
+):
+    with pytest.raises(ValueError, match="filename component"):
+        await config_service.write_config(_make_config(config_id))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_config_ids_retain_last_unambiguous_snapshot(
+    config_service, tmp_path
+):
+    original = _make_config("device", name="Original")
+    await config_service.write_config(original)
+    (tmp_path / "duplicate.yaml").write_text(
+        _config_to_yaml(_make_config("device", name="Duplicate"))
+    )
+    await config_service.refresh()
+    assert not config_service.source_available
+    assert (await config_service.get_config("device")).name == "Original"
+    (tmp_path / "duplicate.yaml").unlink()
+    await config_service.refresh()
+    assert config_service.source_available
+
+
+@pytest.mark.asyncio
+async def test_readers_cannot_mutate_the_stored_config(tmp_path):
+    original = _make_config("dev1")
+    (tmp_path / "dev1.yml").write_text(_config_to_yaml(original))
+    service = FileBackedDeviceConfigService(tmp_path)
+    first = await service.get_config("dev1")
+    first.profiles.clear()
+    assert await service.get_config("dev1") == original
+    async with anyio.create_task_group() as tasks:
+
+        async def read_subscription():
+            async for value in service.subscribe("dev1"):
+                value.profiles.clear()
+                break
+
+        tasks.start_soon(read_subscription)
+    assert await service.get_config("dev1") == original

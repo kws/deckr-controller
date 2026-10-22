@@ -30,7 +30,7 @@ def _event(
 class TestEventTranslator:
     @pytest.fixture
     def translator(self):
-        return EventTranslator(CONTROLLER_ID)
+        return EventTranslator()
 
     def test_non_interaction_events_return_none(self, translator):
         event = hw_messages.CommandRejectedMessage(
@@ -39,11 +39,10 @@ class TestEventTranslator:
             commandType="clear",
             reason="stale",
         )
-        assert translator.translate(event, "d1") is None
+        assert translator.translate(event) is None
 
     def test_gesture_supported_filter(self):
         translator = EventTranslator(
-            CONTROLLER_ID,
             is_gesture_supported=lambda _control_id, event_type: event_type == "up",
         )
         assert (
@@ -53,7 +52,6 @@ class TestEventTranslator:
                     capability_id="button.momentary",
                     event_type="up",
                 ),
-                "d1",
             )
             is not None
         )
@@ -64,7 +62,6 @@ class TestEventTranslator:
                     capability_id="button.momentary",
                     event_type="down",
                 ),
-                "d1",
             )
             is None
         )

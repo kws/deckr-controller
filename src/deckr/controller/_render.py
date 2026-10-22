@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,7 +15,7 @@ from invariant import (
     ref,
 )
 
-from deckr.controller._device_layout import RasterImageFormat
+from deckr.controller._raster import RasterFormat
 from deckr.controller._state_store import ControlStateStore, RenderContent
 from deckr.controller.invariant.executor import get_executor
 from deckr.controller.invariant.recipes import (
@@ -37,16 +36,6 @@ class RenderModel:
     image: str | None = None
     overlay_type: str | None = None
     overlay_title: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class RenderImageFormat:
-    """JSON/pickle-friendly image format for worker render requests."""
-
-    width: int
-    height: int
-    rotation: int = 0
-    format: str = "JPEG"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,18 +68,17 @@ class RenderRequest:
     context_id: str
     control_id: str
     generation: int
-    image_format: RenderImageFormat
+    image_format: RasterFormat
     graph: dict[str, Any]
     config_id: str = ""
     context: dict[str, Any] = field(default_factory=dict)
     binding_id: str | None = None
     source: RenderSource | None = None
-    delay_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class RenderResult:
-    """Rendered JPEG bytes for a specific control generation."""
+    """Rendered encoded raster bytes for a specific control generation."""
 
     context_id: str
     control_id: str
@@ -205,26 +193,8 @@ def _wire_to_node(wire: dict[str, Any], context: dict[str, Any]) -> _RenderNode:
     return _graph_document_to_node(graph_dict, output, context)
 
 
-def _to_render_image_format(image_format: RasterImageFormat) -> RenderImageFormat:
-    return RenderImageFormat(
-        width=image_format.width,
-        height=image_format.height,
-        rotation=image_format.rotation,
-        format=image_format.format,
-    )
-
-
-def _to_hw_image_format(image_format: RenderImageFormat) -> RasterImageFormat:
-    return RasterImageFormat(
-        width=image_format.width,
-        height=image_format.height,
-        rotation=image_format.rotation,
-        format=image_format.format,
-    )
-
-
 def _model_to_graph_document(
-    model: RenderModel, image_format: RasterImageFormat
+    model: RenderModel, image_format: RasterFormat
 ) -> _GraphDocument | None:
     """Resolve a RenderModel to the graph that should be executed."""
 
@@ -267,7 +237,7 @@ def _base_model_to_graph_document(model: RenderModel) -> _GraphDocument | None:
 
 def build_render_request(
     model: RenderModel,
-    image_format: RasterImageFormat,
+    image_format: RasterFormat,
     *,
     config_id: str = "",
     context_id: str = "",
@@ -288,7 +258,7 @@ def build_render_request(
         binding_id=binding_id,
         control_id=control_id,
         generation=generation,
-        image_format=_to_render_image_format(image_format),
+        image_format=image_format,
         graph=_document_to_wire(document),
         context=document.context,
         source=source,
@@ -296,7 +266,7 @@ def build_render_request(
 
 
 def _graph_to_raster_bytes(
-    render_node: _RenderNode, image_format: RasterImageFormat
+    render_node: _RenderNode, image_format: RasterFormat
 ) -> bytes:
     """Render and encode bytes using the descriptor-selected raster format."""
 
@@ -330,10 +300,8 @@ def _graph_to_raster_bytes(
 def render_request_to_frame(request: RenderRequest) -> bytes:
     """Worker-side render function used by thread/process backends."""
 
-    if request.delay_ms > 0:
-        time.sleep(request.delay_ms / 1000)
     node = _wire_to_node(request.graph, request.context)
-    image_format = _to_hw_image_format(request.image_format)
+    image_format = request.image_format
     return _graph_to_raster_bytes(node, image_format)
 
 
@@ -343,7 +311,7 @@ class RenderService:
     def build_request(
         self,
         model: RenderModel,
-        image_format: RasterImageFormat,
+        image_format: RasterFormat,
         *,
         config_id: str = "",
         context_id: str = "",

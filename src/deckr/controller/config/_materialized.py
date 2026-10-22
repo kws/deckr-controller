@@ -11,6 +11,7 @@ from deckr.contracts.keys import encode_key_token
 from deckr.contracts.models import DeckrModel
 from deckr.core.kv import (
     KvBucketPolicy,
+    KvConflict,
     KvEntry,
     KvUnavailable,
 )
@@ -19,19 +20,13 @@ from deckr.core.util.anyio import CoalescedStateBroadcaster
 from pydantic import Field, field_serializer, field_validator
 
 from deckr.controller.config._data import DeviceConfig
+from deckr.controller.config._selection import copy_config, select_device_config
 
 logger = logging.getLogger(__name__)
 
 CONFIG_STATE_BUCKET = "dev_deckr_controller_config_v1"
 CONFIG_PROJECTION_SCHEMA = "dev.deckr.controller.config.materialized.v1"
 CONFIG_RESULT_SCHEMA = "dev.deckr.controller.config.result.v1"
-
-
-def _labels_match(
-    actual: Mapping[str, str],
-    required: Mapping[str, str],
-) -> bool:
-    return all(actual.get(key) == value for key, value in required.items())
 
 
 def materialized_config_key(controller_id: str) -> str:
@@ -190,6 +185,7 @@ class MaterializedDeviceConfigService(BaseComponent):
         self._watch_started = False
         self._watch_done = anyio.Event()
         self._reconcile_lock = anyio.Lock()
+        self._write_lock = anyio.Lock()
         self._state = CoalescedStateBroadcaster[str](current=False)
         self._lock = self._state.lock
         self._stopping: anyio.Event | None = None
@@ -220,64 +216,64 @@ class MaterializedDeviceConfigService(BaseComponent):
         return self._source.subscribe()
 
     async def match_device(
-        self,
-        *,
-        fingerprint: str,
-        labels: Mapping[str, str],
+        self, *, fingerprint: str, labels: Mapping[str, str]
     ) -> DeviceConfig | None:
         async with self._lock:
-            candidates = [
-                config
-                for config in self._config_by_id.values()
-                if config.enabled
-                and config.match.fingerprint == fingerprint
-                and _labels_match(labels, config.match.labels)
-            ]
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda config: len(config.match.labels),
-            reverse=True,
-        )
-        best_specificity = len(candidates[0].match.labels)
-        best = [
-            config
-            for config in candidates
-            if len(config.match.labels) == best_specificity
-        ]
-        if len(best) > 1:
-            ids = ", ".join(sorted(config.id for config in best))
-            raise ValueError(
-                f"Ambiguous device config match for fingerprint {fingerprint!r} "
-                f"labels {dict(labels)!r}: {ids}"
+            return copy_config(
+                select_device_config(
+                    self._config_by_id.values(), fingerprint=fingerprint, labels=labels
+                )
             )
-        return best[0]
 
     async def get_config(self, config_id: str) -> DeviceConfig | None:
         async with self._lock:
-            return self._config_by_id.get(config_id)
+            return copy_config(self._config_by_id.get(config_id))
 
     async def write_config(self, config: DeviceConfig) -> DeviceConfig:
-        async with self._lock:
-            configs = dict(self._config_by_id)
-            configs[config.id] = config
-        publisher = MaterializedConfigPublisher(
-            controller_id=self._controller_id,
-            bucket=self._bucket,
-            producer=MaterializedConfigProducer(
-                id=f"controller:{self._controller_id}",
-                kind="controller_runtime",
-            ),
-        )
-        entry = await publisher.publish_configs(tuple(configs.values()))
-        if self._started:
-            await self._source.wait_for_revision(self._config_key, entry.revision)
-            await self._reconcile(reason="local write observed")
-        else:
-            await self._activate_configs(
-                tuple(sorted(configs.values(), key=lambda item: item.id)),
-                source_revision=entry.revision,
-            )
+        async with self._write_lock:
+            for attempt in range(8):
+                current = await self._bucket.get(self._config_key)
+                if current is None:
+                    configs = {}
+                else:
+                    projection = MaterializedConfigProjection.model_validate(
+                        current.value
+                    )
+                    if projection.controller_id != self._controller_id:
+                        raise ValueError("Projection belongs to another controller")
+                    configs = {item.id: item for item in projection.device_configs}
+                configs[config.id] = config
+                projection = MaterializedConfigProjection(
+                    controllerId=self._controller_id,
+                    timestamp=datetime.now(UTC),
+                    deviceConfigs=tuple(
+                        sorted(configs.values(), key=lambda item: item.id)
+                    ),
+                    producer=MaterializedConfigProducer(
+                        id=f"controller:{self._controller_id}",
+                        kind="controller_runtime",
+                    ),
+                )
+                try:
+                    if current is None:
+                        entry = await self._bucket.create(self._config_key, projection)
+                    else:
+                        entry = await self._bucket.update(
+                            self._config_key, projection, revision=current.revision
+                        )
+                except KvConflict:
+                    if attempt == 7:
+                        raise
+                    await anyio.sleep(0)
+                    continue
+                break
+            if self._started:
+                await self._source.wait_for_revision(self._config_key, entry.revision)
+                await self._reconcile(reason="local write observed")
+            else:
+                await self._activate_configs(
+                    projection.device_configs, source_revision=entry.revision
+                )
         return config
 
     def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
@@ -288,7 +284,7 @@ class MaterializedDeviceConfigService(BaseComponent):
         config_id: str,
     ) -> AsyncIterator[DeviceConfig | None]:
         async with self._state.subscribe(
-            lambda _version, _current: self._config_by_id.get(config_id)
+            lambda _version, _current: copy_config(self._config_by_id.get(config_id))
         ) as subscription:
             yield subscription.initial
             async for wakeup in subscription:
@@ -296,7 +292,9 @@ class MaterializedDeviceConfigService(BaseComponent):
                     continue
                 try:
                     yield await self._state.capture(
-                        lambda _version, _current: self._config_by_id.get(config_id)
+                        lambda _version, _current: copy_config(
+                            self._config_by_id.get(config_id)
+                        )
                     )
                 except anyio.ClosedResourceError:
                     return

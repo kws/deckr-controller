@@ -1,15 +1,9 @@
-"""Compatibility and configuration-stream integration for DeviceSession."""
+"""Configuration-stream integration for DeviceSession."""
 
 import anyio
 import pytest
-from test_device_session import session
 
-from deckr.controller._device_manager import DeviceManager
-from deckr.controller._device_session import DeviceSession
-
-
-def test_device_manager_compatibility_name_is_device_session():
-    assert DeviceManager is DeviceSession
+from test_support.device_session import session
 
 
 @pytest.mark.asyncio
@@ -29,7 +23,7 @@ async def test_config_stream_updates_session_state_and_explicit_removal_clears_i
             await device.start(tg, stopping)
             with anyio.fail_after(1):
                 await finished.wait()
-            assert device.config is changed
+            assert device.config == changed
             assert not device.config_active
             assert not device.snapshot().binding_leases
             await device.aclose()

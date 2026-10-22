@@ -1,5 +1,7 @@
 """Tests for pure binding planner decisions."""
 
+from dataclasses import replace
+
 import pytest
 from deckr.actions.catalog import ActionDescriptor
 from deckr.actions.messages import (
@@ -18,11 +20,8 @@ from deckr.hardware.descriptors import (
 )
 
 from deckr.controller._actions import ActionIntentKey, ActionMetadata
-from deckr.controller._binding_planner import (
-    BindingPlanner,
-    BindingPlanStatus,
-    format_validation_summary,
-)
+from deckr.controller._binding_plan import BindingPlanStatus, format_validation_summary
+from deckr.controller._binding_planner import BindingPlanner
 from deckr.controller._binding_resolution import ConfiguredControlBinding
 from deckr.controller._capability_matching import matched_capabilities
 from deckr.controller._pages import DynamicPageSession, StaticPageRef
@@ -85,14 +84,14 @@ def _device(*control_ids: str) -> DeviceDescriptor:
 
 def _binding(
     control_id: str,
-    action_uuid: str,
+    action_id: str,
     *,
     provider_instance_id: str | None = PROVIDER_INSTANCE_ID,
     stable_id: str | None = None,
 ) -> ConfiguredControlBinding:
     return ConfiguredControlBinding(
         selector=ControlSelector(control_id=control_id),
-        action_uuid=action_uuid,
+        action_id=action_id,
         provider_instance_id=provider_instance_id,
         provider_labels={},
         settings={},
@@ -101,13 +100,13 @@ def _binding(
 
 
 def _metadata(
-    action_uuid: str,
+    action_id: str,
     *,
     provider_instance_id: str = PROVIDER_INSTANCE_ID,
     provider_id: str = PROVIDER_ID,
 ) -> ActionMetadata:
     return ActionMetadata(
-        uuid=action_uuid,
+        action_id=action_id,
         provider_instance_id=provider_instance_id,
         provider_id=provider_id,
         provider_session_id=PROVIDER_SESSION_ID,
@@ -115,10 +114,10 @@ def _metadata(
 
 
 def _intent(
-    action_uuid: str,
+    action_id: str,
     provider_instance_id: str | None = PROVIDER_INSTANCE_ID,
 ) -> ActionIntentKey:
-    return ActionIntentKey(action_uuid, provider_instance_id, ())
+    return ActionIntentKey(action_id, provider_instance_id, ())
 
 
 def _dynamic_session() -> DynamicPageSession:
@@ -130,7 +129,7 @@ def _dynamic_session() -> DynamicPageSession:
         owner_context_id="owner-context",
         owner_binding_id="owner-binding",
         owner_control_id="0,0",
-        owner_action_uuid="action.owner",
+        owner_action_id="action.owner",
         owner_provider_instance_id=PROVIDER_INSTANCE_ID,
         owner_provider_id=PROVIDER_ID,
         owner_provider_session_id=PROVIDER_SESSION_ID,
@@ -181,14 +180,17 @@ def test_static_page_plan_records_bound_and_unavailable_controls():
 )
 def test_missing_action_requirements_control_attachment(required, expected):
     metadata = _metadata("action.test")
-    metadata.descriptor = ActionDescriptor(
-        actionId="action.test",
-        requirements=(
-            {
-                "name": "turn",
-                "required": required,
-                "preferences": [{"family": "dev.deckr.input.encoder"}],
-            },
+    metadata = replace(
+        metadata,
+        descriptor=ActionDescriptor(
+            actionId="action.test",
+            requirements=(
+                {
+                    "name": "turn",
+                    "required": required,
+                    "preferences": [{"family": "dev.deckr.input.encoder"}],
+                },
+            ),
         ),
     )
     result = _planner().build_static_page_plan(
@@ -202,18 +204,21 @@ def test_missing_action_requirements_control_attachment(required, expected):
 
 def test_action_requirement_preference_and_named_matches_are_preserved():
     metadata = _metadata("action.test")
-    metadata.descriptor = ActionDescriptor(
-        actionId="action.test",
-        requirements=(
-            {
-                "name": "activate",
-                "eventTypes": ["down"],
-                "views": ["native"],
-                "preferences": [
-                    {"family": "dev.deckr.input.encoder"},
-                    {"family": "dev.deckr.input.button", "type": "momentary"},
-                ],
-            },
+    metadata = replace(
+        metadata,
+        descriptor=ActionDescriptor(
+            actionId="action.test",
+            requirements=(
+                {
+                    "name": "activate",
+                    "eventTypes": ["down"],
+                    "views": ["native"],
+                    "preferences": [
+                        {"family": "dev.deckr.input.encoder"},
+                        {"family": "dev.deckr.input.button", "type": "momentary"},
+                    ],
+                },
+            ),
         ),
     )
     result = _planner().build_static_page_plan(
@@ -268,7 +273,7 @@ def test_selector_only_static_plan_uses_config_fallback_identity():
     entry = StaticPageRef(profile_name="default", page_index=0)
     binding = ConfiguredControlBinding(
         selector=ControlSelector(kind="key"),
-        action_uuid="action.bound",
+        action_id="action.bound",
         provider_instance_id=PROVIDER_INSTANCE_ID,
         provider_labels={},
         settings={},
@@ -326,7 +331,7 @@ def test_dynamic_page_plan_resolves_explicit_child_action_target():
     assert result.plan is not None
     planned = result.plan.bindings[0]
     assert planned.status == BindingPlanStatus.BOUND
-    assert planned.binding.action_uuid == "action.volume"
+    assert planned.binding.action_id == "action.volume"
     assert planned.binding.provider_instance_id == "sonos-bedroom"
     assert planned.binding.settings["zoneName"] == "Bedroom"
 
@@ -347,3 +352,74 @@ def test_format_validation_summary_handles_empty_and_truncated_errors():
     summary = format_validation_summary(result.validation_errors)
     assert "4 error(s)" in summary
     assert "... and 1 more" in summary
+
+
+@pytest.mark.parametrize("select_one", [False, True])
+def test_multiple_raster_targets_require_explicit_single_output_selection(select_one):
+    control = _make_control("0,0")
+    first = control.output_capabilities[0]
+    second = first.model_copy(update={"capability_id": "raster.second"})
+    control = control.model_copy(update={"output_capabilities": (first, second)})
+    device = _device("0,0").model_copy(update={"controls": (control,)})
+    binding = _binding("0,0", "action.test")
+    if select_one:
+        binding = replace(
+            binding,
+            selector=ControlSelector(
+                control_id="0,0", output=[{"capability_id": "raster.second"}]
+            ),
+        )
+    metadata = replace(
+        _metadata("action.test"),
+        descriptor=ActionDescriptor(
+            actionId="action.test",
+            requirements=[
+                {
+                    "name": "front",
+                    "required": False,
+                    "preferences": [{"capabilityId": "raster.bitmap"}],
+                },
+                {
+                    "name": "back",
+                    "required": False,
+                    "preferences": [{"capabilityId": "raster.second"}],
+                },
+            ],
+        ),
+    )
+    result = _planner().build_static_page_plan(
+        StaticPageRef("default", 0),
+        bindings=(binding,),
+        device=device,
+        action_metadata={_intent("action.test"): metadata},
+    )
+    planned = result.plan.bindings[0]
+    assert planned.status == (
+        BindingPlanStatus.BOUND
+        if select_one
+        else BindingPlanStatus.INVALID_DEVICE_CONTROL
+    )
+    if select_one:
+        assert planned.binding.output_capability_ids == frozenset({"raster.second"})
+
+
+def test_action_snapshot_copies_and_freezes_nested_provider_metadata():
+    from dataclasses import FrozenInstanceError
+
+    labels = {"room": "office"}
+    schema = {"properties": {"text": {"type": "string"}}}
+    metadata = ActionMetadata(
+        action_id="action.test",
+        provider_instance_id="provider",
+        provider_id="plugin",
+        provider_labels=labels,
+        settings_schema=schema,
+    )
+    labels["room"] = "kitchen"
+    schema["properties"]["text"]["type"] = "number"
+    assert metadata.provider_labels["room"] == "office"
+    assert metadata.settings_schema["properties"]["text"]["type"] == "string"
+    with pytest.raises(TypeError):
+        metadata.provider_labels["room"] = "other"
+    with pytest.raises(FrozenInstanceError):
+        metadata.name = "changed"

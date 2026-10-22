@@ -20,36 +20,34 @@ from deckr.controller._actions import (
     ProviderActionKey,
     ProviderSessionKey,
 )
-from deckr.controller._binding_planner import (
-    PagePlan,
-)
+from deckr.controller._binding_plan import PagePlan
 from deckr.controller._binding_resolution import ResolvedControlBinding
-from deckr.controller._bindings._action_lifecycle import (
-    ActionInstanceSnapshot,
-)
 from deckr.controller._bindings._attachments import (
     BindingLease,
 )
+from deckr.controller._bindings._lifecycle_state import (
+    ActionInstanceSnapshot,
+)
 from deckr.controller._device_layout import (
-    ControlSurface,
-    control_surface_for_raster_capability,
+    ControlLayout,
+    control_layout_for_raster_capability,
 )
 from deckr.controller._pages import (
-    PageStackEntry,
+    PageRef,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _find_control_surface(
+def _find_control_layout(
     device: DeviceDescriptor,
     control_id: str,
     *,
     raster_capability_id: str | None = None,
-) -> ControlSurface | None:
+) -> ControlLayout | None:
     for control in device.controls:
         if control.control_id == control_id:
-            return control_surface_for_raster_capability(control, raster_capability_id)
+            return control_layout_for_raster_capability(control, raster_capability_id)
     return None
 
 
@@ -74,13 +72,13 @@ def _dedupe_action_intents(
 def _format_provider_action_keys(
     keys: Iterable[ProviderActionKey],
 ) -> tuple[tuple[str, str], ...]:
-    return tuple(sorted((key.provider_instance_id, key.action_uuid) for key in keys))
+    return tuple(sorted((key.provider_instance_id, key.action_id) for key in keys))
 
 
 @dataclass(frozen=True, slots=True)
 class PageCommit:
     plan: PagePlan
-    departing: PageStackEntry | None
+    departing: PageRef | None
     preserve_binding_ids: frozenset[str]
     preserve_output_control_ids: frozenset[str]
     transition_reason: str
@@ -92,7 +90,7 @@ class BindingLeaseSnapshot:
     context_id: str
     action_instance_id: str
     planned_intent: ActionIntentKey
-    action_uuid: str
+    action_id: str
     provider_instance_id: str
     provider_id: str
     provider_session_id: str | None
@@ -152,13 +150,13 @@ class _UnavailableFallbackRender:
     state: ActionAvailabilityState | None
 
 
-def _qualified_action_id(provider_instance_id: str, action_uuid: str) -> str:
-    return f"{provider_instance_id}::{action_uuid}"
+def _qualified_action_id(provider_instance_id: str, action_id: str) -> str:
+    return f"{provider_instance_id}::{action_id}"
 
 
 def _lease_matches_action(lease: BindingLease, action_meta: ActionMetadata) -> bool:
     return (
-        lease.action_uuid == action_meta.uuid
+        lease.action_id == action_meta.action_id
         and lease.provider_instance_id == action_meta.provider_instance_id
         and lease.provider_id == action_meta.provider_id
         and lease.provider_session_id == action_meta.provider_session_id
@@ -170,7 +168,7 @@ def _lease_matches_action_ignoring_session(
     action_meta: ActionMetadata,
 ) -> bool:
     return (
-        lease.action_uuid == action_meta.uuid
+        lease.action_id == action_meta.action_id
         and lease.provider_instance_id == action_meta.provider_instance_id
         and lease.provider_id == action_meta.provider_id
     )
@@ -195,7 +193,7 @@ def _binding_lease_snapshot(
         context_id=lease.context_id,
         action_instance_id=lease.action_instance_id,
         planned_intent=planned_intent,
-        action_uuid=lease.action_uuid,
+        action_id=lease.action_id,
         provider_instance_id=lease.provider_instance_id,
         provider_id=lease.provider_id,
         provider_session_id=lease.provider_session_id,

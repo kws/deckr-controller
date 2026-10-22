@@ -181,7 +181,8 @@ class ActionInterestTracker:
             and not self._is_expired(self._records[(key, intent)], now=now)
             and (
                 strength == ActionInterestStrength.WARM
-                or self._records[(key, intent)].strength == ActionInterestStrength.STRONG
+                or self._records[(key, intent)].strength
+                == ActionInterestStrength.STRONG
             )
         }
 
@@ -268,7 +269,7 @@ def _intent_sort_key(
     intent: ActionIntentKey,
 ) -> tuple[str, str, tuple[tuple[str, str], ...]]:
     return (
-        intent.action_uuid,
+        intent.action_id,
         intent.provider_instance_id or "",
         intent.provider_labels,
     )

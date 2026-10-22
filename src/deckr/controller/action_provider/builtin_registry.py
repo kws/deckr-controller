@@ -19,7 +19,7 @@ from deckr.controller.action_provider.builtin import (
 )
 
 
-class ActionRegistry(BaseComponent):
+class BuiltinActionRegistry(BaseComponent):
     """Resolve controller-builtin actions.
 
     External provider actions are resolved through ``ControllerActionService``.
@@ -30,7 +30,7 @@ class ActionRegistry(BaseComponent):
         *,
         controller_id: str,
     ):
-        super().__init__(name="ActionRegistry")
+        super().__init__(name="BuiltinActionRegistry")
         del controller_id
         self._builtin_registry = BuiltinRegistry()
         self._builtin_action_registry: dict[str, ActionDescriptor] = {}
@@ -45,7 +45,7 @@ class ActionRegistry(BaseComponent):
         if provider_labels:
             return None
         if "::" in address:
-            qualified_provider_id, _, action_uuid = address.partition("::")
+            qualified_provider_id, _, action_id = address.partition("::")
             if (
                 provider_instance_id is not None
                 and qualified_provider_id != provider_instance_id
@@ -53,7 +53,7 @@ class ActionRegistry(BaseComponent):
                 return None
             if qualified_provider_id not in RESERVED_BUILTIN_PROVIDER_IDS:
                 return None
-            return self._builtin_action_metadata(action_uuid)
+            return self._builtin_action_metadata(action_id)
         if provider_instance_id is not None and (
             provider_instance_id not in RESERVED_BUILTIN_PROVIDER_IDS
         ):
@@ -74,7 +74,7 @@ class ActionRegistry(BaseComponent):
         )
         if meta is None:
             return None
-        return self._builtin_action_registry.get(meta.uuid)
+        return self._builtin_action_registry.get(meta.action_id)
 
     def catalog_snapshot(self) -> tuple[ActionMetadata, ...]:
         return tuple(
@@ -82,22 +82,22 @@ class ActionRegistry(BaseComponent):
             for descriptor in self._builtin_action_registry.values()
         )
 
-    def get_builtin_action(self, uuid: str) -> BuiltinAction | None:
-        return self._builtin_registry.get_action(uuid)
+    def get_builtin_action(self, action_id: str) -> BuiltinAction | None:
+        return self._builtin_registry.get_action(action_id)
 
     async def start(self, ctx: RunContext) -> None:
         del ctx
         self._builtin_action_registry.clear()
-        for action_uuid in self._builtin_registry.provides_actions():
-            descriptor = self._builtin_registry.get_action_descriptor(action_uuid)
+        for action_id in self._builtin_registry.provides_actions():
+            descriptor = self._builtin_registry.get_action_descriptor(action_id)
             if descriptor:
-                self._builtin_action_registry[action_uuid] = descriptor
+                self._builtin_action_registry[action_id] = descriptor
 
     async def stop(self) -> None:
         self._builtin_action_registry.clear()
 
-    def _builtin_action_metadata(self, action_uuid: str) -> ActionMetadata | None:
-        descriptor = self._builtin_action_registry.get(action_uuid)
+    def _builtin_action_metadata(self, action_id: str) -> ActionMetadata | None:
+        descriptor = self._builtin_action_registry.get(action_id)
         if descriptor is None:
             return None
         return _metadata(descriptor)
@@ -105,7 +105,7 @@ class ActionRegistry(BaseComponent):
 
 def _metadata(descriptor: ActionDescriptor) -> ActionMetadata:
     return ActionMetadata(
-        uuid=descriptor.action_id,
+        action_id=descriptor.action_id,
         descriptor=descriptor,
         provider_instance_id=BUILTIN_ACTION_PROVIDER_ID,
         provider_id=descriptor.provider_id or BUILTIN_ACTION_PROVIDER_ID,

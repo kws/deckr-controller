@@ -66,7 +66,7 @@ class InputInteractions:
 
     async def _route_hardware_input(self, message: DeckrMessage):
         event = hw_messages.hardware_body_from_message(message)
-        translated = self.translator.translate(event, self.state.config.id)
+        translated = self.translator.translate(event)
         if translated is None:
             return
         if self.state.navigation.active_dynamic_session() is not None:
@@ -111,7 +111,6 @@ class InputInteractions:
             )
             return
 
-        self._record_held_input_binding(translated, lease)
         await self._deliver_input_to_lease(lease, translated)
 
     async def _deliver_input_to_lease(self, lease: BindingLease, translated) -> None:
@@ -143,6 +142,13 @@ class InputInteractions:
                         "source": match.source,
                     }
                 )
+            if event.event_type == "down":
+                self.state.attachments.record_held_input(
+                    lease=lease,
+                    control_id=translated.control_id,
+                    capability_id=translated.capability_id,
+                    down_event=event,
+                )
             if not self.effects.submit(
                 lease.action_instance_id,
                 Effect("deliver input", lambda: self._send_input(lease, event)),
@@ -163,17 +169,7 @@ class InputInteractions:
         except Exception as e:
             logger.error(
                 "Error delivering input to action %s: %s",
-                lease.action_uuid,
+                lease.action_id,
                 e,
                 exc_info=True,
             )
-
-    def _record_held_input_binding(self, translated, lease: BindingLease) -> None:
-        if translated.action_event.event_type != "down":
-            return
-        self.state.attachments.record_held_input(
-            lease=lease,
-            control_id=translated.control_id,
-            capability_id=translated.capability_id,
-            down_event=translated.action_event,
-        )

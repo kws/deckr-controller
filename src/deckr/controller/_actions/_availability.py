@@ -1,20 +1,17 @@
-"""Local action availability cache for controller-side planning."""
+"""Local action availability records and selection policy."""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 
-from deckr.actions.endpoints import (
-    RESERVED_BUILTIN_PROVIDER_IDS,
-)
-from deckr.actions.messages import (
-    ActionAvailabilityEntry,
-)
+from deckr.actions.endpoints import RESERVED_BUILTIN_PROVIDER_IDS
 
+from deckr.controller._actions._availability_policy import (
+    _labels_match,
+    _metadata_has_ready_provider_session,
+)
 from deckr.controller._actions._models import (
     ActionAvailabilityPolicy,
     ActionAvailabilityRecord,
@@ -23,89 +20,11 @@ from deckr.controller._actions._models import (
     ActionIntentKey,
     ActionMetadata,
     ActionPlanningSnapshot,
-    ActionUnavailableCause,
     ProviderActionKey,
     ProviderSessionKey,
     SettingsActionMetadata,
+    provider_session_key,
 )
-
-PROVIDER_SESSION_INVALID_REASON = "provider_session_invalid"
-SERVICE_VIEW_MISSING_REASON = "action_availability_view_missing"
-SERVICE_VIEW_UNAVAILABLE_REASON = "action_availability_service_unavailable"
-_HASH_SIZE = 12
-
-
-UNAVAILABLE_OVERLAY_TEMPLATE_BY_CAUSE: Mapping[ActionUnavailableCause, str] = {
-    ActionUnavailableCause.MISSING: "unavailable_missing",
-    ActionUnavailableCause.SERVICE: "unavailable_service",
-    ActionUnavailableCause.SESSION: "unavailable_session",
-    ActionUnavailableCause.REJECTED: "unavailable_rejected",
-    ActionUnavailableCause.UNKNOWN: "unavailable_unknown",
-}
-
-_SERVICE_UNAVAILABLE_REASONS = frozenset(
-    {
-        "service_unavailable",
-        "openhab_service_unavailable",
-        "sonos_service_unavailable",
-    }
-)
-_SESSION_UNAVAILABLE_REASONS = frozenset(
-    {
-        PROVIDER_SESSION_INVALID_REASON,
-        "provider_session_unavailable",
-        "missing_provider_session_contract",
-    }
-)
-_REJECTED_UNAVAILABLE_REASONS = frozenset(
-    {
-        "action_not_available",
-        "resource_unavailable",
-        "provider_not_ready",
-        "internal_error",
-    }
-)
-
-
-def action_unavailable_cause(
-    record: ActionAvailabilityRecord | None,
-    *,
-    has_live_provider_session_contract: bool | None = None,
-) -> ActionUnavailableCause:
-    """Classify the controller fallback overlay for an unavailable action."""
-
-    reason = record.reason if record is not None else None
-    if _service_unavailable_reason(reason):
-        return ActionUnavailableCause.SERVICE
-    if reason in _SESSION_UNAVAILABLE_REASONS:
-        return ActionUnavailableCause.SESSION
-    if has_live_provider_session_contract is False:
-        return ActionUnavailableCause.SESSION
-    if reason in _REJECTED_UNAVAILABLE_REASONS:
-        return ActionUnavailableCause.REJECTED
-    if record is None:
-        return ActionUnavailableCause.MISSING
-    if _metadata_missing_provider_session(record.metadata):
-        return ActionUnavailableCause.SESSION
-    return ActionUnavailableCause.UNKNOWN
-
-
-def unavailable_overlay_template(cause: ActionUnavailableCause) -> str:
-    return UNAVAILABLE_OVERLAY_TEMPLATE_BY_CAUSE[cause]
-
-
-def _service_unavailable_reason(reason: str | None) -> bool:
-    return reason is not None and (
-        reason in _SERVICE_UNAVAILABLE_REASONS
-        or reason.endswith("_service_unavailable")
-    )
-
-def _metadata_missing_provider_session(metadata: ActionMetadata | None) -> bool:
-    return (
-        metadata is not None
-        and metadata.provider_instance_id not in RESERVED_BUILTIN_PROVIDER_IDS
-        and metadata.provider_session_id is None
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +49,39 @@ class ActionAvailabilityCache:
         ] = {}
         self._record_keys_by_intent: dict[ActionIntentKey, ProviderActionKey] = {}
 
+    def prune(self, *, live_sessions, interests, now=None):
+        """Bound retired, unreferenced metadata without changing live authority."""
+        now = self._now(now)
+        interests = tuple(interests)
+        candidates = [
+            record
+            for record in self._availability_records.values()
+            if record.key.provider_instance_id not in RESERVED_BUILTIN_PROVIDER_IDS
+            and (
+                record.metadata is None
+                or provider_session_key(record.metadata) not in live_sessions
+            )
+            and not any(
+                self._record_matches_intent(record, intent, now=now)
+                for intent in interests
+            )
+        ]
+        candidates.sort(key=lambda record: record.updated_at, reverse=True)
+        removed = {
+            record.key
+            for index, record in enumerate(candidates)
+            if index >= self._policy.max_unreferenced_records
+            or now - record.updated_at >= self._policy.unreferenced_retention_seconds
+        }
+        for key in removed:
+            self._availability_records.pop(key, None)
+        self._record_keys_by_intent = {
+            intent: key
+            for intent, key in self._record_keys_by_intent.items()
+            if key not in removed
+        }
+        return frozenset(removed)
+
     def record(self, record: ActionAvailabilityRecord) -> None:
         self._availability_records[record.key] = record
 
@@ -143,7 +95,7 @@ class ActionAvailabilityCache:
     ) -> ActionAvailabilityRecord:
         key = ProviderActionKey(
             provider_instance_id=metadata.provider_instance_id,
-            action_uuid=metadata.uuid,
+            action_id=metadata.action_id,
         )
         record = ActionAvailabilityRecord(
             key=key,
@@ -281,7 +233,6 @@ class ActionAvailabilityCache:
         metadata: dict[ActionIntentKey, ActionMetadata] = {}
         pending: set[ActionIntentKey] = set()
         unavailable: set[ActionIntentKey] = set()
-
         for intent in intents:
             selected = self._selected_planning_record(
                 intent,
@@ -292,7 +243,6 @@ class ActionAvailabilityCache:
             if selected is None:
                 unavailable.add(intent)
                 continue
-
             record = selected.record
             if self._planning_record_is_usable(
                 selected,
@@ -311,7 +261,6 @@ class ActionAvailabilityCache:
                 pending.add(intent)
                 continue
             unavailable.add(intent)
-
         return ActionPlanningSnapshot(
             metadata=metadata,
             pending=frozenset(pending),
@@ -356,7 +305,6 @@ class ActionAvailabilityCache:
         records = self._planning_records_for_intent(intent, now=now)
         if not records:
             return None
-
         selected_key = self._record_keys_by_intent.get(intent)
         if selected_key is not None:
             for item in records:
@@ -366,7 +314,6 @@ class ActionAvailabilityCache:
                     ready_provider_session_keys=ready_provider_session_keys,
                 ):
                     return item
-
         for item in records:
             if self._planning_record_is_fresh_available(
                 item,
@@ -374,7 +321,6 @@ class ActionAvailabilityCache:
             ):
                 self._record_keys_by_intent[intent] = item.record.key
                 return item
-
         for item in records:
             if self._planning_record_is_service_view_pending(
                 item,
@@ -382,7 +328,6 @@ class ActionAvailabilityCache:
             ):
                 self._record_keys_by_intent[intent] = item.record.key
                 return item
-
         selected = records[0]
         self._record_keys_by_intent[intent] = selected.record.key
         return selected
@@ -395,7 +340,9 @@ class ActionAvailabilityCache:
     ) -> tuple[_PlanningRecord, ...]:
         selected_key = self._record_keys_by_intent.get(intent)
         records = [
-            _PlanningRecord(record=record, state=self._state_for_record(record, now=now))
+            _PlanningRecord(
+                record=record, state=self._state_for_record(record, now=now)
+            )
             for record in self._availability_records.values()
             if self._record_matches_intent(
                 record,
@@ -501,7 +448,7 @@ class ActionAvailabilityCache:
         now: float,
         trust_mapped_key: bool = False,
     ) -> bool:
-        if record.key.action_uuid != intent.action_uuid:
+        if record.key.action_id != intent.action_id:
             return False
         if (
             intent.provider_instance_id is not None
@@ -536,92 +483,3 @@ class ActionAvailabilityCache:
 
     def _now(self, now: float | None) -> float:
         return self._clock() if now is None else now
-
-
-def _labels_match(
-    actual: Mapping[str, str] | None,
-    required: tuple[tuple[str, str], ...],
-) -> bool:
-    if not required:
-        return True
-    actual = actual or {}
-    return all(actual.get(key) == value for key, value in required)
-
-
-def _metadata_has_ready_provider_session(
-    metadata: ActionMetadata,
-    *,
-    ready_provider_session_keys: frozenset[ProviderSessionKey] | None,
-) -> bool:
-    if metadata.provider_instance_id in RESERVED_BUILTIN_PROVIDER_IDS:
-        return True
-    if metadata.provider_session_id is None:
-        return False
-    if ready_provider_session_keys is None:
-        return True
-    return (
-        ProviderSessionKey(
-            metadata.provider_instance_id,
-            metadata.provider_id,
-            metadata.provider_session_id,
-        )
-        in ready_provider_session_keys
-    )
-
-
-def _metadata_requires_provider_session_revalidation(
-    metadata: ActionMetadata | None,
-) -> bool:
-    return (
-        metadata is not None
-        and metadata.provider_instance_id not in RESERVED_BUILTIN_PROVIDER_IDS
-        and bool(metadata.provider_session_id)
-    )
-
-
-def _availability_state_for_entry(
-    entry: ActionAvailabilityEntry,
-) -> ActionAvailabilityState:
-    if entry.status == "available":
-        return ActionAvailabilityState.AVAILABLE
-    if entry.status == "unavailable":
-        return ActionAvailabilityState.UNAVAILABLE
-    return ActionAvailabilityState.PROBING
-
-
-def _state_value(state: ActionAvailabilityState | None) -> str | None:
-    return state.value if state is not None else None
-
-
-def _json_hash(value: object) -> str | None:
-    if value is None:
-        return None
-    if hasattr(value, "to_dict"):
-        value = value.to_dict()
-    elif hasattr(value, "model_dump"):
-        value = value.model_dump(by_alias=True, exclude_none=True, mode="json")
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:_HASH_SIZE]
-
-
-def _descriptor_hash(descriptor: object | None) -> str | None:
-    return _json_hash(descriptor)
-
-
-def _entry_same_as_existing(
-    existing: ActionAvailabilityRecord | None,
-    new_state: ActionAvailabilityState,
-    metadata: ActionMetadata | None,
-    reason: str | None,
-    *,
-    requires_provider_lifecycle_recovery: bool = False,
-) -> bool:
-    return (
-        existing is not None
-        and existing.source == ActionAvailabilitySource.SERVICE_VIEW
-        and existing.state == new_state
-        and existing.metadata == metadata
-        and existing.reason == reason
-        and existing.requires_provider_lifecycle_recovery
-        == requires_provider_lifecycle_recovery
-    )

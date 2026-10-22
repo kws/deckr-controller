@@ -57,7 +57,7 @@ def _action_metadata(
     session_id: str = PROVIDER_SESSION_ID,
 ) -> ActionMetadata:
     return ActionMetadata(
-        uuid=ACTION_ID,
+        action_id=ACTION_ID,
         provider_instance_id=PROVIDER_INSTANCE_ID,
         provider_id=PROVIDER_ID,
         provider_session_id=session_id,
@@ -98,10 +98,11 @@ def _page_session() -> DynamicPageSession:
         owner_context_id="owner-context",
         owner_binding_id="binding-a",
         owner_control_id="key-1",
-        owner_action_uuid=ACTION_ID,
+        owner_action_id=ACTION_ID,
         owner_provider_instance_id=PROVIDER_INSTANCE_ID,
         owner_provider_id=PROVIDER_ID,
         owner_provider_session_id=PROVIDER_SESSION_ID,
+        owner_contract=CONTRACT,
         owner_action_meta=_action_metadata(),
         owner_profile="default",
         owner_page=0,
@@ -130,7 +131,7 @@ def _lease():
         binding_id="binding-a",
         context_id=CONTEXT_ID,
         action_instance_id=ACTION_INSTANCE_ID,
-        action_uuid=ACTION_ID,
+        action_id=ACTION_ID,
         provider_instance_id=PROVIDER_INSTANCE_ID,
         provider_id=PROVIDER_ID,
         provider_session_id=PROVIDER_SESSION_ID,
@@ -155,6 +156,8 @@ class _RuntimeSender:
         self,
         *,
         provider_session_key,
+        contract,
+        causation_id=None,
         message_type,
         body,
     ) -> bool:
@@ -178,7 +181,7 @@ class _AvailabilityRecorder:
         self.calls.append(kwargs)
         return ProviderActionKey(
             kwargs["provider_instance_id"],
-            kwargs["action_uuid"],
+            kwargs["action_id"],
         )
 
 
@@ -229,6 +232,7 @@ class _Host:
 def _service():
     host = _Host()
     sender = _RuntimeSender()
+    host.recover = AsyncMock()
     recorder = _AvailabilityRecorder()
     lifecycle = ActionInstanceLifecycleService(
         config_id=CONFIG_ID,
@@ -236,6 +240,7 @@ def _service():
         availability_recorder=recorder,
         host=host,
         clock=lambda: 123.0,
+        schedule_recovery=host.recover,
     )
     return host, sender, recorder, lifecycle
 
@@ -273,7 +278,8 @@ def _rejection_message(
 async def test_provider_restart_recreates_instance_for_new_session() -> None:
     host, sender, _, lifecycle = _service()
 
-    await lifecycle.ensure_action_instance(
+    await _start_instance(
+        lifecycle,
         action_meta=_action_metadata(),
         action_instance_id=ACTION_INSTANCE_ID,
         context_id=CONTEXT_ID,
@@ -283,7 +289,8 @@ async def test_provider_restart_recreates_instance_for_new_session() -> None:
     assert sender.messages[0].message_type == ACTION_INSTANCE_CREATED
     assert sender.messages[0].provider_session_key == _session_key()
     # An already-created instance is idempotent within this live session.
-    await lifecycle.ensure_action_instance(
+    await _start_instance(
+        lifecycle,
         action_meta=_action_metadata(),
         action_instance_id=ACTION_INSTANCE_ID,
         context_id=CONTEXT_ID,
@@ -296,7 +303,8 @@ async def test_provider_restart_recreates_instance_for_new_session() -> None:
         generation=1,
     )
     host.contracts.pop(_session_key())
-    await lifecycle.ensure_action_instance(
+    await _start_instance(
+        lifecycle,
         action_meta=_action_metadata(session_id=successor_key.provider_session_id),
         action_instance_id=ACTION_INSTANCE_ID,
         context_id=CONTEXT_ID,
@@ -334,7 +342,8 @@ async def test_stale_lifecycle_recovery_republishes_and_reattaches_once() -> Non
     host, sender, _, lifecycle = _service()
     lease = _lease()
     host.leases.append(lease)
-    await lifecycle.ensure_action_instance(
+    await _start_instance(
+        lifecycle,
         action_meta=_action_metadata(),
         action_instance_id=ACTION_INSTANCE_ID,
         context_id=CONTEXT_ID,
@@ -352,14 +361,14 @@ async def test_stale_lifecycle_recovery_republishes_and_reattaches_once() -> Non
         context_id=CONTEXT_ID,
         binding=lease,
     )
-    await lifecycle.handle_lifecycle_rejected(
+    await lifecycle.rejections.handle(
         message,
         body,
         authorization=authorization,
         sender_provider_instance_id=PROVIDER_INSTANCE_ID,
         context_id=CONTEXT_ID,
     )
-    await lifecycle.handle_lifecycle_rejected(
+    await lifecycle.rejections.handle(
         message,
         body,
         authorization=authorization,
@@ -368,8 +377,9 @@ async def test_stale_lifecycle_recovery_republishes_and_reattaches_once() -> Non
     )
 
     assert lease.stale_lifecycle_recoveries == 1
-    assert [item.message_type for item in sender.messages] == [ACTION_INSTANCE_CREATED]
-    lease.context.on_binding_attached.assert_awaited_once()
+    host.recover.assert_awaited_once_with(lease)
+    assert not sender.messages
+    lease.context.on_binding_attached.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -390,7 +400,7 @@ async def test_terminal_and_retryable_rejections_route_destructive_and_overlay_s
         reason="invalid_settings",
     )
 
-    await lifecycle.handle_lifecycle_rejected(
+    await lifecycle.rejections.handle(
         _rejection_message(terminal),
         terminal,
         authorization=authorization,
@@ -413,7 +423,7 @@ async def test_terminal_and_retryable_rejections_route_destructive_and_overlay_s
         reason="resource_unavailable",
         retryable=True,
     )
-    await lifecycle.handle_lifecycle_rejected(
+    await lifecycle.rejections.handle(
         _rejection_message(retryable),
         retryable,
         authorization=authorization,
@@ -427,7 +437,7 @@ async def test_terminal_and_retryable_rejections_route_destructive_and_overlay_s
             "provider_instance_id": PROVIDER_INSTANCE_ID,
             "provider_id": PROVIDER_ID,
             "provider_session_id": PROVIDER_SESSION_ID,
-            "action_uuid": ACTION_ID,
+            "action_id": ACTION_ID,
             "reason": "resource_unavailable",
             "intent": lease.planned_intent,
             "now": 123.0,
@@ -443,7 +453,8 @@ async def test_action_instance_rejection_requires_current_session_and_contract()
     None
 ):
     host, _, _, lifecycle = _service()
-    await lifecycle.ensure_action_instance(
+    await _start_instance(
+        lifecycle,
         action_meta=_action_metadata(),
         action_instance_id=ACTION_INSTANCE_ID,
         context_id=CONTEXT_ID,
@@ -454,7 +465,7 @@ async def test_action_instance_rejection_requires_current_session_and_contract()
         reason="permission_denied",
     )
 
-    await lifecycle.handle_lifecycle_rejected(
+    await lifecycle.rejections.handle(
         _rejection_message(body, sender_session_id="stale-session"),
         body,
         authorization=None,
@@ -463,7 +474,7 @@ async def test_action_instance_rejection_requires_current_session_and_contract()
     )
     assert lifecycle.has_action_instance(ACTION_INSTANCE_ID)
 
-    await lifecycle.handle_lifecycle_rejected(
+    await lifecycle.rejections.handle(
         _rejection_message(body),
         body,
         authorization=None,
@@ -472,3 +483,15 @@ async def test_action_instance_rejection_requires_current_session_and_contract()
     )
     assert not lifecycle.has_action_instance(ACTION_INSTANCE_ID)
     host.close_page.assert_not_awaited()
+
+
+async def _start_instance(lifecycle, *, action_meta, action_instance_id, context_id):
+    metadata = lifecycle.reserve_action_instance(
+        action_meta=action_meta,
+        action_instance_id=action_instance_id,
+        context_id=context_id,
+    )
+    key = lifecycle.provider_session_keys()[action_instance_id]
+    if not lifecycle.instance_started(metadata):
+        assert await lifecycle.start_reserved_instance(metadata, key)
+        lifecycle.accept_instance_started(metadata, key)

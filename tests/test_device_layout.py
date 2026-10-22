@@ -89,5 +89,3 @@ def _device(*controls: ControlDescriptor, device_id: str = "dev1") -> DeviceDesc
         fingerprint=f"fingerprint:{device_id}",
         controls=controls,
     )
-
-

@@ -2,41 +2,26 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Protocol
 
 from deckr.action_runtime import action_runtime_provider_instance_id
 from deckr.actions.endpoints import (
     RESERVED_BUILTIN_PROVIDER_IDS,
-    parse_action_provider_address,
 )
 from deckr.actions.messages import (
-    ACTION_LIFECYCLE_REJECTED,
-    BINDING_OUTPUT,
-    BINDING_OVERLAY,
-    BINDING_OVERLAY_CLEAR,
-    CLOSE_PAGE,
-    OPEN_PAGE,
-    REPLACE_PAGE,
     ActionLifecycleRejectedBody,
     BindingMetadata,
     BindingOutputBody,
     BindingOverlayBody,
     BindingOverlayClearBody,
     DynamicPageCommand,
-    action_body_dict,
+    PageSessionMetadata,
 )
 from deckr.contracts.messages import DeckrMessage, parse_service_address
-from deckr.hardware.capabilities import (
-    raster_bitmap_command_params,
-)
-from pydantic import ValidationError
 
 from deckr.controller._actions import ProviderSessionKey
-from deckr.controller._actions._routing import action_command_metadata
+from deckr.controller._actions._routing import ActionRuntimeCommand, CommandMetadata
 from deckr.controller._bindings._action_lifecycle import (
     ActionInstanceLifecycleService,
 )
@@ -44,13 +29,11 @@ from deckr.controller._bindings._attachments import (
     AuthorizedCommandTarget,
     BindingLease,
 )
-from deckr.controller._bindings._attachments import (
-    binding_body_matches_lease as _binding_body_matches_lease,
-)
+from deckr.controller._bindings._output_commands import BindingOutputCommands
 from deckr.controller._pages import DynamicPageSession
-from deckr.controller._render import RenderSource
 
 logger = logging.getLogger(__name__)
+
 
 class ProviderCommandHost(Protocol):
     config_id: str
@@ -112,52 +95,6 @@ class ProviderCommandHost(Protocol):
     ) -> None: ...
 
 
-def _message_trace_payload(msg: DeckrMessage) -> dict[str, Any] | None:
-    if msg.trace is None:
-        return None
-    return msg.trace.model_dump(by_alias=True, exclude_none=True, mode="json")
-
-
-def _binding_overlay_render_source(
-    binding: BindingMetadata,
-    msg: DeckrMessage,
-    *,
-    command_type: str,
-    overlay_generation: int,
-) -> RenderSource:
-    return RenderSource(
-        provider_instance_id=binding.provider_instance_id,
-        provider_id=binding.provider_id,
-        provider_session_id=msg.sender_session_id,
-        action_id=binding.action_id,
-        action_instance_id=binding.action_instance_id,
-        action_message_id=msg.message_id,
-        action_causation_id=msg.causation_id,
-        trace=_message_trace_payload(msg),
-        command_type=command_type,
-        binding_output_generation=binding.output_generation,
-        overlay_generation=overlay_generation,
-    )
-
-
-def _payload_kind_hash(params: Mapping[str, Any]) -> tuple[str, str | None]:
-    image = params.get("image")
-    if isinstance(image, str):
-        if image.startswith("data:"):
-            kind = "data_uri"
-        elif image.startswith(("http://", "https://")):
-            kind = "remote_uri"
-        elif image:
-            kind = "encoded_image"
-        else:
-            kind = "empty_image"
-        return kind, hashlib.sha256(image.encode("utf-8")).hexdigest()[:12]
-    if not params:
-        return "empty", None
-    payload = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
-    return "params", hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
-
-
 class ProviderCommandIngress:
     def __init__(
         self,
@@ -166,27 +103,14 @@ class ProviderCommandIngress:
         lifecycle: ActionInstanceLifecycleService,
         logger: logging.Logger = logger,
     ) -> None:
+        self._outputs = BindingOutputCommands(host=host, logger=logger)
         self._host = host
         self._lifecycle = lifecycle
         self._logger = logger
 
-    async def handle(self, msg: DeckrMessage) -> None:
-        """Handle a canonical command message from an action provider."""
-        try:
-            metadata = action_command_metadata(msg)
-            payload = action_body_dict(msg)
-        except (ValidationError, ValueError):
-            self._logger.warning(
-                "Ignoring invalid action command body %s from %s",
-                msg.message_type,
-                msg.sender,
-                exc_info=True,
-            )
-            return
-        msg_type = msg.message_type
-        if msg_type in {OPEN_PAGE, REPLACE_PAGE, CLOSE_PAGE}:
-            return
-
+    async def handle(self, command: ActionRuntimeCommand) -> None:
+        """Dispatch a decoded command without changing or reparsing its envelope."""
+        msg, body, metadata = command.envelope, command.body, command.metadata
         context_id = metadata.context_id if metadata is not None else ""
         if not context_id:
             return
@@ -194,8 +118,7 @@ class ProviderCommandIngress:
         if config_id != self._host.config_id:
             return
 
-        if msg_type == ACTION_LIFECYCLE_REJECTED:
-            body = ActionLifecycleRejectedBody.model_validate(payload)
+        if isinstance(body, ActionLifecycleRejectedBody):
             authorization: AuthorizedCommandTarget | None = None
             sender_provider_instance_id: str | None = None
             if body.target_kind == "action_instance":
@@ -205,13 +128,14 @@ class ProviderCommandIngress:
             elif body.reason != "stale_lifecycle" or body.target_kind == "binding":
                 authorization = await self._authorize_action_command(
                     msg,
+                    metadata=metadata,
                     context_id=context_id,
                 )
                 if authorization is not None:
                     sender_provider_instance_id = (
                         authorization.sender_provider_instance_id
                     )
-            await self._lifecycle.handle_lifecycle_rejected(
+            await self._lifecycle.rejections.handle(
                 msg,
                 body,
                 authorization=authorization,
@@ -222,27 +146,29 @@ class ProviderCommandIngress:
 
         authorization = await self._authorize_action_command(
             msg,
+            metadata=metadata,
             context_id=context_id,
         )
         if authorization is None:
             return
 
-        if msg_type == BINDING_OUTPUT:
+        if isinstance(body, BindingOutputBody):
             if authorization.binding is not None:
-                body = BindingOutputBody.model_validate(payload)
-                await self._handle_binding_output(authorization.binding, body, msg)
+                await self._outputs._handle_binding_output(
+                    authorization.binding, body, msg
+                )
             return
 
-        if msg_type == BINDING_OVERLAY:
+        if isinstance(body, BindingOverlayBody):
             if authorization.binding is not None:
-                body = BindingOverlayBody.model_validate(payload)
-                await self._handle_binding_overlay(authorization.binding, body, msg)
+                await self._outputs._handle_binding_overlay(
+                    authorization.binding, body, msg
+                )
             return
 
-        if msg_type == BINDING_OVERLAY_CLEAR:
+        if isinstance(body, BindingOverlayClearBody):
             if authorization.binding is not None:
-                body = BindingOverlayClearBody.model_validate(payload)
-                await self._handle_binding_overlay_clear(
+                await self._outputs._handle_binding_overlay_clear(
                     authorization.binding,
                     body,
                     msg,
@@ -256,14 +182,10 @@ class ProviderCommandIngress:
         self,
         msg: DeckrMessage,
     ) -> str | None:
-        provider_instance_id = parse_action_provider_address(msg.sender)
-        if provider_instance_id is None:
-            service_id = parse_service_address(msg.sender)
-            provider_instance_id = (
-                action_runtime_provider_instance_id(service_id)
-                if service_id is not None
-                else None
-            )
+        service_id = parse_service_address(msg.sender)
+        provider_instance_id = (
+            action_runtime_provider_instance_id(service_id) if service_id else None
+        )
         if provider_instance_id is None:
             self._logger.warning(
                 "Ignoring action command %s from non-provider sender %s",
@@ -285,17 +207,23 @@ class ProviderCommandIngress:
         msg: DeckrMessage,
         *,
         context_id: str,
+        metadata: CommandMetadata | None,
     ) -> AuthorizedCommandTarget | None:
         sender_provider_instance_id = self._command_sender_provider_instance_id(msg)
         if sender_provider_instance_id is None:
             return None
 
-        metadata = action_command_metadata(msg)
         if metadata is None:
             return None
         action_instance_id = metadata.action_instance_id
-        binding_id = getattr(metadata, "binding_id", None)
-        page_session_id = getattr(metadata, "page_session_id", None)
+        binding_id = (
+            metadata.binding_id if isinstance(metadata, BindingMetadata) else None
+        )
+        page_session_id = (
+            metadata.page_session_id
+            if isinstance(metadata, (BindingMetadata, PageSessionMetadata))
+            else None
+        )
         metadata_provider_id = metadata.provider_instance_id
         if (
             metadata_provider_id is not None
@@ -444,141 +372,3 @@ class ProviderCommandIngress:
             msg.sender,
         )
         return None
-
-    async def _handle_binding_output(
-        self,
-        lease: BindingLease,
-        body: BindingOutputBody,
-        msg: DeckrMessage,
-    ) -> None:
-        if not self._host.binding_output_authorized(lease):
-            self._logger.warning(
-                "Ignoring binding output from non-output owner binding %s",
-                lease.binding_id,
-            )
-            return
-        if not _binding_body_matches_lease(lease, body.binding):
-            self._logger.warning(
-                "Ignoring binding output with mismatched mirrored lease identity"
-            )
-            return
-        if body.binding.output_generation != body.generation:
-            self._logger.warning(
-                "Ignoring binding output with mismatched generation for binding %s",
-                lease.binding_id,
-            )
-            return
-        if body.capability.control_id != lease.control_id:
-            self._logger.warning(
-                "Ignoring binding output for wrong control %s on binding %s",
-                body.capability.control_id,
-                lease.binding_id,
-            )
-            return
-        if body.capability.device_ref != lease.context.metadata.device_ref:
-            self._logger.warning("Ignoring binding output for a different device")
-            return
-        if body.capability.capability_id != lease.raster_capability_id:
-            self._logger.warning(
-                "Ignoring unsupported binding output capability %s on binding %s",
-                body.capability.capability_id,
-                lease.binding_id,
-            )
-            return
-        payload_kind, payload_hash = _payload_kind_hash(body.params)
-        self._logger.debug(
-            "Accepted binding output config=%s control=%s action=%s provider=%s "
-            "binding=%s command_type=%s generation=%s capability=%s "
-            "payload_kind=%s payload_hash=%s",
-            self._host.config_id,
-            lease.control_id,
-            lease.action_uuid,
-            lease.provider_instance_id,
-            lease.binding_id,
-            body.command_type,
-            body.generation,
-            body.capability.capability_id,
-            payload_kind,
-            payload_hash,
-        )
-        try:
-            raster_bitmap_command_params(body.command_type, body.params)
-        except (ValueError, ValidationError):
-            return
-        if body.generation != lease.context.metadata.output_generation:
-            return
-        await self._host.render_direct_output(lease, body, msg)
-
-    async def _handle_binding_overlay(
-        self,
-        lease: BindingLease,
-        body: BindingOverlayBody,
-        msg: DeckrMessage,
-    ) -> None:
-        if not self._host.binding_output_authorized(lease):
-            self._logger.warning(
-                "Ignoring binding overlay from non-output owner binding %s",
-                lease.binding_id,
-            )
-            return
-        if not _binding_body_matches_lease(lease, body.binding):
-            self._logger.warning(
-                "Ignoring binding overlay with mismatched mirrored lease identity"
-            )
-            return
-        ok = await lease.context.show_overlay(
-            template=body.template,
-            title=body.title,
-            params=dict(body.params),
-            duration_seconds=body.duration_seconds,
-            overlay_id=body.overlay_id,
-            generation=body.generation,
-            binding_output_generation=body.binding.output_generation,
-            source=_binding_overlay_render_source(
-                body.binding,
-                msg,
-                command_type=BINDING_OVERLAY,
-                overlay_generation=body.generation,
-            ),
-        )
-        if not ok:
-            self._logger.info(
-                "Ignoring stale binding overlay for binding %s generation=%s",
-                lease.binding_id,
-                body.generation,
-            )
-
-    async def _handle_binding_overlay_clear(
-        self,
-        lease: BindingLease,
-        body: BindingOverlayClearBody,
-        msg: DeckrMessage,
-    ) -> None:
-        if not self._host.binding_output_authorized(lease):
-            self._logger.warning(
-                "Ignoring binding overlay clear from non-output owner binding %s",
-                lease.binding_id,
-            )
-            return
-        if not _binding_body_matches_lease(lease, body.binding):
-            self._logger.warning(
-                "Ignoring binding overlay clear with mismatched mirrored lease identity"
-            )
-            return
-        ok = await lease.context.clear_overlay(
-            overlay_id=body.overlay_id,
-            generation=body.generation,
-            binding_output_generation=body.binding.output_generation,
-            source=_binding_overlay_render_source(
-                body.binding,
-                msg,
-                command_type=BINDING_OVERLAY_CLEAR,
-                overlay_generation=body.generation,
-            ),
-        )
-        if not ok:
-            self._logger.info(
-                "Ignoring stale binding overlay clear for binding %s generation=%s",
-                lease.binding_id,
-                body.generation,
-            )

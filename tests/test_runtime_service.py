@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import anyio
 import pytest
@@ -20,11 +22,11 @@ from deckr.lanes import Lane
 from deckr.runtime import Deckr
 
 from deckr.controller._config_document import ControllerRuntimeConfig
-from deckr.controller._render_dispatcher import (
+from deckr.controller._render_observation import ObservingRenderBackend
+from deckr.controller._render_workers import (
     ProcessPoolRenderBackend,
     ThreadRenderBackend,
 )
-from deckr.controller._render_observation import ObservingRenderBackend
 from deckr.controller._runtime_service import (
     ControllerRuntimeService,
     _build_render_backend,
@@ -33,6 +35,76 @@ from deckr.controller._runtime_service import (
     component_factory,
 )
 from test_support.memory_lane_substrate import MemoryLaneSubstrate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_fails", [False, True])
+async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
+    monkeypatch, close_fails
+):
+    import deckr.controller._runtime_service as module
+
+    closed = []
+
+    def close_resource(name, *, fail=False):
+        async def close(*args):
+            closed.append(name)
+            if fail:
+                raise RuntimeError(f"close {name}")
+
+        return close
+
+    endpoint = SimpleNamespace(session_id="controller-session")
+    endpoint_context = SimpleNamespace(
+        __aenter__=AsyncMock(return_value=endpoint),
+        __aexit__=close_resource("endpoint"),
+    )
+
+    def unavailable_hardware(_endpoint):
+        raise ValueError("hardware construction failed")
+
+    context = SimpleNamespace(
+        open_endpoint=lambda *args, **kwargs: endpoint_context,
+        kv_bucket=lambda policy: None,
+        hardware=unavailable_hardware,
+    )
+    actions = SimpleNamespace(aclose=close_resource("actions", fail=close_fails))
+    renderer = SimpleNamespace(aclose=close_resource("renderer"))
+    monkeypatch.setattr(module, "build_config_service", lambda *a, **kw: object())
+    monkeypatch.setattr(module, "build_settings_service", lambda *a, **kw: object())
+    monkeypatch.setattr(module, "DeckrServices", lambda **kw: object())
+    monkeypatch.setattr(module, "ControllerActionService", lambda **kw: actions)
+    monkeypatch.setattr(module, "_build_render_backend", lambda *a, **kw: renderer)
+    service = ControllerRuntimeService(
+        runtime_name="test-startup",
+        runtime=build_controller_runtime(
+            config_source={}, base_dir=Path.cwd(), controller_id="controller-main"
+        ),
+        context=context,
+        beacon=object(),
+        concord=object(),
+    )
+    service._component_manager = SimpleNamespace(
+        run=object(),
+        add_component=AsyncMock(),
+        stop=close_resource("components"),
+    )
+    ctx = RunContext(
+        tg=SimpleNamespace(start=AsyncMock(), start_soon=object()),
+        stopping=anyio.Event(),
+    )
+    if close_fails:
+        with pytest.raises(ExceptionGroup) as error:
+            await service.start(ctx)
+        assert [str(exc) for exc in error.value.exceptions] == [
+            "hardware construction failed", "close actions"
+        ]
+    else:
+        with pytest.raises(ValueError, match="hardware construction failed"):
+            await service.start(ctx)
+    assert closed == ["components", "renderer", "actions", "endpoint"]
+    assert service._endpoint is None
+    assert service._endpoint_cm is None
 
 
 def _document(raw: dict) -> ConfigDocument:
@@ -83,9 +155,7 @@ def test_build_render_backend_returns_thread_and_process_backends() -> None:
         controller_id="controller-main",
     )
     process_backend = _build_render_backend(
-        ControllerRuntimeConfig.model_validate(
-            {"render": {"backend": "process_pool"}}
-        ),
+        ControllerRuntimeConfig.model_validate({"render": {"backend": "process_pool"}}),
         controller_id="controller-main",
     )
 

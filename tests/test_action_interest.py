@@ -9,13 +9,13 @@ from deckr.controller._actions import ActionIntentKey
 
 
 def _intent(
-    action_uuid: str,
+    action_id: str,
     *,
     provider_instance_id: str | None = None,
     provider_labels: dict[str, str] | None = None,
 ) -> ActionIntentKey:
     return ActionIntentKey(
-        action_uuid=action_uuid,
+        action_id=action_id,
         provider_instance_id=provider_instance_id,
         provider_labels=tuple(sorted((provider_labels or {}).items())),
     )
@@ -84,4 +84,3 @@ def test_replace_warm_interests_removes_absent_warm_records():
     )
 
     assert tracker.snapshot(now=20.0).warm_intents == (beta,)
-

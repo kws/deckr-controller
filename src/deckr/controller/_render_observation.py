@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +14,9 @@ from typing import Any
 import anyio
 
 from deckr.controller._render import RenderRequest, RenderResult, RenderSource
-from deckr.controller._render_dispatcher import RenderBackend
+from deckr.controller._render_workers import RenderBackend, run_thread
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,8 +41,8 @@ class ObservingRenderBackend:
         self._backend = backend
         self._controller_id = controller_id
         self._options = options
-        self._lock = anyio.Lock()
-        options.path.parent.mkdir(parents=True, exist_ok=True)
+        self._slots = threading.BoundedSemaphore(1)
+        self._observation_failed = False
 
     async def render(self, request: RenderRequest) -> RenderResult:
         started = time.perf_counter()
@@ -54,14 +58,27 @@ class ObservingRenderBackend:
                 frame=None,
                 error=str(exc),
             )
-            await self._append_result(request, result, duration_ms=duration_ms)
+            await self._observe(request, result, duration_ms=duration_ms)
             raise
         duration_ms = (time.perf_counter() - started) * 1000
-        await self._append_result(request, result, duration_ms=duration_ms)
+        await self._observe(request, result, duration_ms=duration_ms)
         return result
 
     async def aclose(self) -> None:
         await self._backend.aclose()
+
+    async def _observe(self, request, result, *, duration_ms):
+        try:
+            with anyio.fail_after(0.05):
+                await self._append_result(request, result, duration_ms=duration_ms)
+        except Exception:
+            if not self._observation_failed:
+                logger.warning(
+                    "Dropping render observation: sink unavailable", exc_info=True
+                )
+            self._observation_failed = True
+        else:
+            self._observation_failed = False
 
     async def _append_result(
         self,
@@ -77,16 +94,12 @@ class ObservingRenderBackend:
             separators=(",", ":"),
             default=str,
         )
-        async with (
-            self._lock,
-            await anyio.open_file(
-                self._options.path,
-                "a",
-                encoding="utf-8",
-            ) as stream,
-        ):
-            await stream.write(line)
-            await stream.write("\n")
+        await run_thread(self._append_line, line, slots=self._slots)
+
+    def _append_line(self, line):
+        self._options.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._options.path.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
 
     def _record(
         self,
@@ -125,7 +138,7 @@ class ObservingRenderBackend:
             "availabilityReason": _source_value(source, "availability_reason"),
             "graphSha256": _json_sha256(request.graph),
             "frameSha256": _bytes_sha256(result.frame),
-            "encoding": "jpeg",
+            "encoding": request.image_format.format.lower(),
             "width": request.image_format.width,
             "height": request.image_format.height,
             "durationMs": duration_ms,

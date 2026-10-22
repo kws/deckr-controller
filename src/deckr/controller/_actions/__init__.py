@@ -1,6 +1,6 @@
 """Private controller action-service API."""
 
-from deckr.controller._actions._availability import (
+from deckr.controller._actions._availability_policy import (
     PROVIDER_SESSION_INVALID_REASON,
     SERVICE_VIEW_MISSING_REASON,
     SERVICE_VIEW_UNAVAILABLE_REASON,
@@ -15,8 +15,8 @@ from deckr.controller._actions._models import (
     ActionIntentKey,
     ActionMetadata,
     ActionPlanningSnapshot,
-    ActionProviderManager,
     ActionUnavailableCause,
+    BuiltinActionCatalog,
     ProviderActionKey,
     ProviderSessionKey,
     SettingsActionMetadata,
@@ -35,7 +35,7 @@ __all__ = [
     "ActionIntentKey",
     "ActionMetadata",
     "ActionPlanningSnapshot",
-    "ActionProviderManager",
+    "BuiltinActionCatalog",
     "ActionUnavailableCause",
     "ControllerActionService",
     "ProviderActionKey",

@@ -17,6 +17,8 @@ from deckr.hardware.descriptors import (
 )
 from deckr.hardware.validation import validate_constraints
 
+from deckr.controller._raster import RasterFormat
+
 
 @dataclass(frozen=True)
 class ControlCoordinates:
@@ -25,56 +27,48 @@ class ControlCoordinates:
 
 
 @dataclass(frozen=True)
-class RasterImageFormat:
-    width: int
-    height: int
-    format: str = "JPEG"
-    rotation: int = 0
-
-
-@dataclass(frozen=True)
-class ControlSurface:
+class ControlLayout:
     id: str
     kind: str
     coordinates: ControlCoordinates
     input_events: tuple[str, ...]
-    image_format: RasterImageFormat | None = None
+    image_format: RasterFormat | None = None
     raster_capability_id: str | None = None
 
 
 @dataclass(frozen=True)
-class RasterControl:
+class RasterTarget:
     """One control with a raster output capability."""
 
     control_id: str
     row: int
     column: int
-    image_format: RasterImageFormat
+    image_format: RasterFormat
     capability_id: str
 
 
-def control_surface_by_id(
+def control_layout_by_id(
     device: DeviceDescriptor,
     control_id: str,
-) -> ControlSurface | None:
+) -> ControlLayout | None:
     for control in device.controls:
         if control.control_id == control_id:
-            return control_surface(control)
+            return control_layout(control)
     return None
 
 
-def control_surface(control: ControlDescriptor) -> ControlSurface:
+def control_layout(control: ControlDescriptor) -> ControlLayout:
     raster_capability = _first_raster_capability(control)
-    return control_surface_for_raster_capability(
+    return control_layout_for_raster_capability(
         control,
         raster_capability.capability_id if raster_capability is not None else None,
     )
 
 
-def control_surface_for_raster_capability(
+def control_layout_for_raster_capability(
     control: ControlDescriptor,
     raster_capability_id: str | None,
-) -> ControlSurface:
+) -> ControlLayout:
     raster_capability = _raster_capability_by_id(control, raster_capability_id)
     image_format = (
         _raster_image_format(raster_capability)
@@ -82,7 +76,7 @@ def control_surface_for_raster_capability(
         else None
     )
     geometry = control.geometry
-    return ControlSurface(
+    return ControlLayout(
         id=control.control_id,
         kind=control.kind,
         coordinates=ControlCoordinates(
@@ -97,16 +91,16 @@ def control_surface_for_raster_capability(
     )
 
 
-def raster_controls(device: DeviceDescriptor) -> tuple[RasterControl, ...]:
+def raster_controls(device: DeviceDescriptor) -> tuple[RasterTarget, ...]:
     """Return controls with raster outputs, ordered by descriptor geometry."""
 
-    controls: list[RasterControl] = []
+    controls: list[RasterTarget] = []
     for descriptor in device.controls:
-        surface = control_surface(descriptor)
+        surface = control_layout(descriptor)
         if surface.image_format is None or surface.raster_capability_id is None:
             continue
         controls.append(
-            RasterControl(
+            RasterTarget(
                 control_id=surface.id,
                 row=surface.coordinates.row,
                 column=surface.coordinates.column,
@@ -202,7 +196,7 @@ def _constraint_value(
     raise ValueError(f"No supported raster {subject} satisfies the descriptor")
 
 
-def _raster_image_format(capability: CapabilityDescriptor) -> RasterImageFormat:
+def _raster_image_format(capability: CapabilityDescriptor) -> RasterFormat:
     encoding = None
     for candidate in ("jpeg", "png"):
         try:
@@ -213,7 +207,7 @@ def _raster_image_format(capability: CapabilityDescriptor) -> RasterImageFormat:
         break
     if encoding is None:
         raise ValueError("Raster capability has no supported image encoding")
-    return RasterImageFormat(
+    return RasterFormat(
         width=int(_constraint_value(capability, "width", 72)),
         height=int(_constraint_value(capability, "height", 72)),
         rotation=int(_constraint_value(capability, "rotation", 0)),

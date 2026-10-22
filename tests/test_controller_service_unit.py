@@ -136,18 +136,18 @@ def _manager_context() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_action_command_ignores_invalid_settings_body_and_missing_subject() -> None:
+async def test_action_command_ignores_invalid_settings_body_and_missing_subject() -> (
+    None
+):
     service = _service()
     ctx = _manager_context()
     await service._controller_contexts.set(CONFIG_ID, ctx)
 
-    await service._handle_action_command(
-        _action_message(
-            "settingsPatch",
-            body={"target": {"not": "valid"}},
-        )
-    )
-    await service._handle_action_command(_action_message("openPage"))
+    from deckr.controller._actions._routing import decode_action_command
+
+    for kind in ("settingsPatch", "openPage"):
+        with pytest.raises(ValueError, match="service envelope"):
+            decode_action_command(_action_message(kind))
 
     ctx.handle_provider_command.assert_not_awaited()
 

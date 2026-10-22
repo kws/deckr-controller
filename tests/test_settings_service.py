@@ -78,7 +78,7 @@ async def _action_provider(
         return None
     if action_id == "action.clock":
         return ActionMetadata(
-            uuid="action.clock",
+            action_id="action.clock",
             name="Clock",
             provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
@@ -98,7 +98,7 @@ async def _action_provider(
         )
     if action_id == "action.no_schema":
         return ActionMetadata(
-            uuid="action.no_schema",
+            action_id="action.no_schema",
             name="No Schema",
             provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id="no_schema",
@@ -207,7 +207,7 @@ async def test_settings_metadata_reads_from_action_service(
     availability = MagicMock()
     availability.settings_action_metadata.return_value = SettingsActionMetadata(
         action=ActionMetadata(
-            uuid="action.clock",
+            action_id="action.clock",
             name="Clock",
             provider_instance_id=PROVIDER_INSTANCE_ID,
             provider_id=PROVIDER_ID,
@@ -264,3 +264,28 @@ def test_duplicate_explicit_control_ids_are_rejected() -> None:
 
     with pytest.raises(ValidationError, match="control ids must be unique"):
         DeviceConfig.model_validate(data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_factory", [_stable_action_target, _provider_target])
+@pytest.mark.parametrize(
+    "field", ["controller_id", "provider_id", "provider_instance_id"]
+)
+async def test_settings_reject_forged_target_identity(tmp_path, target_factory, field):
+    service, _ = await _service(tmp_path)
+    target = target_factory().model_copy(update={field: "another-owner"})
+    assert not await service.exists(target)
+    for read in (service.get, service.describe_target):
+        with pytest.raises(KeyError):
+            await read(target)
+
+
+@pytest.mark.asyncio
+async def test_settings_do_not_invent_provider_identity_while_offline(tmp_path):
+    config_service = FileBackedDeviceConfigService(config_dir=tmp_path)
+    await config_service.write_config(_config())
+    service = ConfigBackedSettingsService(
+        controller_id=CONTROLLER_ID, config_service=config_service
+    )
+    assert not await service.exists(_stable_action_target())
+    assert not await service.exists(_provider_target())

@@ -17,8 +17,8 @@ from deckr.controller.invariant.recipes import (
 )
 
 if TYPE_CHECKING:
-    from deckr.controller._device_layout import RasterImageFormat
     from deckr.controller._hardware import HardwareCommandService
+    from deckr.controller._raster import RasterFormat
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,7 @@ class DeviceOutput:
         self._control_id = control_id
         self._capability_id = capability_id
         self.last_frame: bytes | None = None
-        self._claim = (
-            command_service.claim_identity(config_id)
-            if hasattr(command_service, "claim_identity")
-            else None
-        )
+        self._claim = command_service.claim_identity(config_id)
 
     @property
     def control_id(self) -> str:
@@ -132,12 +128,14 @@ def _output_transaction(method):
     @wraps(method)
     async def guarded(self, *args, **kwargs):
         async with self._render_dispatcher.output_transaction():
+            if not self._active:
+                return False
             return await method(self, *args, **kwargs)
 
     return guarded
 
 
-class CommandRouter:
+class PresentationController:
     """Receives action commands, updates ControlStateStore, triggers resolve → encode → write."""
 
     def __init__(
@@ -146,7 +144,7 @@ class CommandRouter:
         render_service: RenderService,
         render_dispatcher: RenderDispatcher,
         output: DeviceOutput | None,
-        image_format: "RasterImageFormat | None",
+        image_format: "RasterFormat | None",
         start_soon: Callable,
     ):
         self._store = store
@@ -155,6 +153,20 @@ class CommandRouter:
         self._output = output
         self._image_format = image_format
         self._start_soon = start_soon
+        self._active = True
+        self._overlay_revision = 0
+        self._overlay_timer: anyio.CancelScope | None = None
+
+    def retire(self) -> None:
+        """Retire presentation and delayed work while holding the session boundary."""
+        self._active = False
+        self._cancel_overlay_timer()
+
+    def _cancel_overlay_timer(self) -> None:
+        self._overlay_revision += 1
+        if self._overlay_timer is not None:
+            self._overlay_timer.cancel()
+            self._overlay_timer = None
 
     @property
     def store(self):
@@ -179,7 +191,7 @@ class CommandRouter:
         source: RenderSource | None = None,
         base_update: bool = False,
     ) -> None:
-        if self._image_format is None or self._output is None:
+        if not self._active or self._image_format is None or self._output is None:
             return
         model = resolve(self._store)
         request = self._render_service.build_request(
@@ -325,6 +337,7 @@ class CommandRouter:
         if resolved_duration is None:
             resolved_duration = OVERLAY_TEMPLATE_DEFAULT_SECONDS.get(resolved_template)
 
+        self._cancel_overlay_timer()
         self._store.overlay_generation = generation
         self._store.overlay = RenderOverlay(
             template=resolved_template,
@@ -340,6 +353,7 @@ class CommandRouter:
                 overlay_id,
                 generation,
                 resolved_duration,
+                self._overlay_revision,
             )
         return True
 
@@ -362,6 +376,7 @@ class CommandRouter:
         if overlay_id is not None and overlay.overlay_id != overlay_id:
             return False
 
+        self._cancel_overlay_timer()
         self._store.overlay_generation = generation
         self._store.overlay = None
         await self._render(
@@ -375,13 +390,26 @@ class CommandRouter:
         overlay_id: str | None,
         generation: int,
         duration_seconds: float,
+        revision: int,
     ) -> None:
-        await anyio.sleep(duration_seconds)
-        await self.clear_overlay(
-            overlay_id=overlay_id,
-            generation=generation,
-            binding_output_generation=self._store.base_output_generation,
-        )
+        with anyio.CancelScope() as scope:
+            if not self._active or revision != self._overlay_revision:
+                return
+            self._overlay_timer = scope
+            try:
+                await anyio.sleep(duration_seconds)
+                async with self._render_dispatcher.output_transaction():
+                    if not self._active or revision != self._overlay_revision:
+                        return
+                    self._overlay_timer = None
+                    await self.clear_overlay(
+                        overlay_id=overlay_id,
+                        generation=generation,
+                        binding_output_generation=self._store.base_output_generation,
+                    )
+            finally:
+                if self._overlay_timer is scope:
+                    self._overlay_timer = None
 
     def _accept_base_generation(self, generation: int | None) -> bool:
         if generation is None:

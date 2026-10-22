@@ -200,7 +200,9 @@ class _ActionRuntimeServicesHarness:
     @asynccontextmanager
     async def use_matching(self, protocol, *, predicate, timeout_seconds):
         assert protocol == ACTION_RUNTIME_SERVICE_PROTOCOL
-        descriptor = next(item for item in self.directory_harness._initial if predicate(item))
+        descriptor = next(
+            item for item in self.directory_harness._initial if predicate(item)
+        )
         async with self.use(descriptor) as lease:
             yield lease
 
@@ -277,8 +279,12 @@ async def _wait_for_contract(
 
 
 @pytest.mark.asyncio
-async def test_controller_action_service_registers_stops_and_restarts_runtime_actions(monkeypatch):
-    monkeypatch.setattr("deckr.controller._actions._service._SERVICE_WATCH_RETRY_SECONDS", 0.01)
+async def test_controller_action_service_registers_stops_and_restarts_runtime_actions(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "deckr.controller._actions._supervisor._SERVICE_WATCH_RETRY_SECONDS", 0.01
+    )
     first_descriptor = _service_descriptor(
         provider_session_id="provider-session-1",
         advertisement_id="first",
@@ -291,7 +297,7 @@ async def test_controller_action_service_registers_stops_and_restarts_runtime_ac
     )
     services = _ActionRuntimeServicesHarness(initial=(first_descriptor,))
     intent = ActionIntentKey(
-        action_uuid=ACTION_UUID,
+        action_id=ACTION_UUID,
         provider_instance_id=PROVIDER_INSTANCE_ID,
         provider_labels=(),
     )
@@ -353,7 +359,9 @@ async def test_controller_action_service_registers_stops_and_restarts_runtime_ac
         # A new advertisement alone cannot revoke the healthy lease.
         await anyio.sleep(0)
         assert service.current_contract(first_key) is not None
-        await services.publish_view(ServiceUnavailable("contract_cancelled", "lost authority"))
+        await services.publish_view(
+            ServiceUnavailable("contract_cancelled", "lost authority")
+        )
         await services.wait_used("provider-session-2")
         await services.publish_view(
             _availability_view(provider_session_id="provider-session-2")
@@ -390,7 +398,14 @@ async def test_controller_action_service_rejects_runtime_context_subject_message
         services=services,
     )
     name = action_runtime_message_name(CLOSE_PAGE)
-    params, event = action_runtime_payload(name, ClosePageBody(target=PageSessionCommandTarget(kind="page_session", pageSessionId="page-1", generation=0)))
+    params, event = action_runtime_payload(
+        name,
+        ClosePageBody(
+            target=PageSessionCommandTarget(
+                kind="page_session", pageSessionId="page-1", generation=0
+            )
+        ),
+    )
     subject = context_subject(
         "ctx-1",
         provider_instance_id=PROVIDER_INSTANCE_ID,
@@ -401,7 +416,7 @@ async def test_controller_action_service_rejects_runtime_context_subject_message
 
     async with anyio.create_task_group() as tg:
         stopping = anyio.Event()
-        service._start_soon = tg.start_soon
+        service.supervisor._start_soon = tg.start_soon
         await service.start(tg, stopping)
         await services.wait_used("provider-session-1")
 

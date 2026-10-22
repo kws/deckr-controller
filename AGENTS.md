@@ -32,6 +32,7 @@ Use `uv` for development commands:
 ```bash
 uv sync
 uv run ruff check .
+uv run mypy
 uv run pytest
 uv run python scripts/check_spec_conformance.py
 uv build

@@ -46,7 +46,10 @@ OPS = frozenset(
 def _expression(value):
     if not value.startswith("${") or not value.endswith("}"):
         raise ContentFailure("invalid_content")
-    tree = ast.parse(value[2:-1], mode="eval")
+    try:
+        tree = ast.parse(value[2:-1], mode="eval")
+    except (SyntaxError, ValueError, TypeError):
+        raise ContentFailure("invalid_content") from None
     references = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -202,8 +205,18 @@ class _Registry:
         self.operations = {
             f"gfx:{name}": op for name, op in gfx_ops.items() if f"gfx:{name}" in OPS
         }
+        from functools import partial
+
+        from deckr.controller._bounded_text import packed_text, render_text
+
         self.operations.update(
             {
+                "gfx:render_text": partial(
+                    render_text, limits=limits, max_dimension=MAX_DIMENSION
+                ),
+                "gfx:packed_text": partial(
+                    packed_text, limits=limits, max_dimension=MAX_DIMENSION
+                ),
                 "stdlib:make_dict": make_dict,
                 "deckr:fetch_image_url": self.fetch,
                 "gfx:blob_to_image": self.decode,
@@ -218,68 +231,6 @@ class _Registry:
             or width * height > self.limits.max_image_pixels
         ):
             raise ContentFailure("limit_exceeded")
-
-    def check_text_allocation(self, name, params):
-        # Invariant's text operations allocate their tight image after measuring.
-        # Preflight the same layout so limits apply before that allocation.
-        from decimal import Decimal
-
-        from invariant_gfx.ops.render_text import (
-            _fit_width_font_size,
-            _measure_text_width,
-        )
-
-        text, font = params["text"], params["font"]
-        weight, style = params.get("weight"), params.get("style", "normal")
-        if name == "gfx:render_text":
-            size = (
-                _fit_width_font_size(
-                    text,
-                    font,
-                    Decimal(str(params["fit_width"])),
-                    weight,
-                    style,
-                    params.get("exact", False),
-                )
-                if params.get("fit_width") is not None
-                else int(params["size"])
-            )
-            width, height = _measure_text_width(text, font, size, weight, style)
-            self.check_size(width + 4, height + 4)
-            return
-        from invariant_gfx.ops.packed_text import _fit_layout, _TextMeasurer
-
-        width, height = map(int, params["size"])
-        minimum = int(params.get("min_font_size", 10))
-        maximum = int(params.get("max_font_size") or max(min(width, height), minimum))
-        gap = int(params.get("line_gap", 0))
-        if (
-            not 1 <= minimum <= maximum <= MAX_DIMENSION
-            or not 0 <= gap <= MAX_DIMENSION
-        ):
-            raise ContentFailure("limit_exceeded")
-        layout = _fit_layout(
-            text=text,
-            font=font,
-            width=width,
-            height=height,
-            min_font_size=minimum,
-            max_font_size=maximum,
-            line_gap=gap,
-            weight=weight,
-            style=style,
-            measurer=_TextMeasurer(font, weight, style),
-        )
-        sizes = [
-            _measure_text_width(line, font, layout.font_size, weight, style)
-            for line in layout.lines
-        ]
-        for line_width, line_height in sizes:
-            self.check_size(line_width + 4, line_height + 4)
-        self.check_size(
-            max(w + 4 for w, _ in sizes),
-            sum(h + 4 for _, h in sizes) + gap * (len(sizes) - 1),
-        )
 
     def decode(self, blob):
         from invariant_gfx.artifacts import ImageArtifact
@@ -381,8 +332,6 @@ class _Registry:
                         for key in ("x", "y")
                     ):
                         raise ContentFailure("limit_exceeded")
-            if name in {"gfx:render_text", "gfx:packed_text"}:
-                self.check_text_allocation(name, params)
             result = op(**params)
             if isinstance(result, ImageArtifact):
                 self.check_size(result.width, result.height)
@@ -392,6 +341,25 @@ class _Registry:
             return result
 
         return run
+
+
+def _renderer_parameters(value):
+    """Adapt admitted wire tuples to the public executor's recursive list codec."""
+    if isinstance(value, dict):
+        if set(value) == {"$tuple"}:
+            return [_renderer_parameters(item) for item in value["$tuple"]]
+        result = {key: _renderer_parameters(item) for key, item in value.items()}
+        color = result.get("color")
+        if isinstance(color, str) and re.fullmatch(
+            r"#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?", color
+        ):
+            from PIL import ImageColor
+
+            result["color"] = list(ImageColor.getcolor(color, "RGBA"))
+        return result
+    if isinstance(value, list):
+        return [_renderer_parameters(item) for item in value]
+    return value
 
 
 def render_graph(document, width, height, limits):
@@ -404,10 +372,17 @@ def render_graph(document, width, height, limits):
     validate_graph(document, limits)
     registry = _Registry(limits, time.monotonic() + limits.max_render_time_ms / 1000)
     registry.check_size(width, height)
-    graph, output = load_graph_document_from_dict(document)
-    result = Executor(registry=registry, store=MemoryStore(max_size=MAX_NODES)).execute(
-        graph, [output], context={"canvas": {"width": width, "height": height}}
-    )[output]
+    try:
+        graph, output = load_graph_document_from_dict(_renderer_parameters(document))
+        result = Executor(
+            registry=registry, store=MemoryStore(max_size=MAX_NODES)
+        ).execute(
+            graph, [output], context={"canvas": {"width": width, "height": height}}
+        )[output]
+    except ContentFailure:
+        raise
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ContentFailure("invalid_content") from exc
     if not isinstance(result, ImageArtifact):
         raise ContentFailure("invalid_content")
     canvas = Image.new("RGBA", (width, height), "black")

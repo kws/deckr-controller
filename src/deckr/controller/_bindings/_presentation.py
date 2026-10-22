@@ -10,20 +10,18 @@ from deckr.controller._actions import (
     provider_session_key,
     unavailable_overlay_template,
 )
-from deckr.controller._binding_planner import (
-    PlannedBinding,
-)
+from deckr.controller._binding_plan import PlannedBinding
 from deckr.controller._bindings._attachments import (
     BindingLease,
 )
 from deckr.controller._bindings._models import (
     _UnavailableFallbackRender,
 )
-from deckr.controller._command_router import DeviceOutput
 from deckr.controller._device_layout import (
-    ControlSurface,
+    ControlLayout,
     raster_controls,
 )
+from deckr.controller._presentation import DeviceOutput
 from deckr.controller._render import RenderModel, RenderService, RenderSource
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
 
@@ -43,7 +41,7 @@ class BindingPresentation:
 
     async def _render_unavailable_to_control(
         self,
-        control: ControlSurface,
+        control: ControlLayout,
         *,
         planned: PlannedBinding,
         page_id: str,
@@ -62,7 +60,7 @@ class BindingPresentation:
             source=self._unavailable_fallback_render_source(planned, fallback),
         )
 
-    async def _render_pending_to_control(self, control: ControlSurface) -> None:
+    async def _render_pending_to_control(self, control: ControlLayout) -> None:
         """Render a pending overlay to an output-capable control."""
         await self._render_status_to_control(
             control,
@@ -72,7 +70,7 @@ class BindingPresentation:
 
     async def _render_status_to_control(
         self,
-        control: ControlSurface,
+        control: ControlLayout,
         *,
         overlay_type: str,
         source: RenderSource | None = None,
@@ -142,7 +140,7 @@ class BindingPresentation:
 
     def _log_unavailable_fallback_render(
         self,
-        control: ControlSurface,
+        control: ControlLayout,
         *,
         planned: PlannedBinding,
         page_id: str,
@@ -152,7 +150,7 @@ class BindingPresentation:
         selected_provider_key = (
             (
                 record.key.provider_instance_id,
-                record.key.action_uuid,
+                record.key.action_id,
             )
             if record is not None
             else None
@@ -165,7 +163,7 @@ class BindingPresentation:
             self.state.config.id,
             page_id,
             control.id,
-            planned.binding.action_uuid,
+            planned.binding.action_id,
             self._unavailable_fallback_provider_instance(planned, record),
             selected_provider_key,
             fallback.state.value if fallback.state is not None else None,
@@ -190,7 +188,7 @@ class BindingPresentation:
                 record,
             ),
             provider_id=metadata.provider_id if metadata is not None else None,
-            action_id=planned.binding.action_uuid,
+            action_id=planned.binding.action_id,
             action_instance_id=planned.action_instance_id,
             command_type="controller_fallback",
             content_kind=f"overlay:{fallback.template}",
@@ -233,7 +231,7 @@ class BindingPresentation:
                 "content_kind=%s attached=%s reason=%s",
                 self.state.config.id,
                 lease.control_id,
-                lease.action_uuid,
+                lease.action_id,
                 lease.provider_instance_id,
                 lease.provider_session_id,
                 lease.binding_id,
@@ -255,7 +253,7 @@ class BindingPresentation:
             "content_kind=%s attached=%s reason=%s",
             self.state.config.id,
             lease.control_id,
-            lease.action_uuid,
+            lease.action_id,
             lease.provider_instance_id,
             lease.provider_session_id,
             lease.binding_id,
@@ -276,7 +274,7 @@ class BindingPresentation:
                 "provider=%s binding=%s reason=%s",
                 self.state.config.id,
                 lease.control_id,
-                lease.action_uuid,
+                lease.action_id,
                 lease.provider_instance_id,
                 lease.binding_id,
                 reason,

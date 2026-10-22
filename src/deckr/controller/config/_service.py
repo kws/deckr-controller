@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Protocol
 
 import anyio
-import yaml
 from deckr.components import BaseComponent, RunContext
 from deckr.core.util.anyio import CoalescedStateBroadcaster
 from decouple import config as decouple_config
 from watchfiles import Change, awatch
 
 from deckr.controller.config._data import DeviceConfig
+from deckr.controller.config._file_storage import read_snapshot, write_config
 from deckr.controller.config._materialized import MaterializedConfigPublisher
+from deckr.controller.config._selection import copy_config, select_device_config
 
 logger = logging.getLogger(__name__)
 
@@ -35,26 +35,6 @@ def resolve_default_config_dir() -> Path:
 def _yaml_filter(change: Change, path: str) -> bool:
     """Only include .yml and .yaml files."""
     return path.endswith(".yml") or path.endswith(".yaml")
-
-
-def _load_config_file(path: Path) -> DeviceConfig | None:
-    """Load and validate DeviceConfig from a file. Returns None on error."""
-    try:
-        content = path.read_text()
-        data = yaml.safe_load(content)
-        if data is None:
-            return None
-        return DeviceConfig.model_validate(data)
-    except Exception:
-        logger.exception("Error loading config from %s", path)
-        return None
-
-
-def _labels_match(
-    actual: Mapping[str, str],
-    required: Mapping[str, str],
-) -> bool:
-    return all(actual.get(key) == value for key, value in required.items())
 
 
 class DeviceConfigService(Protocol):
@@ -107,6 +87,8 @@ class FileBackedDeviceConfigService(BaseComponent):
         self._state = CoalescedStateBroadcaster[str](current=True)
         self._lock = self._state.lock
         self._publish_lock = anyio.Lock()
+        self._scan_lock = anyio.Lock()
+        self._write_lock = anyio.Lock()
         self._published_version: int | None = None
         self._has_snapshot = False
         self._stop_event: anyio.Event | None = None
@@ -126,61 +108,34 @@ class FileBackedDeviceConfigService(BaseComponent):
         await self._state.aclose()
 
     async def match_device(
-        self,
-        *,
-        fingerprint: str,
-        labels: Mapping[str, str],
+        self, *, fingerprint: str, labels: Mapping[str, str]
     ) -> DeviceConfig | None:
-        await self._scan_configs()
+        if not self._has_snapshot:
+            await self._scan_configs()
         async with self._lock:
-            candidates = [
-                config
-                for config in self._config_by_id.values()
-                if config.enabled
-                and config.match.fingerprint == fingerprint
-                and _labels_match(labels, config.match.labels)
-            ]
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda config: len(config.match.labels),
-            reverse=True,
-        )
-        best_specificity = len(candidates[0].match.labels)
-        best = [
-            config
-            for config in candidates
-            if len(config.match.labels) == best_specificity
-        ]
-        if len(best) > 1:
-            ids = ", ".join(sorted(config.id for config in best))
-            raise ValueError(
-                f"Ambiguous device config match for fingerprint {fingerprint!r} "
-                f"labels {dict(labels)!r}: {ids}"
+            return copy_config(
+                select_device_config(
+                    self._config_by_id.values(), fingerprint=fingerprint, labels=labels
+                )
             )
-        return best[0]
 
     async def get_config(self, config_id: str) -> DeviceConfig | None:
         return await self._load_config(config_id)
 
     async def write_config(self, config: DeviceConfig) -> DeviceConfig:
-        await self._scan_configs()
-        async with self._lock:
-            path = next(
-                (
-                    candidate
-                    for candidate, config_id in self._path_to_config.items()
-                    if config_id == config.id
-                ),
-                self._config_dir / f"{config.id}.yml",
-            )
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f".{path.name}.tmp")
-        data = config.model_dump(by_alias=True, exclude_none=True, mode="json")
-        tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-        os.replace(tmp_path, path)
-        await self.refresh()
+        async with self._write_lock:
+            await self._scan_configs()
+            async with self._lock:
+                path = next(
+                    (
+                        path
+                        for path, config_id in self._path_to_config.items()
+                        if config_id == config.id
+                    ),
+                    self._config_dir / f"{config.id}.yml",
+                )
+            await anyio.to_thread.run_sync(write_config, self._config_dir, path, config)
+            await self.refresh()
         return config
 
     async def refresh(self) -> None:
@@ -195,7 +150,7 @@ class FileBackedDeviceConfigService(BaseComponent):
     ) -> AsyncIterator[DeviceConfig | None]:
         await self._scan_configs()
         async with self._state.subscribe(
-            lambda _version, _current: self._config_by_id.get(config_id)
+            lambda _version, _current: copy_config(self._config_by_id.get(config_id))
         ) as subscription:
             yield subscription.initial
             async for wakeup in subscription:
@@ -203,7 +158,9 @@ class FileBackedDeviceConfigService(BaseComponent):
                     continue
                 try:
                     yield await self._state.capture(
-                        lambda _version, _current: self._config_by_id.get(config_id)
+                        lambda _version, _current: copy_config(
+                            self._config_by_id.get(config_id)
+                        )
                     )
                 except anyio.ClosedResourceError:
                     return
@@ -211,65 +168,38 @@ class FileBackedDeviceConfigService(BaseComponent):
     async def _load_config(self, config_id: str) -> DeviceConfig | None:
         async with self._lock:
             if config_id in self._config_by_id:
-                return self._config_by_id[config_id]
-        await self._scan_configs()
+                return self._config_by_id[config_id].model_copy(deep=True)
+        if not self._has_snapshot:
+            await self._scan_configs()
         async with self._lock:
-            return self._config_by_id.get(config_id)
-
-    async def _cache_and_notify(self, path: Path, config: DeviceConfig) -> None:
-        async with self._lock:
-            old_config_id = self._path_to_config.get(path)
-            affected_config_ids = {config.id}
-            if old_config_id is not None and old_config_id != config.id:
-                affected_config_ids.add(old_config_id)
-                self._config_by_id.pop(old_config_id, None)
-            self._path_to_config[path] = config.id
-            self._config_by_id[config.id] = config
-            self._state.publish_locked(affected_config_ids)
+            return copy_config(self._config_by_id.get(config_id))
 
     async def _scan_configs(self) -> None:
-        """Scan config_dir for .yml files and update caches."""
-        # A failed read is not a deletion. Only a successful directory listing
-        # can establish that a previously validated file has been removed.
-        try:
-            paths = tuple(
-                path
-                for path in self._config_dir.iterdir()
-                if path.suffix in {".yml", ".yaml"}
-            )
-        except OSError:
-            self.source_available = False
-            logger.warning(
-                "Config source unavailable; retaining validated snapshots",
-                exc_info=True,
-            )
-            return
-        self.source_available = True
-        path_to_config: dict[Path, str] = {}
-        config_by_id: dict[str, DeviceConfig] = {}
-        for path in paths:
-            cfg = _load_config_file(path)
-            if cfg is None:
-                previous_id = self._path_to_config.get(path)
-                cfg = (
-                    self._config_by_id.get(previous_id)
-                    if previous_id is not None
-                    else None
+        async with self._scan_lock:
+            async with self._lock:
+                previous_paths = dict(self._path_to_config)
+                previous_configs = dict(self._config_by_id)
+            try:
+                paths, configs = await anyio.to_thread.run_sync(
+                    read_snapshot, self._config_dir, previous_paths, previous_configs
                 )
-            if cfg is not None:
-                path_to_config[path] = cfg.id
-                config_by_id[cfg.id] = cfg
-        async with self._lock:
-            affected_config_ids = {
-                config_id
-                for config_id in self._config_by_id.keys() | config_by_id.keys()
-                if self._config_by_id.get(config_id) != config_by_id.get(config_id)
-            }
-            self._path_to_config = path_to_config
-            self._config_by_id = config_by_id
-            self._has_snapshot = True
-            if affected_config_ids:
-                self._state.publish_locked(affected_config_ids)
+            except (OSError, ValueError):
+                self.source_available = False
+                logger.warning(
+                    "Config source invalid or unavailable; retaining validated snapshots",
+                    exc_info=True,
+                )
+                return
+            async with self._lock:
+                changed = {
+                    key
+                    for key in self._config_by_id.keys() | configs.keys()
+                    if self._config_by_id.get(key) != configs.get(key)
+                }
+                self._path_to_config, self._config_by_id = paths, configs
+                self._has_snapshot = self.source_available = True
+                if changed:
+                    self._state.publish_locked(changed)
 
     async def _watch_loop(self) -> None:
         """Background task: watch config_dir and emit to subscribers on changes."""

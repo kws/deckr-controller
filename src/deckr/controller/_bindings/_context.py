@@ -19,10 +19,10 @@ from deckr.controller._actions._gateway import (
     RemoteActionAdapter,
 )
 from deckr.controller._actions._requests import ActionRequestPort
-from deckr.controller._command_router import CommandRouter, DeviceOutput
-from deckr.controller._device_layout import ControlSurface
+from deckr.controller._device_layout import ControlLayout
 from deckr.controller._hardware import HardwareCommandService
 from deckr.controller._pages import DynamicPageSession
+from deckr.controller._presentation import DeviceOutput, PresentationController
 from deckr.controller._render import RenderService, RenderSource
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
@@ -39,6 +39,8 @@ class RuntimeMessageSender(Protocol):
         self,
         *,
         provider_session_key: ProviderSessionKey | None,
+        contract: ContractPointer | None,
+        causation_id: str | None = None,
         message_type: str,
         body: Any,
     ) -> bool: ...
@@ -91,8 +93,8 @@ class ControlContext:
         command_service: HardwareCommandService,
         provider_instance_id: str,
         provider_id: str,
-        action_uuid: str,
-        control: ControlSurface,
+        action_id: str,
+        control: ControlLayout,
         settings: Mapping[str, Any],
         internal: Mapping[str, Any],
         runtime_sender: RuntimeMessageSender,
@@ -116,7 +118,7 @@ class ControlContext:
         self.provider_id = provider_id
         self.provider_session_id = provider_session_id
         self.contract = contract
-        self.action_uuid = action_uuid
+        self.action_id = action_id
         self.action_instance_id = metadata.action_instance_id
         self.binding_id = metadata.binding_id
         self._context_id = metadata.context_id
@@ -146,7 +148,7 @@ class ControlContext:
             if control.raster_capability_id is not None
             else None
         )
-        self._router = CommandRouter(
+        self._router = PresentationController(
             store=self._store,
             render_service=RenderService(),
             render_dispatcher=render_dispatcher,
@@ -154,7 +156,7 @@ class ControlContext:
             image_format=control.image_format,
             start_soon=start_soon,
         )
-        from deckr.controller._bindings._rendering import rendering_support
+        from deckr.controller._bindings._render_policy import rendering_support
 
         self.rendering = rendering_support(self)
         self.controller_context = ControllerActionContext(
@@ -179,7 +181,7 @@ class ControlContext:
         )
 
     @property
-    def presentation(self) -> CommandRouter:
+    def presentation(self) -> PresentationController:
         return self._router
 
     def replace_settings(self, settings: Mapping[str, Any]) -> None:
@@ -232,6 +234,7 @@ class ControlContext:
         )
         sent = await self.runtime_sender.send_action_runtime_message(
             provider_session_key=provider_session_key,
+            contract=self.contract,
             message_type=message_type,
             body=body,
         )
@@ -242,7 +245,7 @@ class ControlContext:
             "control=%s action=%s provider=%s binding=%s message=%s",
             self.config_id,
             self.control.id,
-            self.action_uuid,
+            self.action_id,
             self.provider_instance_id,
             self.binding_id,
             message_type,
@@ -323,7 +326,7 @@ class ControlContext:
             provider_instance_id=self.provider_instance_id,
             provider_id=self.provider_id,
             provider_session_id=self.provider_session_id,
-            action_id=self.action_uuid,
+            action_id=self.action_id,
             action_instance_id=self.action_instance_id,
             command_type=command_type,
         )

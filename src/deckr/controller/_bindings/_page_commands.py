@@ -41,8 +41,8 @@ if TYPE_CHECKING:
     from deckr.controller._bindings._ports import BindingActionService
     from deckr.controller._hardware import HardwareCommandService
     from deckr.controller._pages._navigation import DeviceNavigation
-    from deckr.controller._session_boundary import SessionBoundary
     from deckr.controller._session_state import DeviceState
+    from deckr.controller._state_gate import StateGate
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,7 @@ class PageCommandPorts:
     hardware: HardwareCommandService
     actions: BindingActionService
     navigation: DeviceNavigation
-    boundary: SessionBoundary
+    boundary: StateGate
     state: DeviceState
     binding_by_id: Callable[[str], BindingLease | None]
     binding_command_authorized: Callable[[BindingLease], bool]
@@ -86,7 +86,7 @@ def _owner_from_binding(lease):
         context_id=lease.context_id,
         binding_id=lease.binding_id,
         control_id=lease.control_id,
-        action_uuid=lease.action_uuid,
+        action_id=lease.action_id,
         provider_instance_id=lease.provider_instance_id,
         provider_id=lease.provider_id,
         provider_session_id=lease.provider_session_id,
@@ -105,7 +105,7 @@ def _owner_from_session(session):
         context_id=session.context_id,
         binding_id=session.owner_binding_id,
         control_id=session.owner_control_id,
-        action_uuid=session.owner_action_uuid,
+        action_id=session.owner_action_id,
         provider_instance_id=session.owner_provider_instance_id,
         provider_id=session.owner_provider_id,
         provider_session_id=session.owner_provider_session_id,

@@ -77,7 +77,7 @@ def _control(**updates) -> ControlDescriptor:
 def _binding(selector: ControlSelector) -> ConfiguredControlBinding:
     return ConfiguredControlBinding(
         selector=selector,
-        action_uuid="action.clock",
+        action_id="action.clock",
         provider_instance_id=None,
         provider_labels={},
         settings={},
@@ -92,11 +92,7 @@ def _binding(selector: ControlSelector) -> ConfiguredControlBinding:
     ],
 )
 def test_geometry_selector_mismatch_and_missing_control_geometry(selector) -> None:
-    control = (
-        _control()
-        if selector.geometry.x == 2
-        else _control(geometry=None)
-    )
+    control = _control() if selector.geometry.x == 2 else _control(geometry=None)
 
     result = resolve_binding(_binding(selector), (control,))
 
@@ -129,9 +125,7 @@ def test_selector_mismatch_by_descriptor_field(field: str, value: str) -> None:
 def test_missing_generic_capability_requirement() -> None:
     result = resolve_binding(
         _binding(
-            ControlSelector(
-                capabilities=(CapabilitySelector(family="missing.family"),)
-            )
+            ControlSelector(capabilities=(CapabilitySelector(family="missing.family"),))
         ),
         (_control(),),
     )
@@ -144,9 +138,7 @@ def test_missing_generic_capability_requirement() -> None:
 def test_missing_bucket_specific_capability_requirement() -> None:
     result = resolve_binding(
         _binding(
-            ControlSelector(
-                output=(CapabilitySelector(family="missing.output"),)
-            )
+            ControlSelector(output=(CapabilitySelector(family="missing.output"),))
         ),
         (_control(),),
     )

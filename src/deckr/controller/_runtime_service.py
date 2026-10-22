@@ -27,20 +27,20 @@ from deckr.controller._config_document import (
     parse_controller_config,
 )
 from deckr.controller._controller_service import ControllerService
-from deckr.controller._render_dispatcher import (
-    ProcessPoolRenderBackend,
-    RenderBackend,
-    ThreadRenderBackend,
-)
 from deckr.controller._render_observation import (
     ObservingRenderBackend,
     RenderObservationOptions,
+)
+from deckr.controller._render_workers import (
+    ProcessPoolRenderBackend,
+    RenderBackend,
+    ThreadRenderBackend,
 )
 from deckr.controller._runtime_support import (
     build_config_service,
     build_settings_service,
 )
-from deckr.controller.action_provider.action_registry import ActionRegistry
+from deckr.controller.action_provider.builtin_registry import BuiltinActionRegistry
 from deckr.controller.config import materialized_config_bucket_policy
 
 
@@ -74,6 +74,7 @@ class ControllerRuntimeService(BaseComponent):
 
     async def start(self, ctx: RunContext) -> None:
         manager_started = False
+        unowned = []
         try:
             self._endpoint_cm = self._context.open_endpoint(
                 "controller",
@@ -94,7 +95,7 @@ class ControllerRuntimeService(BaseComponent):
 
             controller_service: ControllerService | None = None
 
-            action_registry = ActionRegistry(
+            action_registry = BuiltinActionRegistry(
                 controller_id=self._runtime.controller_id,
             )
             await self._component_manager.add_component(action_registry)
@@ -113,6 +114,7 @@ class ControllerRuntimeService(BaseComponent):
                 close_services_on_aclose=True,
                 start_soon=ctx.tg.start_soon,
             )
+            unowned.append(action_service.aclose)
             settings_service = build_settings_service(
                 self._runtime.config,
                 controller_id=self._runtime.controller_id,
@@ -124,6 +126,8 @@ class ControllerRuntimeService(BaseComponent):
                 controller_id=self._runtime.controller_id,
             )
 
+            if render_backend is not None:
+                unowned.append(render_backend.aclose)
             controller_service = ControllerService(
                 endpoint=self._endpoint,
                 hardware=self._context.hardware(self._endpoint),
@@ -135,17 +139,35 @@ class ControllerRuntimeService(BaseComponent):
                 render_backend=render_backend,
             )
             await self._component_manager.add_component(controller_service)
-        except BaseException:
+            unowned.clear()
+        except BaseException as failure:
+            errors = [failure]
             with anyio.CancelScope(shield=True):
+                closes = list(reversed(unowned))
                 if manager_started:
-                    await self._component_manager.stop()
-                await self._close_endpoint_context()
-            raise
+                    closes.insert(0, self._component_manager.stop)
+                closes.append(self._close_endpoint_context)
+                for close in closes:
+                    try:
+                        await close()
+                    except Exception as exc:
+                        errors.append(exc)
+            if len(errors) == 1:
+                raise
+            raise BaseExceptionGroup(
+                "Controller startup and cleanup failed", errors
+            ) from None
 
     async def stop(self) -> None:
+        errors = []
         with anyio.CancelScope(shield=True):
-            await self._component_manager.stop()
-            await self._close_endpoint_context()
+            for close in (self._component_manager.stop, self._close_endpoint_context):
+                try:
+                    await close()
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise ExceptionGroup("Controller runtime cleanup failed", errors)
 
     async def _close_endpoint_context(self) -> None:
         endpoint_cm = self._endpoint_cm

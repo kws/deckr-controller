@@ -5,10 +5,8 @@ import io
 import pytest
 from invariant import dump_graph_to_dict
 from PIL import Image
-from test_action_runtime_integration import running_controller
-from test_rendering_contract import parameters, real_backend, result_for
 
-from deckr.controller._bindings._rendering import DEFAULT_LIMITS
+from deckr.controller._bindings._render_policy import DEFAULT_LIMITS
 from deckr.controller._render_content import ContentFailure
 from deckr.controller._render_graph import (
     INVARIANT_FORMAT,
@@ -16,6 +14,8 @@ from deckr.controller._render_graph import (
     validate_graph,
 )
 from deckr.controller.invariant.recipes import icon_button, title_card
+from test_support.action_runtime import running_controller
+from test_support.rendering import parameters, real_backend, result_for
 
 
 def document():
@@ -108,3 +108,25 @@ def test_packed_text_recipe_renders_with_bounded_layout():
     node["op_name"] = "gfx:packed_text"
     node["params"] = {"text": "A favourite album", "font": "Inter", "size": [72, 72]}
     assert render_graph(wire, 72, 72, DEFAULT_LIMITS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [{"invalid": "document"}, None])
+async def test_invalid_graph_does_not_supersede_admitted_text(managed_substrate, data):
+    from test_support.managed_hardware import eventually
+    from test_support.rendering import GatedBackend
+
+    if data is None:
+        data = document()
+        data["graph"]["bg"]["params"]["size"] = ["${1 +}", 72]
+    async with running_controller(managed_substrate, with_output=True) as h:
+        backend = real_backend(h, GatedBackend())
+        old = await h.channel.send("binding_render", parameters(h, text="valid"))
+        await eventually(lambda: len(backend.started) == 1)
+        bad = parameters(h)
+        bad["content"] = {"format": INVARIANT_FORMAT, "data": data}
+        request = await h.channel.send("binding_render", bad)
+        result = await result_for(h, request)
+        assert (result["status"], result["code"]) == ("rejected", "invalid_content")
+        backend.gates[0].set()
+        assert (await result_for(h, old))["status"] == "dispatched"

@@ -125,5 +125,3 @@ bucket = "dev.deckr.controller.config.v1"
 
     with pytest.raises(ValueError, match="JetStream-safe underscore"):
         load_config_document(config_path)
-
-

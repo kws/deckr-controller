@@ -7,6 +7,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Check out repository
@@ -20,25 +24,29 @@ jobs:
       - name: Check out rendering reference
         run: |
           git clone --no-checkout https://github.com/kws/deckr.git ../deckr
-          git -C ../deckr checkout --detach "$(cat ../deckr-core-python/.deckr-spec-revision)"
+          git -C ../deckr checkout --detach "$(cat .deckr-rendering-spec-revision)"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
+
+      - name: Install rendering system library
+        run: sudo apt-get update && sudo apt-get install -y libcairo2
 
       - name: Run unit and managed integration tests
         run: |
           uv sync --locked --dev
           uv run ruff check .
+          uv run mypy
           uv run pytest --cov=src/deckr --cov-report=term-missing --cov-report=xml
           uv run python scripts/check_spec_conformance.py
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: coverage.xml
+          name: coverage-${{ matrix.python }}.xml
           path: coverage.xml

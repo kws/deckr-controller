@@ -12,9 +12,7 @@ from deckr.hardware.descriptors import (
 )
 
 from deckr.controller._actions._requests import OpenPage
-from deckr.controller._binding_planner import (
-    PagePlan,
-)
+from deckr.controller._binding_plan import PagePlan
 from deckr.controller._pages import (
     DynamicPageSession,
     PageOwnerBinding,
@@ -22,7 +20,6 @@ from deckr.controller._pages import (
     PageTransitionEffects,
     StaticPageRef,
 )
-from deckr.controller._session_boundary import SessionEvent
 from deckr.controller.config._data import DeviceConfig
 
 logger = logging.getLogger(__name__)
@@ -60,7 +57,7 @@ class DeviceNavigation:
             await self.page_expired(deadline, now=self.clock())
 
     async def page_expired(self, deadline, *, now: float) -> None:
-        async with self.boundary.event(SessionEvent("page_expired", deadline)):
+        async with self.boundary:
             session = self.state.navigation.accept_expiry(deadline, now=now)
             if session is not None:
                 await self._close_page_locked(
@@ -130,7 +127,6 @@ class DeviceNavigation:
             page_session=draft.page_session,
             page_session_generation=draft.page_session_generation,
             retained_plan=draft.retained_plan,
-            refresh_actions=draft.refresh_actions,
         )
         if (
             plan is None
@@ -260,7 +256,7 @@ class DeviceNavigation:
                     context_id=context_id,
                     binding_id=owner_lease.binding_id,
                     control_id=owner_lease.control_id,
-                    action_uuid=owner_lease.action_uuid,
+                    action_id=owner_lease.action_id,
                     provider_instance_id=owner_lease.provider_instance_id,
                     provider_id=owner_lease.provider_id,
                     provider_session_id=owner_lease.provider_session_id,
@@ -384,12 +380,11 @@ class DeviceNavigation:
     async def on_device_descriptor_changed(self, descriptor: DeviceDescriptor) -> None:
         """Re-resolve the active page against a changed device descriptor."""
 
-        async with self.boundary.event(SessionEvent("device_descriptor", descriptor)):
+        async with self.boundary:
             if self.state.stopped:
                 return
             self.state.device = descriptor
             draft = self.state.navigation.begin_refresh_current(
-                refresh_actions=False,
                 preserve_rebound_outputs=True,
             )
             if draft is None:
@@ -414,7 +409,13 @@ class DeviceNavigation:
 
     async def on_config_changed(self, config: DeviceConfig | None) -> None:
         """Handle config update or removal."""
-        async with self.boundary.event(SessionEvent("configuration", config)):
+        if config is not None:
+            try:
+                config = DeviceConfig.model_validate(config.model_dump(by_alias=True))
+            except ValueError:
+                logger.warning("Ignoring invalid configuration replacement")
+                return
+        async with self.boundary:
             if self.state.stopped:
                 return
             if config is None:

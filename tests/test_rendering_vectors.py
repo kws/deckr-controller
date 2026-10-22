@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 from deckr.actions.rendering import RenderContent, RenderLimits
 from PIL import Image
-from test_action_runtime_integration import running_controller
-from test_rendering_contract import (
+
+from deckr.controller._render_content import ContentFailure, render_content
+from test_support.action_runtime import running_controller
+from test_support.managed_hardware import eventually
+from test_support.rendering import (
     GatedBackend,
     drained,
     parameters,
@@ -17,18 +20,17 @@ from test_rendering_contract import (
     result_for,
 )
 
-from deckr.controller._render_content import ContentFailure, render_content
-from test_support.managed_hardware import eventually
-
 
 def cases(name):
     root = os.environ.get("DECKR_SPEC_ROOT")
     if root is None:
         return []
+    filename = {
+        "acceptance": "action-runtime-rendering",
+        "invariant": "ksi-invariant-rendering",
+    }.get(name, f"action-runtime-rendering-{name}")
     return json.loads(
-        (
-            Path(root) / f"contract/v1/vectors/action-runtime-rendering-{name}.v1.json"
-        ).read_text()
+        (Path(root) / f"contract/v1/vectors/{filename}.v1.json").read_text()
     )["cases"]
 
 
@@ -87,3 +89,43 @@ async def test_reference_ordering(managed_substrate, case):
         assert [
             call.args[0].message.message_id for call in h.commands.await_args_list
         ] == expected
+
+
+@pytest.mark.parametrize("case", cases("acceptance"), ids=lambda c: c["id"])
+def test_reference_render_acceptance(case):
+    from deckr.action_runtime import (
+        RenderCommandContext,
+        RenderRejection,
+        validate_render_command,
+    )
+    from deckr.contracts.messages import DeckrMessage
+
+    code = None
+    try:
+        validate_render_command(
+            DeckrMessage.from_wire(case["instance"]),
+            RenderCommandContext.from_wire(case["context"]),
+        )
+    except RenderRejection as exc:
+        code = exc.code
+    assert code == case["expectedCode"]
+
+
+@pytest.mark.parametrize("case", cases("invariant"), ids=lambda c: c["id"])
+def test_reference_invariant_extension(case):
+    from deckr.controller._render_graph import render_graph
+
+    code = None
+    try:
+        result = render_graph(
+            case["instance"],
+            case["width"],
+            case["height"],
+            RenderLimits.from_wire(case["limits"]),
+        )
+    except ContentFailure as exc:
+        code = exc.code
+    assert code == case["expectedCode"]
+    if code is None:
+        with Image.open(io.BytesIO(result)) as image:
+            assert image.size == (case["width"], case["height"])

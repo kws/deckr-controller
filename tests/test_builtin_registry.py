@@ -6,8 +6,8 @@ import anyio
 import pytest
 from deckr.components import RunContext
 
-from deckr.controller.action_provider.action_registry import ActionRegistry
 from deckr.controller.action_provider.builtin import BUILTIN_ACTION_PROVIDER_ID
+from deckr.controller.action_provider.builtin_registry import BuiltinActionRegistry
 
 CONTROLLER_ID = "controller-main"
 BUILTIN_ACTION_UUID = "dev.deckr.controller.builtin.action.go_to_page"
@@ -15,11 +15,11 @@ EXTERNAL_PROVIDER_INSTANCE_ID = "python-dev.deckr.clock"
 EXTERNAL_ACTION_UUID = "dev.deckr.clock.action.time"
 
 
-def _registry() -> ActionRegistry:
-    return ActionRegistry(controller_id=CONTROLLER_ID)
+def _registry() -> BuiltinActionRegistry:
+    return BuiltinActionRegistry(controller_id=CONTROLLER_ID)
 
 
-async def _start_registry(registry: ActionRegistry) -> None:
+async def _start_registry(registry: BuiltinActionRegistry) -> None:
     await registry.start(
         RunContext(
             tg=MagicMock(),
@@ -41,7 +41,11 @@ async def test_action_registry_loads_builtin_actions() -> None:
     assert descriptor is not None
     assert descriptor.requirements is not None
     assert descriptor.requirements[0].event_types == ()
-    assert [p.event_types for p in descriptor.requirements[0].preferences] == [("up",), ("press",), ("tap",)]
+    assert [p.event_types for p in descriptor.requirements[0].preferences] == [
+        ("up",),
+        ("press",),
+        ("tap",),
+    ]
 
 
 @pytest.mark.asyncio

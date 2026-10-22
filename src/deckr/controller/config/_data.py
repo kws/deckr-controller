@@ -133,8 +133,8 @@ class Page(_ConfigModel):
 
 
 class Profile(_ConfigModel):
-    name: str
-    pages: list[Page]
+    name: str = Field(min_length=1)
+    pages: list[Page] = Field(min_length=1)
     widget_timeout_ms: int | None = None
 
 
@@ -149,10 +149,13 @@ class DeviceConfig(_ConfigModel):
     match: DeviceConfigMatch
     enabled: bool = True
     provider_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    profiles: list[Profile]
+    profiles: list[Profile] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _validate_control_ids(self) -> "DeviceConfig":
+        names = [profile.name for profile in self.profiles]
+        if len(set(names)) != len(names):
+            raise ValueError("profile names must be unique within a device config")
         seen: dict[str, str] = {}
         duplicates: set[str] = set()
         for profile in self.profiles:

@@ -99,7 +99,9 @@ async def test_successor_revalidates_configuration_match(changed, managed_substr
             labels = {"room": "office"}
             h.manager.labels = labels
             await h.manager.set_device(descriptor)
-            await eventually(lambda: h.service.snapshot().candidates[0].labels == labels)
+            await eventually(
+                lambda: h.service.snapshot().candidates[0].labels == labels
+            )
             await h.service.reconcile(reason="labels refreshed")
             # Discovery metadata alone must not revoke the current agreement.
             assert h.service.route_for_config("config-a") == original
@@ -107,7 +109,8 @@ async def test_successor_revalidates_configuration_match(changed, managed_substr
 
         await eventually(
             lambda: any(
-                owned.state.local_authority and owned.state.contract != original.contract
+                owned.state.local_authority
+                and owned.state.contract != original.contract
                 for owned in h.service.snapshot().owned_claims
             )
         )

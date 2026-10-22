@@ -1,21 +1,24 @@
-"""Targeted tests for CommandRouter routing and DeviceOutput."""
+"""Targeted tests for PresentationController routing and DeviceOutput."""
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 
-from deckr.controller._command_router import (
-    CommandRouter,
+from deckr.controller._presentation import (
     DeviceOutput,
+    PresentationController,
 )
-from deckr.controller._device_layout import RasterImageFormat
+from deckr.controller._raster import RasterFormat
 from deckr.controller._render import RenderService
 from deckr.controller._render_dispatcher import RenderDispatcher
 from deckr.controller._state_store import ControlStateStore
 
 
 class FakeHardwareCommandService:
+    def claim_identity(self, config_id):
+        return None
+
     def __init__(self):
         self.set_raster_frame = AsyncMock()
         self.clear_raster = AsyncMock()
@@ -39,12 +42,12 @@ def _make_output(
 # --- DeviceOutput: last_frame tracking ---
 
 
-# --- CommandRouter content updates ---
+# --- PresentationController content updates ---
 
 
 @pytest_asyncio.fixture
 def router_with_mocks():
-    """CommandRouter with mock dispatcher and render service."""
+    """PresentationController with mock dispatcher and render service."""
     store = ControlStateStore(context_id="dev.slot0")
     store.settings = {}
 
@@ -54,12 +57,12 @@ def router_with_mocks():
     render_dispatcher.submit_request = AsyncMock()
 
     output = _make_output()
-    image_format = RasterImageFormat(width=72, height=72)
+    image_format = RasterFormat(width=72, height=72)
 
     def no_start_soon(*args, **kwargs):
         pass  # don't run overlay expiry in tests
 
-    router = CommandRouter(
+    router = PresentationController(
         store=store,
         render_service=render_service,
         render_dispatcher=render_dispatcher,
@@ -82,7 +85,7 @@ async def test_render_no_op_when_image_format_none():
     render_dispatcher.submit_request = AsyncMock()
     command_service = FakeHardwareCommandService()
     output = _make_output("B1", command_service=command_service)
-    router = CommandRouter(
+    router = PresentationController(
         store=store,
         render_service=render_service,
         render_dispatcher=render_dispatcher,
@@ -141,12 +144,12 @@ async def test_binding_overlay_unknown_template_uses_unknown_fallback():
     render_dispatcher.submit_request = AsyncMock()
     started = []
 
-    router = CommandRouter(
+    router = PresentationController(
         store=store,
         render_service=render_service,
         render_dispatcher=render_dispatcher,
         output=_make_output(),
-        image_format=RasterImageFormat(width=72, height=72),
+        image_format=RasterFormat(width=72, height=72),
         start_soon=lambda func, *args: started.append((func, args)),
     )
 
@@ -162,7 +165,7 @@ async def test_binding_overlay_unknown_template_uses_unknown_fallback():
 
     assert store.overlay is not None
     assert store.overlay.template == "unknown"
-    assert started[0][1][-1] == 2.0
+    assert started[0][1][-2] == 2.0
 
 
 @pytest.mark.asyncio
@@ -174,12 +177,12 @@ async def test_pending_overlay_is_persistent_until_replaced_or_cleared():
     render_dispatcher.submit_request = AsyncMock()
     started = []
 
-    router = CommandRouter(
+    router = PresentationController(
         store=store,
         render_service=render_service,
         render_dispatcher=render_dispatcher,
         output=_make_output(),
-        image_format=RasterImageFormat(width=72, height=72),
+        image_format=RasterFormat(width=72, height=72),
         start_soon=lambda func, *args: started.append((func, args)),
     )
 
@@ -292,9 +295,9 @@ def test_command_router_does_not_expose_settings_writer():
     render_dispatcher = MagicMock(spec=RenderDispatcher)
     render_dispatcher.submit_request = AsyncMock()
     output = _make_output()
-    image_format = RasterImageFormat(width=72, height=72)
+    image_format = RasterFormat(width=72, height=72)
 
-    router = CommandRouter(
+    router = PresentationController(
         store=store,
         render_service=render_service,
         render_dispatcher=render_dispatcher,

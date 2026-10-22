@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from deckr.actions.messages import ActionMessageBody
+    from deckr.actions.rendering import BindingRenderResultBody
     from deckr.contracts.authority import ContractPointer
     from deckr.contracts.messages import DeckrMessage
 
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
         ProviderSessionKey,
         SettingsActionMetadata,
     )
+    from deckr.controller._actions._routing import ActionRuntimeCommand
 
 
 class LifecycleAvailabilityRecorder(Protocol):
@@ -29,7 +32,7 @@ class LifecycleAvailabilityRecorder(Protocol):
         *,
         provider_instance_id: str,
         provider_id: str,
-        action_uuid: str,
+        action_id: str,
         provider_session_id: str | None = None,
         reason: str | None = None,
         intent: ActionIntentKey | None = None,
@@ -50,7 +53,7 @@ class BindingActionService(LifecycleAvailabilityRecorder, Protocol):
 
     def settings_action_metadata(
         self,
-        action_uuid: str,
+        action_id: str,
         *,
         provider_instance_id: str | None = None,
         provider_id: str | None = None,
@@ -63,25 +66,40 @@ class BindingActionService(LifecycleAvailabilityRecorder, Protocol):
         provider_session_key: ProviderSessionKey | None,
     ) -> ContractPointer | None: ...
 
-    async def authorize_runtime_message(
-        self, key: ProviderSessionKey | None, message: DeckrMessage
-    ) -> bool: ...
+    async def decode_inbound_runtime_message(
+        self, message: DeckrMessage
+    ) -> ActionRuntimeCommand | None: ...
 
-    async def authorize_decoded_message(
-        self, key: ProviderSessionKey | None, message: DeckrMessage
+    async def authorize_runtime_message(
+        self,
+        key: ProviderSessionKey | None,
+        message: DeckrMessage,
+        *,
+        validate_payload: bool = True,
     ) -> bool: ...
 
     async def send_runtime_message(
         self,
         provider_session_key: ProviderSessionKey,
         message_type: str,
-        body: Any,
+        body: ActionMessageBody,
+        *,
+        contract: ContractPointer | None,
+        causation_id: str | None = None,
     ) -> bool: ...
 
     async def ensure_local_builtin_availability(
         self,
         intents: Iterable[ActionIntentKey],
-    ) -> frozenset[ProviderActionKey]: ...
+    ) -> None: ...
+
+    async def render_message_key(
+        self, message: DeckrMessage
+    ) -> ProviderSessionKey | None: ...
+
+    async def send_render_result(
+        self, message: DeckrMessage, body: BindingRenderResultBody
+    ) -> bool: ...
 
     def record_for_key(
         self,

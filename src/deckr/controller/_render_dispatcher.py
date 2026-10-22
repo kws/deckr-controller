@@ -1,28 +1,23 @@
-"""Async render backends and per-device render dispatch with stale-result dropping."""
+"""Per-device output revisions, coalescing and authorized hardware handoff."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
-import signal
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import anyio
-import httpx
 
-from deckr.controller._render import (
-    RenderRequest,
-    RenderResult,
-    render_request_to_frame,
-)
+from deckr.controller._render import RenderRequest, RenderResult
+from deckr.controller._render_workers import RenderBackend, render_with_retry
+from deckr.controller._state_gate import StateGate
 
 if TYPE_CHECKING:
     from deckr.controller._hardware import HardwareCommandService
+logger = logging.getLogger(__name__)
+MAX_ACTIVE_RENDERS_PER_CONTROL = 2
 
 
 class ControlOutput(Protocol):
@@ -35,188 +30,6 @@ class ControlOutput(Protocol):
     async def clear_tagged(self, message_id: str) -> None: ...
 
 
-logger = logging.getLogger(__name__)
-MAX_ACTIVE_RENDERS_PER_CONTROL = 2
-RENDER_TIMEOUT_SECONDS = 2.0
-
-
-async def render_with_retry(
-    backend, request, *, is_current, timeout=RENDER_TIMEOUT_SECONDS
-):
-    """Retry pure worker work once; never retry a hardware send or action input."""
-    with anyio.fail_after(timeout):
-        for attempt in range(2):
-            if not is_current():
-                return None
-            try:
-                result = await backend.render(request)
-            except Exception:
-                if attempt:
-                    raise
-            else:
-                if not result.error or attempt:
-                    return result
-            await anyio.sleep(0)
-    return None
-
-
-def _init_render_worker() -> None:
-    """Let the parent process own Ctrl-C handling for render workers.
-
-    Without this, ProcessPoolExecutor workers inherit the terminal's SIGINT and can
-    emit noisy KeyboardInterrupt tracebacks while the controller is already shutting
-    down gracefully.
-    """
-
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-
-class RenderWorkerImageFetchError(Exception):
-    """Pickle-safe wrapper for image fetch failures raised inside render workers."""
-
-
-def default_render_workers() -> int:
-    """Default process-pool size for render workers."""
-
-    cpu_count = os.cpu_count() or 1
-    return min(4, max(1, cpu_count - 1))
-
-
-class RenderBackend(Protocol):
-    """Async backend that turns a RenderRequest into a RenderResult."""
-
-    async def render(self, request: RenderRequest) -> RenderResult: ...
-
-    async def aclose(self) -> None: ...
-
-
-class ThreadRenderBackend:
-    """Same-process backend that still renders off the event loop."""
-
-    async def render(self, request: RenderRequest) -> RenderResult:
-        try:
-            frame = await anyio.to_thread.run_sync(render_request_to_frame, request)
-            return RenderResult(
-                context_id=request.context_id,
-                binding_id=request.binding_id,
-                control_id=request.control_id,
-                generation=request.generation,
-                frame=frame,
-            )
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "Thread render skipped after image fetch failed for %s:%s gen=%s: %s",
-                request.context_id,
-                request.control_id,
-                request.generation,
-                exc,
-            )
-            return RenderResult(
-                context_id=request.context_id,
-                binding_id=request.binding_id,
-                control_id=request.control_id,
-                generation=request.generation,
-                frame=None,
-                error=str(exc),
-            )
-        except Exception as exc:
-            logger.exception(
-                "Thread render failed for %s:%s gen=%s",
-                request.context_id,
-                request.control_id,
-                request.generation,
-            )
-            return RenderResult(
-                context_id=request.context_id,
-                binding_id=request.binding_id,
-                control_id=request.control_id,
-                generation=request.generation,
-                frame=None,
-                error=str(exc),
-            )
-
-    async def aclose(self) -> None:
-        return
-
-
-class ProcessPoolRenderBackend:
-    """Multiprocess render backend using ProcessPoolExecutor."""
-
-    def __init__(self, *, max_workers: int | None = None):
-        self._executor = ProcessPoolExecutor(
-            max_workers=max_workers or default_render_workers(),
-            initializer=_init_render_worker,
-        )
-
-    async def render(self, request: RenderRequest) -> RenderResult:
-        try:
-            frame = await _run_in_process_pool(self._executor, request)
-            return RenderResult(
-                context_id=request.context_id,
-                binding_id=request.binding_id,
-                control_id=request.control_id,
-                generation=request.generation,
-                frame=frame,
-            )
-        except (httpx.HTTPError, RenderWorkerImageFetchError) as exc:
-            logger.warning(
-                "Process render skipped after image fetch failed for %s:%s gen=%s: %s",
-                request.context_id,
-                request.control_id,
-                request.generation,
-                exc,
-            )
-            return RenderResult(
-                context_id=request.context_id,
-                binding_id=request.binding_id,
-                control_id=request.control_id,
-                generation=request.generation,
-                frame=None,
-                error=str(exc),
-            )
-        except Exception as exc:
-            logger.exception(
-                "Process render failed for %s:%s gen=%s",
-                request.context_id,
-                request.control_id,
-                request.generation,
-            )
-            return RenderResult(
-                context_id=request.context_id,
-                binding_id=request.binding_id,
-                control_id=request.control_id,
-                generation=request.generation,
-                frame=None,
-                error=str(exc),
-            )
-
-    async def aclose(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=True)
-
-
-async def _run_in_process_pool(
-    executor: ProcessPoolExecutor,
-    request: RenderRequest,
-) -> bytes:
-    """Bridge to ProcessPoolExecutor while preserving worker initialization.
-
-    AnyIO's process helper does not expose per-worker initializers, and the render
-    backend needs `_init_render_worker()` so child processes ignore Ctrl-C.
-    """
-
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        executor, _render_request_to_frame_worker, request
-    )
-
-
-def _render_request_to_frame_worker(request: RenderRequest) -> bytes:
-    try:
-        return render_request_to_frame(request)
-    except httpx.HTTPError as exc:
-        raise RenderWorkerImageFetchError(str(exc)) from None
-
-
 @dataclass(slots=True)
 class _ControlRenderState:
     generation: int = 0
@@ -226,7 +39,8 @@ class _ControlRenderState:
     output: ControlOutput | None = None
     active_render_count: int = 0
     pending_request: RenderRequest | None = None
-    io_lock: anyio.Lock = field(default_factory=anyio.Lock)
+    io_lock: StateGate = field(default_factory=StateGate)
+    scopes: set[anyio.CancelScope] = field(default_factory=set)
 
 
 class RenderTicket(NamedTuple):
@@ -255,7 +69,7 @@ class RenderDispatcher:
         self._start_soon = start_soon
         self._result_authorizer = result_authorizer
         self._completion_transaction = completion_transaction
-        self._lock = anyio.Lock()
+        self._lock = StateGate()
         self._controls: dict[str, _ControlRenderState] = {}
         self._pending_clears: dict[str, int] = {}
         self._clearing: set[str] = set()
@@ -282,6 +96,8 @@ class RenderDispatcher:
             state.binding_id = binding_id
             state.output = output
             state.pending_request = None
+            for scope in tuple(state.scopes):
+                scope.cancel()
             return RenderTicket(control_id, context_id, binding_id, state.base_revision)
 
     def base_is_current(self, ticket):
@@ -360,6 +176,9 @@ class RenderDispatcher:
 
         async with self._lock:
             state = self._controls.setdefault(control_id, _ControlRenderState())
+            if state.binding_id != binding_id or state.context_id != context_id:
+                for scope in tuple(state.scopes):
+                    scope.cancel()
             if base_update:
                 state.base_revision += 1
             state.generation += 1
@@ -445,6 +264,8 @@ class RenderDispatcher:
             if output is not None:
                 state.output = output
             state.pending_request = None
+            for scope in tuple(state.scopes):
+                scope.cancel()
 
         logger.debug(
             "Render dispatcher clear queued config=%s control=%s binding=%s "
@@ -493,34 +314,36 @@ class RenderDispatcher:
             self._clearing.discard(control_id)
 
     async def _run_control(self, control_id: str, request: RenderRequest) -> None:
+        state = self._controls[control_id]
         current = request
-        while True:
-            try:
-
-                def is_current(current=current):
-                    state = self._controls.get(control_id)
-                    return state is not None and state.generation == current.generation
-
-                result = await render_with_retry(
-                    self._backend, current, is_current=is_current
-                )
-                if result is not None:
-                    await self._apply_result(result)
-            except Exception:
-                logger.warning(
-                    "Render or output failed for %s", control_id, exc_info=True
-                )
-
-            async with self._lock:
-                state = self._controls.get(control_id)
-                if state is None:
-                    return
-                next_request = state.pending_request
-                if next_request is None:
+        try:
+            while True:
+                with anyio.CancelScope() as scope:
+                    state.scopes.add(scope)
+                    try:
+                        result = await render_with_retry(
+                            self._backend,
+                            current,
+                            is_current=lambda current=current: state.generation
+                            == current.generation,
+                        )
+                        if result is not None:
+                            await self._apply_result(result)
+                    except Exception:
+                        logger.warning(
+                            "Render or output failed for %s", control_id, exc_info=True
+                        )
+                    finally:
+                        state.scopes.discard(scope)
+                async with self._lock:
+                    current = state.pending_request
+                    state.pending_request = None
+                    if current is None:
+                        return
+        finally:
+            with anyio.CancelScope(shield=True):
+                async with self._lock:
                     state.active_render_count = max(0, state.active_render_count - 1)
-                    return
-                state.pending_request = None
-            current = next_request
 
     async def _apply_result(self, result: RenderResult) -> None:
         async with self._lock:

@@ -23,17 +23,14 @@ class EventTranslator:
 
     def __init__(
         self,
-        controller_id: str,
         *,
         is_gesture_supported: Callable[[str, str], bool] | None = None,
     ):
-        del controller_id
         self._is_gesture_supported = is_gesture_supported or (lambda _s, _g: True)
 
     def translate(
-        self, event: hw_messages.HardwareMessageBody, config_id: str
+        self, event: hw_messages.HardwareMessageBody
     ) -> TranslatedEvent | None:
-        del config_id
         if not isinstance(event, hw_messages.ControlInputMessage):
             return None
         if not self._is_gesture_supported(event.control_id, event.event_type):

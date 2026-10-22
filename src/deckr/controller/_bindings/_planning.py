@@ -9,14 +9,14 @@ from deckr.controller._actions import (
     ActionPlanningSnapshot,
     ProviderActionKey,
 )
-from deckr.controller._binding_planner import (
+from deckr.controller._binding_plan import (
     BindingPlanStatus,
     PagePlan,
     format_validation_summary,
 )
 from deckr.controller._pages import (
     DynamicPageSession,
-    PageStackEntry,
+    PageRef,
     StaticPageRef,
 )
 
@@ -46,7 +46,7 @@ class PagePlanning:
             exact_keys.add(
                 ProviderActionKey(
                     planned.action_meta.provider_instance_id,
-                    planned.action_meta.uuid,
+                    planned.action_meta.action_id,
                 )
             )
         if changed_keys & exact_keys:
@@ -67,7 +67,7 @@ class PagePlanning:
         key: ProviderActionKey,
         intent: ActionIntentKey,
     ) -> bool:
-        if key.action_uuid != intent.action_uuid:
+        if key.action_id != intent.action_id:
             return False
         if intent.provider_instance_id is not None:
             return key.provider_instance_id == intent.provider_instance_id
@@ -82,21 +82,17 @@ class PagePlanning:
     async def _action_metadata_snapshot_for_plan(
         self,
         intents: tuple[ActionIntentKey, ...],
-        *,
-        refresh_actions: bool,
     ) -> ActionPlanningSnapshot:
         snapshot = self.catalog.planning_snapshot(
             intents,
             existing_provider_keys=self._existing_provider_action_keys(),
             now=self.clock(),
         )
-        if not refresh_actions:
-            return snapshot
         return snapshot
 
     def _existing_provider_action_keys(self) -> frozenset[ProviderActionKey]:
         return frozenset(
-            ProviderActionKey(lease.provider_instance_id, lease.action_uuid)
+            ProviderActionKey(lease.provider_instance_id, lease.action_id)
             for lease in self.state.attachments.binding_leases.values()
         )
 
@@ -114,7 +110,7 @@ class PagePlanning:
                 err.code,
                 err.message,
                 err.control_ref,
-                err.action_uuid,
+                err.action_id,
                 err.details,
             )
 
@@ -132,7 +128,7 @@ class PagePlanning:
                 err.code,
                 err.message,
                 err.control_ref,
-                err.action_uuid,
+                err.action_id,
                 err.details,
             )
 
@@ -141,12 +137,14 @@ class PagePlanning:
         entry: StaticPageRef,
         *,
         retained_plan: PagePlan | None = None,
-        refresh_actions: bool = True,
     ) -> PagePlan | None:
-        bindings = self.state.navigation.resolve_static_bindings(entry)
+        try:
+            bindings = self.state.navigation.resolve_static_bindings(entry)
+        except ValueError:
+            logger.warning("Invalid configured page reference: %s", entry)
+            return None
         action_metadata = await self._action_metadata_snapshot_for_plan(
             self.planner.static_action_intents(bindings),
-            refresh_actions=refresh_actions,
         )
         action_status = self._binding_plan_status(action_metadata)
         result = self.planner.build_static_page_plan(
@@ -168,15 +166,13 @@ class PagePlanning:
         page_session: DynamicPageSession,
         page_session_generation: int | None = None,
         retained_plan: PagePlan | None = None,
-        refresh_actions: bool = True,
     ) -> PagePlan | None:
         action_metadata = await self._action_metadata_snapshot_for_plan(
             self.planner.dynamic_action_intents(
                 entry.bindings,
-                owner_action_uuid=page_session.owner_action_uuid,
+                owner_action_id=page_session.owner_action_id,
                 owner_provider_instance_id=page_session.owner_provider_instance_id,
             ),
-            refresh_actions=refresh_actions,
         )
         action_status = self._binding_plan_status(action_metadata)
         result = self.planner.build_dynamic_page_plan(
@@ -194,18 +190,16 @@ class PagePlanning:
 
     async def _build_page_plan(
         self,
-        entry: PageStackEntry,
+        entry: PageRef,
         *,
         page_session: DynamicPageSession | None = None,
         page_session_generation: int | None = None,
         retained_plan: PagePlan | None = None,
-        refresh_actions: bool = True,
     ) -> PagePlan | None:
         if isinstance(entry, StaticPageRef):
             return await self._build_static_page_plan(
                 entry,
                 retained_plan=retained_plan,
-                refresh_actions=refresh_actions,
             )
         if page_session is None:
             logger.error("Dynamic page planning missing page session")
@@ -215,7 +209,6 @@ class PagePlanning:
             page_session=page_session,
             page_session_generation=page_session_generation,
             retained_plan=retained_plan,
-            refresh_actions=refresh_actions,
         )
 
     def _binding_plan_status(

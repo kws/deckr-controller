@@ -24,7 +24,7 @@ class ConfiguredControlBinding:
     """A static-page action binding before descriptor selector resolution."""
 
     selector: ControlSelector
-    action_uuid: str
+    action_id: str
     provider_instance_id: str | None
     provider_labels: Mapping[str, str]
     settings: Mapping[str, Any]
@@ -42,7 +42,7 @@ class ResolvedControlBinding:
     """A binding resolved to one descriptor control and selected capabilities."""
 
     control: ControlDescriptor
-    action_uuid: str
+    action_id: str
     provider_instance_id: str | None
     provider_labels: Mapping[str, str]
     settings: Mapping[str, Any]
@@ -118,7 +118,7 @@ def resolve_binding(
     return SelectorResolution(
         binding=ResolvedControlBinding(
             control=control,
-            action_uuid=binding.action_uuid,
+            action_id=binding.action_id,
             provider_instance_id=binding.provider_instance_id,
             provider_labels=binding.provider_labels,
             settings=binding.settings,
@@ -163,7 +163,7 @@ def resolve_binding(
 def exact_control_binding(
     *,
     control_id: str,
-    action_uuid: str,
+    action_id: str,
     provider_instance_id: str | None = None,
     provider_labels: Mapping[str, str] | None = None,
     settings: Mapping[str, Any],
@@ -172,7 +172,7 @@ def exact_control_binding(
 
     return ConfiguredControlBinding(
         selector=ControlSelector(control_id=control_id),
-        action_uuid=action_uuid,
+        action_id=action_id,
         provider_instance_id=provider_instance_id,
         provider_labels=dict(provider_labels or {}),
         settings=settings,
