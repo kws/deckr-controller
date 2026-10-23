@@ -51,11 +51,17 @@ async def test_page_targets_generations_and_lifecycle_over_managed_services(
         await eventually(lambda: len(notifications(h, "page_session_opened")) == 1)
         session = h.device.active_page_session()
         opened_event = next(
-            r.message for r in h.received
+            r.message
+            for r in h.received
             if r.authorization.body.name == "page_session_opened"
         )
         assert opened_event.causation_id == opening.message_id
         assert opened_event.contract == opening.contract
+        children = notifications(h, "page_session_opened")[0]["pageSession"]["bindings"]
+        assert len(children) == 1
+        assert children[0]["controlRef"]["controlId"] == "key-1"
+        attached = notifications(h, "binding_attached")[-1]["binding"]
+        assert children[0]["bindingId"] == attached["bindingId"]
         assert session.generation == 0
         assert len(notifications(h, "page_session_opened")) == 1
         assert (
@@ -71,18 +77,29 @@ async def test_page_targets_generations_and_lifecycle_over_managed_services(
         )
         await eventually(lambda: len(notifications(h, "page_session_opened")) == 2)
         opened_events = [
-            r.message for r in h.received
+            r.message
+            for r in h.received
             if r.authorization.body.name == "page_session_opened"
         ]
         assert opened_events[-1].causation_id == replacing.message_id
         assert session.generation == 1
+        replaced = notifications(h, "page_session_opened")[-1]["pageSession"][
+            "bindings"
+        ]
+        assert len(replaced) == 1
+        assert replaced[0]["bindingId"] != children[0]["bindingId"]
+        assert (
+            replaced[0]["bindingId"]
+            == notifications(h, "binding_attached")[-1]["binding"]["bindingId"]
+        )
         await h.channel.send("close_page", {"target": target})
         closing = await h.channel.send(
             "close_page", {"target": {**target, "generation": 1}}
         )
         await eventually(lambda: len(notifications(h, "page_session_closed")) == 1)
         closed_event = next(
-            r.message for r in h.received
+            r.message
+            for r in h.received
             if r.authorization.body.name == "page_session_closed"
         )
         assert closed_event.causation_id == closing.message_id

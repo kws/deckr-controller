@@ -2,11 +2,14 @@
 
 import base64
 import io
+import threading
+from unittest.mock import AsyncMock
 
 import anyio
 import pytest
 from PIL import Image
 
+from deckr.controller import _render_workers as workers
 from deckr.controller._bindings._render_policy import DEFAULT_LIMITS
 from test_support.action_runtime import notifications, running_controller
 from test_support.managed_hardware import eventually
@@ -18,6 +21,110 @@ from test_support.rendering import (
     real_backend,
     result_for,
 )
+
+
+@pytest.mark.asyncio
+async def test_startup_burst_waits_for_shared_workers_without_losing_frames(
+    managed_substrate, monkeypatch
+):
+    slots = threading.BoundedSemaphore(8)
+    monkeypatch.setattr(workers, "_THREAD_SLOTS", slots)
+    async with running_controller(
+        managed_substrate, with_output=True, control_count=14
+    ) as h:
+        real_backend(h)
+        h.commands.reset_mock()
+        for _ in range(8):
+            slots.acquire()
+        try:
+            requests = [
+                await h.channel.send(
+                    "binding_render", parameters(h, control_id=f"key-{i}")
+                )
+                for i in range(1, 15)
+            ]
+            rendering = h.device.components.rendering
+            await eventually(lambda: len(rendering.jobs) == 14)
+            assert all(not job.done for job in rendering.jobs.values())
+            assert not notifications(h, "binding_render_result")
+            h.commands.assert_not_awaited()
+        finally:
+            for _ in range(8):
+                slots.release()
+        for request in requests:
+            assert (await result_for(h, request))["status"] == "dispatched"
+        await drained(h)
+        assert h.commands.await_count == 14
+        commands = [call.args[0].message for call in h.commands.await_args_list]
+        assert {c.body["controlId"] for c in commands} == {
+            f"key-{i}" for i in range(1, 15)
+        }
+        for command in commands:
+            assert command.body["commandType"] == "set_frame"
+            with Image.open(
+                io.BytesIO(base64.b64decode(command.body["params"]["image"]))
+            ) as image:
+                assert image.size == (72, 72)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["deadline", "retire"])
+async def test_queued_render_is_bounded_and_cannot_dispatch_after_expiry_or_retirement(
+    managed_substrate, monkeypatch, stop
+):
+    import deckr.controller._bindings._render_policy as policy
+    import deckr.controller._bindings._rendering as rendering
+
+    admission = threading.BoundedSemaphore(2)
+    execution = anyio.Semaphore(1)
+    monkeypatch.setattr(rendering, "_ADMISSION_SLOTS", admission)
+    monkeypatch.setattr(rendering, "_WORKERS", execution)
+    if stop == "deadline":
+        monkeypatch.setattr(
+            policy, "DEFAULT_LIMITS",
+            DEFAULT_LIMITS.model_copy(update={"max_render_time_ms": 300}),
+        )
+    async with running_controller(
+        managed_substrate, with_output=True, control_count=3
+    ) as h:
+        backend = real_backend(h)
+        observe = AsyncMock(wraps=backend.render)
+        monkeypatch.setattr(backend, "render", observe)
+        h.commands.reset_mock()
+        await execution.acquire()
+        try:
+            first = await h.channel.send("binding_render", parameters(h))
+            queued = await h.channel.send(
+                "binding_render", parameters(h, control_id="key-2")
+            )
+            await eventually(lambda: execution.statistics().tasks_waiting == 2)
+            refused = await h.channel.send(
+                "binding_render", parameters(h, control_id="key-3")
+            )
+            assert (await result_for(h, refused))["code"] == "busy"
+            if stop == "retire":
+                binding = h.device.context_for_control("key-2").metadata.binding_id
+                await h.device.components.rendering.retire_binding(binding)
+            result = await result_for(h, queued)
+            assert result["code"] == (
+                "deadline_exceeded" if stop == "deadline" else "target_not_current"
+            )
+            observe.assert_not_awaited()
+            await eventually(
+                lambda: execution.statistics().tasks_waiting
+                == (0 if stop == "deadline" else 1)
+            )
+        finally:
+            execution.release()
+        await result_for(h, first)
+        await eventually(lambda: not any(h.device.components.rendering.active.values()))
+        assert observe.await_count == (1 if stop == "retire" else 0)
+        assert h.commands.await_count == (1 if stop == "retire" else 0)
+        assert admission.acquire(blocking=False)
+        assert admission.acquire(blocking=False)
+        assert not admission.acquire(blocking=False)
+        admission.release()
+        admission.release()
 
 
 @pytest.mark.asyncio

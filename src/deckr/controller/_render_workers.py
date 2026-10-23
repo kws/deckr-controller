@@ -2,71 +2,102 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import contextvars
 import logging
 import os
 import signal
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
 
 import anyio
 import anyio.to_process
 import httpx
 
+from deckr.controller._raster import RasterFormat
 from deckr.controller._render import (
+    RenderModel,
     RenderRequest,
     RenderResult,
+    RenderService,
     render_request_to_frame,
 )
 
 logger = logging.getLogger(__name__)
 RENDER_TIMEOUT_SECONDS = 2.0
-# Admission is nonblocking and includes work awaiting process/thread capacity.
+# Execution stays bounded, including abandoned threads that have not exited.
+# Callers bound waiting work per control and cancel it at the render deadline.
 _PROCESS_SLOTS = threading.BoundedSemaphore(8)
 _THREAD_SLOTS = threading.BoundedSemaphore(8)
+_THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="deckr-render")
 
 
-class RenderBusy(RuntimeError):
-    """No bounded execution capacity is available."""
+async def _acquire_slot(slots):
+    # A thread may release capacity after its owner has been cancelled. Keep the
+    # semaphore process-wide without blocking the event loop or consuming another
+    # worker thread just to wait. Check cancellation before claiming capacity.
+    await anyio.lowlevel.checkpoint()
+    while not slots.acquire(blocking=False):
+        await anyio.sleep(0.005)
 
 
 async def run_process(function, *args, limiter=None):
-    if not _PROCESS_SLOTS.acquire(blocking=False):
-        raise RenderBusy("render workers busy")
+    slots = _PROCESS_SLOTS
+    await _acquire_slot(slots)
     try:
         return await anyio.to_process.run_sync(
             function, *args, cancellable=True, limiter=limiter
         )
     finally:
-        _PROCESS_SLOTS.release()
+        slots.release()
 
 
 async def run_thread(function, *args, slots=None):
     slots = slots if slots is not None else _THREAD_SLOTS
-    if not slots.acquire(blocking=False):
-        raise RenderBusy("render workers busy")
-    started = False
-    abandoned = False
-    lock = threading.Lock()
-
-    def invoke():
-        nonlocal started
-        with lock:
-            if abandoned:
-                return None
-            started = True
-        try:
-            return function(*args)
-        finally:
-            # An abandoned thread retains its slot until it actually exits.
-            slots.release()
-
+    await _acquire_slot(slots)
+    # Own a fixed pool: cancellation before AnyIO 4.13 invokes a queued job can
+    # strand its worker (and thread-local cache connection) outside the idle pool.
+    # The concurrent future owns capacity until it finishes or is cancelled while
+    # still queued. Cancelling the waiter never releases a running job's slot.
+    context = contextvars.copy_context()
     try:
-        return await anyio.to_thread.run_sync(invoke, abandon_on_cancel=True)
+        future = _THREAD_POOL.submit(context.run, function, *args)
+    except BaseException:
+        slots.release()
+        raise
+    future.add_done_callback(lambda _: slots.release())
+    try:
+        return await asyncio.wrap_future(future)
     finally:
-        with lock:
-            if not started:
-                abandoned = True
-                slots.release()
+        # Does nothing once execution has started. Queued obsolete work must not
+        # run after its caller's deadline or binding retirement.
+        future.cancel()
+
+
+async def prepare_thread_rendering():
+    """Initialize local raster composition before admitting device bindings."""
+    # A tiny local image loads the executor, graphics operations and composition
+    # recipe once. Concurrent first frames must not all pay that cold-start cost
+    # inside their advertised deadline. No hardware or observation is involved.
+    from io import BytesIO
+
+    from PIL import Image
+
+    def prepare():
+        image = BytesIO()
+        Image.new("RGB", (1, 1)).save(image, format="PNG")
+        request = RenderService().build_request(
+            RenderModel(
+                image="data:image/png;base64,"
+                + base64.b64encode(image.getvalue()).decode("ascii")
+            ),
+            RasterFormat(1, 1),
+        )
+        render_request_to_frame(request)
+
+    await run_thread(prepare)
 
 
 async def render_with_retry(
@@ -79,8 +110,6 @@ async def render_with_retry(
                 return None
             try:
                 result = await backend.render(request)
-            except RenderBusy:
-                raise
             except Exception:
                 if attempt:
                     raise
@@ -133,8 +162,6 @@ class _OwnedRenderBackend:
             try:
                 frame = await self._execute(request)
                 error = None
-            except RenderBusy:
-                raise
             except (httpx.HTTPError, RenderWorkerImageFetchError) as exc:
                 logger.warning("Render image fetch failed: %s", exc)
                 frame, error = None, str(exc)

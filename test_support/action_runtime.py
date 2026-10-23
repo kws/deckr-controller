@@ -29,9 +29,17 @@ from test_support.managed_hardware import (
 
 
 @asynccontextmanager
-async def running_controller(substrate, *, with_output=False):
+async def running_controller(substrate, *, with_output=False, control_count=1):
     contracts = MessageContractRegistry(CORE_LANE_CONTRACTS.values())
     descriptor = device_descriptor()
+    descriptor = descriptor.model_copy(
+        update={
+            "controls": tuple(
+                descriptor.controls[0].model_copy(update={"control_id": f"key-{i}"})
+                for i in range(1, control_count + 1)
+            )
+        }
+    )
     if not with_output:
         descriptor = descriptor.model_copy(
             update={
@@ -52,10 +60,11 @@ async def running_controller(substrate, *, with_output=False):
                         Page(
                             controls=[
                                 Control(
-                                    selector=ControlSelector(control_id="key-1"),
+                                    selector=ControlSelector(control_id=f"key-{i}"),
                                     action="action.test",
                                     provider_instance_id="test",
                                 )
+                                for i in range(1, control_count + 1)
                             ]
                         )
                     ],
@@ -197,9 +206,9 @@ async def running_controller(substrate, *, with_output=False):
                         break
                     await anyio.sleep(0.005)
             await eventually(
-                lambda: any(
+                lambda: sum(
                     r.authorization.body.name == "binding_attached" for r in received
-                )
+                ) == control_count
             )
             yield SimpleNamespace(
                 controller=controller,

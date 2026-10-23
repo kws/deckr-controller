@@ -39,12 +39,21 @@ from test_support.memory_lane_substrate import MemoryLaneSubstrate
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("close_fails", [False, True])
+@pytest.mark.parametrize("startup_failure", ["hardware", "warmup"])
 async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
-    monkeypatch, close_fails
+    monkeypatch, close_fails, startup_failure
 ):
     import deckr.controller._runtime_service as module
 
     closed = []
+    prepared = []
+
+    async def warmup():
+        if startup_failure == "warmup":
+            raise ValueError("renderer preparation failed")
+        prepared.append(True)
+
+    monkeypatch.setattr(module, "prepare_thread_rendering", warmup)
 
     def close_resource(name, *, fail=False):
         async def close(*args):
@@ -61,6 +70,7 @@ async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
     )
 
     def unavailable_hardware(_endpoint):
+        assert prepared == [True]
         raise ValueError("hardware construction failed")
 
     context = SimpleNamespace(
@@ -78,7 +88,8 @@ async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
     service = ControllerRuntimeService(
         runtime_name="test-startup",
         runtime=build_controller_runtime(
-            config_source={}, base_dir=Path.cwd(), controller_id="controller-main"
+            config_source={"render": {"backend": "thread"}},
+            base_dir=Path.cwd(), controller_id="controller-main"
         ),
         context=context,
         beacon=object(),
@@ -93,14 +104,19 @@ async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
         tg=SimpleNamespace(start=AsyncMock(), start_soon=object()),
         stopping=anyio.Event(),
     )
+    failure_message = (
+        "renderer preparation failed"
+        if startup_failure == "warmup"
+        else "hardware construction failed"
+    )
     if close_fails:
         with pytest.raises(ExceptionGroup) as error:
             await service.start(ctx)
         assert [str(exc) for exc in error.value.exceptions] == [
-            "hardware construction failed", "close actions"
+            failure_message, "close actions"
         ]
     else:
-        with pytest.raises(ValueError, match="hardware construction failed"):
+        with pytest.raises(ValueError, match=failure_message):
             await service.start(ctx)
     assert closed == ["components", "renderer", "actions", "endpoint"]
     assert service._endpoint is None

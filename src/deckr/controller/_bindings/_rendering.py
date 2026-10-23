@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     pass
 from deckr.controller._bindings._render_execution import RenderExecution
 from deckr.controller._bindings._render_policy import (
+    _ADMISSION_SLOTS,
     _WORKERS,
     DEFAULT_LIMITS,
     RenderingPorts,
@@ -190,7 +191,9 @@ class BindingRenderer:
                 await self._result(message, body, "rejected", exc.code)
                 return True
         control_id = lease.control_id
-        if self.active.get(control_id, 0) >= 2 or not _WORKERS.acquire(blocking=False):
+        if self.active.get(control_id, 0) >= 2 or not _ADMISSION_SLOTS.acquire(
+            blocking=False
+        ):
             if not direct:
                 await self._result(message, body, "rejected", "busy")
             return True
@@ -225,7 +228,7 @@ class BindingRenderer:
             self.ports.start_soon(self._expire, job)
         except BaseException:
             self.active[control_id] -= 1
-            _WORKERS.release()
+            _ADMISSION_SLOTS.release()
             raise
         return True
 
@@ -382,8 +385,11 @@ class BindingRenderer:
     async def _run(self, job):
         try:
             with job.scope:
-                if not job.done:
-                    await self.execution.execute(job)
+                # Admission is bounded per control. Execution capacity is shared
+                # across devices; queue time remains inside the advertised deadline.
+                async with _WORKERS:
+                    if not job.done:
+                        await self.execution.execute(job)
         finally:
             self.active[job.lease.control_id] -= 1
-            _WORKERS.release()
+            _ADMISSION_SLOTS.release()

@@ -43,7 +43,10 @@ from deckr.controller._render_graph import (
     INVARIANT_FORMAT,
 )
 
-_WORKERS = threading.BoundedSemaphore(8)
+# Separate bounded admission from execution: an initial multi-control burst may
+# wait for workers, but it cannot accumulate arbitrary request payloads/tasks.
+_ADMISSION_SLOTS = threading.BoundedSemaphore(32)
+_WORKERS = anyio.Semaphore(8)
 _GRAPH_WORKERS = anyio.CapacityLimiter(4)
 logger = logging.getLogger(__name__)
 DEFAULT_LIMITS = RenderLimits(

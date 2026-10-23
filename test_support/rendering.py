@@ -16,8 +16,8 @@ def png(size=(10, 5), color=(255, 0, 0, 255)):
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def parameters(h, *, text="Kitchen", operation="set"):
-    binding = h.device.context_for_control("key-1").metadata
+def parameters(h, *, text="Kitchen", operation="set", control_id="key-1"):
+    binding = h.device.context_for_control(control_id).metadata
     result = {
         "target": {
             "kind": "binding",

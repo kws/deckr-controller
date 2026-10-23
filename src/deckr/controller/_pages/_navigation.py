@@ -71,7 +71,11 @@ class DeviceNavigation:
         bindings = tuple(
             lease.context.metadata
             for lease in self.state.attachments.binding_leases.values()
-            if lease.attached and lease.page_session_id == session.page_session_id
+            # Attachment effects precede the page notification on the owner's
+            # queue, but have not run when this immutable snapshot is built.
+            # Include their reserved identities; only binding_attached grants
+            # the runtime access to an actual child binding.
+            if lease.page_session_id == session.page_session_id
         )
         return PageSessionMetadata(
             providerInstanceId=session.owner_provider_instance_id,

@@ -107,6 +107,9 @@ agreement; the runtime gateway refuses them if it is no longer current. The core
 managed one-way send captures a concrete service-use lease before awaiting I/O and
 does not replay it after recovery. A successor in the same provider session does
 not inherit old effects. Page notifications preserve command causation.
+Page snapshots include committed child identities whose attachment effects are
+still queued. Those effects precede the owner's page notification; the runtime
+only obtains a usable child through its separately authorized attachment.
 
 Controller shutdown attempts every owned close under cancellation shielding and
 reports collected errors after cleanup. Startup failure closes resources constructed
@@ -332,9 +335,15 @@ current. Hardware sends and user input are never replayed by this retry policy.
 Failed rendering preserves the last successfully dispatched base.
 
 [Render workers](../src/deckr/controller/_render_workers.py) own cancellable jobs.
+The thread runtime initializes local raster composition before starting device
+bindings, keeping executor imports and initial recipe setup out of the first
+provider requests' advertised deadlines.
 Process execution uses AnyIO's managed, cancellable process pool. Admission is
 bounded across controller instances (eight process jobs and eight local thread
-jobs); ordinary render attempts have a two-second deadline. Retiring bindings,
+jobs). Accepted work waits asynchronously for execution capacity instead of
+failing when another control temporarily occupies the workers. The wait is
+cancellable and consumes the existing render deadline; ordinary render attempts
+have a two-second deadline. Retiring bindings,
 replacing base output and closing backends cancel their work. Abandoned local
 threads retain capacity until they actually exit. Provider rendering retains its
 negotiated deadline and admission limits. Output revisions fence every hardware handoff.
@@ -344,12 +353,23 @@ negotiated deadline and admission limits. Output revisions fence every hardware 
 | Ordinary render requests per control | Two active workers, one coalesced latest pending request. |
 | Ordinary render/send deadlines | Two seconds each. |
 | Shared execution capacity | Eight process jobs and eight local thread jobs across controller instances in the process. |
-| Provider render jobs | Two admitted per control, eight per process; busy work is refused. |
+| Provider render jobs | Two admitted per control, 32 admitted per process, eight executing per process. Waiting jobs count against both admission bounds and the deadline; excess work is refused with `busy`. |
 | Invariant graph workers | Four concurrent executions. |
 | Provider render deadline | Advertised target limit, normally two seconds. |
 | Completed request retention | Target of 512 records; age-based cleanup after 60 seconds. |
 | Hardware rejection mappings | 1,024 records with 60-second expiry. |
 | Queued clears | Latest clear per control; superseded clears are rejected before handoff. |
+
+The provider queue has fixed global and per-control bounds. A burst of initial
+frames across more than eight controls
+can wait for the same eight workers. Superseding or retiring a binding cancels
+its waiting jobs; expired work cannot start later or send hardware output.
+Trusted thread rendering uses a process-owned pool of eight reusable threads.
+Cancelling queued work removes its execution authority; cancelling running work
+abandons only the wait, retaining capacity until the function exits. This avoids
+stranding AnyIO workers and their thread-local SQLite cache connections during
+cancellation. Context variables are copied into each submitted job.
+
 
 Provider commands support text, inline PNG/JPEG and validated Invariant graphs.
 The declared limits include 256 KiB messages, 128 KiB image data, 1,048,576 pixels

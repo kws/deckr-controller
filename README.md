@@ -98,6 +98,15 @@ The watcher publishes a complete projection for the target controller.
 See [configuration](docs/architecture.md#configuration) and
 [recovery policies](docs/architecture.md#recovery-policies) for storage and activation behavior.
 
+When hosted by the configured Deckr launcher, supervised restart cleanup is
+provided by the Python core. Set `DECKR_RESTART_HANDOFF` to a supervisor-controlled
+file and `DECKR_INSTANCE_ID` to the configured host process identity. The
+[handoff contract](https://github.com/kws/deckr/blob/main/docs/deckr-deployment.md#verified-restart-handoff)
+requires confirmed exit of the exact predecessor and its directly reported
+endpoint sessions. The host cancels that predecessor's participation before
+starting replacement endpoints; other live instances retain their contracts.
+Embedded hosts pass the verified evidence to `Deckr(restart=proof)` explicitly.
+
 ## Packaging
 
 Deckr is under active alpha development. Ordinary changes use Git commits as
