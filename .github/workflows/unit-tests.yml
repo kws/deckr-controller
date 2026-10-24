@@ -21,6 +21,13 @@ jobs:
           git clone --no-checkout https://github.com/kws/deckr-core-python.git ../deckr-core-python
           git -C ../deckr-core-python checkout --detach "$(cat .deckr-core-revision)"
 
+      - name: Check out Invariant dependencies
+        run: |
+          git clone --no-checkout https://github.com/kws/invariant-core.git ../invariant-core
+          git -C ../invariant-core checkout --detach "$(cat .invariant-core-revision)"
+          git clone --no-checkout https://github.com/kws/invariant-gfx.git ../invariant-gfx
+          git -C ../invariant-gfx checkout --detach "$(cat .invariant-gfx-revision)"
+
       - name: Check out rendering reference
         run: |
           git clone --no-checkout https://github.com/kws/deckr.git ../deckr

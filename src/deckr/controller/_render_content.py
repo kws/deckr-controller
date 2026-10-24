@@ -32,12 +32,20 @@ def decode_image(data: RenderImage, limits: RenderLimits) -> Image.Image:
         raw = base64.b64decode(data.image, validate=True)
         if base64.b64encode(raw).decode("ascii") != data.image:
             raise ContentFailure("invalid_content")
-        if len(raw) > limits.max_image_bytes:
-            raise ContentFailure("limit_exceeded")
+    except (ValueError, binascii.Error) as exc:
+        raise ContentFailure("invalid_content") from exc
+    return decode_image_bytes(raw, data.encoding, limits)
+
+
+def decode_image_bytes(raw: bytes, encoding: str, limits: RenderLimits) -> Image.Image:
+    """Validate downloaded or wire-decoded bytes without a base64 round trip."""
+    if len(raw) > limits.max_image_bytes:
+        raise ContentFailure("limit_exceeded")
+    try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(raw)) as source:
-                if source.format != {"png": "PNG", "jpeg": "JPEG"}[data.encoding]:
+                if source.format != {"png": "PNG", "jpeg": "JPEG"}[encoding]:
                     raise ContentFailure("invalid_content")
                 if source.width * source.height > limits.max_image_pixels:
                     raise ContentFailure("limit_exceeded")

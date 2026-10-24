@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from invariant import (
@@ -34,6 +34,7 @@ class RenderModel:
 
     title: str | None = None
     image: str | None = None
+    raster: bytes | None = None
     overlay_type: str | None = None
     overlay_title: str | None = None
 
@@ -74,6 +75,11 @@ class RenderRequest:
     context: dict[str, Any] = field(default_factory=dict)
     binding_id: str | None = None
     source: RenderSource | None = None
+    raster: bytes | None = None
+    overlay_type: str | None = None
+    overlay_title: str | None = None
+    resources: dict = field(default_factory=dict)
+    image_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +109,8 @@ class _RenderNode:
 
 def _content_to_model(content: RenderContent) -> RenderModel:
     """Build RenderModel from the current render content."""
+    if content.raster is not None:
+        return RenderModel(raster=content.raster)
     if content.image is not None:
         return RenderModel(image=content.image)
     if content.title is not None:
@@ -190,6 +198,15 @@ def _wire_to_node(wire: dict[str, Any], context: dict[str, Any]) -> _RenderNode:
     """Rehydrate a wire-serialized graph into a canvas-aware SubGraphNode."""
 
     graph_dict, output = load_graph_document_from_dict(wire)
+
+    def ephemeral_fetches(graph):
+        for name, node in tuple(graph.items()):
+            if isinstance(node, SubGraphNode):
+                ephemeral_fetches(node.graph)
+            elif isinstance(node, Node) and node.op_name == "deckr:fetch_image_url":
+                graph[name] = replace(node, cache=False)
+
+    ephemeral_fetches(graph_dict)
     return _graph_document_to_node(graph_dict, output, context)
 
 
@@ -248,6 +265,20 @@ def build_render_request(
 ) -> RenderRequest | None:
     """Convert a RenderModel to a serialized render request."""
 
+    if model.raster is not None and model.overlay_type != "blank":
+        return RenderRequest(
+            config_id=config_id,
+            context_id=context_id,
+            binding_id=binding_id,
+            control_id=control_id,
+            generation=generation,
+            image_format=image_format,
+            graph={},
+            raster=model.raster,
+            overlay_type=model.overlay_type,
+            overlay_title=model.overlay_title,
+            source=source,
+        )
     document = _model_to_graph_document(model, image_format)
     if document is None:
         return None
@@ -262,6 +293,13 @@ def build_render_request(
         graph=_document_to_wire(document),
         context=document.context,
         source=source,
+        overlay_type=model.overlay_type,
+        overlay_title=model.overlay_title,
+        image_url=model.image
+        if model.overlay_type != "blank"
+        and model.image
+        and model.image.startswith(("http://", "https://"))
+        else None,
     )
 
 
@@ -300,9 +338,18 @@ def _graph_to_raster_bytes(
 def render_request_to_frame(request: RenderRequest) -> bytes:
     """Worker-side render function used by thread/process backends."""
 
-    node = _wire_to_node(request.graph, request.context)
-    image_format = request.image_format
-    return _graph_to_raster_bytes(node, image_format)
+    if request.raster is not None:
+        from deckr.controller._render_raster import compose_raster
+
+        return compose_raster(request)
+    from deckr.controller.invariant.ops.fetch_url import IMAGE_RESOURCES
+
+    token = IMAGE_RESOURCES.set(request.resources)
+    try:
+        node = _wire_to_node(request.graph, request.context)
+        return _graph_to_raster_bytes(node, request.image_format)
+    finally:
+        IMAGE_RESOURCES.reset(token)
 
 
 class RenderService:

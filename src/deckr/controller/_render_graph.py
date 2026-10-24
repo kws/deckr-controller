@@ -7,19 +7,16 @@ It runs in a cancellable worker process; the caller enforces the render deadline
 from __future__ import annotations
 
 import ast
-import base64
 import io
 import math
 import re
 import time
 from functools import wraps
-from urllib.parse import urlsplit
 
-import httpx
-from deckr.actions.rendering import RenderImage
 from deckr.contracts.models import thaw_json
 
-from deckr.controller._render_content import ContentFailure, decode_image
+from deckr.controller._render_content import ContentFailure, decode_image_bytes
+from deckr.controller._render_resources import validate_url
 
 INVARIANT_FORMAT = "com.k-si.deckr.render.invariant.v1"
 MAX_NODES = 64
@@ -172,6 +169,10 @@ def validate_graph(document, limits):
         ):
             raise ContentFailure("invalid_content")
         _value(node["params"], limits, dependencies=set(node["deps"]))
+        if node["op_name"] == "deckr:fetch_image_url":
+            if set(node["params"]) != {"url"}:
+                raise ContentFailure("invalid_content")
+            validate_url(node["params"]["url"])
         if node["op_name"] == "gfx:render_svg":
             ref = node["params"].get("svg_content")
             source = graph.get(ref.get("$ref")) if isinstance(ref, dict) else None
@@ -197,13 +198,14 @@ def validate_graph(document, limits):
 
 
 class _Registry:
-    def __init__(self, limits, deadline):
+    def __init__(self, limits, deadline, resources=None):
         from invariant.ops.stdlib import make_dict
         from invariant_gfx.ops import OPS as gfx_ops
 
         self.limits, self.deadline = limits, deadline
         self.pixels = 0
         self.fetched_blobs = set()
+        self.resources = resources or {}
         self.operations = {
             f"gfx:{name}": op for name, op in gfx_ops.items() if f"gfx:{name}" in OPS
         }
@@ -242,10 +244,9 @@ class _Registry:
         if encoding is None:
             raise ContentFailure("invalid_content")
         fetched = id(blob) in self.fetched_blobs
-        source = decode_image(
-            RenderImage(
-                image=base64.b64encode(blob.data).decode("ascii"), encoding=encoding
-            ),
+        source = decode_image_bytes(
+            blob.data,
+            encoding,
             self.limits.model_copy(
                 update={"max_image_pixels": MAX_FETCHED_IMAGE_PIXELS}
             )
@@ -263,45 +264,14 @@ class _Registry:
         return ImageArtifact(source)
 
     def fetch(self, url):
-        from invariant_gfx.artifacts import BlobArtifact
-
-        parsed = urlsplit(url)
-        if (
-            parsed.scheme not in {"https", "http"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.fragment
-        ):
-            raise ContentFailure("invalid_content")
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise ContentFailure("deadline_exceeded")
-        # No redirects, cookies, environment proxies, credentials, or persistent cache.
-        with (
-            httpx.Client(
-                timeout=min(1.0, remaining), follow_redirects=False, trust_env=False
-            ) as client,
-            client.stream("GET", url) as response,
-        ):
-            response.raise_for_status()
-            content_type = (
-                response.headers.get("content-type", "").split(";")[0].strip().lower()
-            )
-            # Some external artwork servers label JPEG bytes as image/jpg.
-            # Normalize at the HTTP boundary; the Deckr image contract stays JPEG.
-            if content_type == "image/jpg":
-                content_type = "image/jpeg"
-            if content_type not in {"image/png", "image/jpeg"}:
-                raise ContentFailure("invalid_content")
-            data = bytearray()
-            for chunk in response.iter_bytes(chunk_size=16384):
-                if time.monotonic() >= self.deadline:
-                    raise ContentFailure("deadline_exceeded")
-                if len(data) + len(chunk) > self.limits.max_image_bytes:
-                    raise ContentFailure("limit_exceeded")
-                data.extend(chunk)
-        blob = BlobArtifact(data=bytes(data), content_type=content_type)
+        # Network access is completed by the controller before CPU admission.
+        validate_url(url)
+        try:
+            blob = self.resources[url]
+        except KeyError:
+            raise ContentFailure("invalid_content") from None
+        if len(blob.data) > self.limits.max_image_bytes:
+            raise ContentFailure("limit_exceeded")
         self.fetched_blobs.add(id(blob))
         return blob
 
@@ -383,7 +353,7 @@ def _renderer_parameters(value):
     return value
 
 
-def render_graph(document, width, height, limits):
+def render_graph(document, width, height, limits, resources=None):
     from invariant import Executor, load_graph_document_from_dict
     from invariant.store.memory import MemoryStore
     from invariant_gfx.artifacts import ImageArtifact
@@ -391,12 +361,14 @@ def render_graph(document, width, height, limits):
 
     document = thaw_json(document)
     validate_graph(document, limits)
-    registry = _Registry(limits, time.monotonic() + limits.max_render_time_ms / 1000)
+    registry = _Registry(
+        limits, time.monotonic() + limits.max_render_time_ms / 1000, resources
+    )
     registry.check_size(width, height)
     try:
         graph, output = load_graph_document_from_dict(_renderer_parameters(document))
         result = Executor(
-            registry=registry, store=MemoryStore(max_size=MAX_NODES)
+            registry=registry, store=MemoryStore(max_size=MAX_NODES), cache=False
         ).execute(
             graph, [output], context={"canvas": {"width": width, "height": height}}
         )[output]
@@ -414,3 +386,23 @@ def render_graph(document, width, height, limits):
     buffer = io.BytesIO()
     canvas.convert("RGB").save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def graph_resource_urls(document, limits):
+    """Return only literal resources reachable from the admitted output."""
+    document = thaw_json(document)
+    validate_graph(document, limits)
+    graph, visited, urls = document["graph"], set(), []
+
+    def visit(name):
+        if name == "canvas" or name in visited:
+            return
+        visited.add(name)
+        node = graph[name]
+        for dep in node["deps"]:
+            visit(dep)
+        if node["op_name"] == "deckr:fetch_image_url":
+            urls.append(node["params"]["url"])
+
+    visit(document["output"])
+    return tuple(dict.fromkeys(urls))

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 from deckr.controller._bindings._render_policy import _GRAPH_WORKERS
 from deckr.controller._render_graph import (
     INVARIANT_FORMAT,
+    graph_resource_urls,
     render_graph,
 )
 
@@ -80,6 +81,7 @@ class RenderExecution:
     async def execute(self, job):
         router = job.lease.context.presentation
         dispatcher = self.ports().dispatcher
+        started = time.monotonic()
         try:
             if job.body.operation == "clear":
                 image = None
@@ -87,21 +89,24 @@ class RenderExecution:
                 image = await run_thread(self.direct_frame, job)
             elif job.body.content.format == INVARIANT_FORMAT:
                 document = thaw_json(job.body.content.data)
-                # Supersession invalidates publication immediately, but let this
-                # bounded pure computation finish so page churn does not destroy
-                # warm workers. Its original deadline still kills stalled work.
-                with (
-                    anyio.CancelScope(shield=True),
-                    anyio.fail_after(max(0, job.deadline - time.monotonic())),
-                ):
-                    image = await run_process(
-                        render_graph,
-                        document,
-                        job.target.width,
-                        job.target.height,
-                        job.target.limits,
-                        limiter=_GRAPH_WORKERS,
-                    )
+                fetching = time.monotonic()
+                resources = await self.ports().backend.resources.acquire(
+                    graph_resource_urls(document, job.target.limits),
+                    max_bytes=job.target.limits.max_image_bytes,
+                    deadline=job.deadline,
+                )
+                job.timings["resourcesMs"] = (time.monotonic() - fetching) * 1000
+                image = await run_process(
+                    render_graph,
+                    document,
+                    job.target.width,
+                    job.target.height,
+                    job.target.limits,
+                    resources,
+                    limiter=_GRAPH_WORKERS,
+                    deadline=job.deadline,
+                    timings=job.timings,
+                )
             else:
                 image = await run_thread(
                     render_content,
@@ -110,11 +115,7 @@ class RenderExecution:
                     job.target.height,
                     job.target.limits,
                 )
-            image_uri = (
-                "data:image/png;base64," + base64.b64encode(image).decode("ascii")
-                if image is not None
-                else None
-            )
+            job.timings["contentMs"] = (time.monotonic() - started) * 1000
             while not job.done:
                 await self.authorize(job)
                 if not dispatcher.base_is_current(job.ticket):
@@ -123,7 +124,7 @@ class RenderExecution:
                 revision = dispatcher.composition_revision(job.ticket)
                 overlay = router.store.overlay
                 model = RenderModel(
-                    image=image_uri,
+                    raster=image,
                     overlay_type=overlay.template if overlay else None,
                     overlay_title=overlay.title if overlay else None,
                 )
@@ -162,14 +163,18 @@ class RenderExecution:
                             job.body.content.data["image"], validate=True
                         )
                     else:
-                        with anyio.CancelScope(shield=True):
-                            result = await render_with_retry(
-                                self.ports().backend,
-                                request,
-                                is_current=lambda: not job.done
-                                and dispatcher.base_is_current(job.ticket),
-                                timeout=max(0, job.deadline - time.monotonic()),
-                            )
+                        composing = time.monotonic()
+                        result = await render_with_retry(
+                            self.ports().backend,
+                            request,
+                            is_current=lambda: not job.done
+                            and dispatcher.base_is_current(job.ticket),
+                            timeout=max(0, job.deadline - time.monotonic()),
+                        )
+                        job.timings["compositionMs"] = (
+                            job.timings.get("compositionMs", 0)
+                            + (time.monotonic() - composing) * 1000
+                        )
                         if result is None:
                             await self.finish(job, "superseded", "newer_output")
                             return
@@ -178,6 +183,8 @@ class RenderExecution:
                         frame = result.frame
                 if job.done:
                     return
+                job.ready = True
+                job.loading.cancel()
                 await self.authorize(job)
                 job.command_id = str(uuid.uuid4())
                 receipt = job.receipt
@@ -199,10 +206,12 @@ class RenderExecution:
                 )
 
                 def committed():
-                    router.store.content.image = image_uri
+                    router.store.content.raster = image
+                    router.store.content.image = None
                     router.store.content.title = None
 
                 with anyio.fail_after(max(0, job.deadline - time.monotonic())):
+                    dispatching = time.monotonic()
                     sent = await dispatcher.publish_base(
                         job.ticket,
                         revision,
@@ -211,6 +220,10 @@ class RenderExecution:
                         authorize=lambda: self.authorize(job),
                         committed=committed,
                         recompose=router.render,
+                    )
+                    job.timings["dispatchMs"] = (
+                        job.timings.get("dispatchMs", 0)
+                        + (time.monotonic() - dispatching) * 1000
                     )
                 if sent:
                     await self.finish(job, "dispatched")

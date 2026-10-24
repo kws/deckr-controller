@@ -1,4 +1,4 @@
-"""Per-context declaration store. No frames, no rendered bytes."""
+"""Per-context declarations and the last accepted logical base image."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ class RenderContent:
 
     title: str | None = None
     image: str | None = None
+    raster: bytes | None = None
 
 
 @dataclass

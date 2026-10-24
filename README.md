@@ -11,8 +11,21 @@ The Python `deckr` package comes from [deckr-core-python](https://github.com/kws
 ## Development
 
 Use Python 3.11 or later and `uv`.
-Check out `deckr-core-python` beside this repository.
-The source override in `pyproject.toml` uses that checkout as an editable dependency.
+Check out `deckr-core-python`, `invariant-core` and `invariant-gfx` beside this
+repository. The source overrides in `pyproject.toml` use those editable checkouts.
+The Invariant changes require the exact commits recorded in `.invariant-core-revision`
+and `.invariant-gfx-revision`, rather than the older published stable packages.
+
+```bash
+git clone https://github.com/kws/invariant-core.git ../invariant-core
+git -C ../invariant-core checkout --detach "$(cat .invariant-core-revision)"
+git clone https://github.com/kws/invariant-gfx.git ../invariant-gfx
+git -C ../invariant-gfx checkout --detach "$(cat .invariant-gfx-revision)"
+```
+
+In the parent Deckr workspace, this controller is an editable standalone dependency
+and is excluded from workspace membership. That lets both the parent and standalone
+CI resolve its sibling source overrides consistently.
 
 The Invariant renderer also needs the Cairo system library (`libcairo2` on
 Debian/Ubuntu, or `brew install cairo` on macOS). If a managed Python on macOS
@@ -39,7 +52,7 @@ CI selects the core commit from `.deckr-core-revision`.
 It selects the rendering reference from `.deckr-rendering-spec-revision`, including
 the advertised Invariant extension vectors. The core implementation keeps its own
 specification pin. CI validates this combination on Python 3.11, 3.12 and 3.13.
-Update `.deckr-core-revision` and `uv.lock` together when the controller adopts a new core commit.
+Update dependency revision files and `uv.lock` together when adopting new core or Invariant source commits.
 Check the controller against that commit before the update.
 
 Managed integration tests start isolated NATS brokers with temporary storage and authentication.

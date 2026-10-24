@@ -226,7 +226,7 @@ async def test_overlay_update_commits_during_send_and_recomposes_accepted_base(
         assert (await result_for(h, request))["status"] == "dispatched"
         await eventually(lambda: h.commands.await_count == 2)
         assert router._store.overlay.template == "ok"
-        assert router.store.content.image is not None
+        assert router.store.content.raster is not None
         images = [
             call.args[0].message.body["params"]["image"]
             for call in h.commands.await_args_list

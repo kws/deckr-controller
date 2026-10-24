@@ -42,6 +42,8 @@ class _ControlRenderState:
     pending_request: RenderRequest | None = None
     io_lock: StateGate = field(default_factory=StateGate)
     scopes: set[anyio.CancelScope] = field(default_factory=set)
+    accepted_frame: bytes | None = None
+    provisional: bool = False
 
 
 class RenderTicket(NamedTuple):
@@ -91,6 +93,9 @@ class RenderDispatcher:
         """Admit a base update; even a later decoder failure invalidates old work."""
         async with self._lock:
             state = self._controls.setdefault(control_id, _ControlRenderState())
+            if (state.context_id, state.binding_id) != (context_id, binding_id):
+                state.accepted_frame = None
+                state.provisional = False
             state.base_revision += 1
             state.generation += 1
             state.context_id = context_id
@@ -153,6 +158,8 @@ class RenderDispatcher:
                 changed = False
                 async with self._lock:
                     if self.base_is_current(ticket):
+                        state.accepted_frame = frame
+                        state.provisional = False
                         changed = state.generation != composition_revision
                         state.generation += 1
                         state.pending_request = None
@@ -179,8 +186,10 @@ class RenderDispatcher:
         async with self._lock:
             state = self._controls.setdefault(control_id, _ControlRenderState())
             if state.binding_id != binding_id or state.context_id != context_id:
-                for scope in tuple(state.scopes):
-                    scope.cancel()
+                state.accepted_frame = None
+                state.provisional = False
+            for scope in tuple(state.scopes):
+                scope.cancel()
             if base_update:
                 state.base_revision += 1
             state.generation += 1
@@ -266,6 +275,8 @@ class RenderDispatcher:
             if output is not None:
                 state.output = output
             state.pending_request = None
+            state.accepted_frame = None
+            state.provisional = False
             for scope in tuple(state.scopes):
                 scope.cancel()
 
@@ -326,14 +337,19 @@ class RenderDispatcher:
             while True:
                 with anyio.CancelScope() as scope:
                     state.scopes.add(scope)
+                    progress = anyio.CancelScope()
+                    self._start_soon(self._show_loading, current, progress)
                     try:
-                        with anyio.CancelScope(shield=True):
-                            result = await render_with_retry(
-                                self._backend,
-                                current,
-                                is_current=lambda current=current: state.generation
-                                == current.generation,
-                            )
+                        result = await render_with_retry(
+                            self._backend,
+                            current,
+                            is_current=lambda current=current: state.generation
+                            == current.generation,
+                        )
+                        progress.cancel()
+                        # Computation may be superseded; an initiated hardware
+                        # handoff remains ordered by the output lock.
+                        state.scopes.discard(scope)
                         if result is not None:
                             await self._apply_result(result)
                     except Exception:
@@ -341,7 +357,10 @@ class RenderDispatcher:
                             "Render or output failed for %s", control_id, exc_info=True
                         )
                     finally:
+                        progress.cancel()
                         state.scopes.discard(scope)
+                        if not scope.cancel_called:
+                            await self.restore_feedback(control_id, current.generation)
                 async with self._lock:
                     current = state.pending_request
                     state.pending_request = None
@@ -387,3 +406,80 @@ class RenderDispatcher:
                 with anyio.fail_after(2):
                     await target_output.write(result.frame)
                 state.published_generation = result.generation
+                if state.generation == result.generation:
+                    state.accepted_frame = result.frame
+                    state.provisional = False
+
+    async def _show_loading(self, request, scope):
+        from deckr.controller._render_feedback import LOADING_DELAY, loading_frame
+
+        if request.overlay_type:
+            return
+        with scope:
+            await anyio.sleep(LOADING_DELAY)
+            try:
+                frame = await loading_frame(request.image_format)
+                await self.publish_feedback(
+                    request.control_id,
+                    request.generation,
+                    frame,
+                    is_pending=lambda: not scope.cancel_called,
+                )
+            except Exception:
+                logger.debug("Loading feedback failed", exc_info=True)
+
+    def _authorized(self, control_id, state):
+        return self._result_authorizer is None or self._result_authorizer(
+            control_id, state.binding_id, state.context_id
+        )
+
+    async def publish_feedback(
+        self, control_id, generation, frame, *, is_pending, authorize=None
+    ):
+        """Publish provisional pixels without accepting a base or completing a job."""
+        state = self._controls[control_id]
+        async with state.io_lock:
+            if authorize is not None:
+                await authorize()
+            async with self.output_transaction(), self._lock:
+                if (
+                    state.generation != generation
+                    or not is_pending()
+                    or not self._authorized(control_id, state)
+                ):
+                    return
+                output = state.output
+                if output is None:
+                    return
+                state.provisional = True
+            # Keep this send ordered with final output even if the timer is
+            # cancelled while hardware is accepting the provisional command.
+            with anyio.CancelScope(shield=True), anyio.fail_after(0.5):
+                await output.write(frame)
+            state.published_generation = generation
+            return True
+
+    async def restore_feedback(self, control_id, generation, is_current=lambda: True):
+        state = self._controls[control_id]
+        try:
+            async with state.io_lock:
+                async with self.output_transaction(), self._lock:
+                    if (
+                        state.generation != generation
+                        or not state.provisional
+                        or not is_current()
+                        or not self._authorized(control_id, state)
+                    ):
+                        return
+                    output, frame = state.output, state.accepted_frame
+                    if output is None:
+                        return
+                with anyio.fail_after(0.5):
+                    if frame is None:
+                        await output.clear()
+                    else:
+                        await output.write(frame)
+                if state.generation == generation:
+                    state.provisional = False
+        except Exception:
+            logger.debug("Loading feedback restoration failed", exc_info=True)

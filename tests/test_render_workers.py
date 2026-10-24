@@ -189,3 +189,94 @@ async def test_untransportable_result_does_not_destroy_warm_worker(probe, messag
             assert await workers.run_process(os.getpid) == pid
     finally:
         await _render_process.close_idle()
+
+
+@pytest.mark.asyncio
+async def test_workload_waiters_do_not_reserve_idle_process_capacity(monkeypatch):
+    slots = threading.BoundedSemaphore(2)
+    monkeypatch.setattr(workers, "_PROCESS_SLOTS", slots)
+    limiter = anyio.CapacityLimiter(1)
+    entered, release, composition = anyio.Event(), anyio.Event(), anyio.Event()
+
+    async def execute(name):
+        if name == "graph":
+            entered.set()
+            await release.wait()
+        else:
+            composition.set()
+
+    monkeypatch.setattr(workers._render_process, "run", execute)
+
+    async def graph():
+        await workers.run_process("graph", limiter=limiter)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(graph)
+        await entered.wait()
+        group.start_soon(graph)
+        with anyio.fail_after(1):
+            while not limiter.statistics().tasks_waiting:
+                await anyio.sleep(0)
+            group.start_soon(workers.run_process, "composition")
+            await composition.wait()
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_superseded_graph_waiter_never_starts(monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    from deckr.controller._bindings._render_execution import RenderExecution
+    from deckr.controller._bindings._render_policy import DEFAULT_LIMITS
+    from deckr.controller._render_graph import INVARIANT_FORMAT
+
+    slots = threading.BoundedSemaphore(1)
+    slots.acquire()
+    monkeypatch.setattr(workers, "_PROCESS_SLOTS", slots)
+    execute_process = AsyncMock(return_value=b"unused")
+    monkeypatch.setattr(workers._render_process, "run", execute_process)
+    job = SimpleNamespace(
+        lease=SimpleNamespace(context=SimpleNamespace(presentation=object())),
+        body=SimpleNamespace(
+            operation="set",
+            content=SimpleNamespace(format=INVARIANT_FORMAT, data={}),
+        ),
+        target=SimpleNamespace(width=72, height=72, limits=DEFAULT_LIMITS),
+        direct=False,
+        timings={},
+        done=False,
+        deadline=time.monotonic() + 2,
+        scope=anyio.CancelScope(),
+    )
+    monkeypatch.setattr(
+        "deckr.controller._bindings._render_execution.graph_resource_urls",
+        lambda *args: (),
+    )
+    execution = RenderExecution(
+        ports=lambda: SimpleNamespace(
+            dispatcher=object(),
+            backend=SimpleNamespace(
+                resources=SimpleNamespace(acquire=AsyncMock(return_value={}))
+            ),
+        ),
+        authorize=AsyncMock(),
+        finish=AsyncMock(),
+        hardware_rejection=AsyncMock(),
+    )
+    done = anyio.Event()
+
+    async def run():
+        with job.scope:
+            await execution.execute(job)
+        done.set()
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(run)
+        await anyio.sleep(0.02)
+        job.done = True
+        job.scope.cancel()
+        with anyio.fail_after(0.5):
+            await done.wait()
+        slots.release()
+    execute_process.assert_not_awaited()

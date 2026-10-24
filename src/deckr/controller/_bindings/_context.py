@@ -209,6 +209,8 @@ class ControlContext:
         overlay = self._store.overlay
         if overlay is not None:
             return f"overlay:{overlay.template}"
+        if self._store.content.raster is not None:
+            return "data_image"
         image = self._store.content.image
         if image is not None:
             if image.startswith("data:application/vnd.invariant.graph"):

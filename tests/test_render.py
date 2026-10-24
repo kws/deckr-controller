@@ -5,7 +5,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Lock
 
-import httpx
 import pytest
 from deckr.hardware.descriptors import CapabilityDescriptor
 from PIL import Image
@@ -81,28 +80,42 @@ def test_get_executor_builds_singleton_once_under_concurrent_calls(monkeypatch):
     assert calls == 1
 
 
-def test_fetch_image_url_http_uses_bounded_timeout(monkeypatch):
-    class TimeoutClient:
-        kwargs = None
-
-        def __init__(self, **kwargs):
-            type(self).kwargs = kwargs
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc_info):
-            return None
-
-        def stream(self, method, url):
-            raise httpx.ReadTimeout("timed out")
-
-    monkeypatch.setattr(fetch_url_module.httpx, "Client", TimeoutClient)
-
-    with pytest.raises(httpx.ReadTimeout):
+def test_worker_requests_async_resource_without_opening_a_connection():
+    with pytest.raises(
+        fetch_url_module.ImageResourceRequired, match="https://example.test/image.png"
+    ):
         fetch_url_module.fetch_image_url("https://example.test/image.png")
 
-    assert TimeoutClient.kwargs == {
-        "timeout": fetch_url_module.HTTP_IMAGE_TIMEOUT,
-        "follow_redirects": True,
-    }
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("encoding", ["PNG", "JPEG"])
+@pytest.mark.parametrize("overlay", [None, "loading", "blank"])
+def test_logical_raster_handoff_preserves_encoding_rotation_and_overlay(
+    rotation, encoding, overlay
+):
+    import base64
+
+    from deckr.controller._raster import RasterFormat
+    from deckr.controller._render import RenderModel
+
+    size = (48, 72) if rotation % 180 else (72, 48)
+    logical = Image.new("RGB", size, "navy")
+    logical.paste("red", (0, 0, size[0] // 2, size[1] // 2))
+    stream = io.BytesIO()
+    logical.save(stream, format="PNG")
+    raw = stream.getvalue()
+    options = {"overlay_type": overlay, "overlay_title": "Wait"}
+    fmt = RasterFormat(72, 48, format=encoding, rotation=rotation)
+    direct = render_request_to_frame(
+        build_render_request(RenderModel(raster=raw, **options), fmt)
+    )
+    legacy = render_request_to_frame(
+        build_render_request(
+            RenderModel(
+                image="data:image/png;base64," + base64.b64encode(raw).decode(),
+                **options,
+            ),
+            fmt,
+        )
+    )
+    assert direct == legacy

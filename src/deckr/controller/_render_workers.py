@@ -9,7 +9,9 @@ import logging
 import os
 import signal
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Protocol
 
 import anyio
@@ -24,6 +26,7 @@ from deckr.controller._render import (
     RenderService,
     render_request_to_frame,
 )
+from deckr.controller._render_resources import ImageResources
 
 logger = logging.getLogger(__name__)
 RENDER_TIMEOUT_SECONDS = 2.0
@@ -34,6 +37,7 @@ _PROCESS_SLOTS = threading.BoundedSemaphore(PROCESS_WORKERS)
 _PROCESS_LIMITER = anyio.CapacityLimiter(PROCESS_WORKERS)
 _THREAD_SLOTS = threading.BoundedSemaphore(8)
 _THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="deckr-render")
+_RENDER_DEADLINE = contextvars.ContextVar("render_deadline", default=None)
 
 
 async def _acquire_slot(slots):
@@ -45,17 +49,34 @@ async def _acquire_slot(slots):
         await anyio.sleep(0.005)
 
 
-async def run_process(function, *args, limiter=None):
-    slots = _PROCESS_SLOTS
-    await _acquire_slot(slots)
-    try:
-        async with limiter or _PROCESS_LIMITER:
-            return await _render_process.run(function, *args)
-    finally:
-        slots.release()
+async def run_process(function, *args, limiter=None, deadline=None, timings=None):
+    # Waiting for a narrower workload limit must not reserve an idle process.
+    queued = time.monotonic()
+    async with limiter or _PROCESS_LIMITER:
+        slots = _PROCESS_SLOTS
+        await _acquire_slot(slots)
+        started = time.monotonic()
+        if timings is not None:
+            timings["graphQueueMs"] = (started - queued) * 1000
+        try:
+            await anyio.lowlevel.checkpoint()
+            if deadline is None:
+                return await _render_process.run(function, *args)
+            # Preserve a warm worker only once execution capacity is owned.
+            # Superseded queue entries remain cancellable; running CPU work may
+            # finish, but never outlive the request's original absolute deadline.
+            with (
+                anyio.CancelScope(shield=True),
+                anyio.fail_after(max(0, deadline - time.monotonic())),
+            ):
+                return await _render_process.run(function, *args)
+        finally:
+            if timings is not None:
+                timings["graphWorkerMs"] = (time.monotonic() - started) * 1000
+            slots.release()
 
 
-async def run_thread(function, *args, slots=None):
+async def run_thread(function, *args, slots=None, pool=None):
     slots = slots if slots is not None else _THREAD_SLOTS
     await _acquire_slot(slots)
     # Own a fixed pool: cancellation before AnyIO 4.13 invokes a queued job can
@@ -64,7 +85,7 @@ async def run_thread(function, *args, slots=None):
     # still queued. Cancelling the waiter never releases a running job's slot.
     context = contextvars.copy_context()
     try:
-        future = _THREAD_POOL.submit(context.run, function, *args)
+        future = (pool or _THREAD_POOL).submit(context.run, function, *args)
     except BaseException:
         slots.release()
         raise
@@ -133,19 +154,27 @@ async def render_with_retry(
     backend, request, *, is_current, timeout=RENDER_TIMEOUT_SECONDS
 ):
     """Retry pure worker work once; never replay a hardware send or action input."""
-    with anyio.fail_after(timeout):
-        for attempt in range(2):
-            if not is_current():
-                return None
-            try:
-                result = await backend.render(request)
-            except Exception:
-                if attempt:
-                    raise
-            else:
-                if not result.error or attempt:
-                    return result
-            await anyio.sleep(0)
+    token = _RENDER_DEADLINE.set(time.monotonic() + timeout)
+    try:
+        with anyio.fail_after(timeout):
+            return await _render_attempts(backend, request, is_current)
+    finally:
+        _RENDER_DEADLINE.reset(token)
+
+
+async def _render_attempts(backend, request, is_current):
+    for attempt in range(2):
+        if not is_current():
+            return None
+        try:
+            result = await backend.render(request)
+        except Exception:
+            if attempt:
+                raise
+        else:
+            if not result.error or attempt:
+                return result
+        await anyio.sleep(0)
     return None
 
 
@@ -170,12 +199,15 @@ def default_render_workers() -> int:
 
 
 class RenderBackend(Protocol):
+    resources: ImageResources
+
     async def render(self, request: RenderRequest) -> RenderResult: ...
     async def aclose(self) -> None: ...
 
 
 class _OwnedRenderBackend:
     def __init__(self):
+        self.resources = ImageResources()
         self._closed = False
         self._jobs: dict[anyio.CancelScope, anyio.Event] = {}
 
@@ -189,7 +221,39 @@ class _OwnedRenderBackend:
         with anyio.CancelScope() as scope:
             self._jobs[scope] = done
             try:
-                frame = await self._execute(request)
+                from deckr.controller.invariant.ops.fetch_url import (
+                    MAX_IMAGE_BYTES,
+                    ImageResourceRequired,
+                )
+
+                deadline = (
+                    _RENDER_DEADLINE.get() or time.monotonic() + RENDER_TIMEOUT_SECONDS
+                )
+                resources = dict(request.resources)
+                if request.image_url:
+                    resources[request.image_url] = await self.resources.get(
+                        request.image_url,
+                        max_bytes=MAX_IMAGE_BYTES,
+                        deadline=deadline,
+                        media_types=None,
+                    )
+                while True:
+                    try:
+                        frame = await self._execute(
+                            replace(request, resources=resources)
+                        )
+                        break
+                    except ImageResourceRequired as missing:
+                        url = str(missing)
+                        remaining = 8 * MAX_IMAGE_BYTES - sum(
+                            len(blob.data) for blob in resources.values()
+                        )
+                        resources[url] = await self.resources.get(
+                            url,
+                            max_bytes=min(MAX_IMAGE_BYTES, remaining),
+                            deadline=deadline,
+                            media_types=None,
+                        )
                 error = None
             except (httpx.HTTPError, RenderWorkerImageFetchError) as exc:
                 logger.warning("Render image fetch failed: %s", exc)
@@ -216,9 +280,10 @@ class _OwnedRenderBackend:
         for scope, _ in jobs:
             scope.cancel()
         with anyio.CancelScope(shield=True):
-            with anyio.fail_after(1):
+            with anyio.fail_after(RENDER_TIMEOUT_SECONDS + 1):
                 for _, done in jobs:
                     await done.wait()
+        await self.resources.aclose()
         await _render_process.close_idle()
 
 
@@ -238,5 +303,8 @@ class ProcessPoolRenderBackend(_OwnedRenderBackend):
 
     async def _execute(self, request):
         return await run_process(
-            _render_request_to_frame_worker, request, limiter=self._limiter
+            _render_request_to_frame_worker,
+            request,
+            limiter=self._limiter,
+            deadline=_RENDER_DEADLINE.get(),
         )

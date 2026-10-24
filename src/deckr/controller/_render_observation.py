@@ -50,6 +50,10 @@ class ObservingRenderBackend:
         self._slots = threading.BoundedSemaphore(1)
         self._observation_failed = False
 
+    @property
+    def resources(self):
+        return self._backend.resources
+
     async def render(self, request: RenderRequest) -> RenderResult:
         started = time.perf_counter()
         try:
@@ -72,6 +76,18 @@ class ObservingRenderBackend:
 
     async def aclose(self) -> None:
         await self._backend.aclose()
+
+    async def observe_pipeline(self, record):
+        """Write full provider-stage timings outside the hardware handoff path."""
+        try:
+            with anyio.fail_after(0.05):
+                await run_thread(
+                    self._append_line,
+                    json.dumps(record, sort_keys=True),
+                    slots=self._slots,
+                )
+        except Exception:
+            logger.debug("Dropping render pipeline observation", exc_info=True)
 
     async def _observe(self, request, result, *, duration_ms):
         try:
@@ -162,6 +178,7 @@ class ObservingRenderBackend:
             "availabilityReason": _source_value(source, "availability_reason"),
             "graphSha256": _json_sha256(request.graph),
             "frameSha256": _bytes_sha256(result.frame),
+            "rasterSha256": _bytes_sha256(request.raster),
             "encoding": request.image_format.format.lower(),
             "width": request.image_format.width,
             "height": request.image_format.height,

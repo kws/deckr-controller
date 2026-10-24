@@ -46,7 +46,6 @@ from deckr.controller._render_graph import (
 # Separate bounded admission from execution: an initial multi-control burst may
 # wait for workers, but it cannot accumulate arbitrary request payloads/tasks.
 _ADMISSION_SLOTS = threading.BoundedSemaphore(32)
-_WORKERS = anyio.Semaphore(8)
 _GRAPH_WORKERS = anyio.CapacityLimiter(4)
 logger = logging.getLogger(__name__)
 DEFAULT_LIMITS = RenderLimits(
@@ -121,9 +120,12 @@ class _Job:
     receipt: _Receipt
     direct: bool = False
     done: bool = False
+    ready: bool = False
+    timings: dict[str, float] = field(default_factory=dict)
     command_id: str | None = None
     scope: anyio.CancelScope = field(default_factory=anyio.CancelScope)
     timer: anyio.CancelScope = field(default_factory=anyio.CancelScope)
+    loading: anyio.CancelScope = field(default_factory=anyio.CancelScope)
 
 
 @dataclass(frozen=True)

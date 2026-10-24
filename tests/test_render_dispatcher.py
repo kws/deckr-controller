@@ -19,7 +19,7 @@ from test_support.render_dispatch import (
 
 
 @pytest.mark.asyncio
-async def test_render_dispatcher_replaces_pending_and_drops_stale():
+async def test_render_dispatcher_cancels_obsolete_waiters_and_drops_stale():
     command_service = FakeHardwareCommandService()
 
     backend = ControlledBackend()
@@ -59,11 +59,7 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
             output=output,
         )
 
-        with anyio.fail_after(1.0):
-            while backend.calls != [1, 2]:
-                await anyio.sleep(0.01)
-
-        backend.release(2)
+        # The newest request starts without releasing either obsolete waiter.
         with anyio.fail_after(1.0):
             while backend.calls != [1, 2, 3]:
                 await anyio.sleep(0.01)
@@ -82,6 +78,7 @@ async def test_render_dispatcher_replaces_pending_and_drops_stale():
             b"frame-3",
         )
         backend.release(1)
+        backend.release(2)
         await anyio.sleep(0.05)
         command_service.set_raster_frame.assert_awaited_once()
         tg.cancel_scope.cancel()

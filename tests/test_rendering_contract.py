@@ -73,16 +73,22 @@ async def test_startup_burst_waits_for_shared_workers_without_losing_frames(
             rendering = h.device.components.rendering
             await eventually(lambda: len(rendering.jobs) == 14)
             assert all(not job.done for job in rendering.jobs.values())
+            assert all(job.command_id is None for job in rendering.jobs.values())
             assert not notifications(h, "binding_render_result")
-            h.commands.assert_not_awaited()
         finally:
             for _ in range(8):
                 slots.release()
+        final_ids = set()
         for request in requests:
-            assert (await result_for(h, request))["status"] == "dispatched"
+            result = await result_for(h, request)
+            assert result["status"] == "dispatched"
+            final_ids.add(result["commandMessageId"])
         await drained(h)
-        assert h.commands.await_count == 14
         commands = [call.args[0].message for call in h.commands.await_args_list]
+        assert 14 <= len(commands) <= 28  # At most one provisional frame per job.
+        assert {c.message_id for c in commands} >= final_ids
+        latest = {c.body["controlId"]: c.message_id for c in commands}
+        assert set(latest.values()) == final_ids
         assert {c.body["controlId"] for c in commands} == {
             f"key-{i}" for i in range(1, 15)
         }
@@ -105,7 +111,17 @@ async def test_queued_render_is_bounded_and_cannot_dispatch_after_expiry_or_reti
     admission = threading.BoundedSemaphore(2)
     execution = anyio.Semaphore(1)
     monkeypatch.setattr(rendering, "_ADMISSION_SLOTS", admission)
-    monkeypatch.setattr(rendering, "_WORKERS", execution)
+    import deckr.controller._bindings._render_execution as execution_module
+    import deckr.controller._render_feedback as feedback
+
+    original = execution_module.run_thread
+
+    async def limited(*args, **kwargs):
+        async with execution:
+            return await original(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module, "run_thread", limited)
+    monkeypatch.setattr(feedback, "LOADING_DELAY", 10)
     if stop == "deadline":
         monkeypatch.setattr(
             policy,
@@ -259,7 +275,11 @@ async def test_superseded_jobs_release_capacity_and_deadline_prevents_late_dispa
         for gate in backend.gates:
             gate.set()
         await drained(h)
-        assert h.commands.await_count == 0
+        await eventually(lambda: h.commands.await_count == 2)
+        assert [
+            call.args[0].message.body["commandType"]
+            for call in h.commands.await_args_list
+        ] == ["set_frame", "clear"]
 
 
 @pytest.mark.asyncio

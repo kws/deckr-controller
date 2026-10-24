@@ -32,6 +32,14 @@ def build_executor(*, cache_dir: Path | str | None = None) -> Executor:
     registry.register("deckr:encode_jpeg", encode_jpeg)
     registry.register("deckr:encode_raster", encode_raster)
 
+    # GFX v2 identities use raw RGBA pixels and typed resource bytes. Keep the
+    # producer policy separate from pre-upgrade manifests and cached URL data.
+    cache_dir = (
+        Path(cache_dir)
+        if cache_dir is not None
+        else Path.cwd() / ".invariant" / "cache"
+    ) / "deckr-render-v2"
+
     store = ChainStore(
         l1=MemoryStore(cache=ByteBudgetCache(L1_SIZE_LIMIT_BYTES, L1_MAX_ARTIFACTS)),
         l2=DiskStore(

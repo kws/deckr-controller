@@ -39,6 +39,8 @@ OVERLAY_TEMPLATES = frozenset(STATUS_OVERLAY_STYLES)
 def _store_content_kind(store: ControlStateStore) -> str:
     if store.overlay is not None:
         return f"overlay:{store.overlay.template}"
+    if store.content.raster is not None:
+        return "data_image"
     if store.content.image is not None:
         if store.content.image.startswith("data:application/vnd.invariant.graph"):
             return "invariant_graph"
@@ -262,6 +264,7 @@ class PresentationController:
         previous_generation = self._store.base_output_generation
         if not self._accept_base_generation(generation):
             return
+        self._store.content.raster = None
         self._store.content.title = text
         self._store.content.image = None
         if (
@@ -282,6 +285,7 @@ class PresentationController:
         previous_generation = self._store.base_output_generation
         if not self._accept_base_generation(generation):
             return
+        self._store.content.raster = None
         self._store.content.image = image
         self._store.content.title = None
         if (
@@ -296,6 +300,7 @@ class PresentationController:
         previous_generation = self._store.base_output_generation
         if not self._accept_base_generation(generation):
             return
+        self._store.content.raster = None
         self._store.content.image = None
         self._store.content.title = None
         if (

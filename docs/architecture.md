@@ -349,12 +349,13 @@ Process execution uses controller-owned spawned workers. Ownership starts before
 the first cancellation checkpoint, and cancelled workers are killed and joined,
 including cancellation during startup. Worker errors are checked for a complete
 serialization round trip; exceptions that cannot cross the process boundary
-become a plain diagnostic error. Failed artwork downloads therefore leave warm
+become a plain diagnostic error. Artwork acquisition happens outside these workers, so network failures leave warm
 workers reusable. Unserializable results also fail the job without killing its
 worker. Idle workers are reused and closed with the render backend. Admission is
 bounded across controller instances (eight process jobs and eight local thread
 jobs). Accepted work waits asynchronously for execution capacity instead of
-failing when another control temporarily occupies the workers. The wait is
+failing when another control temporarily occupies the workers. The narrower graph/backend limiter is acquired before global process capacity,
+so waiting graph jobs cannot reserve idle composition slots. The wait is
 cancellable and consumes the existing render deadline; ordinary render attempts
 have a two-second deadline. Superseded pure computation may finish within that
 original deadline so rapid navigation does not repeatedly destroy warm workers;
@@ -367,16 +368,20 @@ negotiated deadline and admission limits. Output revisions fence every hardware 
 | Ordinary render requests per control | Two active workers, one coalesced latest pending request. |
 | Ordinary render/send deadlines | Two seconds each. |
 | Shared execution capacity | Eight process jobs and eight local thread jobs across controller instances in the process. Eight processes are warmed before binding admission. |
-| Provider render jobs | Two admitted per control, 32 admitted per process, eight executing per process. Waiting jobs count against both admission bounds and the deadline; excess work is refused with `busy`. |
-| Invariant graph workers | Four concurrent executions. |
+| Provider render jobs | Two admitted per control and 32 admitted per process. Resource and CPU stages have separate execution limits. Waiting jobs count against both admission bounds and the deadline; excess work is refused with `busy`. |
+| Invariant graph workers | Four concurrent executions; HTTP never holds a graph or process slot. |
+| Artwork acquisition | Sixteen global requests, four per origin per backend; one second per streamed response, within the original job deadline. |
+| Resource buffers | 1 MiB per image by default; 8 MiB aggregate per job, including concurrent response chunks. |
+| HTTP memory cache | 128 entries and 16 MiB per backend; explicit freshness capped at 60 seconds. |
+| Loading feedback | Static indicator after 120 ms, with two reserved threads and at most 64 cached target formats. No animation ticks or backlog. |
 | Provider render deadline | Advertised target limit, normally two seconds. |
 | Completed request retention | At most 512 identity/expiry records, pruned after 60 seconds. Finished jobs release render payloads and binding leases. |
 | Hardware rejection mappings | 1,024 compact receipts with 60-second expiry, pruned by the hardware maintenance loop and removed at disconnect. Receipts hold a weak reference to their recipient. |
 | Queued clears | Latest clear per control; superseded clears are rejected before handoff. |
 
 The provider queue has fixed global and per-control bounds. A burst of initial
-frames across more than eight controls
-can wait for the same eight workers. Superseding or retiring a binding cancels
+frames can acquire resources independently while waiting for the bounded raster
+workers. Superseding or retiring a binding cancels
 its waiting jobs; expired work cannot start later or send hardware output.
 Trusted thread rendering uses a process-owned pool of eight reusable threads.
 Cancelling queued work removes its execution authority; cancelling running work
@@ -391,11 +396,14 @@ The shared disk tier retains its 512 MiB eviction target. These are cache budget
 not limits on total process RSS: interpreter, fonts, active graphs and transient
 encoding allocations also consume memory. Deployment budgets must cover the
 warmed pool plus active rendering allocations. Lower process counts require real
-full-grid startup validation: graph fetches and composition share capacity, and
-queue time counts against their deadlines.
+full-grid startup validation: graph CPU and composition share process capacity,
+and queue time counts against their deadlines. The disk cache uses the
+`deckr-render-v2` namespace so old URL-only entries and earlier GFX identities
+cannot leak into this producer policy.
 
-The ordinary image-card path streams HTTP artwork with a 1 MiB byte limit and a
-two-second total download deadline. Inline images have the same byte limit.
+The ordinary image-card path uses the same asynchronous pooled artwork service
+as provider graphs, with a 1 MiB byte limit and one-second response deadline
+within its two-second render budget. Inline images have the same byte limit.
 Raster headers are checked against a 4,194,304-pixel ceiling before downstream
 decoding allocates pixels. Provider graphs retain their separately negotiated
 limits and total pixel-allocation budget.
@@ -412,6 +420,45 @@ downscaled to the graph's 1024-pixel dimension and canvas pixel bounds before us
 Source decoding counts toward the graph's total pixel budget; oversized sources
 are rejected before allocating their pixel buffer. Inline image limits are unchanged.
 
+Validated provider graphs collect only reachable literal HTTP URLs, deduplicate
+within the job and download independent resources concurrently. No redirects,
+cookies, credentials or environment proxy settings are reused. Only PNG/JPEG are
+admitted by this extension. Fresh responses may be shared according to explicit
+HTTP `max-age`, subtracting `Age`; `no-cache` revalidates, and `no-store`, `private`
+or `Vary` responses are not retained. Stale entries require a new response or a
+conditional ETag/Last-Modified 304; errors never serve stale bytes. Each job still
+validates its image limits and current output authority. Download bytes never
+enter the persistent graph cache. The cache is discarded when the backend closes.
+
+Ordinary trusted graph execution obtains missing HTTP resources through the same
+async service and resumes the pure graph in a worker. Simple URL cards acquire
+their resource before taking a CPU slot. Dynamic graph URLs are discovered on the
+active demand path, preserving lazy switches and unreachable-branch semantics;
+those discovered URLs are acquired successively. HTTP fetch nodes and their
+dependents are ephemeral, so an old persistent URL result cannot bypass freshness.
+
+The provider executor uses Invariant's public `cache=False` policy. Node identity
+memoisation still avoids repeating a referenced node, without PNG hashing or
+per-job content-store lookups. Validated logical PNGs cross the worker boundary
+as bytes and are retained as the accepted base. Final composition decodes these
+bytes directly, adds the latest overlay, rotates and encodes the target format;
+it does not construct another base64 image-card graph or resize an already fitted
+canvas. GFX image identities hash versioned geometry and raw RGBA pixels. Its
+non-normal blend modes use bounded NumPy strips with the same pixel/alpha results.
+
+Automatic loading feedback is controller-owned and separate from the accepted
+base and provider overlay identities. If a current render is still pending after
+120 ms, a cached neutral loading frame can be sent through the ordered output
+lock. Existing provider feedback takes priority. The final-ready phase stops the
+timer before final handoff; current binding, generation and authority are checked
+again after the output lock, so queued loading pixels cannot replace a final frame.
+Provisional commands have independent hardware command IDs and never emit the
+provider request's terminal result. Failure or timeout restores the last accepted
+presentation, or clears if none exists, only while the same binding/revision is
+current. Retirement never restores old page pixels. Loading does not extend the
+original render deadline. Restoration is bounded to 500 ms and best effort when
+hardware is unavailable.
+
 A `dispatched` result confirms local command dispatch, not physical display.
 Hardware rejection must match the exact command ID, contract, device, control,
 capability and command type. Rejecting an older command never rolls back newer
@@ -423,7 +470,7 @@ public font metrics before allocation; packed text wraps at word boundaries and
 shrinks to fit complete words before truncating at its minimum font size. It draws
 directly onto a bounded canvas. Fixed text is limited to 128
 points by graph policy; width fitting searches up to 500 points. The adapter has
-explicit geometry/allocation coverage against `invariant-gfx` 0.4.x. Wire tuples
+explicit geometry/allocation coverage against the pinned `invariant-gfx` source revision. Wire tuples
 are normalized to the executor's recursive list representation so expressions are evaluated before dimension checks; hex
 colours are converted through Pillow's public colour parser.
 
@@ -433,6 +480,14 @@ write per sink; an abandoned write retains its slot. Records report the requeste
 raster encoding. Files rotate at 25 MiB with three backups; an individual record
 larger than that budget is dropped without failing rendering. The integration
 harness deliberately retains complete evidence in its isolated run directory.
+Provider jobs also emit a `render.pipeline` observation after terminal handling,
+with resource, graph queue/worker, content, composition, dispatch, total and first
+feedback timings where those phases completed. These records use the originating
+request ID and do not delay hardware output. Resource debug logs separate queue,
+headers and body latency, byte count and fresh-cache hits without logging URL
+paths. Backend `render.result` duration covers its own render stage, not the whole
+provider pipeline. Physical device presentation latency remains outside this
+measurement boundary.
 
 Sources: [pipeline](../src/deckr/controller/_bindings/_rendering.py),
 [dispatcher](../src/deckr/controller/_render_dispatcher.py),
@@ -444,7 +499,9 @@ Tests: [render contract](../tests/test_rendering_contract.py),
 [worker lifetime](../tests/test_render_workers.py),
 [graph admission/allocation](../tests/test_render_graph.py),
 [resource cleanup and cache bounds](../tests/test_render_resources.py),
-[artwork fetch limits](../tests/test_invariant_ops.py),
+[async artwork and freshness](../tests/test_async_image_resources.py),
+[provisional loading](../tests/test_render_loading.py),
+[artwork decode limits](../tests/test_invariant_ops.py),
 [observation failures](../tests/test_render_observation.py).
 
 ## Configuration

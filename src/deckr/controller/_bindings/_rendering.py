@@ -37,7 +37,6 @@ if TYPE_CHECKING:
 from deckr.controller._bindings._render_execution import RenderExecution
 from deckr.controller._bindings._render_policy import (
     _ADMISSION_SLOTS,
-    _WORKERS,
     DEFAULT_LIMITS,
     RenderingPorts,
     _Job,
@@ -244,6 +243,8 @@ class BindingRenderer:
             self.jobs[cache_key] = job
             self.ports.start_soon(self._run, job)
             self.ports.start_soon(self._expire, job)
+            if not direct and body.operation != "clear":
+                self.ports.start_soon(self._show_loading, job)
         except BaseException:
             self.active[control_id] -= 1
             _ADMISSION_SLOTS.release()
@@ -347,6 +348,25 @@ class BindingRenderer:
         if job.done:
             return
         job.done = True
+        job.timings["totalMs"] = (
+            time.monotonic() - job.deadline
+        ) * 1000 + job.target.limits.max_render_time_ms
+        record = dict(
+            event="render.pipeline",
+            actionMessageId=job.message.message_id,
+            controlId=job.lease.control_id,
+            bindingId=job.lease.binding_id,
+            status=status,
+            code=code,
+            stages=dict(job.timings),
+        )
+        logger.debug("Render pipeline %s", record)
+        observe = getattr(self.ports.backend, "observe_pipeline", None)
+        if observe is not None:
+            self.ports.start_soon(observe, record)
+        job.loading.cancel()
+        if status != "dispatched":
+            self.ports.start_soon(self._restore_loading, job)
         self.completed[job.cache_key] = job.deadline + 60
         while len(self.completed) > 512:
             self.completed.popitem(last=False)
@@ -363,6 +383,51 @@ class BindingRenderer:
         if job.receipt.rejection is not None:
             await self._hardware_rejection(job.receipt, job.receipt.rejection)
         job.scope.cancel()
+
+    async def _show_loading(self, job):
+        from deckr.controller._render_feedback import LOADING_DELAY, loading_frame
+
+        router = job.lease.context.presentation
+        dispatcher = self.ports.dispatcher
+
+        def pending():
+            return (
+                not job.done
+                and not job.ready
+                and time.monotonic() < job.deadline
+                and dispatcher.base_is_current(job.ticket)
+                and router.store.overlay is None
+            )
+
+        with job.loading:
+            await anyio.sleep(LOADING_DELAY)
+            try:
+                if pending():
+                    revision = dispatcher.composition_revision(job.ticket)
+                    frame = await loading_frame(router.image_format)
+                    sent = await dispatcher.publish_feedback(
+                        job.lease.control_id,
+                        revision,
+                        frame,
+                        is_pending=pending,
+                        authorize=lambda: self._authorize(job),
+                    )
+                    if sent:
+                        job.timings["firstFeedbackMs"] = (
+                            time.monotonic() - job.deadline
+                        ) * 1000 + job.target.limits.max_render_time_ms
+            except Exception:
+                logger.debug("Loading feedback failed", exc_info=True)
+
+    async def _restore_loading(self, job):
+        dispatcher = self.ports.dispatcher
+        if dispatcher.base_is_current(job.ticket):
+            await dispatcher.restore_feedback(
+                job.lease.control_id,
+                dispatcher.composition_revision(job.ticket),
+                lambda: dispatcher.base_is_current(job.ticket)
+                and job.lease.context.presentation.store.overlay is None,
+            )
 
     async def retire_binding(self, binding_id):
         for job in tuple(self.jobs.values()):
@@ -406,11 +471,8 @@ class BindingRenderer:
     async def _run(self, job):
         try:
             with job.scope:
-                # Admission is bounded per control. Execution capacity is shared
-                # across devices; queue time remains inside the advertised deadline.
-                async with _WORKERS:
-                    if not job.done:
-                        await self.execution.execute(job)
+                if not job.done:
+                    await self.execution.execute(job)
         finally:
             self.jobs.pop(job.cache_key, None)
             control_id = job.lease.control_id

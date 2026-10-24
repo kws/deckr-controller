@@ -1,18 +1,22 @@
-"""deckr:fetch_image_url op - download image from URL or parse data URI."""
+"""deckr:fetch_image_url op - consume acquired image bytes or parse a data URI."""
 
 import base64
 import io
-import time
 import urllib.parse
+from contextvars import ContextVar
 
-import httpx
 from invariant_gfx.artifacts import BlobArtifact
 from PIL import Image, UnidentifiedImageError
 
-HTTP_IMAGE_TIMEOUT = httpx.Timeout(2.0, connect=1.0)
 MAX_IMAGE_BYTES = 1024 * 1024
 MAX_IMAGE_PIXELS = 4 * 1024 * 1024
-HTTP_IMAGE_SECONDS = 2.0
+
+
+IMAGE_RESOURCES = ContextVar("image_resources", default=None)
+
+
+class ImageResourceRequired(Exception):
+    """An active graph requires bytes from the controller's async resource stage."""
 
 
 def fetch_image_url(url: str) -> BlobArtifact:
@@ -30,7 +34,11 @@ def fetch_image_url(url: str) -> BlobArtifact:
     if url.startswith("data:"):
         return _parse_data_uri(url)
     if url.startswith(("http://", "https://")):
-        return _fetch_http(url)
+        resources = IMAGE_RESOURCES.get() or {}
+        if url not in resources:
+            raise ImageResourceRequired(url)
+        blob = resources[url]
+        return _bounded_blob(blob.data, blob.content_type)
     raise ValueError(f"Unsupported URL scheme: {url[:20]}...")
 
 
@@ -50,27 +58,6 @@ def _parse_data_uri(url: str) -> BlobArtifact:
     else:
         raw = urllib.parse.unquote_to_bytes(data)
     return _bounded_blob(raw, content_type)
-
-
-def _fetch_http(url: str) -> BlobArtifact:
-    deadline = time.monotonic() + HTTP_IMAGE_SECONDS
-    with (
-        httpx.Client(timeout=HTTP_IMAGE_TIMEOUT, follow_redirects=True) as client,
-        client.stream("GET", url) as response,
-    ):
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "application/octet-stream")
-        # Strip charset if present, e.g. "image/png; charset=utf-8"
-        if ";" in content_type:
-            content_type = content_type.split(";", 1)[0].strip()
-        data = bytearray()
-        for chunk in response.iter_bytes():
-            if time.monotonic() >= deadline:
-                raise httpx.ReadTimeout("Image download exceeded its total deadline")
-            if len(data) + len(chunk) > MAX_IMAGE_BYTES:
-                raise ValueError("Image exceeds byte budget")
-            data.extend(chunk)
-        return _bounded_blob(bytes(data), content_type)
 
 
 def _bounded_blob(data, content_type):
