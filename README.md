@@ -120,6 +120,13 @@ endpoint sessions. The host cancels that predecessor's participation before
 starting replacement endpoints; other live instances retain their contracts.
 Embedded hosts pass the verified evidence to `Deckr(restart=proof)` explicitly.
 
+For Linux Docker deployments, use the workspace's
+[trusted supervisor setup](https://github.com/kws/sidepanel/blob/main/docker/README.md#supervised-controller-restarts-on-linux).
+It supplies `DECKR_SUPERVISOR_SOCKET` as well as the handoff settings, records
+sessions before the controller can use them, and owns container restart ordering.
+Docker's automatic restart must be disabled for this supervised container.
+The launcher confirms predecessor cleanup before controller components start.
+
 ## Packaging
 
 Deckr is under active alpha development. Ordinary changes use Git commits as
