@@ -370,11 +370,11 @@ negotiated deadline and admission limits. Output revisions fence every hardware 
 | Shared execution capacity | Eight process jobs and eight local thread jobs across controller instances in the process. Eight processes are warmed before binding admission. |
 | Provider render jobs | Two admitted per control and 32 admitted per process. Resource and CPU stages have separate execution limits. Waiting jobs count against both admission bounds and the deadline; excess work is refused with `busy`. |
 | Invariant graph workers | Four concurrent executions; HTTP never holds a graph or process slot. |
-| Artwork acquisition | Sixteen global requests, four per origin per backend; one second per streamed response, within the original job deadline. |
+| Artwork acquisition | Sixteen global requests, four per origin per backend; two seconds per streamed response, within the original job deadline. |
 | Resource buffers | 1 MiB per image by default; 8 MiB aggregate per job, including concurrent response chunks. |
 | HTTP memory cache | 128 entries and 16 MiB per backend; explicit freshness capped at 60 seconds. |
 | Loading feedback | Static indicator after 120 ms, with two reserved threads and at most 64 cached target formats. No animation ticks or backlog. |
-| Provider render deadline | Advertised target limit, normally two seconds. |
+| Provider render deadline | Advertised target limit, normally five seconds, including resource queues, fetching, graph execution, composition and dispatch. |
 | Completed request retention | At most 512 identity/expiry records, pruned after 60 seconds. Finished jobs release render payloads and binding leases. |
 | Hardware rejection mappings | 1,024 compact receipts with 60-second expiry, pruned by the hardware maintenance loop and removed at disconnect. Receipts hold a weak reference to their recipient. |
 | Queued clears | Latest clear per control; superseded clears are rejected before handoff. |
@@ -396,13 +396,13 @@ The shared disk tier retains its 512 MiB eviction target. These are cache budget
 not limits on total process RSS: interpreter, fonts, active graphs and transient
 encoding allocations also consume memory. Deployment budgets must cover the
 warmed pool plus active rendering allocations. Lower process counts require real
-full-grid startup validation: graph CPU and composition share process capacity,
-and queue time counts against their deadlines. The disk cache uses the
+full-grid startup validation: graph CPU and ordinary graph cards share process
+capacity, and queue time counts against their deadlines. The disk cache uses the
 `deckr-render-v2` namespace so old URL-only entries and earlier GFX identities
 cannot leak into this producer policy.
 
 The ordinary image-card path uses the same asynchronous pooled artwork service
-as provider graphs, with a 1 MiB byte limit and one-second response deadline
+as provider graphs, with a 1 MiB byte limit and two-second response deadline
 within its two-second render budget. Inline images have the same byte limit.
 Raster headers are checked against a 4,194,304-pixel ceiling before downstream
 decoding allocates pixels. Provider graphs retain their separately negotiated

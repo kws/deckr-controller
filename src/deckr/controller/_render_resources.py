@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 MAX_RESOURCE_BYTES = 8 * 1024 * 1024
 CACHE_BYTES = 16 * 1024 * 1024
 CACHE_ENTRIES = 128
+FETCH_TIMEOUT_SECONDS = 2.0
 _FETCH_SLOTS = anyio.Semaphore(16)
 
 
@@ -176,7 +177,10 @@ class ImageResources:
                                 headers["if-modified-since"] = entry.headers[
                                     "last-modified"
                                 ]
-                        seconds = min(1.0, max(0, deadline - time.monotonic()))
+                        seconds = min(
+                            FETCH_TIMEOUT_SECONDS,
+                            max(0, deadline - time.monotonic()),
+                        )
                         with anyio.fail_after(seconds):
                             request = httpx.Request(
                                 "GET",

@@ -39,6 +39,50 @@ async def test_http_preparation_loads_certificates_outside_event_loop(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_artwork_can_take_over_one_second_without_losing_the_frame():
+    async def respond(request):
+        await anyio.sleep(1.05)
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=b"artwork"
+        )
+
+    resources = ImageResources(transport=httpx.MockTransport(respond))
+    try:
+        blob = await resources.get(
+            "https://art.test/a", max_bytes=100, deadline=time.monotonic() + 5
+        )
+        assert blob.data == b"artwork"
+    finally:
+        await resources.aclose()
+
+
+@pytest.mark.asyncio
+async def test_network_timeout_cannot_consume_the_entire_longer_job(monkeypatch):
+    import deckr.controller._render_resources as module
+
+    monkeypatch.setattr(module, "FETCH_TIMEOUT_SECONDS", 0.02)
+    cancelled = anyio.Event()
+
+    async def respond(request):
+        try:
+            await anyio.sleep_forever()
+        finally:
+            cancelled.set()
+
+    resources = ImageResources(transport=httpx.MockTransport(respond))
+    try:
+        with anyio.fail_after(1):
+            with pytest.raises(TimeoutError):
+                await resources.get(
+                    "https://art.test/a", max_bytes=100, deadline=time.monotonic() + 5
+                )
+        assert cancelled.is_set()
+        assert not resources._origins
+    finally:
+        await resources.aclose()
+
+
+@pytest.mark.asyncio
 async def test_parallel_acquisition_deduplicates_and_bounds_each_origin():
     active, peak, calls = 0, 0, []
 

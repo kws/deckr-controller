@@ -55,7 +55,10 @@ DEFAULT_LIMITS = RenderLimits(
     max_image_bytes=1048576,
     max_image_pixels=1048576,
     max_text_code_points=1024,
-    max_render_time_ms=2000,
+    # The absolute budget includes per-origin fetch queues and composition.
+    # Loading feedback keeps slow artwork visible without a one-second network
+    # assumption causing persistent provider placeholders on a full device.
+    max_render_time_ms=5000,
 )
 
 
