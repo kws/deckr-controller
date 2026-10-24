@@ -223,6 +223,16 @@ async def setup(
                 await eventually(
                     lambda: service.route_for_config("config-a") is not None
                 )
+                # NATS delivers the negotiated claim to each participant
+                # independently. Command-validation tests need both sides ready.
+                route = service.route_for_config("config-a")
+                await eventually(
+                    lambda: any(
+                        claim.contract.contract_id == route.contract.contract_id
+                        and claim.contract.generation == route.contract.generation
+                        for claim in manager.live_claims
+                    )
+                )
             yield SimpleNamespace(
                 runtime=runtime,
                 substrate=substrate,

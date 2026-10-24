@@ -92,7 +92,18 @@ async def test_failure_restores_same_binding_but_never_retired_content():
 
 
 @pytest.mark.asyncio
-async def test_loading_precedes_final_without_accepting_placeholder(managed_substrate):
+async def test_loading_precedes_final_without_accepting_placeholder(
+    managed_substrate, monkeypatch
+):
+    from deckr.controller._bindings import _render_policy as policy
+
+    # Hold the final frame until the independently delivered loading frame is
+    # observed. Expiry is exercised separately below, not by runner CPU speed.
+    monkeypatch.setattr(
+        policy,
+        "DEFAULT_LIMITS",
+        policy.DEFAULT_LIMITS.model_copy(update={"max_render_time_ms": 10000}),
+    )
     async with running_controller(managed_substrate, with_output=True) as h:
         backend = real_backend(h, GatedBackend())
         renderer = h.device.components.rendering
@@ -106,8 +117,8 @@ async def test_loading_precedes_final_without_accepting_placeholder(managed_subs
         assert not next(iter(renderer.jobs.values())).done
         backend.gates[0].set()
         result = await result_for(h, request)
-        assert result["status"] == "dispatched"
-        assert h.commands.await_count == 2
+        assert result["status"] == "dispatched", repr(result)
+        await eventually(lambda: h.commands.await_count == 2)
         assert router.store.content.raster is not None
         messages = [c.args[0].message for c in h.commands.await_args_list]
         assert messages[0].message_id != result["commandMessageId"]

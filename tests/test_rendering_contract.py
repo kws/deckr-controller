@@ -54,6 +54,16 @@ async def test_completed_render_releases_job_but_keeps_duplicate_fence(
 async def test_startup_burst_waits_for_shared_workers_without_losing_frames(
     managed_substrate, monkeypatch
 ):
+    from deckr.controller._bindings import _render_policy as policy
+
+    # This test deliberately occupies every worker while admitting fourteen
+    # requests. Verify queueing independently of instrumented runner CPU speed;
+    # the deadline/retirement tests below exercise expiry with controlled gates.
+    monkeypatch.setattr(
+        policy,
+        "DEFAULT_LIMITS",
+        DEFAULT_LIMITS.model_copy(update={"max_render_time_ms": 10000}),
+    )
     await workers.prepare_thread_rendering()
     slots = threading.BoundedSemaphore(8)
     monkeypatch.setattr(workers, "_THREAD_SLOTS", slots)
