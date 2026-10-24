@@ -79,7 +79,10 @@ async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
         hardware=unavailable_hardware,
     )
     actions = SimpleNamespace(aclose=close_resource("actions", fail=close_fails))
-    renderer = SimpleNamespace(aclose=close_resource("renderer"))
+    renderer = SimpleNamespace(
+        aclose=close_resource("renderer"),
+        resources=SimpleNamespace(prepare=AsyncMock()),
+    )
     monkeypatch.setattr(module, "build_config_service", lambda *a, **kw: object())
     monkeypatch.setattr(module, "build_settings_service", lambda *a, **kw: object())
     monkeypatch.setattr(module, "DeckrServices", lambda **kw: object())

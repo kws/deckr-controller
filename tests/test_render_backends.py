@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import logging
 
 import anyio
 import httpx
 import pytest
+from PIL import Image
 
 from deckr.controller._raster import RasterFormat
 from deckr.controller._render import (
@@ -110,6 +112,31 @@ async def test_process_pool_render_backend_renders_request():
         assert result.frame is not None
         assert len(result.frame) > 100
     finally:
+        await backend.aclose()
+
+
+@pytest.mark.asyncio
+async def test_logical_raster_composition_does_not_wait_for_busy_graph_processes():
+    from deckr.controller._render_workers import _PROCESS_SLOTS
+
+    data = io.BytesIO()
+    Image.new("RGB", (72, 72), "red").save(data, format="PNG")
+    backend = ProcessPoolRenderBackend()
+    request = RenderService().build_request(
+        RenderModel(raster=data.getvalue()), RasterFormat(72, 72)
+    )
+    held = 0
+    try:
+        while _PROCESS_SLOTS.acquire(blocking=False):
+            held += 1
+        with anyio.fail_after(1):
+            result = await backend.render(request)
+        assert result.frame and result.error is None
+        with Image.open(io.BytesIO(result.frame)) as frame:
+            assert frame.size == (72, 72)
+    finally:
+        for _ in range(held):
+            _PROCESS_SLOTS.release()
         await backend.aclose()
 
 

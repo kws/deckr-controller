@@ -440,11 +440,16 @@ dependents are ephemeral, so an old persistent URL result cannot bypass freshnes
 The provider executor uses Invariant's public `cache=False` policy. Node identity
 memoisation still avoids repeating a referenced node, without PNG hashing or
 per-job content-store lookups. Validated logical PNGs cross the worker boundary
-as bytes and are retained as the accepted base. Final composition decodes these
+as bytes and are retained as the accepted base. Final composition uses the bounded
+local thread pool even with the process backend, so small validated rasters do not
+queue behind provider graphs a second time. Final composition decodes these
 bytes directly, adds the latest overlay, rotates and encodes the target format;
 it does not construct another base64 image-card graph or resize an already fitted
 canvas. GFX image identities hash versioned geometry and raw RGBA pixels. Its
 non-normal blend modes use bounded NumPy strips with the same pixel/alpha results.
+Startup warms local composition and initializes the HTTP client off the event
+loop before admitting bindings, keeping TLS certificate loading out of the first
+artwork burst.
 
 Automatic loading feedback is controller-owned and separate from the accepted
 base and provider overlay identities. If a current render is still pending after

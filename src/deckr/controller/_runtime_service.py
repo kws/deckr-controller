@@ -132,11 +132,9 @@ class ControllerRuntimeService(BaseComponent):
             from deckr.controller._render_workers import prepare_process_rendering
 
             await prepare_process_rendering()
-            if (
-                self._runtime.config.render is not None
-                and self._runtime.config.render.backend == "thread"
-            ):
-                await prepare_thread_rendering()
+            await prepare_thread_rendering()
+            if render_backend is not None:
+                await render_backend.resources.prepare()
             controller_service = ControllerService(
                 endpoint=self._endpoint,
                 hardware=self._context.hardware(self._endpoint),

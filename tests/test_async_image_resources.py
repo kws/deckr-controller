@@ -1,6 +1,7 @@
 """Async resource limits, HTTP freshness, cancellation and worker isolation."""
 
 import io
+import threading
 import time
 
 import anyio
@@ -14,6 +15,27 @@ from deckr.controller._render_resources import ImageResources
 
 def deadline():
     return time.monotonic() + 2
+
+
+@pytest.mark.asyncio
+async def test_http_preparation_loads_certificates_outside_event_loop(monkeypatch):
+    resources = ImageResources(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200))
+    )
+    event_loop_thread = threading.get_ident()
+    original = resources._http
+    threads = []
+
+    def prepare():
+        threads.append(threading.get_ident())
+        return original()
+
+    monkeypatch.setattr(resources, "_http", prepare)
+    await resources.prepare()
+    assert threads and threads[0] != event_loop_thread
+    client = resources._client
+    assert original() is client
+    await resources.aclose()
 
 
 @pytest.mark.asyncio

@@ -303,6 +303,11 @@ class ProcessPoolRenderBackend(_OwnedRenderBackend):
         self._limiter = anyio.CapacityLimiter(max_workers or default_render_workers())
 
     async def _execute(self, request):
+        # A logical raster has already passed provider validation and CPU
+        # isolation. Its small local composition must not queue a second time
+        # behind unrelated provider graphs in the process pool.
+        if request.raster is not None:
+            return await run_thread(render_request_to_frame, request)
         return await run_process(
             _render_request_to_frame_worker,
             request,

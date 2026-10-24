@@ -80,6 +80,10 @@ class ImageResources:
             )
         return self._client
 
+    async def prepare(self):
+        """Load TLS certificates before admitting the first artwork burst."""
+        await anyio.to_thread.run_sync(self._http)
+
     @asynccontextmanager
     async def _capacity(self, origin):
         entry = self._origins.setdefault(origin, [anyio.Semaphore(4), 0])
