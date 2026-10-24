@@ -190,7 +190,9 @@ async def test_waiting_fetch_does_not_take_a_raster_worker(controls):
         await entered.wait()
         with anyio.fail_after(0.5):
             fast = await backend.render(
-                build_render_request(RenderModel(title="Ready"), RasterFormat(72, 72))
+                build_render_request(
+                    RenderModel(raster=data.getvalue()), RasterFormat(72, 72)
+                )
             )
         assert fast.frame and not finished.is_set()
         release.set()

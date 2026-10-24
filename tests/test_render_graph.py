@@ -13,6 +13,7 @@ from deckr.controller._render_graph import (
     render_graph,
     validate_graph,
 )
+from deckr.controller._render_workers import prepare_process_rendering
 from deckr.controller.invariant.recipes import icon_button, title_card
 from test_support.action_runtime import running_controller
 from test_support.rendering import parameters, real_backend, result_for
@@ -62,13 +63,15 @@ def test_computed_size_is_bounded_before_allocation():
 
 @pytest.mark.asyncio
 async def test_extension_crosses_managed_render_boundary(managed_substrate):
+    # The real runtime warms graph workers before admitting device bindings.
+    await prepare_process_rendering()
     async with running_controller(managed_substrate, with_output=True) as h:
         real_backend(h)
         params = parameters(h)
         params["content"] = {"format": INVARIANT_FORMAT, "data": document()}
         request = await h.channel.send("binding_render", params)
         result = await result_for(h, request)
-        assert result["status"] == "dispatched", result
+        assert result["status"] == "dispatched", repr(result)
 
 
 @pytest.mark.parametrize("packed", [False, True])

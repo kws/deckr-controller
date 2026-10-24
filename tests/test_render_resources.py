@@ -56,6 +56,10 @@ async def test_entire_process_pool_can_be_replaced_after_stalled_jobs(tmp_path):
                     backend,
                     request,
                     is_current=lambda: True,
+                    # Recovery includes eight fresh interpreter/font imports.
+                    # Test bounded replacement independently of host CPU speed;
+                    # deadline rejection has its own deterministic gated tests.
+                    timeout=10,
                 )
             )
 

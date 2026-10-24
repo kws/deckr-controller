@@ -100,8 +100,8 @@ async def run_thread(function, *args, slots=None, pool=None):
 
 async def prepare_thread_rendering():
     """Initialize local raster composition before admitting device bindings."""
-    # A tiny local image loads the executor, graphics operations and composition
-    # recipe once. Concurrent first frames must not all pay that cold-start cost
+    # A local image and title load the executor, graphics operations, fonts and
+    # composition recipe. Concurrent first frames must not pay that cold-start cost
     # inside their advertised deadline. No hardware or observation is involved.
     from io import BytesIO
 
@@ -113,9 +113,10 @@ async def prepare_thread_rendering():
         request = RenderService().build_request(
             RenderModel(
                 image="data:image/png;base64,"
-                + base64.b64encode(image.getvalue()).decode("ascii")
+                + base64.b64encode(image.getvalue()).decode("ascii"),
+                title="Ready",
             ),
-            RasterFormat(1, 1),
+            RasterFormat(72, 72),
         )
         render_request_to_frame(request)
 

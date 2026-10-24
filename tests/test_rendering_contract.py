@@ -54,6 +54,7 @@ async def test_completed_render_releases_job_but_keeps_duplicate_fence(
 async def test_startup_burst_waits_for_shared_workers_without_losing_frames(
     managed_substrate, monkeypatch
 ):
+    await workers.prepare_thread_rendering()
     slots = threading.BoundedSemaphore(8)
     monkeypatch.setattr(workers, "_THREAD_SLOTS", slots)
     async with running_controller(
@@ -84,6 +85,13 @@ async def test_startup_burst_waits_for_shared_workers_without_losing_frames(
             assert result["status"] == "dispatched"
             final_ids.add(result["commandMessageId"])
         await drained(h)
+        # Result notifications and hardware frames use independent NATS lanes.
+        await eventually(
+            lambda: {
+                call.args[0].message.message_id for call in h.commands.await_args_list
+            }
+            >= final_ids
+        )
         commands = [call.args[0].message for call in h.commands.await_args_list]
         assert 14 <= len(commands) <= 28  # At most one provisional frame per job.
         assert {c.message_id for c in commands} >= final_ids
