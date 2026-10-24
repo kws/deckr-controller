@@ -445,6 +445,7 @@ class RenderDispatcher:
                 if (
                     state.generation != generation
                     or not is_pending()
+                    or state.accepted_frame is not None
                     or not self._authorized(control_id, state)
                 ):
                     return

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import anyio
 import anyio.to_process
 from deckr.action_runtime import (
+    RenderCommand,
     validate_rendering_support,
 )
 from deckr.actions.rendering import (
@@ -122,6 +123,7 @@ class _Job:
     cache_key: tuple
     receipt: _Receipt
     direct: bool = False
+    command: RenderCommand | None = None
     done: bool = False
     ready: bool = False
     timings: dict[str, float] = field(default_factory=dict)

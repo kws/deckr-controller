@@ -1,6 +1,6 @@
 """Tests for FileBackedDeviceConfigService subscribe and matching behavior."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import anyio
 import pytest
@@ -9,6 +9,37 @@ from deckr.components import RunContext
 
 from deckr.controller.config._data import Control, DeviceConfig, Page, Profile
 from deckr.controller.config._service import FileBackedDeviceConfigService
+
+
+@pytest.mark.asyncio
+async def test_periodic_scan_reuses_unchanged_yaml_but_reads_every_file(
+    tmp_path, monkeypatch
+):
+    import os
+
+    from deckr.controller.config import _file_storage
+
+    config = _make_config("dev1", name="First")
+    path = tmp_path / "dev1.yml"
+    path.write_text(_config_to_yaml(config))
+    timestamp = path.stat().st_mtime_ns
+    parse = Mock(wraps=yaml.safe_load)
+    monkeypatch.setattr(_file_storage.yaml, "safe_load", parse)
+    service = FileBackedDeviceConfigService(tmp_path)
+    for _ in range(10):
+        await service.refresh()
+    assert parse.call_count == 1
+    # Same size and mtime must not conceal changed contents.
+    changed = _make_config("dev1", name="Other")
+    path.write_text(_config_to_yaml(changed))
+    os.utime(path, ns=(timestamp, timestamp))
+    await service.refresh()
+    assert parse.call_count == 2
+    assert await service.get_config("dev1") == changed
+    path.unlink()
+    await service.refresh()
+    assert await service.get_config("dev1") is None
+    assert not service._documents
 
 
 @pytest.mark.asyncio

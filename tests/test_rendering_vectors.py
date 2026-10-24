@@ -94,16 +94,15 @@ async def test_reference_ordering(managed_substrate, case):
 @pytest.mark.parametrize("case", cases("acceptance"), ids=lambda c: c["id"])
 def test_reference_render_acceptance(case):
     from deckr.action_runtime import (
+        RenderCommand,
         RenderCommandContext,
         RenderRejection,
-        validate_render_command,
     )
     from deckr.contracts.messages import DeckrMessage
 
     code = None
     try:
-        validate_render_command(
-            DeckrMessage.from_wire(case["instance"]),
+        RenderCommand(DeckrMessage.from_wire(case["instance"])).validate(
             RenderCommandContext.from_wire(case["context"]),
         )
     except RenderRejection as exc:

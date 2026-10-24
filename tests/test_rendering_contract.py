@@ -26,6 +26,50 @@ from test_support.rendering import (
 
 
 @pytest.mark.asyncio
+async def test_render_rechecks_current_facts_without_reparsing_content(
+    managed_substrate, monkeypatch
+):
+    import deckr.action_runtime.rendering as validation
+
+    async with running_controller(managed_substrate, with_output=True) as h:
+        backend = real_backend(h, GatedBackend())
+        request = await h.channel.send("binding_render", parameters(h))
+        await eventually(lambda: bool(backend.gates))
+        renderer = h.device.components.rendering
+        job = next(iter(renderer.jobs.values()))
+        context = renderer._context(job.message, job.lease)
+
+        def already_parsed(*args, **kwargs):
+            raise AssertionError("Admitted content must not be parsed again")
+
+        monkeypatch.setattr(
+            validation, "action_runtime_body_from_service_message", already_parsed
+        )
+        for _ in range(100):
+            job.command.validate(context)
+        with pytest.raises(validation.RenderRejection, match="unauthorized"):
+            job.command.validate(context.model_copy(update={"local_authority": False}))
+        with pytest.raises(validation.RenderRejection, match="target_not_current"):
+            job.command.validate(
+                context.model_copy(update={"hardware_authority": False})
+            )
+        binding = context.bindings[job.lease.binding_id]
+        changed = binding.model_copy(
+            update={
+                "binding": binding.binding.model_copy(
+                    update={"output_generation": binding.binding.output_generation + 1}
+                )
+            }
+        )
+        with pytest.raises(validation.RenderRejection, match="target_not_current"):
+            job.command.validate(
+                context.model_copy(update={"bindings": {job.lease.binding_id: changed}})
+            )
+        backend.gates[0].set()
+        assert (await result_for(h, request))["status"] == "dispatched"
+
+
+@pytest.mark.asyncio
 async def test_completed_render_releases_job_but_keeps_duplicate_fence(
     managed_substrate,
 ):

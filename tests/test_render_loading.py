@@ -52,7 +52,7 @@ async def test_queued_feedback_cannot_replace_a_final_frame():
 
 
 @pytest.mark.asyncio
-async def test_failure_restores_same_binding_but_never_retired_content():
+async def test_loading_preserves_accepted_content_but_new_binding_gets_feedback():
     output = AsyncMock()
     dispatcher = RenderDispatcher(
         command_service=FakeHardwareCommandService(),
@@ -73,22 +73,30 @@ async def test_failure_restores_same_binding_but_never_retired_content():
             frame=b"accepted",
         )
     )
+    output.reset_mock()
+    ticket = await dispatcher.reserve_base(
+        control_id="key", context_id="ctx", binding_id="b", output=output
+    )
+    revision = dispatcher.composition_revision(ticket)
     await dispatcher.publish_feedback(
         "key", revision, b"loading", is_pending=lambda: True
     )
     assert dispatcher._controls["key"].accepted_frame == b"accepted"
     await dispatcher.restore_feedback("key", revision)
-    assert output.write.await_args.args == (b"accepted",)
-    await dispatcher.publish_feedback(
-        "key", revision, b"loading", is_pending=lambda: True
-    )
-    await dispatcher.reserve_base(
+    output.write.assert_not_awaited()
+    next_ticket = await dispatcher.reserve_base(
         control_id="key", context_id="next", binding_id="next", output=output
     )
-    output.reset_mock()
     await dispatcher.restore_feedback("key", revision)
     output.write.assert_not_awaited()
     assert dispatcher._controls["key"].accepted_frame is None
+    await dispatcher.publish_feedback(
+        "key",
+        dispatcher.composition_revision(next_ticket),
+        b"loading",
+        is_pending=lambda: True,
+    )
+    output.write.assert_awaited_once_with(b"loading")
 
 
 @pytest.mark.asyncio

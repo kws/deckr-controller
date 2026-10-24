@@ -84,6 +84,7 @@ class FileBackedDeviceConfigService(BaseComponent):
         self._materialized_publisher = materialized_publisher
         self._path_to_config: dict[Path, str] = {}
         self._config_by_id: dict[str, DeviceConfig] = {}
+        self._documents: dict[Path, str] = {}
         self._state = CoalescedStateBroadcaster[str](current=True)
         self._lock = self._state.lock
         self._publish_lock = anyio.Lock()
@@ -180,8 +181,12 @@ class FileBackedDeviceConfigService(BaseComponent):
                 previous_paths = dict(self._path_to_config)
                 previous_configs = dict(self._config_by_id)
             try:
-                paths, configs = await anyio.to_thread.run_sync(
-                    read_snapshot, self._config_dir, previous_paths, previous_configs
+                paths, configs, documents = await anyio.to_thread.run_sync(
+                    read_snapshot,
+                    self._config_dir,
+                    previous_paths,
+                    previous_configs,
+                    self._documents,
                 )
             except (OSError, ValueError):
                 self.source_available = False
@@ -197,6 +202,7 @@ class FileBackedDeviceConfigService(BaseComponent):
                     if self._config_by_id.get(key) != configs.get(key)
                 }
                 self._path_to_config, self._config_by_id = paths, configs
+                self._documents = documents
                 self._has_snapshot = self.source_available = True
                 if changed:
                     self._state.publish_locked(changed)

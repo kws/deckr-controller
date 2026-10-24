@@ -12,14 +12,20 @@ from deckr.controller.config._data import DeviceConfig
 logger = logging.getLogger(__name__)
 
 
-def read_snapshot(directory, previous_paths, previous_configs):
+def read_snapshot(directory, previous_paths, previous_configs, previous_documents):
     paths = sorted(
         path for path in directory.iterdir() if path.suffix in {".yml", ".yaml"}
     )
-    by_path, by_id = {}, {}
+    by_path, by_id, documents = {}, {}, {}
     for path in paths:
         try:
-            config = DeviceConfig.model_validate(yaml.safe_load(path.read_text()))
+            document = path.read_text()
+            prior = previous_configs.get(previous_paths.get(path))
+            if prior is not None and previous_documents.get(path) == document:
+                config = prior
+            else:
+                config = DeviceConfig.model_validate(yaml.safe_load(document))
+            documents[path] = document
         except (OSError, ValueError, yaml.YAMLError):
             logger.warning("Invalid config file; retaining prior value: %s", path)
             config = previous_configs.get(previous_paths.get(path))
@@ -28,7 +34,7 @@ def read_snapshot(directory, previous_paths, previous_configs):
         if config.id in by_id:
             raise ValueError(f"Duplicate config ID: {config.id}")
         by_path[path], by_id[config.id] = config.id, config
-    return by_path, by_id
+    return by_path, by_id, documents
 
 
 def write_config(directory: Path, path: Path, config: DeviceConfig) -> None:

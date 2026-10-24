@@ -451,10 +451,19 @@ Startup warms local composition and initializes the HTTP client off the event
 loop before admitting bindings, keeping TLS certificate loading out of the first
 artwork burst.
 
+Admitted provider jobs retain a core `RenderCommand` with validated immutable
+content. Each asynchronous handoff checks fresh service and hardware authority,
+endpoint sessions, binding generation, target support and limits without parsing
+the graph again. Concord itself reuses bounded validation snapshots only while
+raw entries, source generations and source health remain unchanged.
+
 Automatic loading feedback is controller-owned and separate from the accepted
 base and provider overlay identities. If a current render is still pending after
-120 ms, a cached neutral loading frame can be sent through the ordered output
-lock. Existing provider feedback takes priority. The final-ready phase stops the
+120 ms and the binding has no accepted frame, a cached neutral loading frame can
+be sent through the ordered output lock. Accepted content stays visible during
+updates, including provider-supplied loading content, avoiding duplicate loading
+frames and artwork flicker. A new binding starts without accepted content.
+Existing provider feedback takes priority. The final-ready phase stops the
 timer before final handoff; current binding, generation and authority are checked
 again after the output lock, so queued loading pixels cannot replace a final frame.
 Provisional commands have independent hardware command IDs and never emit the
@@ -515,7 +524,8 @@ Configurations require unique nonempty profile names, at least one profile and
 at least one page per profile; an empty page is valid. Invalid replacements retain
 the prior config and grants.
 
-File configuration observation reads and validates YAML off the event loop, then
+File configuration observation reads YAML off the event loop, reusing validation
+only for files whose full contents are unchanged, then
 publishes one validated snapshot. Duplicate IDs reject the ambiguous snapshot;
 invalid files retain their previous validated value. Selection is the shared pure
 policy in [config selection](../src/deckr/controller/config/_selection.py), without

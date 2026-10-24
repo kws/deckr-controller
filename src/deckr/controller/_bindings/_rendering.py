@@ -11,10 +11,10 @@ import anyio
 import anyio.to_process
 from deckr.action_runtime import (
     RenderBindingState,
+    RenderCommand,
     RenderCommandContext,
     RenderRejection,
     action_runtime_service_id,
-    validate_render_command,
 )
 from deckr.actions.pages import BindingCommandTarget
 from deckr.actions.rendering import (
@@ -172,16 +172,19 @@ class BindingRenderer:
                     raise RenderRejection("target_not_current")
                 if key != lease.provider_session_key:
                     raise RenderRejection("target_not_current")
-                _, support = validate_render_command(
-                    message, self._context(message, lease)
-                )
+                command = RenderCommand(message)
+                _, support = command.validate(self._context(message, lease))
             except RenderRejection as exc:
                 if exc.code != "unauthorized":
                     await self._result(message, body, "rejected", exc.code)
                 return True
-            return await self._admit(message, body, lease, support, cache_key)
+            return await self._admit(
+                message, body, lease, support, cache_key, command=command
+            )
 
-    async def _admit(self, message, body, lease, support, cache_key, *, direct=False):
+    async def _admit(
+        self, message, body, lease, support, cache_key, *, direct=False, command=None
+    ):
         # The outer check can race concurrent deliveries waiting on the nav lock.
         if self._retained(cache_key):
             return True
@@ -236,6 +239,7 @@ class BindingRenderer:
                     direct,
                 ),
                 direct=direct,
+                command=command,
             )
             for old in tuple(self.jobs.values()):
                 if not old.done and old.lease.control_id == control_id:
@@ -457,14 +461,19 @@ class BindingRenderer:
     async def _authorize(self, job):
         if job.done or time.monotonic() >= job.deadline:
             raise ContentFailure("deadline_exceeded")
-        if not await self.ports.actions.authorize_runtime_message(
-            job.lease.provider_session_key, job.message
-        ):
-            raise RenderRejection("target_not_current")
         if job.direct:
+            if not await self.ports.actions.authorize_runtime_message(
+                job.lease.provider_session_key, job.message
+            ):
+                raise RenderRejection("target_not_current")
             self._validate_direct(job.message, job.body, job.lease, job.target)
         else:
-            validate_render_command(job.message, self._context(job.message, job.lease))
+            # Content and envelope were validated before admission. Recheck the
+            # exact current service contract, endpoint sessions, binding, target,
+            # output generation, hardware authority and limits without reparsing
+            # the immutable graph at every asynchronous phase.
+            assert job.command is not None
+            job.command.validate(self._context(job.message, job.lease))
         if job.done or time.monotonic() >= job.deadline:
             raise ContentFailure("deadline_exceeded")
 
