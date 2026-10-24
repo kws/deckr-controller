@@ -1,7 +1,7 @@
 """Real managed endpoints over an in-process transport for controller integration."""
 
 import io
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -122,10 +122,10 @@ class MemoryConfigService:
         self._configs.pop(config_id, None)
         await self._notify(config_id, None)
 
-    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+    def subscribe(self, config_id: str) -> AsyncGenerator[DeviceConfig | None, None]:
         return self._subscribe(config_id)
 
-    async def _subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+    async def _subscribe(self, config_id: str) -> AsyncGenerator[DeviceConfig | None, None]:
         send, receive = anyio.create_memory_object_stream[DeviceConfig | None](10)
         self._subscribers.setdefault(config_id, set()).add(send)
         try:

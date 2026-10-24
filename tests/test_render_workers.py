@@ -24,7 +24,7 @@ async def test_process_capacity_wait_is_cancellable_and_does_not_release_unowned
         entered.set()
         await release.wait()
 
-    monkeypatch.setattr(anyio.to_process, "run_sync", blocked)
+    monkeypatch.setattr(workers._render_process, "run", blocked)
     async with anyio.create_task_group() as tg:
         tg.start_soon(workers.run_process, str)
         await entered.wait()
@@ -130,3 +130,62 @@ async def test_controller_cleanup_attempts_every_owned_resource():
     assert calls == ["hardware", "session", "actions", "renderer"]
     service._controller_contexts.clear.assert_awaited_once()
     assert len(error.value.exceptions) == 3
+
+
+@pytest.mark.asyncio
+async def test_page_churn_cancels_workers_during_startup_without_orphans(monkeypatch):
+    from deckr.controller import _render_process
+
+    await _render_process.close_idle()
+    original = _render_process.Worker
+    children = []
+
+    def starting():
+        worker = original()
+        children.append(worker.process.pid)
+        scope.cancel()
+        return worker
+
+    monkeypatch.setattr(_render_process, "Worker", starting)
+    for _ in range(8):
+        with anyio.CancelScope() as scope:
+            await workers.run_process(str, "obsolete page")
+        assert scope.cancel_called
+    for pid in children:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    assert not _render_process._pool()
+
+
+@pytest.mark.asyncio
+async def test_completed_render_reuses_worker_and_shutdown_reaps_it():
+    from deckr.controller import _render_process
+
+    first = await workers.run_process(os.getpid)
+    assert await workers.run_process(os.getpid) == first
+    await _render_process.close_idle()
+    with pytest.raises(ProcessLookupError):
+        os.kill(first, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe", "message"),
+    [
+        ("fail_http_in_process", "HTTPStatusError.*503"),
+        ("unpicklable_result_in_process", "lambda"),
+    ],
+)
+async def test_untransportable_result_does_not_destroy_warm_worker(probe, message):
+    import test_support.render_workers as probes
+    from deckr.controller import _render_process
+
+    await _render_process.close_idle()
+    try:
+        pid = await workers.run_process(os.getpid)
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match=message):
+                await workers.run_process(getattr(probes, probe))
+            assert await workers.run_process(os.getpid) == pid
+    finally:
+        await _render_process.close_idle()

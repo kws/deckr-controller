@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 import anyio
 import pytest_asyncio
@@ -184,11 +184,11 @@ class MemoryConfigService:
         self.config = config
         return config
 
-    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+    def subscribe(self, config_id: str) -> AsyncGenerator[DeviceConfig | None, None]:
         del config_id
         return self._subscribe()
 
-    async def _subscribe(self) -> AsyncIterator[DeviceConfig | None]:
+    async def _subscribe(self) -> AsyncGenerator[DeviceConfig | None, None]:
         yield self.config
 
 

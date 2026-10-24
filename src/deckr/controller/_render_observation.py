@@ -26,6 +26,12 @@ class RenderObservationOptions:
     path: Path
     include_graph: bool = False
     include_context: bool = False
+    max_bytes: int = 25 * 1024 * 1024
+    backup_count: int = 3
+
+    def __post_init__(self):
+        if self.max_bytes < 1 or self.backup_count < 0:
+            raise ValueError("Observation retention limits must be positive")
 
 
 class ObservingRenderBackend:
@@ -97,9 +103,27 @@ class ObservingRenderBackend:
         await run_thread(self._append_line, line, slots=self._slots)
 
     def _append_line(self, line):
-        self._options.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._options.path.open("a", encoding="utf-8") as stream:
-            stream.write(line + "\n")
+        payload = (line + "\n").encode("utf-8")
+        if len(payload) > self._options.max_bytes:
+            raise ValueError("Render observation exceeds the file budget")
+        path = self._options.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if (
+            path.exists()
+            and path.stat().st_size + len(payload) > self._options.max_bytes
+        ):
+            # Writes are serialized by this backend's slot, including writers
+            # still running after their diagnostic deadline.
+            for index in range(self._options.backup_count, 0, -1):
+                source = (
+                    path if index == 1 else path.with_name(f"{path.name}.{index - 1}")
+                )
+                if source.exists():
+                    source.replace(path.with_name(f"{path.name}.{index}"))
+            if not self._options.backup_count:
+                path.unlink()
+        with path.open("ab") as stream:
+            stream.write(payload)
 
     def _record(
         self,

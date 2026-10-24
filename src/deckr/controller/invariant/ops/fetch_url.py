@@ -1,12 +1,18 @@
 """deckr:fetch_image_url op - download image from URL or parse data URI."""
 
 import base64
+import io
+import time
 import urllib.parse
 
 import httpx
 from invariant_gfx.artifacts import BlobArtifact
+from PIL import Image, UnidentifiedImageError
 
 HTTP_IMAGE_TIMEOUT = httpx.Timeout(2.0, connect=1.0)
+MAX_IMAGE_BYTES = 1024 * 1024
+MAX_IMAGE_PIXELS = 4 * 1024 * 1024
+HTTP_IMAGE_SECONDS = 2.0
 
 
 def fetch_image_url(url: str) -> BlobArtifact:
@@ -29,6 +35,8 @@ def fetch_image_url(url: str) -> BlobArtifact:
 
 
 def _parse_data_uri(url: str) -> BlobArtifact:
+    if len(url) > MAX_IMAGE_BYTES * 3 + 1024:
+        raise ValueError("Image exceeds byte budget")
     header, _, data = url.partition(",")
     if not data:
         raise ValueError("Invalid data URI: no comma")
@@ -41,15 +49,39 @@ def _parse_data_uri(url: str) -> BlobArtifact:
         raw = base64.b64decode(data)
     else:
         raw = urllib.parse.unquote_to_bytes(data)
-    return BlobArtifact(data=raw, content_type=content_type)
+    return _bounded_blob(raw, content_type)
 
 
 def _fetch_http(url: str) -> BlobArtifact:
-    with httpx.Client(timeout=HTTP_IMAGE_TIMEOUT, follow_redirects=True) as client:
-        response = client.get(url)
+    deadline = time.monotonic() + HTTP_IMAGE_SECONDS
+    with (
+        httpx.Client(timeout=HTTP_IMAGE_TIMEOUT, follow_redirects=True) as client,
+        client.stream("GET", url) as response,
+    ):
         response.raise_for_status()
         content_type = response.headers.get("content-type", "application/octet-stream")
         # Strip charset if present, e.g. "image/png; charset=utf-8"
         if ";" in content_type:
             content_type = content_type.split(";", 1)[0].strip()
-        return BlobArtifact(data=response.content, content_type=content_type)
+        data = bytearray()
+        for chunk in response.iter_bytes():
+            if time.monotonic() >= deadline:
+                raise httpx.ReadTimeout("Image download exceeded its total deadline")
+            if len(data) + len(chunk) > MAX_IMAGE_BYTES:
+                raise ValueError("Image exceeds byte budget")
+            data.extend(chunk)
+        return _bounded_blob(bytes(data), content_type)
+
+
+def _bounded_blob(data, content_type):
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("Image exceeds byte budget")
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            # Inspect headers before gfx's downstream decoder allocates pixels.
+            if source.width * source.height > MAX_IMAGE_PIXELS:
+                raise ValueError("Image exceeds pixel budget")
+    except UnidentifiedImageError:
+        # This operation also transports SVG; its renderer validates that format.
+        pass
+    return BlobArtifact(data=data, content_type=content_type)

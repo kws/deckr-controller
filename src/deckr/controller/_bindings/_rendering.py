@@ -41,6 +41,7 @@ from deckr.controller._bindings._render_policy import (
     DEFAULT_LIMITS,
     RenderingPorts,
     _Job,
+    _Receipt,
 )
 from deckr.controller._render_graph import (
     INVARIANT_FORMAT,
@@ -60,14 +61,15 @@ class BindingRenderer:
             hardware_rejection=self._hardware_rejection,
         )
         self.jobs = OrderedDict()
+        self.completed = OrderedDict()
         self.active = {}
 
     def _retained(self, key):
-        job = self.jobs.get(key)
-        if job is not None and job.done and job.deadline + 60 < time.monotonic():
-            self.jobs.pop(key)
-            return False
-        return job is not None
+        now = time.monotonic()
+        for old, expiry in tuple(self.completed.items()):
+            if expiry < now:
+                self.completed.pop(old, None)
+        return key in self.jobs or key in self.completed
 
     def _context(self, message, lease):
         ports = self.ports
@@ -206,6 +208,21 @@ class BindingRenderer:
                 binding_id=lease.binding_id,
                 output=router.output,
             )
+            receipt_body = BindingRenderBody(
+                target=body.target,
+                requirementName=body.requirement_name,
+                operation="clear",
+            )
+            receipt_message = message.model_copy(
+                update={
+                    "body": {
+                        **message.body,
+                        "params": receipt_body.model_dump(
+                            by_alias=True, mode="json", exclude_none=True
+                        ),
+                    }
+                }
+            )
             job = _Job(
                 message,
                 body,
@@ -213,17 +230,18 @@ class BindingRenderer:
                 support,
                 ticket,
                 time.monotonic() + support.limits.max_render_time_ms / 1000,
+                cache_key,
+                _Receipt(
+                    receipt_message,
+                    receipt_body,
+                    direct,
+                ),
                 direct=direct,
             )
             for old in tuple(self.jobs.values()):
                 if not old.done and old.lease.control_id == control_id:
                     await self._finish(old, "superseded", "newer_output")
             self.jobs[cache_key] = job
-            for key, old in tuple(self.jobs.items()):
-                if old.done and (
-                    len(self.jobs) > 512 or old.deadline + 60 < time.monotonic()
-                ):
-                    self.jobs.pop(key, None)
             self.ports.start_soon(self._run, job)
             self.ports.start_soon(self._expire, job)
         except BaseException:
@@ -329,18 +347,21 @@ class BindingRenderer:
         if job.done:
             return
         job.done = True
+        self.completed[job.cache_key] = job.deadline + 60
+        while len(self.completed) > 512:
+            self.completed.popitem(last=False)
         job.timer.cancel()
         if not job.direct:
             await self._result(
-                job.message,
-                job.body,
+                job.receipt.message,
+                job.receipt.body,
                 status,
                 code,
                 job.command_id if status == "dispatched" else None,
             )
-        job.result_emitted = True
-        if job.rejection is not None:
-            await self._hardware_rejection(job, job.rejection)
+        job.receipt.result_emitted = True
+        if job.receipt.rejection is not None:
+            await self._hardware_rejection(job.receipt, job.receipt.rejection)
         job.scope.cancel()
 
     async def retire_binding(self, binding_id):
@@ -391,5 +412,9 @@ class BindingRenderer:
                     if not job.done:
                         await self.execution.execute(job)
         finally:
-            self.active[job.lease.control_id] -= 1
+            self.jobs.pop(job.cache_key, None)
+            control_id = job.lease.control_id
+            self.active[control_id] -= 1
+            if not self.active[control_id]:
+                self.active.pop(control_id)
             _ADMISSION_SLOTS.release()

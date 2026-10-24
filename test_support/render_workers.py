@@ -17,3 +17,15 @@ def block_in_process(path):
 
     Path(path).write_text(str(os.getpid()))
     time.sleep(60)
+
+
+def fail_http_in_process():
+    import httpx
+
+    request = httpx.Request("GET", "http://artwork.test/cover.jpg")
+    response = httpx.Response(503, request=request)
+    response.raise_for_status()
+
+
+def unpicklable_result_in_process():
+    return lambda: None

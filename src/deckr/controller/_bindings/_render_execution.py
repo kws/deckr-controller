@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
     from deckr.contracts.messages import DeckrMessage
 
-    from deckr.controller._bindings._render_policy import RenderingPorts, _Job
+    from deckr.controller._bindings._render_policy import RenderingPorts, _Job, _Receipt
 
 
 import base64
@@ -17,6 +17,7 @@ import io
 import logging
 import time
 import uuid
+import weakref
 from typing import TYPE_CHECKING
 
 import anyio
@@ -57,7 +58,7 @@ class RenderExecution:
         ports: Callable[[], RenderingPorts],
         authorize: Callable[[_Job], Awaitable[None]],
         finish: Callable[..., Awaitable[None]],
-        hardware_rejection: Callable[[_Job, DeckrMessage], Awaitable[None]],
+        hardware_rejection: Callable[[_Receipt, DeckrMessage], Awaitable[None]],
     ):
         self.ports, self.authorize, self.finish = ports, authorize, finish
         self.hardware_rejection = hardware_rejection
@@ -86,7 +87,13 @@ class RenderExecution:
                 image = await run_thread(self.direct_frame, job)
             elif job.body.content.format == INVARIANT_FORMAT:
                 document = thaw_json(job.body.content.data)
-                with anyio.fail_after(max(0, job.deadline - time.monotonic())):
+                # Supersession invalidates publication immediately, but let this
+                # bounded pure computation finish so page churn does not destroy
+                # warm workers. Its original deadline still kills stalled work.
+                with (
+                    anyio.CancelScope(shield=True),
+                    anyio.fail_after(max(0, job.deadline - time.monotonic())),
+                ):
                     image = await run_process(
                         render_graph,
                         document,
@@ -155,13 +162,14 @@ class RenderExecution:
                             job.body.content.data["image"], validate=True
                         )
                     else:
-                        result = await render_with_retry(
-                            self.ports().backend,
-                            request,
-                            is_current=lambda: not job.done
-                            and dispatcher.base_is_current(job.ticket),
-                            timeout=max(0, job.deadline - time.monotonic()),
-                        )
+                        with anyio.CancelScope(shield=True):
+                            result = await render_with_retry(
+                                self.ports().backend,
+                                request,
+                                is_current=lambda: not job.done
+                                and dispatcher.base_is_current(job.ticket),
+                                timeout=max(0, job.deadline - time.monotonic()),
+                            )
                         if result is None:
                             await self.finish(job, "superseded", "newer_output")
                             return
@@ -172,13 +180,22 @@ class RenderExecution:
                     return
                 await self.authorize(job)
                 job.command_id = str(uuid.uuid4())
+                receipt = job.receipt
+                receipt.command_id = job.command_id
+                receiver = weakref.WeakMethod(self.hardware_rejection)
+
+                async def rejected(message, receipt=receipt, receiver=receiver):
+                    callback = receiver()
+                    if callback is not None:
+                        await callback(receipt, message)
+
                 self.ports().hardware.observe_render_command(
                     job.command_id,
                     self.ports().config_id,
                     job.lease.control_id,
                     job.lease.raster_capability_id,
                     "clear" if frame is None else "set_frame",
-                    lambda message: self.hardware_rejection(job, message),
+                    rejected,
                 )
 
                 def committed():

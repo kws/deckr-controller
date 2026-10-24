@@ -89,7 +89,8 @@ async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
         runtime_name="test-startup",
         runtime=build_controller_runtime(
             config_source={"render": {"backend": "thread"}},
-            base_dir=Path.cwd(), controller_id="controller-main"
+            base_dir=Path.cwd(),
+            controller_id="controller-main",
         ),
         context=context,
         beacon=object(),
@@ -113,7 +114,8 @@ async def test_startup_failure_closes_resources_not_yet_owned_by_controller(
         with pytest.raises(ExceptionGroup) as error:
             await service.start(ctx)
         assert [str(exc) for exc in error.value.exceptions] == [
-            failure_message, "close actions"
+            failure_message,
+            "close actions",
         ]
     else:
         with pytest.raises(ValueError, match=failure_message):
@@ -155,13 +157,13 @@ class _FakeComponentContext:
         return self.concord
 
 
-def test_build_render_backend_returns_none_without_render_config() -> None:
-    assert (
+def test_build_render_backend_owns_default_without_render_config() -> None:
+    assert isinstance(
         _build_render_backend(
             ControllerRuntimeConfig.model_validate({}),
             controller_id="controller-main",
-        )
-        is None
+        ),
+        ProcessPoolRenderBackend,
     )
 
 

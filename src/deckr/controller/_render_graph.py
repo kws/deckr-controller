@@ -25,6 +25,7 @@ INVARIANT_FORMAT = "com.k-si.deckr.render.invariant.v1"
 MAX_NODES = 64
 MAX_DEPTH = 16
 MAX_DIMENSION = 1024
+MAX_FETCHED_IMAGE_PIXELS = 4 * 1024 * 1024
 MAX_TOTAL_PIXELS = 16 * 1024 * 1024
 OPS = frozenset(
     {
@@ -202,6 +203,7 @@ class _Registry:
 
         self.limits, self.deadline = limits, deadline
         self.pixels = 0
+        self.fetched_blobs = set()
         self.operations = {
             f"gfx:{name}": op for name, op in gfx_ops.items() if f"gfx:{name}" in OPS
         }
@@ -234,18 +236,31 @@ class _Registry:
 
     def decode(self, blob):
         from invariant_gfx.artifacts import ImageArtifact
+        from PIL import Image
 
         encoding = {"image/png": "png", "image/jpeg": "jpeg"}.get(blob.content_type)
         if encoding is None:
             raise ContentFailure("invalid_content")
-        return ImageArtifact(
-            decode_image(
-                RenderImage(
-                    image=base64.b64encode(blob.data).decode("ascii"), encoding=encoding
-                ),
-                self.limits,
+        fetched = id(blob) in self.fetched_blobs
+        source = decode_image(
+            RenderImage(
+                image=base64.b64encode(blob.data).decode("ascii"), encoding=encoding
+            ),
+            self.limits.model_copy(
+                update={"max_image_pixels": MAX_FETCHED_IMAGE_PIXELS}
             )
+            if fetched
+            else self.limits,
         )
+        if fetched:
+            # Bound external source decoding separately from graph canvas sizes.
+            # Artist portraits are often larger than the control's render canvas.
+            self.pixels += source.width * source.height
+            if self.pixels > MAX_TOTAL_PIXELS:
+                raise ContentFailure("limit_exceeded")
+            side = min(MAX_DIMENSION, math.isqrt(self.limits.max_image_pixels))
+            source.thumbnail((side, side), Image.Resampling.LANCZOS)
+        return ImageArtifact(source)
 
     def fetch(self, url):
         from invariant_gfx.artifacts import BlobArtifact
@@ -271,8 +286,12 @@ class _Registry:
         ):
             response.raise_for_status()
             content_type = (
-                response.headers.get("content-type", "").split(";")[0].strip()
+                response.headers.get("content-type", "").split(";")[0].strip().lower()
             )
+            # Some external artwork servers label JPEG bytes as image/jpg.
+            # Normalize at the HTTP boundary; the Deckr image contract stays JPEG.
+            if content_type == "image/jpg":
+                content_type = "image/jpeg"
             if content_type not in {"image/png", "image/jpeg"}:
                 raise ContentFailure("invalid_content")
             data = bytearray()
@@ -282,7 +301,9 @@ class _Registry:
                 if len(data) + len(chunk) > self.limits.max_image_bytes:
                     raise ContentFailure("limit_exceeded")
                 data.extend(chunk)
-        return BlobArtifact(data=bytes(data), content_type=content_type)
+        blob = BlobArtifact(data=bytes(data), content_type=content_type)
+        self.fetched_blobs.add(id(blob))
+        return blob
 
     def has(self, name):
         return name in self.operations

@@ -138,6 +138,7 @@ class ControllerHardwareService:
 
     async def _config_loop(self, stopping):
         while not stopping.is_set():
+            self.command_service.prune_render_commands()
             await self.reconcile(reason="configuration")
             await sleep_until_stopping(stopping, 1.0)
 
@@ -316,6 +317,7 @@ class ControllerHardwareService:
                 done.set()
 
     async def _disconnect(self, config_id, reason):
+        self.command_service.forget_render_commands(config_id)
         if self._routes.disconnect_config(config_id) is not None:
             await self._callbacks.on_hardware_disconnected(config_id, reason=reason)
 

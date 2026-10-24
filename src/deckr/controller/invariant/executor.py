@@ -12,16 +12,18 @@ from invariant.store.chain import ChainStore
 from invariant.store.disk import DiskStore
 from invariant.store.memory import MemoryStore
 
+from deckr.controller.invariant._memory_cache import ByteBudgetCache
 from deckr.controller.invariant.ops.encode_jpeg import encode_jpeg, encode_raster
 from deckr.controller.invariant.ops.fetch_url import fetch_image_url
 
 L1_MAX_ARTIFACTS = 2_000
+L1_SIZE_LIMIT_BYTES = 16 * 1024 * 1024
 L2_SIZE_LIMIT_BYTES = 512 * 1024 * 1024
 L2_EVICTION_POLICY = "least-frequently-used"
 
 
 def build_executor(*, cache_dir: Path | str | None = None) -> Executor:
-    """Build an Executor with gfx core ops and a bounded LFU cache chain."""
+    """Build an Executor with byte-bounded memory and disk caches."""
 
     registry = OpRegistry()
     invariant_gfx.register_core_ops(registry)
@@ -31,7 +33,7 @@ def build_executor(*, cache_dir: Path | str | None = None) -> Executor:
     registry.register("deckr:encode_raster", encode_raster)
 
     store = ChainStore(
-        l1=MemoryStore(cache="lfu", max_size=L1_MAX_ARTIFACTS),
+        l1=MemoryStore(cache=ByteBudgetCache(L1_SIZE_LIMIT_BYTES, L1_MAX_ARTIFACTS)),
         l2=DiskStore(
             cache_dir=cache_dir,
             size_limit_bytes=L2_SIZE_LIMIT_BYTES,

@@ -51,7 +51,9 @@ _GRAPH_WORKERS = anyio.CapacityLimiter(4)
 logger = logging.getLogger(__name__)
 DEFAULT_LIMITS = RenderLimits(
     max_message_bytes=262144,
-    max_image_bytes=131072,
+    # Ordinary 640px album covers can exceed 128 KiB. This also bounds HTTP
+    # resources in graph jobs; inline content still has the wire-message cap.
+    max_image_bytes=1048576,
     max_image_pixels=1048576,
     max_text_code_points=1024,
     max_render_time_ms=2000,
@@ -96,6 +98,18 @@ def rendering_support(context):
 
 
 @dataclass
+class _Receipt:
+    """Late-result correlation without render content or a binding/session lease."""
+
+    message: DeckrMessage
+    body: BindingRenderBody
+    direct: bool
+    command_id: str | None = None
+    rejection: DeckrMessage | None = None
+    result_emitted: bool = False
+
+
+@dataclass
 class _Job:
     message: DeckrMessage
     body: BindingRenderBody
@@ -103,11 +117,11 @@ class _Job:
     target: RenderTargetSupport
     ticket: RenderTicket
     deadline: float
+    cache_key: tuple
+    receipt: _Receipt
     direct: bool = False
     done: bool = False
     command_id: str | None = None
-    rejection: DeckrMessage | None = None
-    result_emitted: bool = False
     scope: anyio.CancelScope = field(default_factory=anyio.CancelScope)
     timer: anyio.CancelScope = field(default_factory=anyio.CancelScope)
 

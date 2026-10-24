@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 from typing import Protocol
 
@@ -57,13 +57,13 @@ class DeviceConfigService(Protocol):
         """Persist a complete config and publish the updated value."""
         ...
 
-    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+    def subscribe(self, config_id: str) -> AsyncGenerator[DeviceConfig | None, None]:
         """Subscribe to config by controller-local config id.
 
         First emission: current config (or None if not found).
         Subsequent emissions: full config on each change (or None if removed).
 
-        Exit the iterator to unsubscribe.
+        Close the generator to unsubscribe, including when setup exits early.
         """
         ...
 
@@ -142,12 +142,12 @@ class FileBackedDeviceConfigService(BaseComponent):
         await self._scan_configs()
         await self._publish_materialized_snapshot()
 
-    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+    def subscribe(self, config_id: str) -> AsyncGenerator[DeviceConfig | None, None]:
         return self._subscribe_impl(config_id)
 
     async def _subscribe_impl(
         self, config_id: str
-    ) -> AsyncIterator[DeviceConfig | None]:
+    ) -> AsyncGenerator[DeviceConfig | None, None]:
         await self._scan_configs()
         async with self._state.subscribe(
             lambda _version, _current: copy_config(self._config_by_id.get(config_id))
@@ -282,9 +282,9 @@ class NullDeviceConfigService(BaseComponent):
         del config
         raise RuntimeError("No device config service is configured")
 
-    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+    def subscribe(self, config_id: str) -> AsyncGenerator[DeviceConfig | None, None]:
         del config_id
         return self._subscribe_impl()
 
-    async def _subscribe_impl(self) -> AsyncIterator[DeviceConfig | None]:
+    async def _subscribe_impl(self) -> AsyncGenerator[DeviceConfig | None, None]:
         yield None

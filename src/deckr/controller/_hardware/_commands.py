@@ -50,13 +50,12 @@ class HardwareCommandService:
         self, message_id, config_id, control_id, capability_id, command_type, callback
     ):
         now = time.monotonic()
-        for key, record in tuple(self._render_rejections.items()):
-            if record[0] < now:
-                self._render_rejections.pop(key, None)
+        self.prune_render_commands()
         while len(self._render_rejections) >= 1024:
             self._render_rejections.popitem(last=False)
         self._render_rejections[message_id] = (
             now + 60,
+            config_id,
             self.claim_identity(config_id),
             control_id,
             capability_id,
@@ -64,17 +63,30 @@ class HardwareCommandService:
             callback,
         )
 
+    def prune_render_commands(self):
+        now = time.monotonic()
+        for key, record in tuple(self._render_rejections.items()):
+            if record[0] < now:
+                self._render_rejections.pop(key, None)
+
+    def forget_render_commands(self, config_id):
+        for key, record in tuple(self._render_rejections.items()):
+            if record[1] == config_id:
+                self._render_rejections.pop(key, None)
+
     async def render_command_rejected(self, live, message):
         from deckr.hardware.messages import hardware_body_from_message
 
         record = self._render_rejections.get(message.in_reply_to)
         if record is None:
             return
-        expiry, claim, control_id, capability_id, command_type, callback = record
+        expiry, _, claim, control_id, capability_id, command_type, callback = record
+        if expiry < time.monotonic():
+            self._render_rejections.pop(message.in_reply_to, None)
+            return
         event = hardware_body_from_message(message)
         if (
-            expiry < time.monotonic()
-            or claim != self.claim_identity(live.config_id)
+            claim != self.claim_identity(live.config_id)
             or message.contract != live.contract
             or event.device_ref != live.ref
             or event.control_id != control_id

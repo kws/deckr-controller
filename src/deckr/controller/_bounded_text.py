@@ -95,16 +95,31 @@ def _lines(text, face, width):
     lines = []
     for paragraph in text.split("\n"):
         line = ""
-        for character in paragraph:
-            candidate = line + character
+        for word in paragraph.split():
+            candidate = f"{line} {word}" if line else word
             bounds = face.getbbox(candidate)
             if line and bounds[2] - bounds[0] + 4 > width:
-                lines.append(line.rstrip())
-                line = character.lstrip()
+                lines.append(line)
+                line = word
             else:
                 line = candidate
         lines.append(line)
     return lines
+
+
+def _ellipsize(text, face, width):
+    bounds = face.getbbox("…")
+    if bounds[2] - bounds[0] + 4 > width:
+        return ""
+    low, high, selected = 0, len(text), 0
+    while low <= high:
+        mid = (low + high) // 2
+        bounds = face.getbbox(text[:mid] + "…")
+        if bounds[2] - bounds[0] + 4 <= width:
+            selected, low = mid, mid + 1
+        else:
+            high = mid - 1
+    return text[:selected] + "…"
 
 
 def packed_text(
@@ -160,7 +175,9 @@ def packed_text(
         face = _font(font, mid, weight, style)
         lines = _lines(text, face, width)
         line_height = sum(face.getmetrics()) + 4
-        fits = len(lines) * (line_height + gap) - gap <= height
+        fits = len(lines) * (line_height + gap) - gap <= height and all(
+            face.getbbox(line)[2] - face.getbbox(line)[0] + 4 <= width for line in lines
+        )
         if fits:
             selected, low = mid, mid + 1
         else:
@@ -171,10 +188,14 @@ def packed_text(
     count = max(1, (height + gap) // (line_height + gap))
     if len(lines) > count:
         lines = lines[:count]
-        last = lines[-1]
-        while last and face.getlength(last + "…") + 4 > width:
-            last = last[:-1]
-        lines[-1] = last + "…"
+        lines[-1] = _ellipsize(lines[-1], face, width)
+    # Only truncate a word when it cannot fit even at the minimum font size.
+    lines = [
+        _ellipsize(line, face, width)
+        if face.getbbox(line)[2] - face.getbbox(line)[0] + 4 > width
+        else line
+        for line in lines
+    ]
     canvas = Image.new("RGBA", (width, height))
     draw = ImageDraw.Draw(canvas)
     block_height = len(lines) * (line_height + gap) - gap

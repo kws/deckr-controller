@@ -199,3 +199,54 @@ async def test_failed_clear_does_not_drop_a_newer_queued_clear():
             await cleared.wait()
         first.clear.assert_awaited_once()
         successor.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_page_clears_old_labels_even_when_new_render_is_only_admitted():
+    """Close must not remain visible while its slot now invokes another action."""
+    service = FakeHardwareCommandService()
+    output = DeviceOutput(service, "dev", "0,0", "raster.bitmap")
+    queued = []
+    dispatcher = RenderDispatcher(
+        command_service=service,
+        config_id="dev",
+        backend=ControlledBackend(),
+        start_soon=lambda fn, *args: queued.append((fn, args)),
+    )
+    await dispatcher.clear_control("0,0", output=output)
+    await dispatcher.reserve_base(
+        control_id="0,0",
+        context_id="home",
+        binding_id="play-pause",
+        output=output,
+    )
+    # The replacement fails before publishing: the queued clear still must run.
+    for fn, args in queued:
+        await fn(*args)
+    service.clear_raster.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delayed_page_clear_does_not_erase_published_replacement():
+    service = FakeHardwareCommandService()
+    output = DeviceOutput(service, "dev", "0,0", "raster.bitmap")
+    queued = []
+    dispatcher = RenderDispatcher(
+        command_service=service,
+        config_id="dev",
+        backend=ImmediateBackend(),
+        start_soon=lambda fn, *args: queued.append((fn, args)),
+    )
+    await dispatcher.clear_control("0,0", output=output)
+    await dispatcher.submit_request(
+        control_id="0,0",
+        context_id="home",
+        binding_id="play-pause",
+        request=_solid_request(),
+        output=output,
+    )
+    # The new image wins the hardware lock before the old queued page clear.
+    for fn, args in reversed(queued):
+        await fn(*args)
+    service.set_raster_frame.assert_awaited_once()
+    service.clear_raster.assert_not_awaited()

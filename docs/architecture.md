@@ -114,7 +114,10 @@ only obtains a usable child through its separately authorized attachment.
 Controller shutdown attempts every owned close under cancellation shielding and
 reports collected errors after cleanup. Startup failure closes resources constructed
 before their owning component is registered. Render backends cancel their jobs
-and bound their close wait to one second.
+and bound their close wait to one second. The default backend is owned before
+process warmup, so failed startup also reaps warmed workers. Device setup closes
+its config subscription on all exit paths, including a disconnect before the
+listener starts consuming updates.
 
 Sources: [boundary](../src/deckr/controller/_state_gate.py),
 [effects](../src/deckr/controller/_session_effects.py),
@@ -332,19 +335,30 @@ recomposed with that accepted base, invalidating work built from the previous ba
 
 Render execution can retry once within its deadline while its ticket remains
 current. Hardware sends and user input are never replayed by this retry policy.
-Failed rendering preserves the last successfully dispatched base.
+Failed rendering preserves the last successfully dispatched base within a binding.
+Page retirement still clears its old output: admitting a replacement render does
+not suppress that clear unless replacement output actually reaches the hardware.
+External JPEG artwork also accepts the common HTTP `image/jpg` spelling; decoded
+image content remains validated.
 
 [Render workers](../src/deckr/controller/_render_workers.py) own cancellable jobs.
-The thread runtime initializes local raster composition before starting device
-bindings, keeping executor imports and initial recipe setup out of the first
-provider requests' advertised deadlines.
-Process execution uses AnyIO's managed, cancellable process pool. Admission is
+The runtime initializes raster composition before starting device bindings,
+including warming process workers, keeping cold imports and initial recipe setup
+out of the first provider requests' advertised deadlines.
+Process execution uses controller-owned spawned workers. Ownership starts before
+the first cancellation checkpoint, and cancelled workers are killed and joined,
+including cancellation during startup. Worker errors are checked for a complete
+serialization round trip; exceptions that cannot cross the process boundary
+become a plain diagnostic error. Failed artwork downloads therefore leave warm
+workers reusable. Unserializable results also fail the job without killing its
+worker. Idle workers are reused and closed with the render backend. Admission is
 bounded across controller instances (eight process jobs and eight local thread
 jobs). Accepted work waits asynchronously for execution capacity instead of
 failing when another control temporarily occupies the workers. The wait is
 cancellable and consumes the existing render deadline; ordinary render attempts
-have a two-second deadline. Retiring bindings,
-replacing base output and closing backends cancel their work. Abandoned local
+have a two-second deadline. Superseded pure computation may finish within that
+original deadline so rapid navigation does not repeatedly destroy warm workers;
+its output remains fenced by current binding authority and output revision. Abandoned local
 threads retain capacity until they actually exit. Provider rendering retains its
 negotiated deadline and admission limits. Output revisions fence every hardware handoff.
 
@@ -352,12 +366,12 @@ negotiated deadline and admission limits. Output revisions fence every hardware 
 | --- | --- |
 | Ordinary render requests per control | Two active workers, one coalesced latest pending request. |
 | Ordinary render/send deadlines | Two seconds each. |
-| Shared execution capacity | Eight process jobs and eight local thread jobs across controller instances in the process. |
+| Shared execution capacity | Eight process jobs and eight local thread jobs across controller instances in the process. Eight processes are warmed before binding admission. |
 | Provider render jobs | Two admitted per control, 32 admitted per process, eight executing per process. Waiting jobs count against both admission bounds and the deadline; excess work is refused with `busy`. |
 | Invariant graph workers | Four concurrent executions. |
 | Provider render deadline | Advertised target limit, normally two seconds. |
-| Completed request retention | Target of 512 records; age-based cleanup after 60 seconds. |
-| Hardware rejection mappings | 1,024 records with 60-second expiry. |
+| Completed request retention | At most 512 identity/expiry records, pruned after 60 seconds. Finished jobs release render payloads and binding leases. |
+| Hardware rejection mappings | 1,024 compact receipts with 60-second expiry, pruned by the hardware maintenance loop and removed at disconnect. Receipts hold a weak reference to their recipient. |
 | Queued clears | Latest clear per control; superseded clears are rejected before handoff. |
 
 The provider queue has fixed global and per-control bounds. A burst of initial
@@ -370,11 +384,33 @@ abandons only the wait, retaining capacity until the function exits. This avoids
 stranding AnyIO workers and their thread-local SQLite cache connections during
 cancellation. Context variables are copied into each submitted job.
 
+Each process-local raster executor caches at most 16 MiB of estimated artifact
+storage in memory (also capped at 2,000 entries). RGBA images are charged for both
+pixels and lazily retained PNG bytes; unknown object types bypass memory caching.
+The shared disk tier retains its 512 MiB eviction target. These are cache budgets,
+not limits on total process RSS: interpreter, fonts, active graphs and transient
+encoding allocations also consume memory. Deployment budgets must cover the
+warmed pool plus active rendering allocations. Lower process counts require real
+full-grid startup validation: graph fetches and composition share capacity, and
+queue time counts against their deadlines.
+
+The ordinary image-card path streams HTTP artwork with a 1 MiB byte limit and a
+two-second total download deadline. Inline images have the same byte limit.
+Raster headers are checked against a 4,194,304-pixel ceiling before downstream
+decoding allocates pixels. Provider graphs retain their separately negotiated
+limits and total pixel-allocation budget.
+
 
 Provider commands support text, inline PNG/JPEG and validated Invariant graphs.
-The declared limits include 256 KiB messages, 128 KiB image data, 1,048,576 pixels
+The declared limits include 256 KiB messages, 1 MiB image data, 1,048,576 pixels
 and 1,024 text code points. Orientation and matched raster capabilities determine
-the advertised target geometry.
+the advertised target geometry. The image allowance accommodates ordinary
+640-pixel album artwork fetched by graph jobs; inline images must also fit the
+message limit. Downloads and decoded dimensions remain bounded.
+Fetched graph artwork has a separate 4,194,304-source-pixel ceiling and is
+downscaled to the graph's 1024-pixel dimension and canvas pixel bounds before use.
+Source decoding counts toward the graph's total pixel budget; oversized sources
+are rejected before allocating their pixel buffer. Inline image limits are unchanged.
 
 A `dispatched` result confirms local command dispatch, not physical display.
 Hardware rejection must match the exact command ID, contract, device, control,
@@ -383,8 +419,9 @@ accepted presentation.
 
 The Invariant extension uses public executor/graphics APIs and a controller-owned
 [bounded text adapter](../src/deckr/controller/_bounded_text.py). Text fitting uses
-public font metrics before allocation; packed text draws directly onto a bounded
-canvas and clips/truncates at the requested size. Fixed text is limited to 128
+public font metrics before allocation; packed text wraps at word boundaries and
+shrinks to fit complete words before truncating at its minimum font size. It draws
+directly onto a bounded canvas. Fixed text is limited to 128
 points by graph policy; width fitting searches up to 500 points. The adapter has
 explicit geometry/allocation coverage against `invariant-gfx` 0.4.x. Wire tuples
 are normalized to the executor's recursive list representation so expressions are evaluated before dimension checks; hex
@@ -393,7 +430,9 @@ colours are converted through Pillow's public colour parser.
 Diagnostic render observations are best effort: a failed or busy sink cannot
 change the render result. Writes have a 50 ms caller budget and one outstanding
 write per sink; an abandoned write retains its slot. Records report the requested
-raster encoding.
+raster encoding. Files rotate at 25 MiB with three backups; an individual record
+larger than that budget is dropped without failing rendering. The integration
+harness deliberately retains complete evidence in its isolated run directory.
 
 Sources: [pipeline](../src/deckr/controller/_bindings/_rendering.py),
 [dispatcher](../src/deckr/controller/_render_dispatcher.py),
@@ -404,6 +443,8 @@ Tests: [render contract](../tests/test_rendering_contract.py),
 [reference vectors](../tests/test_rendering_vectors.py),
 [worker lifetime](../tests/test_render_workers.py),
 [graph admission/allocation](../tests/test_render_graph.py),
+[resource cleanup and cache bounds](../tests/test_render_resources.py),
+[artwork fetch limits](../tests/test_invariant_ops.py),
 [observation failures](../tests/test_render_observation.py).
 
 ## Configuration

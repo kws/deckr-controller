@@ -351,3 +351,7 @@ class ControllerService(BaseComponent):
         finally:
             if self._device_disconnect_events.get(live.config_id) is disconnect_event:
                 self._device_disconnect_events.pop(live.config_id, None)
+            # Setup may return before the config listener ever consumes this
+            # generator. Own its subscription through every early exit as well.
+            with anyio.CancelScope(shield=True):
+                await stream.aclose()

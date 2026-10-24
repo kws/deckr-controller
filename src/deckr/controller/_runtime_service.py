@@ -129,6 +129,9 @@ class ControllerRuntimeService(BaseComponent):
 
             if render_backend is not None:
                 unowned.append(render_backend.aclose)
+            from deckr.controller._render_workers import prepare_process_rendering
+
+            await prepare_process_rendering()
             if (
                 self._runtime.config.render is not None
                 and self._runtime.config.render.backend == "thread"
@@ -201,10 +204,12 @@ def _build_render_backend(
     config: ControllerRuntimeConfig,
     *,
     controller_id: str,
-) -> RenderBackend | None:
+) -> RenderBackend:
     render = config.render
     if render is None:
-        return None
+        # Own the default before warming processes: startup may fail before a
+        # ControllerService exists to take responsibility for their cleanup.
+        return ProcessPoolRenderBackend()
 
     if render.backend == "thread":
         backend: RenderBackend = ThreadRenderBackend()

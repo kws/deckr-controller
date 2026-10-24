@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -276,13 +276,13 @@ class MaterializedDeviceConfigService(BaseComponent):
                 )
         return config
 
-    def subscribe(self, config_id: str) -> AsyncIterator[DeviceConfig | None]:
+    def subscribe(self, config_id: str) -> AsyncGenerator[DeviceConfig | None, None]:
         return self._subscribe_impl(config_id)
 
     async def _subscribe_impl(
         self,
         config_id: str,
-    ) -> AsyncIterator[DeviceConfig | None]:
+    ) -> AsyncGenerator[DeviceConfig | None, None]:
         async with self._state.subscribe(
             lambda _version, _current: copy_config(self._config_by_id.get(config_id))
         ) as subscription:

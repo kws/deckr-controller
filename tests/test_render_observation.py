@@ -140,3 +140,29 @@ async def test_observation_failure_preserves_render_success_and_actual_encoding(
     result = await backend.render(request)
     assert result.frame == b"png-frame" and result.error is None
     assert backend._record(request, result, duration_ms=0)["encoding"] == "png"
+
+
+def test_observation_files_have_a_byte_budget_and_keep_recent_complete_records(
+    tmp_path,
+):
+    import json
+
+    path = tmp_path / "renders.jsonl"
+    backend = ObservingRenderBackend(
+        ImmediateBackend(),
+        controller_id="bounded",
+        options=RenderObservationOptions(path=path, max_bytes=100, backup_count=2),
+    )
+    for index in range(100):
+        backend._append_line(json.dumps({"index": index, "text": "é" * 10}))
+    files = list(tmp_path.iterdir())
+    assert len(files) == 3
+    assert all(file.stat().st_size <= 100 for file in files)
+    records = [
+        json.loads(line) for file in files for line in file.read_text().splitlines()
+    ]
+    assert max(record["index"] for record in records) == 99
+    assert min(record["index"] for record in records) > 0
+    with pytest.raises(ValueError, match="exceeds the file budget"):
+        backend._append_line("x" * 101)
+    assert all(file.stat().st_size <= 100 for file in files)

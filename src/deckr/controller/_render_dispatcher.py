@@ -33,6 +33,7 @@ class ControlOutput(Protocol):
 @dataclass(slots=True)
 class _ControlRenderState:
     generation: int = 0
+    published_generation: int = 0
     base_revision: int = 0
     context_id: str | None = None
     binding_id: str | None = None
@@ -147,6 +148,7 @@ class RenderDispatcher:
                 await output.clear_tagged(message_id)
             else:
                 await output.write_tagged(frame, message_id)
+            state.published_generation = composition_revision
             async with self.output_transaction():
                 changed = False
                 async with self._lock:
@@ -293,7 +295,10 @@ class RenderDispatcher:
                     state = self._controls[control_id]
                     async with state.io_lock:
                         async with self.output_transaction(), self._lock:
-                            if state.generation != generation:
+                            # Admission is not publication: a replacement render
+                            # can fail. Keep the page-transition clear until newer
+                            # pixels have actually reached this control.
+                            if state.published_generation > generation:
                                 continue
                             if (
                                 self._result_authorizer is not None
@@ -306,6 +311,7 @@ class RenderDispatcher:
                         if output is not None:
                             with anyio.fail_after(2):
                                 await output.clear()
+                            state.published_generation = generation
                 except Exception:
                     logger.warning(
                         "Hardware clear failed for %s", control_id, exc_info=True
@@ -321,12 +327,13 @@ class RenderDispatcher:
                 with anyio.CancelScope() as scope:
                     state.scopes.add(scope)
                     try:
-                        result = await render_with_retry(
-                            self._backend,
-                            current,
-                            is_current=lambda current=current: state.generation
-                            == current.generation,
-                        )
+                        with anyio.CancelScope(shield=True):
+                            result = await render_with_retry(
+                                self._backend,
+                                current,
+                                is_current=lambda current=current: state.generation
+                                == current.generation,
+                            )
                         if result is not None:
                             await self._apply_result(result)
                     except Exception:
@@ -379,3 +386,4 @@ class RenderDispatcher:
             if target_output is not None:
                 with anyio.fail_after(2):
                     await target_output.write(result.frame)
+                state.published_generation = result.generation

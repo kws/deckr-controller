@@ -94,7 +94,7 @@ def test_fetch_image_url_http_uses_bounded_timeout(monkeypatch):
         def __exit__(self, *exc_info):
             return None
 
-        def get(self, url):
+        def stream(self, method, url):
             raise httpx.ReadTimeout("timed out")
 
     monkeypatch.setattr(fetch_url_module.httpx, "Client", TimeoutClient)

@@ -110,6 +110,34 @@ def test_packed_text_recipe_renders_with_bounded_layout():
     assert render_graph(wire, 72, 72, DEFAULT_LIMITS)
 
 
+@pytest.mark.parametrize(
+    "title", ["ABBA", "Adele", "AC/DC", "Chasing Pavements", "Make\nYou\nFeel My Love"]
+)
+def test_artist_labels_fit_without_splitting_words(monkeypatch, title):
+    from PIL import ImageDraw
+
+    from deckr.controller._bounded_text import packed_text
+
+    rendered_lines = []
+    original = ImageDraw.ImageDraw.text
+
+    def draw_text(self, xy, text, *args, **kwargs):
+        rendered_lines.append(text)
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", draw_text)
+    result = packed_text(
+        text=title,
+        size=[96, 96],
+        font="Inter",
+        min_font_size=4,
+        limits=DEFAULT_LIMITS,
+        max_dimension=1024,
+    )
+    assert result.image.size == (96, 96)
+    assert " ".join(rendered_lines).split() == title.split()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("data", [{"invalid": "document"}, None])
 async def test_invalid_graph_does_not_supersede_admitted_text(managed_substrate, data):
@@ -130,3 +158,112 @@ async def test_invalid_graph_does_not_supersede_admitted_text(managed_substrate,
         assert (result["status"], result["code"]) == ("rejected", "invalid_content")
         backend.gates[0].set()
         assert (await result_for(h, old))["status"] == "dispatched"
+
+
+@pytest.mark.parametrize(
+    "content_type", ["image/jpeg", "image/jpg", "Image/JPG; charset=binary"]
+)
+def test_external_artwork_jpeg_media_types(monkeypatch, content_type):
+    import time
+
+    import httpx
+
+    from deckr.controller._render_graph import _Registry
+
+    stream = io.BytesIO()
+    Image.new("RGB", (96, 96), "red").save(stream, format="JPEG")
+    client = httpx.Client
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200, headers={"content-type": content_type}, content=stream.getvalue()
+        )
+    )
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kwargs: client(transport=transport, **kwargs)
+    )
+    registry = _Registry(DEFAULT_LIMITS, time.monotonic() + 2)
+    image = registry.decode(registry.fetch("https://artwork.example/album.jpg"))
+    assert image.image.size == (96, 96)
+    assert image.image.getpixel((48, 48))[0] > 240
+
+
+def test_detailed_640px_album_art_renders_and_download_limit_still_applies(monkeypatch):
+    import random
+    import time
+
+    import httpx
+
+    from deckr.controller._render_graph import _Registry
+
+    out = io.BytesIO()
+    Image.frombytes("RGB", (640, 640), random.Random(7).randbytes(640 * 640 * 3)).save(
+        out, format="JPEG", quality=90
+    )
+    artwork = out.getvalue()
+    assert 131072 < len(artwork) < DEFAULT_LIMITS.max_image_bytes
+    client = httpx.Client
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "image/jpeg"},
+            content=artwork if request.url.path == "/album" else b"x" * 1048577,
+        )
+    )
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kwargs: client(transport=transport, **kwargs)
+    )
+    wire = {
+        "format": "invariant-graph",
+        "version": 1,
+        "output": "output",
+        "graph": {
+            "blob": {
+                "kind": "node",
+                "op_name": "deckr:fetch_image_url",
+                "params": {"url": "https://artwork.example/album"},
+                "deps": [],
+            },
+            "output": {
+                "kind": "node",
+                "op_name": "gfx:blob_to_image",
+                "params": {"blob": {"$ref": "blob"}},
+                "deps": ["blob"],
+            },
+        },
+    }
+    result = render_graph(wire, 96, 96, DEFAULT_LIMITS)
+    with Image.open(io.BytesIO(result)) as image:
+        assert image.size == (96, 96)
+    registry = _Registry(DEFAULT_LIMITS, time.monotonic() + 2)
+    with pytest.raises(ContentFailure, match="limit_exceeded"):
+        registry.fetch("https://artwork.example/oversized")
+
+
+@pytest.mark.parametrize("dimensions", [(1000, 1333), (3000, 3000)])
+def test_fetched_artist_portraits_are_downscaled_with_a_source_pixel_bound(
+    monkeypatch, dimensions
+):
+    import time
+
+    import httpx
+
+    from deckr.controller._render_graph import _Registry
+
+    out = io.BytesIO()
+    Image.new("RGB", dimensions, "red").save(out, format="JPEG")
+    client = httpx.Client
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200, headers={"content-type": "image/jpeg"}, content=out.getvalue()
+        )
+    )
+    monkeypatch.setattr(httpx, "Client", lambda **kw: client(transport=transport, **kw))
+    registry = _Registry(DEFAULT_LIMITS, time.monotonic() + 2)
+    blob = registry.fetch("https://artwork.example/artist")
+    if dimensions == (3000, 3000):
+        with pytest.raises(ContentFailure, match="limit_exceeded"):
+            registry.decode(blob)
+    else:
+        image = registry.decode(blob).image
+        assert image.size == (768, 1024)
+        assert image.getpixel((384, 512))[0] > 240

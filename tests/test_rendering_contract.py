@@ -1,8 +1,10 @@
 """Rendering contracts exercised through the production managed service boundary."""
 
 import base64
+import gc
 import io
 import threading
+import weakref
 from unittest.mock import AsyncMock
 
 import anyio
@@ -21,6 +23,31 @@ from test_support.rendering import (
     real_backend,
     result_for,
 )
+
+
+@pytest.mark.asyncio
+async def test_completed_render_releases_job_but_keeps_duplicate_fence(
+    managed_substrate,
+):
+    async with running_controller(managed_substrate, with_output=True) as h:
+        backend = real_backend(h, GatedBackend())
+        request = await h.channel.send("binding_render", parameters(h))
+        await eventually(lambda: bool(backend.gates))
+        renderer = h.device.components.rendering
+        job = weakref.ref(next(iter(renderer.jobs.values())))
+        backend.gates[0].set()
+        assert (await result_for(h, request))["status"] == "dispatched"
+        await drained(h)
+        gc.collect()
+        assert job() is None, (
+            "Completed render history retains payload and binding lease"
+        )
+        await h.substrate.publish(request)
+        barrier = await h.channel.send(
+            "binding_render", {**parameters(h), "requirementName": "missing"}
+        )
+        await result_for(h, barrier)
+        assert len(backend.gates) == 1
 
 
 @pytest.mark.asyncio
@@ -81,7 +108,8 @@ async def test_queued_render_is_bounded_and_cannot_dispatch_after_expiry_or_reti
     monkeypatch.setattr(rendering, "_WORKERS", execution)
     if stop == "deadline":
         monkeypatch.setattr(
-            policy, "DEFAULT_LIMITS",
+            policy,
+            "DEFAULT_LIMITS",
             DEFAULT_LIMITS.model_copy(update={"max_render_time_ms": 300}),
         )
     async with running_controller(

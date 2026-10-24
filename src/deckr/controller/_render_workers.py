@@ -13,9 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
 
 import anyio
-import anyio.to_process
 import httpx
 
+from deckr.controller import _render_process
 from deckr.controller._raster import RasterFormat
 from deckr.controller._render import (
     RenderModel,
@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 RENDER_TIMEOUT_SECONDS = 2.0
 # Execution stays bounded, including abandoned threads that have not exited.
 # Callers bound waiting work per control and cancel it at the render deadline.
-_PROCESS_SLOTS = threading.BoundedSemaphore(8)
+PROCESS_WORKERS = 8
+_PROCESS_SLOTS = threading.BoundedSemaphore(PROCESS_WORKERS)
+_PROCESS_LIMITER = anyio.CapacityLimiter(PROCESS_WORKERS)
 _THREAD_SLOTS = threading.BoundedSemaphore(8)
 _THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="deckr-render")
 
@@ -47,9 +49,8 @@ async def run_process(function, *args, limiter=None):
     slots = _PROCESS_SLOTS
     await _acquire_slot(slots)
     try:
-        return await anyio.to_process.run_sync(
-            function, *args, cancellable=True, limiter=limiter
-        )
+        async with limiter or _PROCESS_LIMITER:
+            return await _render_process.run(function, *args)
     finally:
         slots.release()
 
@@ -98,6 +99,34 @@ async def prepare_thread_rendering():
         render_request_to_frame(request)
 
     await run_thread(prepare)
+
+
+def _prepare_process():
+    from invariant import dump_graph_to_dict
+
+    from deckr.controller._bindings._render_policy import DEFAULT_LIMITS
+    from deckr.controller._render_graph import render_graph
+    from deckr.controller.invariant.recipes import icon_button
+
+    graph = icon_button(icon="lucide:play", title="Ready")
+    frame = render_graph(
+        dump_graph_to_dict(graph.graph, output=graph.output),
+        96,
+        96,
+        DEFAULT_LIMITS.model_copy(update={"max_render_time_ms": 30000}),
+    )
+    request = RenderService().build_request(
+        RenderModel(image="data:image/png;base64," + base64.b64encode(frame).decode()),
+        RasterFormat(96, 96),
+    )
+    render_request_to_frame(request)
+
+
+async def prepare_process_rendering():
+    """Pay graphics import and font initialization before exposing bindings."""
+    async with anyio.create_task_group() as group:
+        for _ in range(PROCESS_WORKERS):
+            group.start_soon(run_process, _prepare_process)
 
 
 async def render_with_retry(
@@ -190,6 +219,7 @@ class _OwnedRenderBackend:
             with anyio.fail_after(1):
                 for _, done in jobs:
                     await done.wait()
+        await _render_process.close_idle()
 
 
 class ThreadRenderBackend(_OwnedRenderBackend):
@@ -200,7 +230,7 @@ class ThreadRenderBackend(_OwnedRenderBackend):
 
 
 class ProcessPoolRenderBackend(_OwnedRenderBackend):
-    """Cancellable rendering in AnyIO's managed process pool."""
+    """Cancellable rendering in the controller-owned process pool."""
 
     def __init__(self, *, max_workers: int | None = None):
         super().__init__()
