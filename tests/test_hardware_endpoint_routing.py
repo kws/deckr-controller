@@ -143,6 +143,15 @@ async def test_successor_revalidates_configuration_match(changed, managed_substr
         h.callbacks.on_hardware_connected.assert_awaited_with(
             live, initial_config=replacement
         )
+        # NATS delivers the successor to both participants independently, just
+        # as it does the initial claim. Wait for command admission at the peer.
+        await eventually(
+            lambda: any(
+                claim.contract.contract_id == successor.contract_id
+                and claim.contract.generation == successor.generation
+                for claim in h.manager.live_claims
+            )
+        )
         await h.service.command_service.clear_raster("replacement", "key-1", "raster")
         await eventually(lambda: h.commands.await_count == 1)
         assert h.commands.await_args.args[0].message.contract == successor
