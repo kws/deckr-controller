@@ -721,7 +721,7 @@ wheels = [
 
 [[package]]
 name = "invariant-core"
-version = "0.7.0a1"
+version = "0.7.0"
 source = { editable = "../invariant-core" }
 dependencies = [
     { name = "cachetools" },
@@ -753,7 +753,7 @@ dev = [
 
 [[package]]
 name = "invariant-gfx"
-version = "0.5.0a1"
+version = "0.5.0"
 source = { editable = "../invariant-gfx" }
 dependencies = [
     { name = "cairosvg" },
@@ -768,7 +768,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cairosvg", specifier = ">=2.8.2,<3.0.0" },
-    { name = "invariant-core", specifier = ">=0.7.0a1" },
+    { name = "invariant-core", specifier = ">=0.7.0" },
     { name = "justmyresource", specifier = ">=1.1.1,<2.0.0" },
     { name = "justmytype", specifier = ">=0.3.0,<1.0.0" },
     { name = "justmytype-western-core", marker = "extra == 'fonts'", specifier = ">=0.1.0" },

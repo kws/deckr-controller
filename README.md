@@ -13,8 +13,11 @@ The Python `deckr` package comes from [deckr-core-python](https://github.com/kws
 Use Python 3.11 or later and `uv`.
 Check out `deckr-core-python`, `invariant-core` and `invariant-gfx` beside this
 repository. The source overrides in `pyproject.toml` use those editable checkouts.
-The Invariant changes require the exact commits recorded in `.invariant-core-revision`
-and `.invariant-gfx-revision`, rather than the older published stable packages.
+The exact commits recorded in `.invariant-core-revision` and
+`.invariant-gfx-revision` select the published Invariant Core 0.7.0 and
+Invariant GFX 0.5.0 releases. Use these release checkouts for local development
+and CI; the libraries' upstream `main` branches carry post-release development
+versions.
 
 ```bash
 git clone https://github.com/kws/invariant-core.git ../invariant-core
